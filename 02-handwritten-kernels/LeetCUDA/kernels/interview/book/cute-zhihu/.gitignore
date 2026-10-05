@@ -1,0 +1,11 @@
+cute-zhihu.pdf
+*.aux
+*.log
+*.toc
+*.out
+.tmp/
+.tmp_build*.log
+mini-*.tex
+cover-tikz.aux
+cover-tikz.log
+cover_preview.png

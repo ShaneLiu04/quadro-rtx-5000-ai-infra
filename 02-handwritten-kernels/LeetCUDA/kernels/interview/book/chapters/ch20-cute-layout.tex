@@ -1,0 +1,1586 @@
+% ch20-cute-layout.tex — CuTe（一）：Layout 基础与代数（RFC-F，2026-09-11）
+% \url 由 book.tex 的 hyperref 提供；单章独立编译时降级为可断行的 \ttfamily
+% （逐字符插入 \allowbreak，避免长 URL 造成 Overfull \hbox）
+\makeatletter
+\providecommand{\urlchbrk}[1]{\@tfor\next:=#1\do{\next\allowbreak}}
+\makeatother
+\providecommand{\url}[1]{{\ttfamily\urlchbrk{#1}}}
+\chapter{CuTe（一）：Layout 基础与代数}\label{ch:20}
+
+\section{本章导读}
+
+前十九章的 kernel 都是「手写地址算术」的产物：自己在 gmem 上算 $(m,k)$ 的偏移，
+自己在 smem 上做 XOR swizzle，自己拼 ldmatrix 的 lane 地址，自己在 epilogue 里
+用 \texttt{\_\_shfl\_sync} 把 fragment 拼回连续向量。这套做法在第~\ref{ch:11}、
+\ref{ch:12}~章把 HGEMM 推到了 122 TFLOPS 量级，但它的知识结构是「散」的：
+同一组形状与步长的事实，以五种不同的写法散落在 kernel 的五个角落。Part~IV
+换一种做法：把 \textbf{(Shape, Stride) 提升为一等的数学对象}，用代数运算
+（复合、逆、乘积、切分）代替手写公式，把「我想要的布局」与「怎么算地址」
+这两件事分开。
+
+本章是 Part~IV 的原理篇开篇，也是全书唯一一章\textbf{不写任何 GPU kernel}：
+我们只研究 layout 本身。四章路线：本章（layout 代数）$\to$ 第~\ref{ch:21}~章
+（Tensor 与 TiledCopy：把 layout 用在数据上）$\to$ 第~\ref{ch:22}~章（TiledMMA：
+把 layout 用在计算上）$\to$ 第~\ref{ch:23}~章（Swizzle 与 TMA：把 layout 用在
+硬件特性上）；随后第~\ref{ch:24}--\ref{ch:26}~章用这套语言重写 HGEMM 与
+FlashAttention/FFPA，与前面手写版逐项对照。本章不假设读者用过 CuTe。
+
+\textbf{前置章节}：第~\ref{ch:11}~章（MMA fragment 与分块）、第~\ref{ch:12}~章
+（XOR swizzle 的位运算）。\textbf{源码区间}：hgemm.cuh~L788--820，即
+Phase~7c-1 的 CuTe HGEMM 头注释与模板参数清单（本章只引用这个区间；CuTe 版
+kernel 本体的逐行讲解留给第~\ref{ch:24}~章）。\textbf{编译宏}：
+\texttt{NOTES\_\allowbreak{}V2\_\allowbreak{}ENABLE\_\allowbreak{}CUTE}（CuTe 路径需 CUTLASS 头文件可用，sm80+ 均可编）。
+配套最小测试 \texttt{book/\allowbreak{}tests/\allowbreak{}ch20\_\allowbreak{}layout.\allowbreak{}cu}：host 端 CuTe 布局断言，
+不需 GPU kernel。
+
+\section{问题与动机}
+
+先盘点第~\ref{ch:12}~章 swizzle kernel 中的布局知识。一个
+$B_M\times B_K = 128\times64$ 的 A tile 从 gmem 搬到寄存器，同一组「形状与
+步长」的事实至少出现在五处：
+
+\begin{enumerate}
+  \item \textbf{gmem 寻址}：A 是 row-major 的 $M\times K$ 矩阵，$(m,k)$ 的地址
+        为 $m\cdot K+k$；
+  \item \textbf{cp.async 搬运地址}：block tile 偏移、stage 偏移、16\,B chunk
+        粒度的 gmem$\to$smem 地址换算；
+  \item \textbf{ldmatrix 的 lane 映射}：$\mathrm{row}=\mathrm{lane}\bmod16$、
+        chunk $=\lfloor\mathrm{lane}/16\rfloor$——这是 MMA fragment layout 与
+        smem layout 的交点；
+  \item \textbf{XOR swizzle}：$addr' = addr \oplus ((\mathrm{addr} \mathbin{\&}
+        \mathrm{mask}) \gg S)$，而它的效果依赖 smem 行宽（第~\ref{ch:12}~章实测：
+        $B_K{=}16$ 时 2-way 冲突、$B_K{=}64$ 时 8-way）；
+  \item \textbf{epilogue}：C fragment 的 lane 分布、shuffle 拼接、128-bit 写回。
+\end{enumerate}
+
+五处公式必须彼此一致。任何一处写错都不会报错，只会静默地错数据。更麻烦的是
+它们的联动：把 $B_K$ 从 64 改成 32，五处里至少三处要跟着改；把 mma atom 从
+m16n8k16 换成别的，第 3、5 处重算。第~\ref{ch:12}~章末尾的「结论随行宽变」
+就是这个现象：\textbf{bank 冲突度不是 kernel 的属性，而是 layout 的属性}，
+它应该由工具从布局里推出来，而不是由人记住。
+
+CuTe 的答案是：把一个 layout 定义成「\textbf{坐标 $\to$ 线性 offset} 的函数」，
+形状与步长只是它的表示参数；再给这套函数配一代数。kernel 作者声明三件事：gmem
+上数据的 layout、smem 上 tile 的 layout、fragment 的 layout；剩下的地址
+计算由库在编译期折叠掉。本章把这套代数的定义与直觉讲透，第~\ref{ch:24}~章会看到
+hgemm 的手写版（235 行去注释代码）变成 CuTe 版 kernel 本体 118 行，且后者没有
+一行地址算术、没有一条内联 PTX。
+
+\section{数学原理}
+
+\subsection{Layout 是一个函数}
+
+在 CUDA 里访问一个元素，最终都要落到「基址 $+$ 偏移」：拿到一段内存的
+起始指针后，真正决定「我要的 $(m,k)$ 在哪里」的，是一个从坐标到偏移的
+映射。第~\ref{ch:11}、\ref{ch:12}~章手写 HGEMM 时，这个映射以五种面貌
+出现（gmem 寻址、cp.async 地址、ldmatrix lane 映射、XOR swizzle、
+epilogue 拼接），每种写一遍、彼此还要对齐。@竹熙佳处在《写给大家看的
+CuTe 教程：Layout Compose \& Inverse》里给出的视角是：把这些映射
+\textbf{统一看成一个函数}：输入是逻辑坐标，输出是一个整数偏移，函数体
+只有整数乘法与加法。把这件事命名并形式化，就得到了 CuTe 的 layout。
+
+\textbf{定义（layout）}。layout 由 shape 与 stride 两个参数组成：
+
+\begin{itemize}
+  \item \textbf{坐标空间}：shape $S=(s_0,\dots,s_{k-1})$ 张成
+        $Z(S) = [0,s_0)\times\cdots\times[0,s_{k-1})$，其元素叫坐标
+        $\mathbf{c}=(c_0,\dots,c_{k-1})$。
+  \item \textbf{线性化}：stride $D=(d_0,\dots,d_{k-1})$ 把坐标映成整数
+        \begin{equation}
+          \mathrm{idx} \;=\; f(\mathbf{c}) \;=\; \sum_{i=0}^{k-1} d_i\,c_i .
+          \label{eq:20-linear}
+        \end{equation}
+  \item \textbf{colex 序}：式~\eqref{eq:20-linear} 里 $c_0$ 是枚举最快的坐标
+        （整数 $x$ 加 1 时最先翻转的是 $c_0$；这与各 mode 的 stride 大小
+        无关），$c_{k-1}$ 最慢。
+        CuTe 全书默认这一约定，来源是「column-major」：对
+        $S=(4,8),D=(1,4)$，坐标 $(c_0,c_1)$ 是（行，列），
+        $f=c_0+4c_1$，即 C 语义下的列优先。
+\end{itemize}
+
+用映射语言说，式~\eqref{eq:20-linear} 就是「$k$ 维坐标按各方向的步长折算成
+一个整数」：每个 mode 贡献 $d_i c_i$，最后求和，没有别的运算。CuTe 的
+\texttt{Layout} 就装着一对 $(S,D)$；调用 \texttt{layout\allowbreak{}(coord)} 得到
+式~\eqref{eq:20-linear} 的值。
+
+还有一个反直觉的二象性：\textbf{把整数 $x$ 交给 layout} 时，
+CuTe 先把 $x$ 按 colex 序分解回坐标
+\begin{equation}
+  c_i \;=\; \Bigl\lfloor x \big/ \textstyle\prod_{j<i} s_j \Bigr\rfloor
+  \bmod s_i ,
+  \label{eq:20-colex-decomp}
+\end{equation}
+再代入式~\eqref{eq:20-linear}。这个分解只用到 shape、与 stride 无关，
+@竹熙佳处在教程里特别提示过这是初学时最容易卡住的一点。于是「$f$ 在坐标
+上」与「$f$ 在线性索引上」是同一个函数（用映射语言说：线性索引与坐标只是
+同一个函数的两种输入写法）。注意 $f(x)$ 一般\emph{不}单调：colex 进位时
+$x\to x+1$ 同时改变两个坐标（低位复位、高位 $+1$），offset 增量
+$d_{i+1}-d_i(s_i-1)$ 可为负：$(2,3){:}(3,1)$ 的 offset 序列是
+$0,3,1,4,2,5$，row-major 的 $(4,8){:}(8,1)$ 也有 $f(3)=24>f(4)=8$；只有
+当各 mode 的 stride 按 colex 排序（如 compact col-major，此时 $f(x)=x$）
+时才单调不减。这条单调性并非后续结论的前提：layout 的整数域本身是一个
+「一次遍历」的索引空间，后面所有遍历式断言（以及 \texttt{cosize}）依赖的
+只是 shape 分解 $[0,\mathrm{size})\to Z(S)$ 的双射性，与单调性无关。
+
+配套两个规模量：\textbf{size}（定义域基数）与 \textbf{cosize}（值域上界）
+\begin{equation}
+  \mathrm{size}(f) = \prod_i s_i , \qquad
+  \mathrm{cosize}(f) = 1 + \sum_i d_i (s_i - 1) .
+  \label{eq:20-size-cosize}
+\end{equation}
+用映射语言说：size 是定义域的元素个数；cosize 是值域的上界，$1+\sum
+d_i(s_i-1)$ 恰为「最大偏移加一」。当 $\mathrm{cosize}=\mathrm{size}$ 时称
+布局是 \textbf{compact}（无空洞、双射）；否则有「孔洞」（padding/skip）。
+这个区分在 kernel 里很重要：CuTe 里 padding 后的一行 smem 就是一个带孔洞的
+layout，而 \texttt{cosize} 直接就是这块 smem 实际要占的元素数，声明布局的
+同时把 smem 用量也算出来了。
+
+\begin{itemize}
+  \item 例 1（compact col-major）：$S=(4,8),D=(1,4)$：$f(c_0,c_1)=c_0+4c_1$，
+        $f(1,3)=13$、$f(3,1)=7$；$f(x)=x$（列优先 compact 下线性索引即恒等，
+        本章测试 case~A 对这个 layout 逐点核对了 128 个断言）。
+  \item 例 2（row-major）：$S=(4,8),D=(8,1)$：$f(c_0,c_1)=8c_0+c_1$，
+        $f(1,3)=11$。CuTe 里写 \texttt{make\_\allowbreak{}layout\allowbreak{}(shape,\allowbreak{} Layout\allowbreak{}Right\{\})}
+        得到它；注意 \texttt{make\_\allowbreak{}layout\allowbreak{}(Shape)} 的默认是 column-major，
+        与 C 数组的直觉相反（常见坑二）。
+  \item 例 3（带孔洞）：$S=(8,4),D=(2,16)$：$f(c_0,c_1)=2c_0+16c_1$，
+        $\mathrm{size}=32$ 但 $\mathrm{cosize}=1+2\cdot7+16\cdot3=63$，
+        值域只命中偶数——这是一个「每两个位置放一个值」的稀疏布局
+        （图~\ref{fig:20-hole-size-cosize}）。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\tiny]
+  \begin{scope}
+    \foreach \fr in {0,...,7}{
+      \foreach \fc/\fh in {0/1,1/3,2/5,3/7}{
+        \pgfmathtruncatemacro{\vv}{2*\fr+16*\fc}
+        \edef\cfill{colorx\fh!18}
+        \node[fill=\cfill, minimum width=0.66cm, minimum height=0.5cm, inner sep=0pt]
+          at ({(\fc+0.5)*0.66},{-(\fr+0.5)*0.5}) {\vv};
+      }
+    }
+    \draw[thin] (0,0) grid[xstep=0.66cm, ystep=0.5cm] (2.64,-4);
+    \draw[very thick] (0,0) rectangle (2.64,-4);
+    \foreach \fr in {0,...,7}{
+      \node[anchor=east] at (-0.05,{-\fr*0.5-0.25}) {\fr};
+    }
+    \foreach \fc in {0,...,3}{
+      \node[anchor=south] at ({\fc*0.66+0.33},0.05) {\fc};
+    }
+    \node[anchor=north, align=center] at (1.32,-4.3)
+      {$(8,4){:}(2,16)$，格内 $=2c_0+16c_1$；\\
+       行 $c_0$（mode 0）向下、列 $c_1$（mode 1）向右};
+  \end{scope}
+  \node[anchor=north west, align=left, text width=8.2cm] at (3.2,0.05)
+    {\textbf{$64$ 个坐标只落到 $32$ 个 offset 上}：行步长 $2$ 使 $c_0+1$ 跳过奇数
+     offset，列步长 $16$ 使 $c_1+1$ 跳过 $2$ 个 offset（$c_1{=}0$ 的最后一格是
+     $14$，下一格 $16$——中间的 $15$ 永远读不到）。最大 offset
+     $=2\cdot7+16\cdot3=62$，于是 $\mathrm{size}=32$ 而
+     $\mathrm{cosize}=63$：\textbf{$\mathrm{cosize}>\mathrm{size}$ 即「孔洞」}。
+     声明布局的同时把 smem 用量也算了出来——padding 过的 smem 行就是这类布局。};
+  \begin{scope}[shift={(0,-5.9)}]
+    \foreach \br in {0,...,3}{
+      \foreach \bc in {0,...,15}{
+        \pgfmathtruncatemacro{\off}{16*\br+\bc}
+        \ifnum\off<63
+          \pgfmathtruncatemacro{\odd}{mod(\off,2)}
+          \ifnum\odd=0
+            \node[fill=gray!35, minimum width=0.5cm, minimum height=0.4cm, inner sep=0pt]
+              at ({\bc*0.5+0.25},{-\br*0.4-0.2}) {};
+          \else
+            \node[pattern=north east lines, pattern color=gray!70, fill=white,
+              minimum width=0.5cm, minimum height=0.4cm, inner sep=0pt]
+              at ({\bc*0.5+0.25},{-\br*0.4-0.2}) {};
+          \fi
+        \fi
+      }
+      \pgfmathtruncatemacro{\ncol}{min(16,63-16*\br)}
+      \draw[thin] (0,{-\br*0.4}) grid[xstep=0.5cm, ystep=0.4cm]
+        ({0.5*\ncol},{-\br*0.4-0.4});
+      \node[anchor=east] at (-0.08,{-\br*0.4-0.2}) {$c_1{=}\br$};
+    }
+    \draw[very thick] (0,0) rectangle (8,-1.6);
+    \draw[thin, dashed, gray!70] (7.5,-1.2) rectangle (8,-1.6);
+    \node[anchor=south, font=\scriptsize\bfseries] at (4,0.36)
+      {下面板：offset 轴 $0$–$62$ 的命中分布（每格 $=$ 一个 offset）};
+    \node[anchor=west, align=left, text width=7.0cm] at (8.5,-0.8)
+      {灰格 $=$ 命中（$32$ 个偶数 offset，恰为 $\mathrm{size}$）；\\
+       斜线格 $=$ 孔洞（$31$ 个奇数 offset，任何坐标都读不到）；\\
+       最大 offset $62$ 加 $1$ 就是 $\mathrm{cosize}=63$，虚线格 $63$ 已越界。};
+  \end{scope}
+\end{tikzpicture}
+\caption{带孔洞布局的 size 与 cosize（例~3，$L=(8,4){:}(2,16)$）：
+上面板把 $64$ 个坐标的值列出来，行步长 $2$、列步长 $16$ 使值域只取偶数，
+同一行的 8 个值跨 $16$ 个 offset；下面板把 offset 轴 $0$–$62$ 铺开——
+$32$ 个灰格是命中（$=2c_0+16c_1$ 的全部取值）、$31$ 个斜线格是永远读不到
+的孔洞，虚线的第 $63$ 格已越界。$\mathrm{cosize}=1+\sum_i d_i(s_i-1)=63$
+即「最大偏移加一」，也就是这块 smem 实际要占的元素数。}
+\label{fig:20-hole-size-cosize}
+\end{figure}
+
+\subsection{五个运算，五类实际问题}
+
+把 layout 当函数以后，kernel 里的布局操作就全部变成函数运算。CuTe 提供
+五个运算族，每一族都对应 kernel 里的一类实际问题。本节先按
+「问题 $\to$ 运算」的顺序把它们梳理一遍（@竹熙佳处在教程里指出过 CuTe 官方
+文档「没有前后联系地抛出一堆概念和代数运算」；本章刻意反向组织：先让每个
+运算有具体的应用场景，再在下一节给出定义与公式）：
+
+\begin{enumerate}
+  \item \textbf{Compose（复合）：解决「两层映射怎么串联」。}三个真实场景：
+        (a) \textbf{TV-layout 寻址}——拷贝划分先给出 (thread, value) 到
+        逻辑坐标 $(m,n)$ 的映射，而真正访问内存还要再叠一层 tensor 自身的
+        $(m,n)\to$ offset 映射，两次映射复合才是「线程 $t$ 的第 $v$ 个值
+        在哪个地址」（第~\ref{ch:21}~章展开）；
+        (b) \textbf{swizzle 消 bank conflict}——swizzle 本身是
+        offset$\to$offset$'$ 的映射，把它复合到 smem 布局的外层，之后代码
+        仍可用正常 $(m,n)$ 坐标访问，物理地址已被改写而调用代码无需感知
+        （4.1 节的 \texttt{SmemLayoutA} 就是 \texttt{Swizzle}$\circ$atom
+        的一次复合）；
+        (c) \textbf{FA2 的 P 矩阵转换}——给 QK 的 accumulator 布局复合一次
+        「列拆半」变换，P 就能原地重解释为 $PV$ 的 A 操作数
+        （4.8 节完整推一遍）。
+  \item \textbf{Inverse（逆）：解决「从 offset 反查坐标」。}给定一个 offset
+        反查它的坐标：copy 的地址反解、\texttt{max\_\allowbreak{}common\_\allowbreak{}layout}
+        （求两个布局的最大公共连续块）都以它为基础；4.8 节的代数法更是把它
+        当作 layout 变换的中心工具。
+  \item \textbf{Product（乘积）：解决「小布局怎么铺成大布局」。}\allowbreak{}smem 上
+        $8\times B_K$ 的 swizzle atom 要铺满 $(B_M,B_K,k_{\mathrm{Stage}})$
+        的完整布局，靠的就是 product 族（\texttt{tile\_\allowbreak{}to\_\allowbreak{}shape}）；
+        「两块数据并排摆、坐标分量相加」是它的几何语义。
+  \item \textbf{Divide（切分）：解决「大矩阵怎么切块」。}\allowbreak{}GEMM 的
+        \texttt{local\_tile}、注意力里对 K/V 的分块遍历，底层是同一条
+        运算：把大 layout 切成「tile 内布局 $+$ tile 索引」两段；
+        \texttt{zipped\_\allowbreak{}divide} 的实测是本章最核心的数据（4.5 节）。
+  \item \textbf{Mode 操作（投影/合并/展平/化简）：解决「索引结构不合用的
+        问题」。}\allowbreak{}MMA fragment 与 remainder mode 的分离（第~\ref{ch:22}~章）、
+        epilogue 把 $(\mathrm{CPY}_M,\mathrm{CPY}_N)$ 两层循环压成一个线性
+        索引（第~\ref{ch:21}~章），都是这类操作。
+\end{enumerate}
+
+一个 layout 恒等式是否成立，判据只有一条：\textbf{对定义域内每个坐标逐点相等}。
+CuTe 自己的单测也是这么写的（例如 \texttt{test\_\allowbreak{}composition} 对
+$c<\mathrm{size}(B)$ 断言 $R(c)=A(B(c))$），本章测试沿用同一手法：所有代数
+结论都用「全遍历 + 逐点断言 + 双射覆盖检查」验证，而不是抽几个样例做粗略对照。
+
+\section{设计与实现}
+
+\subsection{先看「类型即布局」：hgemm.cuh 的 CuTe 类型清单}
+
+第~\ref{ch:12}~章的手写 kernel 把布局知识藏在常量与宏里；CuTe 版则把它们
+全部提升为模板参数。先看 hgemm.cuh L788--805 的头注释，它概括了 CuTe 版
+kernel 的流水线结构，与第~\ref{ch:11}、\ref{ch:12}~章手写版一一对应：
+
+头注释（Phase 7c-1：TN 布局 $+$ Smem Swizzle $+$ Multistage Pipeline）先声明
+TN 布局：$C_{M \times N} = A_{M \times K} \cdot B^{\top}_{N \times K}$，$A$
+为 row-major，$B^{\top}$ 也为 row-major（等价于 $B$ 是 col-major 的
+$[K \times N]$）；在 CuTe 中由
+\texttt{make\_\allowbreak{}tensor\allowbreak{}(make\_\allowbreak{}gmem\_\allowbreak{}ptr\allowbreak{}(ptr),\allowbreak{} shape,\allowbreak{} stride)}
+描述。流水线流程（stage 是 K tile 的循环缓冲槽，不是一条完整计算链）：
+
+\begin{enumerate}
+  \item \textbf{PREFETCH}：预加载 kStage$-$1 个 K tile（G$\to$S via
+        \texttt{cp.async}），填满 stage。
+  \item \textbf{主循环 over K tiles}：(a)~从当前 stage 做 S$\to$R——
+        \texttt{cute::copy(...)}，落到 ldmatrix；(b)~对当前 K slice 做
+        MMA——\texttt{cute::gemm(...)}，落到 \texttt{mma.sync}；
+        (c)~在处理当前 tile 的首个 MMA slice 时，异步提交下一个 tile 的
+        G$\to$S；(d)~当前 tile 的最后一个 K slice 完成后，等待并切换
+        smem stage。
+  \item \textbf{Epilogue}：R$\to$S（\texttt{UniversalCopy} 写入 C
+        scratchpad）$\to$ S$\to$G（128-bit store）。
+\end{enumerate}
+
+头注释末尾是一组「面试对比」，比较手写 MMA 与 CuTe 的代码量：手写版要做
+ldmatrix PTX 地址计算 $+$ swizzle XOR $+$ mma PTX $+$ epilogue shuffle，
+约 200 行；CuTe 版只需 partition $+$ copy $+$ gemm，约 80 行，其余由
+launch wrapper 的类型推导完成。
+
+再看紧随其后的模板参数清单，本章的核心主题「layout 是类型」在这里体现得最直接：
+
+\lstinputlisting[linerange={806-820},firstnumber=auto,
+  title={hgemm.cuh L806-820（模板参数：TiledMMA / 各类 Copy / SmemLayout 全是类型）}]{../hgemm.cuh}
+
+逐项解读（第~\ref{ch:21}--\ref{ch:23}~章会把这些类型逐个拆开）：
+
+\begin{itemize}
+  \item \texttt{TiledMMA}：MMA 的「原子 + 排布」，注释写明
+        \texttt{SM80\_\allowbreak{}16x8x16\_\allowbreak{}F16\allowbreak{}F16\allowbreak{}F16\allowbreak{}F16\_\allowbreak{}TN} 且 EURepeat $=2\times2\times1$；
+  \item \texttt{G2SCopyA/B}：gmem$\to$smem 的搬运原子（\texttt{cp.async}
+        的 16\,B 版本）；
+  \item \texttt{Smem\allowbreak{}Layout\allowbreak{}A/\allowbreak{}B}：smem 上 A/B tile 的布局——
+        \texttt{Swizzle\allowbreak{}<3,\allowbreak{}3,\allowbreak{}3>} 与 $8\times B_K$ atom 复合再铺满
+        $(B_M,B_K,k_{\mathrm{Stage}})$，正是第~\ref{ch:12}~章手写 XOR swizzle 的
+        声明式写法；
+  \item \texttt{S2\allowbreak{}RCopy\allowbreak{}Atom\allowbreak{}A/\allowbreak{}B}：smem$\to$寄存器（\texttt{ldmatrix.x4}）；
+  \item \texttt{R2\allowbreak{}SCopy\allowbreak{}Atom\allowbreak{}C}/\texttt{S2\allowbreak{}GCopy\allowbreak{}Atom\allowbreak{}C}/\texttt{S2GCopyC}：
+        epilogue 的寄存器$\to$smem（32-bit）与 smem$\to$gmem（128-bit）搬运。
+\end{itemize}
+
+这些「类型」就是布局本身：它们由 \texttt{Int<N>}（编译期整数常量，类型级）、
+\texttt{Shape}、\texttt{Stride}、\texttt{Layout}、\texttt{Swizzle} 等拼装出来。
+由于 shape/stride 是类型的一部分，\texttt{cosize}、复合、切分的结果都可以在
+\textbf{编译期}折叠为常数，这是后文「零成本抽象」论证的根基。
+
+\paragraph{实践须知}
+\begin{itemize}
+  \item 模板参数清单里的 \texttt{TiledMMA}、\texttt{G2SCopyA}、
+        \texttt{SmemLayoutA} 等名字只说明「类型角色」；具体型号（哪个 MMA
+        原子、哪个 cp.async 变体、哪个 ldmatrix 方向）要去 launch wrapper
+        的构造段（hgemm.cuh~L1303--1377）核对。本书逐项核过（CUTLASS
+        v4.6.1）：F16 累加路径用 \texttt{SM80\_\allowbreak{}16x8x16\_\allowbreak{}}\allowbreak
+        \texttt{F16\allowbreak{}F16\allowbreak{}F16\allowbreak{}F16\_\allowbreak{}TN}（F32 累加则切到
+        \texttt{F32\allowbreak{}F16\allowbreak{}F16\allowbreak{}F32\_\allowbreak{}TN}），G2S 用
+        \texttt{SM80\_\allowbreak{}CP\_\allowbreak{}ASYNC\_\allowbreak{}}\allowbreak\texttt{CACHEGLOBAL\allowbreak{}<uint128\_\allowbreak{}t>}，
+        S2R 用 \texttt{SM75\_\allowbreak{}U32x4\_\allowbreak{}LDSM\_\allowbreak{}N}，R2S/S2G 用
+        \texttt{Universal\allowbreak{}Copy\allowbreak{}<int>} 与
+        \texttt{Universal\allowbreak{}Copy\allowbreak{}<}\allowbreak\texttt{uint128\_t>}，与注释一致。
+  \item 类型名随 CUTLASS 版本变化：换版本后「注释与实现是否一致」要重核，
+        不要照抄本节列表。
+  \item 更省事的做法是把注释声称的类型写进 \texttt{static\_\allowbreak{}assert}（或按本章
+        测试的做法在 host 端做类型断言），让「注释与实现一致」变成编译期
+        检查，而不是依靠人工阅读核对。
+\end{itemize}
+
+\subsection{Compose：$R(c)=A(B(c))$}
+
+先看 compose 解决的三个真实问题，再看定义。
+
+\textbf{场景一：TV-layout 寻址（第~\ref{ch:21}~章的核心内容）。}
+\texttt{make\_\allowbreak{}tiled\_\allowbreak{}copy} 类划分先算出「$(t,v)\to(m,n)$」：线程 $t$ 的
+第 $v$ 个值对应 tile 的第 $(m,n)$ 格。但 $(m,n)$ 还只是\emph{逻辑}坐标；
+要把值真正取出来，还得再叠一层「$(m,n)\to$ 物理 offset」的 tensor 布局。
+两次映射的复合（$(t,v)\to(m,n)\to\mathrm{offset}$）才给出每个线程的访问
+地址。@竹熙佳处把这一点的价值概括为「变换 layout 时只关注坐标空间」：
+同一个 $(m,n)$ 复合不同的 tensor 布局，就能分别正确落到 global / shared /
+register 上，这是一份划分同时服务三种内存的关键。
+
+\textbf{场景二：swizzle 消 bank conflict。}\allowbreak{}swizzle 是
+offset$\to$offset$'$ 的映射。对一块 smem 布局做 swizzle 后，访问链变成
+$(m,n)\to\mathrm{offset}\to\mathrm{offset}'$：用映射语言说，这是在原函数
+外面\textbf{再叠一层 swizzle 函数}，所以源码里 swizzle 总是出现在
+\texttt{composition} 的第一个参数位置（A 的位置，见 4.1 节的
+\texttt{SmemLayoutA} 定义）。这样后续代码仍按正常 $(m,n)$ 坐标写字，物理
+地址已经被换掉，而「换掉」这件事对上层透明。第~\ref{ch:12}~章手写版要
+人工维护的那套 XOR 公式，在这里收缩成一次复合。
+
+\textbf{场景三：FA2 的 P 矩阵转换（4.8 节完整展开）。}\allowbreak{}QK 累加器与 PV 左
+操作数是同一批寄存器的两种索引方式，两个索引方式之间恰好差一次
+「列拆半 $+$ 重组」的复合，这就是 4.8 节两条路线要解的题。
+
+\textbf{定义 20.1（composition）}。给定 layout $A$（任意 rank）与 $B$，若 $B$ 的
+值域以「整除」方式落在 $A$ 的 mode 结构里（CuTe 称 divisibility 条件），则
+$R=\mathrm{composition}(A,B)$ 是满足
+\begin{equation}
+  R(\mathbf{c}) = A\bigl(B(\mathbf{c})\bigr), \qquad \forall \mathbf{c}\in Z(B)
+  \label{eq:20-compose}
+\end{equation}
+的 layout，且 $R$ 的顶层 shape 与 $B$ 一致（CuTe 注释原文：
+\texttt{@post compatible\allowbreak{}(rhs,\allowbreak{} result)}、\texttt{@post result(c) = lhs(rhs(c))}）。
+直觉：$B$ 决定取 $A$ 定义域中的哪些坐标，$A$ 决定坐标对应的 offset，复合是把 $B$ 的
+取值翻译到 $A$ 的坐标系里。
+
+例子 1（stride 折叠，非平凡）：$A=(6,2){:}(9,2)$、$B=(4){:}(1)$。逐坐标算：
+$B(0..3)=0,1,2,3$，而 $A(x)=9\,(x\bmod6)+2\lfloor x/6\rfloor$，故
+$A(B(c))=9c\ (c<4)$，于是
+\begin{equation}
+  R = (4){:}(9) .
+\end{equation}
+\textbf{结论：复合结果的 stride 等于 $A$ 在 $B$ 的像上的「斜率」}。本例中
+$B$ 的像落在 $A$ 的 mode-0 上，斜率就是 9。这也是「CuTe 用 layout 代数做
+坐标变换」的最小例子。
+
+例子 2（恒等段）：$A=(4,8){:}(1,4)$、$B=(2,2){:}(2,1)$。$B$ 的像是
+$\{0,1,2,3\}\subset[0,4)$，而 $A$ 在 $[0,4)$ 上恒等，故 $R=B$ 逐点成立。
+本章测试对这两个例子累计 14 个断言，全部通过。
+
+教训（也是常见坑）：\textbf{compose 不是无条件的函数复合}。当 $B$ 的 stride
+结构与 $A$ 的 mode 结构不整除时，CuTe 会先按 $A$ 的 colex 结构重解释 $B$
+（\texttt{coalesce\_x}），结果依然是一个合法 layout，但语义不再是「几何
+意义上的先 $B$ 后 $A$」，4.5 节的 tile 反例会给出实例。
+
+\subsection{Inverse：右逆与左逆}
+
+inverse 回答的问题最直白：「给定一个 offset，它是哪个坐标的？」但真正常用
+的场合不止反解坐标：
+
+\textbf{场景一：copy 的坐标反查。}（第~\ref{ch:21}~章）拷贝划分需要把
+「tile 上的位置」拉回「atom 内部的坐标」，用的就是 $A(R(i))=i$ 这条右逆
+性质；\texttt{max\_\allowbreak{}common\_\allowbreak{}layout}（求两个布局的最大公共连续块，判断能否
+直接互拷）也以右逆为基础。
+
+\textbf{场景二：layout 变换经由逆运算（4.8 节）。}\allowbreak{}FA2 的代数法第一步就是
+\texttt{left\_\allowbreak{}inverse}：把 accumulator 的「坐标$\to$offset」翻成
+「offset$\to$坐标」，再把目标 A 布局复合上来；「输入输出对调」是这类
+变换的关键步骤。
+
+一个实践提醒（也来自 @竹熙佳处）：单独做一次 inverse 得到的 layout 往往
+没有语义，通常要再 \texttt{with\_shape}（本质上还是复合一个布局）把结果
+排列成想要的形状，它才是「可用的布局」。这条在 4.8 节会再次出现。
+
+\textbf{定义 20.2（right\_inverse）}。$R=\mathrm{right\_inverse}(A)$ 满足
+\begin{equation}
+  A\bigl(R(i)\bigr) = i , \qquad \forall i < \mathrm{size}(R) ,
+  \label{eq:20-right-inv}
+\end{equation}
+等价地 $\mathrm{composition}(A,R)$ 恒等于 $\mathrm{make\_layout}(\mathrm{shape}(R))$
+（即恒等布局）。前提：$A$ 静态。
+
+\textbf{定义 20.3（left\_inverse，准逆）}。$R=\mathrm{left\_inverse}(A)$ 满足
+\begin{equation}
+  A\Bigl(R\bigl(A(\mathbf{c})\bigr)\Bigr) = A(\mathbf{c}) , \qquad \forall \mathbf{c},
+  \label{eq:20-left-inv}
+\end{equation}
+即 $\mathrm{composition}(A,\mathrm{composition}(R,A))$ 恒等于 $A$；当 $A$ 是单射
+时它就是真正的左逆。
+
+两个定义初读不易区分，看实测行为就清楚了（本章测试 case C/D 的数据）：
+
+\begin{itemize}
+  \item $A=(4,8){:}(1,4)$（compact col-major，双射）：
+        $R=(32){:}(1)$，即「offset $\to$ 坐标」的 colex 逆映射；此时
+        $A$ 在 $[0,32)$ 上恒等，逆也是恒等。
+  \item $A=(8,4){:}(2,16)$（带孔洞）：$R=(1){:}(0)$——\textbf{退化为平凡右逆}。
+        原因：$A$ 的值域是偶数集合，不含 1；而式~\eqref{eq:20-right-inv} 要求
+        $A(R(1))=1$，长度 $\ge2$ 的右逆根本不存在。所以右逆「非平凡」的条件是
+        $A$ 的像包含从 0 开始的连续段。
+  \item 同一个孔洞 layout 的左逆：$R=(2,32){:}(0,1)$。它的映射是
+        $R(o)=\lfloor o/2\rfloor$（把偶 offset 拉回坐标）。注意 shape 里那个
+        $(2){:}(0)$：\textbf{stride-0 的 mode 是「歧义位」}——它对 offset 没有
+        贡献，作用是记录「每个坐标至多对应 2 个 offset 候选」（值域以 2 为
+        间隔分布）；真正的连续展开在 $(32){:}(1)$ 那一层。这是 CuTe 用
+        layout 编码「多对一」的方式，
+        测试里对 32 个坐标逐一验证了式~\eqref{eq:20-left-inv}。
+  \item 二者关系：对 colex compact（双射）的 layout，左逆与右逆逐点相同
+        （测试 32 点核对）。
+\end{itemize}
+
+逆运算的用途不是「反解坐标」这么窄：右逆负责「值域中连续的那一段」，左逆
+负责「整个陪域」（含多对一的情形），选择依据就是本小节的实测：需要哪一种
+坐标变换方向，就选哪一个逆。
+
+\subsection{Product：乘积}
+
+product 解决的是「小布局怎么铺成大布局」：smem 上一块 $8\times B_K$ 的
+swizzle atom 只是基本单元，kernel 真正要声明的是整块
+$(B_M,B_K,k_{\mathrm{Stage}})$ 的 A tile 布局（4.1 节的 \texttt{SmemLayoutA}
+就是这么拼出来的）。product 族的语义很直观，\textbf{把两块布局在 mode
+上相乘（拼接）：坐标各自输入，offset 相加}：
+
+\textbf{定义 20.4（concatenation）}。$P=\mathrm{make\_layout}(A,B)$
+（即 \texttt{product}）把两个 layout 相乘：
+\begin{equation}
+  \mathrm{shape}(P)=\bigl(\mathrm{shape}(A),\mathrm{shape}(B)\bigr),\quad
+  \mathrm{stride}(P)=\bigl(\mathrm{stride}(A),\mathrm{stride}(B)\bigr),
+  \label{eq:20-product-shape}
+\end{equation}
+\begin{equation}
+  P(\mathbf{c}_A,\mathbf{c}_B) = A(\mathbf{c}_A) + B(\mathbf{c}_B) .
+  \label{eq:20-product}
+\end{equation}
+实测：$\mathrm{make\_layout}\bigl((4,8){:}(1,4),\,(8,4){:}(2,16)\bigr)
+= \bigl((4,8),(8,4)\bigr){:}\bigl((1,4),(2,16)\bigr)$。注意 mode 的折叠方式：
+$A$ 的\emph{整棵} shape 成为 $P$ 的第一个 mode，所以 $2$ 个 rank-2 layout 相乘后
+\textbf{外层是 rank 2}（shape 为 $\bigl((4,8),(8,4)\bigr)$），不是 rank 4。
+测试对 $P(\mathrm{make\_coord}(a_0,a_1),b)=A(a_0,a_1)+B(b)$ 逐点核对 24 个断言。
+
+Product 家族还有几个更「kernel 化」的成员，本章只简要介绍、第~\ref{ch:24}~章展开：
+\texttt{logical\_\allowbreak{}product}（把 block 铺在 tiler 上）、\texttt{blocked\_\allowbreak{}product}
+（按 tiler 重复 block）、\texttt{raked\_\allowbreak{}product}（交错重复）、
+\texttt{tile\_\allowbreak{}to\_\allowbreak{}shape}（按目标 shape 铺 atom，最小测试 case~G 的实测
+用到它）。
+
+\subsection{Divide：tile 的数学}
+
+divide 是 kernel 里用得最多的一条：\texttt{local\_tile} 把大 Tensor 切出
+当前 CTA 的块（4.1 节 gA/gB/gD 的切法）、注意力里对 K/V 的分块遍历、
+4.8 节 tri-dao 的 P 转换，底层都是同一条运算：\textbf{把一个大 layout
+切成「tile 内布局 $+$ tile 在外面的索引」}。完整定义分两步。
+
+\textbf{第一步：complement。}对 tile layout $T$，
+$\mathrm{complement}\bigl(T,\mathrm{shape}(L)\bigr)$ 返回「补空间」的
+layout：把 $T$ 的 codomain 之外的地址空间按最小可用 stride 依次填满，直到
+覆盖 $L$ 的 codomain。它回答「tile 之外的剩下那些 offset 怎么编号」。
+
+\textbf{第二步：logical\_divide 与 zipped\_divide。}
+\begin{align}
+  \mathrm{logical\_divide}(L,T) &=
+    \mathrm{composition}\Bigl(L,\;
+      \mathrm{make\_layout}\bigl(T,\ \mathrm{complement}(T,\mathrm{shape}(L))\bigr)
+    \Bigr), \label{eq:20-logical-divide} \\
+  \mathrm{zipped\_divide}(L,T) &= \mathrm{tile\_unzip}\bigl(\mathrm{logical\_divide}(L,T),T\bigr).
+    \label{eq:20-zipped-divide}
+\end{align}
+式~\eqref{eq:20-logical-divide} 一次说清三件事：结果分两大 mode，第一个是
+$T$ 自己（tile 内布局），第二个是补空间（tile 索引）；整个结果 $=$ 把 $L$ 重新
+沿这两个 mode 解释。\texttt{zipped\_\allowbreak{}divide} 把结果再整理成「(tile 分量,
+rest 分量)」两个 mode；\texttt{tiled\_\allowbreak{}divide}/\texttt{flat\_divide}
+则是把 rest 分量展平的变体。
+
+来看本章最核心的实测（测试 case F）。取 $L=(8,8){:}(1,8)$（col-major 的
+$8\times8$ 逻辑矩阵）、$T=(4,4){:}(1,8)$（与 $L$ 同 stride 族的 $4\times4$
+tile）：
+\begin{equation}
+  \mathrm{zipped\_divide}(L,T) = \bigl((4,4),(2,2)\bigr){:}\bigl((1,8),(4,32)\bigr),
+  \label{eq:20-zd-example}
+\end{equation}
+按坐标写开：tile 内坐标 $(t_0,t_1)$ 贡献 $t_0+8t_1$，rest 坐标 $(r_0,r_1)$
+贡献 $4r_0+32r_1$，于是
+\begin{equation}
+  \mathrm{zd}(t_0,t_1,r_0,r_1)
+  = (t_0+4r_0) + 8\,(t_1+4r_1)
+  = t_0 + 8t_1 + 4r_0 + 32r_1 .
+  \label{eq:20-zd-coord}
+\end{equation}
+式~\eqref{eq:20-zd-coord} 括号里就是「行 $= t_0+4r_0$、列 $= t_1+4r_1$」：
+$r_0$ 是行方向的 tile 编号（步进 4 行）、$r_1$ 是列方向的 tile 编号（步进
+4 列 $\times$ 8 行的列 stride $=32$）。这正是「$4\times4$ tile、$2\times2$ 个
+tile」的严格数学表达。测试做了三重核对（76 个断言）：(a) 结构，
+$\mathrm{rank}=2$、$\mathrm{size}_0=16$、$\mathrm{size}_1=4$、
+$\mathrm{compatible}(T,\mathrm{layout}_0)$ 为真；(b) 坐标公式，64 组
+$(t,r)$ 全部满足式~\eqref{eq:20-zd-coord}；(c) \textbf{双射覆盖}，64 个输出
+恰好把 $[0,64)$ 各命中一次，这条约束最强：它同时排除了重叠与遗漏。两种
+tiler 下 tile 几何的正反例对照见图~\ref{fig:20-zd-tile-shape}。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\tiny]
+  \definecolor{zdA}{RGB}{209,226,243}
+  \definecolor{zdB}{RGB}{137,183,222}
+  \definecolor{zdC}{RGB}{254,232,200}
+  \definecolor{zdD}{RGB}{232,164,110}
+  \def\cwd{0.5}
+  \def\chh{0.5}
+  \foreach \fr in {0,...,7}{
+    \foreach \fc in {0,...,7}{
+      \pgfmathtruncatemacro{\voff}{\fr+8*\fc}
+      \pgfmathtruncatemacro{\ra}{\fr/4}
+      \pgfmathtruncatemacro{\rb}{\fc/4}
+      \ifnum\ra=0
+        \ifnum\rb=0 \def\cfill{zdA} \else \def\cfill{zdB} \fi
+      \else
+        \ifnum\rb=0 \def\cfill{zdC} \else \def\cfill{zdD} \fi
+      \fi
+      \node[fill=\cfill, minimum width=\cwd cm, minimum height=\chh cm, inner sep=0pt]
+        at ({(\fc+0.5)*\cwd},{-(\fr+0.5)*\chh}) {\voff};
+    }
+  }
+  \draw[thin] (0,0) grid[xstep=0.5cm, ystep=0.5cm] (4,-4);
+  \draw[very thick] (0,0) rectangle (4,-4);
+  \draw[thick] (2,0) -- (2,-4);
+  \draw[thick] (0,-2) -- (4,-2);
+  \foreach \fr in {0,...,7}{
+    \node[anchor=east] at (-0.07,{-\fr*0.5-0.25}) {\fr};
+  }
+  \foreach \fc in {0,...,7}{
+    \node[anchor=south] at ({\fc*0.5+0.25},0.07) {\fc};
+  }
+  \node[anchor=south] at (1,0.3) {$r_1{=}0$};
+  \node[anchor=south] at (3,0.3) {$r_1{=}1$};
+  \node[anchor=east] at (-0.55,-1) {$r_0{=}0$};
+  \node[anchor=east] at (-0.55,-3) {$r_0{=}1$};
+  \node[anchor=east, font=\tiny, rotate=90] at (-1.05,-2) {行 $i_0$（mode 0）};
+  \node[anchor=south, font=\scriptsize\bfseries] at (2,0.92)
+    {左：$T=(4,4){:}(1,8)$（与 $L$ 同 stride 族）};
+  \node[anchor=north, font=\tiny] at (2,-4.15)
+    {$\mathrm{zd}=\bigl((4,4),(2,2)\bigr){:}\bigl((1,8),(4,32)\bigr)$};
+  \node[anchor=north, font=\tiny, align=center] at (2,-4.6)
+    {tile $=$ $4\times4$ 方块 $\times\ 2\times2$ 个（色块 $=$ tile 身份 $(r_0,r_1)$）；\\
+     $r_0$ 步进 4 行、$r_1$ 步进 $4\times8{=}32$ offset};
+  \begin{scope}[shift={(5.9,0)}]
+    \foreach \fr in {0,...,7}{
+      \foreach \fc in {0,...,7}{
+        \pgfmathtruncatemacro{\voff}{\fr+8*\fc}
+        \pgfmathtruncatemacro{\fq}{\fc/2}
+        \pgfmathtruncatemacro{\gl}{8+14*\fq}
+        \node[fill=gray!\gl, minimum width=0.5cm, minimum height=0.5cm, inner sep=0pt]
+          at ({(\fc+0.5)*0.5},{-(\fr+0.5)*0.5}) {\voff};
+      }
+    }
+    \draw[thin] (0,0) grid[xstep=0.5cm, ystep=0.5cm] (4,-4);
+    \draw[very thick] (0,0) rectangle (4,-4);
+    \draw[thick] (1,0) -- (1,-4);
+    \draw[thick] (2,0) -- (2,-4);
+    \draw[thick] (3,0) -- (3,-4);
+    \foreach \fc in {0,...,7}{
+      \node[anchor=south] at ({\fc*0.5+0.25},0.07) {\fc};
+    }
+    \draw[very thick] (1,0) rectangle (2,-4);
+    \node[anchor=south, font=\scriptsize\bfseries] at (2,0.92)
+      {右：$T=(4,4){:}(1,4)$（compact，坑三反例）};
+    \node[anchor=north, font=\tiny] at (2,-4.15)
+      {$\mathrm{zd}=\bigl((4,4),(4)\bigr){:}\bigl((1,4),(16)\bigr)$};
+    \node[anchor=north, font=\tiny, align=center] at (2,-4.6)
+      {tile $=$ 16 个连续 offset $=$ 8 行 $\times$ 2 列条带\\（粗框 $=$ 条带 1：offset 16--31；灰度 $=$ 条带号）};
+    \node[anchor=north, font=\tiny, align=center] at (2,-5.5)
+      {（「方块」语义被静默换掉、不报错——常见坑三）};
+  \end{scope}
+  \draw[->, thick] (4.35,-2) -- (5.55,-2);
+  \node[font=\tiny, align=center] at (4.95,-1.55) {只改 tiler\\stride};
+\end{tikzpicture}
+\caption{zipped\_divide 的 8$\times$8 实测与坑三 compact-tiler 反例（测试
+case~F）：格内数字为 $L=(8,8){:}(1,8)$ 的线性 offset（$=i_0+8i_1$，64 格
+逐格满足式~\eqref{eq:20-zd-coord}）。左：tiler 与 $L$ 同 stride 族时，tile
+是 $2\times2$ 个 $4\times4$ 方块（色块 $=$ tile 身份）；右：compact tiler
+$(4,4){:}(1,4)$ 的「tile」退化为 16 个连续 offset 的「8 行 $\times$ 2 列」
+列条带——结果仍是合法 layout、双射覆盖不变，但「方块」语义被静默换掉、
+不报错（常见坑三）。}
+\label{fig:20-zd-tile-shape}
+\end{figure}
+
+\paragraph{实践须知}
+\begin{itemize}
+  \item \textbf{tile 的 stride 必须与目标 layout 同族。}\allowbreak{}divide 的语义完全
+        取决于 $T$ 的 stride 是否与 $L$ 的 stride 结构相容：把上面的 $T$
+        换成「compact col-major 的 $4\times4$」$(4,4){:}(1,4)$，结果是
+        $\bigl((4,4),(4)\bigr){:}\bigl((1,4),(16)\bigr)$——tile 变成
+        16 个\emph{连续 offset}（在 col-major 的 $8\times8$ 里即
+        「8 行 $\times$ 2 列」的列条带），不再是 $4\times4$ 方块；同理
+        row-major 全体（$L=(8,8){:}(8,1)$、$T=(4,4){:}(4,1)$）会得到
+        $\bigl(((2,2),4),4\bigr){:}\bigl(((32,1),8),2\bigr)$ 这种被 colex
+        结构重排的结果。
+  \item \textbf{正确写法}：tiler 用 $(B_M,B_K){:}(d_M,d_K)$，stride 从目标
+        layout 派生（hgemm 的 \texttt{local\_tile} 与 \texttt{SmemLayoutA}
+        都是这么写的）；不要为省事写 compact tile。
+  \item \textbf{判别法}：检查 $T$ 的 stride 是否等于 $L$ 在对应方向上的
+        stride（本章案例应为 $(1,8)$）。不相等时结果仍是合法 layout，
+        只是语义被默默换掉——不报错（另见常见坑三）。
+\end{itemize}
+
+\subsection{Mode 操作：投影、合并、展平、化简}
+
+mode 操作解决的是「索引结构不合用」的问题：MMA 的 fragment mode 与 rest
+mode 混在一起时要把它们分开（第~\ref{ch:22}~章），epilogue 要把
+$(\mathrm{CPY}_M,\mathrm{CPY}_N)$ 两层循环压成一个线性索引来遍历
+（第~\ref{ch:21}~章），都要对 shape 这棵树做结构调整。一个 layout 的 shape
+是一棵树（mode 里还能嵌套 mode）。对树的操作有：
+\texttt{layout\allowbreak{}<I>\allowbreak{}(L)}（等价 \texttt{get<I>(L)}）取第 $I$ 个 mode 的子 layout；
+\texttt{select\allowbreak{}<Is.\allowbreak{}.\allowbreak{}.\allowbreak{}>} 取多个；\texttt{group\allowbreak{}<B,\allowbreak{}E>\allowbreak{}(L)} 把模式区间 $[B,E)$ 合并成
+一个 mode；\texttt{flatten} 把嵌套展平为一层；\texttt{coalesce} 合并所有
+「可合并」的相邻 mode（stride 恰好衔接）。实测（本章测试）：
+\begin{itemize}
+  \item $L_g = \bigl((2,4),(3,2)\bigr){:}\bigl((1,2),(8,24)\bigr)$；
+  \item $\mathrm{layout}_0(L_g) = (2,4){:}(1,2)$，
+        $\mathrm{layout}_1(L_g) = (3,2){:}(8,24)$——取 mode 就是取子 layout；
+  \item $\mathrm{group}_{[0,2)}(L_g)$ 把两个 mode 合成一个（外层变为 rank 1，
+        $\mathrm{size}$ 不变）；
+  \item $\mathrm{flatten}(L_g) = (2,4,3,2){:}(1,2,8,24)$；
+  \item $\mathrm{coalesce}(L_g) = (48){:}(1)$——该 layout 恰好整体连续，
+        化简成单 mode。
+\end{itemize}
+这些操作在 kernel 里的高频用途是「把 MMA 的 fragment mode 与其余的 rest mode
+分离」（第~\ref{ch:22}~章），以及把 copy 的重复结构展平成线性索引
+（第~\ref{ch:21}~章）。
+
+\begin{sloppypar}
+一个命名上容易混淆的点：很多 CuTe 教程（以及 hgemm.cuh 的部分注释）用
+\texttt{group\_\allowbreak{}modes\allowbreak{}<B,\allowbreak{}E>} 这个名字。在本仓库 CUTLASS v4.6.1 里，
+这两个名字分属两层：\textbf{layout 级是 \texttt{group\allowbreak{}<B,\allowbreak{}E>\allowbreak{}(layout)}
+（配 \texttt{select\allowbreak{}<I.\allowbreak{}.\allowbreak{}.\allowbreak{}>} 取多个），Tensor 级才是
+\texttt{group\_\allowbreak{}modes\allowbreak{}<B,\allowbreak{}E>}\allowbreak\texttt{(tensor)}}（定义在
+\texttt{cute/\allowbreak{}tensor\_\allowbreak{}impl.\allowbreak{}hpp}，内部就是一行
+\texttt{make\_\allowbreak{}tensor\allowbreak{}(t.\allowbreak{}data\allowbreak{}(),\allowbreak{}}\allowbreak\texttt{group\allowbreak{}<B,\allowbreak{}E>\allowbreak{}(t.\allowbreak{}layout\allowbreak{}()))}；
+hgemm.cuh~L1073 的 \texttt{group\_\allowbreak{}modes\allowbreak{}<1,\allowbreak{}3>} 用的正是 Tensor 版，
+第~\ref{ch:21}~章 4.5 节会再遇到它）。阅读旧教程时按层替换即可，
+语义一致。
+\end{sloppypar}
+
+\subsection{运算一览与 hgemm 的落地位置}
+
+\begin{table}[htbp]
+\centering
+\footnotesize
+\begin{tabular}{@{}p{1.3cm}p{3.2cm}p{3.7cm}p{4.3cm}@{}}
+  \hline
+  运算 & 数学 & CuTe API & 在 hgemm CuTe 版中的位置（预览） \\
+  \hline
+  compose & $R(c)=A(B(c))$ & \texttt{composition} / \texttt{compose}
+    & \texttt{Smem\allowbreak{}Layout\allowbreak{}Atom} $=$ \texttt{Swizzle}\,$\circ$\,atom \\
+  inverse & $A(R(i))=i$（准逆见正文） & \texttt{right\_\allowbreak{}inverse} / \texttt{left\_\allowbreak{}inverse}
+    & 公共连续块、坐标反查（第~\ref{ch:21}~章） \\
+  product & $P(c_A,c_B)=A(c_A)+B(c_B)$ & \texttt{make\_\allowbreak{}layout\allowbreak{}(A,\allowbreak{}B)}、
+    \texttt{blocked\_\allowbreak{}product}、\texttt{raked\_\allowbreak{}product}、\texttt{tile\_\allowbreak{}to\_\allowbreak{}shape}
+    & $8\times B_K$ atom $\to(B_M,B_K,k_{\mathrm{Stage}})$ \\
+  divide & 式~\eqref{eq:20-logical-divide}、\eqref{eq:20-zipped-divide}
+    & \texttt{logical\_\allowbreak{}divide} / \texttt{zipped\_\allowbreak{}divide}
+    & \texttt{local\_tile} 的 gmem tile 选取 \\
+  mode & 投影/合并/展平/化简 & \texttt{layout<I>}、\texttt{select}/\texttt{group}、
+    \texttt{flatten}/\texttt{coalesce}
+    & fragment 与 rest mode 分离（第~\ref{ch:21}、\ref{ch:22}~章） \\
+  \hline
+\end{tabular}
+\caption{本章五个运算族与其在各章的位置对照（表~20-1）。}\label{tab:20-1}
+\end{table}
+
+\subsection{Compose \& Inverse 实战：FA2 的 P 矩阵布局转换}
+
+本节把 compose 与 inverse 两个运算用在 FlashAttention 的经典难题上：
+同一批寄存器，在上一个 mma 里是输出，在下一个 mma 里要作为输入。
+
+\textbf{问题。}\allowbreak{}FA2 的核心是两连乘 $P=QK^{\top}$ 与 $O=PV$（为聚焦布局
+问题，先忽略 softmax）。第一段 mma 的输出是 accumulator，按 C fragment
+排布 $(\mathrm{MMA}=4,\ \mathrm{MMA}_M,\ \mathrm{MMA}_N)$；第二段 mma 的
+左操作数 P 要按 A fragment 排布；m16n8k16 下虽然都是 4 个寄存器，但 C 的
+4 个按「2 行 $\times$ 2 列」组织、A 的 4 个按「2 行 $\times$ 2 个 K 向
+切片」组织，把 C 直接当 A 用会得到寄存器对齐错误（\texttt{cute::gemm}
+静态报错拒绝）。第~\ref{ch:16}~章的手写版靠一份「P 布局约定」注释 $+$
+人工挑寄存器位置（\texttt{R\_S[i][w]}、\texttt{R\_S[i][w+1]} 送入
+\texttt{HMMA16816}）绕开这个问题；到了 CuTe 里，同一件事必须写成一个
+\textbf{layout 变换}。
+
+\textbf{路线一（tri-dao 的 logical\_divide 法：几何重排）。}把
+$\mathrm{MMA}_N$ 拆成 $(2,\mathrm{MMA}_N/2)$，再把「后 2」与 MMA mode
+重组：
+\begin{equation}
+  (\mathrm{MMA},\ \mathrm{MMA}_M,\ (2,\mathrm{MMA}_N/2))
+  \;\longrightarrow\;
+  \bigl((\mathrm{MMA},2),\ \mathrm{MMA}_M,\ \mathrm{MMA}_N/2\bigr) .
+  \label{eq:20-fa2-tri}
+\end{equation}
+用映射语言说：先把 $S$ 的列方向拆成两半，再把「后一半」拼进
+MMA mode，于是 C 的「相邻两列」在 A 的坐标系里成了「K 向相邻两个元素」。
+
+\textbf{路线二（reed 的 layout-algebra 法：代数复合）。}构造一条三步的
+映射链：先求 C 布局的逆（offset 拉回 C 的坐标），再复合 A 布局（把 A 的
+坐标翻译到 C 的坐标系），最后复合 C 本身（顺着 C 读回 offset）：
+\begin{align}
+  \mathrm{Layout}_C^{-1} &\leftarrow \mathrm{left\_inverse}(\mathrm{Layout}_C)
+    && (\mathrm{offset} \to \text{C 坐标}) \label{eq:20-fa2-reed1} \\
+  a &\leftarrow \mathrm{Layout}_C^{-1} \circ \mathrm{Layout}_A
+    && (x_a,y_a) \to \mathrm{offset} \to \text{C 坐标} \label{eq:20-fa2-reed2} \\
+  \mathrm{Layout}_C^{A} &\leftarrow \mathrm{Layout}_C \circ a
+    && (x_a,y_a) \to \cdots \to \mathrm{offset}_C \label{eq:20-fa2-reed3}
+\end{align}
+用映射语言说：第一步把输入输出对调，第二步把 A 的坐标经 offset 换到 C 的
+坐标系，第三步沿 C 的映射读回 offset。这也是 4.3 节「inverse 要配
+\texttt{with\_shape} 才有语义」的完整实例：单独一次
+\texttt{left\_\allowbreak{}inverse} 的结果没有形状语义，复合上目标布局它才成为可用的
+变换。
+
+\textbf{本书用的是哪种。}看源码：flash\_attn.cuh 的共享工具函数
+\texttt{convert\_\allowbreak{}layout\_\allowbreak{}acc\_\allowbreak{}Aregs}（L2341--2372）就是路线一：
+\texttt{logical\_\allowbreak{}divide} 拆 mode $+$ \texttt{make\_layout} 重组四个碎片；
+ffpa\_attn.cuh 的 P 转换（L300--305、L584--588）直接复用这个函数，注释
+写明「与 TMA WS kernel 一致」。两个文件的 P 路径都走 \textbf{tri-dao 的
+几何法}。选它的理由很实际：这是一次纯 mode 重排，6 行代码就能写完、效果
+可直接验证；路线二的代数法把「C$\to$A」表达成「逆 $+$ 两次复合」，
+更\textbf{通用}（换任意两个 fragment 布局都能推，例如量化 gemm 里
+dtype 变化引起的布局变换），但中间布局要 \texttt{with\_shape} 才可读、
+且依赖静态 stride；在本例中它的收益与几何法相同。两法等价这件事本身
+是个好练习：第~\ref{ch:25}~章会看到该变换在 CuTe 版 FA 里的完整位置
+（softmax 之后、$PV$ 之前），对照本节把两条路线各推一遍即可复现。
+
+两条路线的对照示意见图~\ref{fig:20-3}。
+
+\section{图示}
+
+\begin{figure}[htbp]
+\centering
+% was: \includegraphics[width=0.92\textwidth]{figures/drawio/fig-20-1-colex/fig-20-1.png}
+\begin{tikzpicture}[font=\footnotesize, x=1cm, y=1cm]
+  % 单元格尺寸；表 = 行头列 + c0=0..3 列、列头行 + c1=0..7 行
+  \def\cw{0.90}
+  \def\chh{0.565}
+  % 左：坐标表 f(c0,c1) = c0 + 4 c1
+  \foreach \c in {0,...,5}{\draw[gray!45] (\c*\cw, 0) -- (\c*\cw, -9*\chh);}
+  \foreach \r in {0,...,9}{\draw[gray!45] (0, -\r*\chh) -- (5*\cw, -\r*\chh);}
+  \filldraw[fill=gray!22, draw=gray!55, thin] (0, -\chh) rectangle (\cw, -9*\chh);
+  \filldraw[fill=gray!22, draw=gray!55, thin] (\cw, 0) rectangle (5*\cw, -\chh);
+  \foreach \r/\rh in {0/1,1/2,2/3,3/4,4/5,5/6,6/7,7/8}{
+    \edef\cfill{colorx\rh!16}
+    \fill[\cfill] (\cw, {-(\r+1)*\chh}) rectangle (5*\cw, {-(\r+2)*\chh});
+  }
+  \node at (0.5*\cw, -0.5*\chh) {$c_1\backslash c_0$};
+  \foreach \c in {0,1,2,3}{\node at ({(\c+1.5)*\cw}, -0.5*\chh) {\c};}
+  \foreach \r in {0,...,7}{\node at (0.5*\cw, {-(\r+1.5)*\chh}) {\r};}
+  \foreach \c in {0,1,2,3}{\foreach \r in {0,...,7}{%
+    \pgfmathsetmacro\val{int(\c+4*\r)}%
+    \node at ({(\c+1.5)*\cw}, {-(\r+1.5)*\chh}) {\val};}}
+  % 高亮 f(1,3)=13（蓝）与 f(3,1)=7（绿）
+  \fill[tkFillBlue] (2*\cw, -4*\chh) rectangle (3*\cw, -5*\chh);
+  \draw[tkBlue, semithick] (2*\cw, -4*\chh) rectangle (3*\cw, -5*\chh);
+  \node[text=tkBlue, font=\footnotesize\bfseries] at (2.5*\cw, -4.5*\chh) {13};
+  \fill[tkFillGreen] (4*\cw, -2*\chh) rectangle (5*\cw, -3*\chh);
+  \draw[tkGreen, semithick] (4*\cw, -2*\chh) rectangle (5*\cw, -3*\chh);
+  \node[text=tkGreen, font=\footnotesize\bfseries] at (4.5*\cw, -2.5*\chh) {7};
+  % 右：展平后的 1D 数带（列 j 自上而下为 8j..8j+7）
+  \def\bx{6.83}
+  \foreach \c in {0,...,4}{\draw[gray!45] ({\bx+\c*\cw}, -\chh) -- ({\bx+\c*\cw}, -9*\chh);}
+  \foreach \r in {1,...,9}{\draw[gray!45] (\bx, -\r*\chh) -- ({\bx+4*\cw}, -\r*\chh);}
+  \foreach \bg/\gt/\gb in {0/1/2,1/3/4,2/5/6,3/7/8}{
+    \edef\cfillA{colorx\gt!16}
+    \edef\cfillB{colorx\gb!16}
+    \fill[\cfillA] ({\bx+\bg*\cw}, -\chh) rectangle ({\bx+(\bg+1)*\cw}, -5*\chh);
+    \fill[\cfillB] ({\bx+\bg*\cw}, -5*\chh) rectangle ({\bx+(\bg+1)*\cw}, -9*\chh);
+  }
+  \foreach \c in {0,...,3}{\foreach \r in {0,...,7}{%
+    \pgfmathsetmacro\val{int(8*\c+\r)}%
+    \node at ({\bx+(\c+0.5)*\cw}, {-(\r+1.5)*\chh}) {\val};}}
+  \fill[tkFillGreen] (\bx, -8*\chh) rectangle ({\bx+\cw}, -9*\chh);
+  \draw[tkGreen, semithick] (\bx, -8*\chh) rectangle ({\bx+\cw}, -9*\chh);
+  \node[text=tkGreen, font=\footnotesize\bfseries] at ({\bx+0.5*\cw}, -8.5*\chh) {7};
+  \fill[tkFillBlue] ({\bx+\cw}, -6*\chh) rectangle ({\bx+2*\cw}, -7*\chh);
+  \draw[tkBlue, semithick] ({\bx+\cw}, -6*\chh) rectangle ({\bx+2*\cw}, -7*\chh);
+  \node[text=tkBlue, font=\footnotesize\bfseries] at ({\bx+1.5*\cw}, -6.5*\chh) {13};
+  % 连线：绿沿表格右缘下行、经数带下方自 7 格底边进入；蓝沿数带行边界进入 13 格上边
+  \draw[tkGreen, semithick, -{Stealth[length=4pt]}]
+    (5*\cw, -2.5*\chh) -- (5*\cw, -9.75*\chh) -- ({\bx+0.5*\cw}, -9.75*\chh) -- ({\bx+0.5*\cw}, -9*\chh);
+  \draw[tkBlue, semithick, -{Stealth[length=4pt]}]
+    (5*\cw+0.12, -4.5*\chh) -- (5.55, -4.5*\chh) -- (5.55, -6*\chh) -- ({\bx+1.5*\cw}, -6*\chh);
+  % 右侧注记与标题
+  \node[anchor=west, text=tkBlue] at (10.75, -0.8) {$f(1,3) = 1\cdot 1 + 3\cdot 4 = 13$};
+  \node[anchor=west, text=tkGreen] at (10.75, -1.3) {$f(3,1) = 3\cdot 1 + 1\cdot 4 = 7$};
+  \node[anchor=west, text=black!55, font=\scriptsize] at (10.75, -1.85) {整数输入时 $f(x)=x$};
+  \node[anchor=west, text=black!55, font=\scriptsize] at (10.75, -2.15) {（compact $+$ col-major）};
+  \node[anchor=west] at (0, 0.95) {$\mathrm{Layout}\ \mathcal{L} = (4,8){:}(1,4)$：行 $= c_1$（慢），列 $= c_0$（快）};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (0, 0.5) {$f(c_0,c_1) = c_0 + 4\,c_1$（colex 读法：$c_0$ 变化最快）};
+  \node[anchor=west] at (\bx, -0.12) {展平后 1D 数带（$\mathrm{offset} =$ 线性下标）};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (0, -6.3)
+    {对照：row-major 版 $(4,8){:}(8,1)$ 的 $f(1,3) = 1\cdot 8 + 3\cdot 1 = 11$——同一 shape，stride 决定读序};
+\end{tikzpicture}
+\caption{colex 线性化：坐标 $(c_0,c_1)$ 与 offset 的对应表（左），同一
+布局展平后的 1D 数带（右）。$c_0$ 沿行方向变化最快，故
+$\mathrm{idx}=c_0+4c_1$；整数输入时 CuTe 用
+式~\eqref{eq:20-colex-decomp} 先把 $x$ 分解回坐标。compact 且 col-major 时
+$f(x)=x$。对照 row-major 版 $(4,8){:}(8,1)$：
+$f(1,3)=11$——同一 shape，stride 决定读序。}
+\label{fig:20-1}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+% was: \includegraphics[width=0.95\textwidth]{figures/drawio/fig-20-2-mode-ops/fig-20-2.png}
+\begin{tikzpicture}[font=\footnotesize, x=1cm, y=1cm,
+    treenode/.style={draw=gray!60, fill=gray!12, align=center, inner sep=2pt, minimum height=0.66cm},
+    modebox/.style={draw=tkBlue!75, fill=tkFillBlue, text=tkBlue, align=center, inner sep=2pt, minimum height=0.72cm},
+    oprow/.style={draw, align=center, inner sep=2pt, minimum height=0.60cm, minimum width=10.4cm, anchor=west}]
+  % 左：mode 树
+  \node[treenode, minimum width=4.0cm] (root) at (2.30, -0.50) {$L_g$ 根节点（rank-2 嵌套布局）};
+  \node[modebox, minimum width=2.1cm] (m0) at (1.15, -1.75) {mode0 $= (2,4){:}(1,2)$};
+  \node[modebox, minimum width=2.1cm] (m1) at (3.45, -1.75) {mode1 $= (3,2){:}(8,24)$};
+  \draw[gray!65] (2.30, -0.83) -- (2.30, -1.20);
+  \draw[gray!65] (1.15, -1.20) -- (3.45, -1.20);
+  \draw[gray!65] (1.15, -1.20) -- (1.15, -1.39);
+  \draw[gray!65] (3.45, -1.20) -- (3.45, -1.39);
+  \node[anchor=west, text=black!60, font=\scriptsize] at (0.0, -2.50) {mode0：2 元素 stride 1，4 元素 stride 2};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (0.0, -2.82) {mode1：3 元素 stride 8，2 元素 stride 24};
+  % 右：四种 mode 操作
+  \node[draw=gray!55, fill=gray!18, align=center, inner sep=2pt, minimum height=0.53cm, minimum width=10.4cm, anchor=west]
+    at (6.60, -0.415) {四种 mode 操作（结果 shape$\,$:$\,$stride）};
+  \node[oprow, draw=tkBlue!75] at (6.60, -0.98)
+    {projection：$\mathrm{layout}\vert(L_g) = (2,4){:}(1,2)$；$\mathrm{layout}\vert(L_g) = (3,2){:}(8,24)$};
+  \node[oprow, draw=tkGreen!75] at (6.60, -1.58)
+    {merge：$\mathrm{group}\vert(L_g) = ((2,4),(3,2)){:}((1,2),(8,24))$（rank-1）};
+  \node[oprow, draw=tkOrange!80] at (6.60, -2.18)
+    {flatten：$L_g = (2,4,3,2){:}(1,2,8,24)$};
+  \node[oprow, draw=tkGreen, fill=tkFillGreen, text=tkGreen!80!black, minimum height=0.66cm] at (6.60, -2.81)
+    {coalesce：$L_g = (48){:}(1)$——一段连续 48 格};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (6.60, -3.55)
+    {strides 链式衔接：$1 \to 2 \to 8 \to 24$（$2 = 1\times2$，$8 = 2\times4$，$24 = 8\times3$），编译期消除冗余 mode};
+  % 底部结论条
+  \node[draw=tkOrange!80, fill=tkFillOrange, text=tkOrange!75!black, align=center, inner sep=3pt,
+    minimum height=0.70cm, minimum width=17.0cm] at (8.50, -4.45)
+    {kernel 里「fragment mode 与 rest mode 分离」就是一次投影；合并/展平把嵌套结构变成可直接索引的线性结构};
+  % 标题
+  \node at (8.50, 0.55) {mode 树与四种 mode 操作（$L_g = ((2,4),(3,2)){:}((1,2),(8,24))$）};
+\end{tikzpicture}
+\caption{mode 树与四种 mode 操作的结果。投影用于取子布局，合并/展平用于把嵌套结构变成可直接索引的线性结构，化简（coalesce）在编译期消除冗余 mode——kernel 里「fragment mode 与 rest mode 分离」就是一次投影。}
+\label{fig:20-2}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+% was: \includegraphics[width=0.95\textwidth]{figures/drawio/fig-20-3-layout-convert/fig-20-3.png}
+\begin{tikzpicture}[font=\footnotesize, x=1cm, y=1cm,
+    bluebox/.style={draw=tkBlue!75, fill=tkFillBlue, text=tkBlue!85!black, align=center, inner sep=2pt},
+    stepbox/.style={draw=tkGreen!75, fill=white, text=black!85, align=center, inner sep=2pt},
+    band/.style={draw, fill=gray!18, align=center, inner sep=2pt}]
+  % 顶：源（C fragment）与目标（A fragment）
+  \node[bluebox, minimum width=4.48cm, minimum height=0.83cm] at (2.24, -1.075)
+    {S（C fragment）$(4,\ \mathrm{MMA\_M},\ \mathrm{MMA\_N})$};
+  \node[bluebox, minimum width=5.02cm, minimum height=0.83cm] at (14.09, -1.075)
+    {P（A fragment）$((4,2),\ \mathrm{MMA\_M},\ \mathrm{MMA\_N}/2)$};
+  % 路线 a：几何重排（本书采用）
+  \node[band, draw=tkBlue!75, text=tkBlue!85!black, font=\scriptsize, minimum width=16.60cm, minimum height=0.48cm]
+    at (8.30, -2.33) {路线 a（tri-dao，几何重排）——本书 \texttt{convert\_layout\_acc\_Aregs} 采用（flash\_attn.cuh，被 ffpa\_attn.cuh 复用）};
+  \node[draw=tkBlue!75, fill=white, align=center, inner sep=2pt, minimum width=7.76cm, minimum height=0.59cm]
+    at (4.12, -2.985) {\texttt{logical\_divide}：拆 $\mathrm{MMA\_N} \to (2,\ \mathrm{MMA\_N}/2)$};
+  \node[draw=tkBlue!75, fill=white, align=center, inner sep=2pt, minimum width=7.82cm, minimum height=0.59cm]
+    at (12.45, -2.985) {\texttt{regroup}：mode0 $+$ mode2.0，mode1，mode2.1（四碎片重组）};
+  % 路线 b：代数复合
+  \node[band, draw=tkGreen!75, text=tkGreen!85!black, font=\scriptsize, minimum width=16.60cm, minimum height=0.48cm]
+    at (8.30, -3.94) {路线 b（reed，代数复合）};
+  \node[stepbox, minimum width=5.07cm, minimum height=0.60cm] at (2.775, -4.60)
+    {\texttt{inv} $=$ \texttt{left\_inverse(Layout\_C)}};
+  \node[stepbox, minimum width=5.08cm, minimum height=0.60cm] at (8.15, -4.60)
+    {\texttt{a} $=$ \texttt{inv}\,$\cdot$\,\texttt{compose(Layout\_A)}};
+  \node[stepbox, minimum width=5.37cm, minimum height=0.60cm] at (13.675, -4.60)
+    {\texttt{out} $=$ \texttt{Layout\_C}\,$\cdot$\,\texttt{compose(a)}};
+  \node[font=\scriptsize, text=black!60, anchor=center] at (8.30, -5.15)
+    {映射语言：$(x_a, y_a)$ \texttt{--Layout\_A-->} offset0 \texttt{--inv-->} $(x_c, y_c)$ \texttt{--Layout\_C-->} offset1（compose 1/2 对应 \texttt{eq.\ 20-fa2-reed2/reed3}）};
+  \node[draw=tkGreen, fill=tkFillGreen, text=tkGreen!80!black, align=center, inner sep=3pt,
+    minimum width=16.60cm, minimum height=0.66cm] at (8.30, -5.91)
+    {两条路线结果等价：zero-copy——同一批寄存器，只是索引语言不同};
+  % 竖箭头：S -> 路线 a 首步；P -> regroup；两条路线各向下汇入
+  \draw[tkBlue, semithick, -{Stealth[length=3.5pt]}] (2.24, -1.49) -- (2.24, -2.69);
+  \draw[tkBlue, semithick, -{Stealth[length=3.5pt]}] (8.00, -2.985) -- (8.54, -2.985);
+  \draw[tkBlue, semithick, -{Stealth[length=3.5pt]}] (2.24, -3.28) -- (2.24, -3.70);
+  \draw[tkGreen, semithick, -{Stealth[length=3.5pt]}] (14.09, -1.49) -- (14.09, -2.69);
+  \draw[tkGreen, semithick, -{Stealth[length=3.5pt]}] (14.09, -3.28) -- (14.09, -3.70);
+  \draw[tkGreen, semithick, -{Stealth[length=3.5pt]}] (5.31, -4.60) -- (5.61, -4.60);
+  \draw[tkGreen, semithick, -{Stealth[length=3.5pt]}] (10.69, -4.60) -- (10.99, -4.60);
+  % 标题
+  \node at (8.30, -0.21) {FA2 $P$ 矩阵布局转换：两条路线（zero-copy）};
+\end{tikzpicture}
+\caption{FA2 的 P 矩阵布局转换：tri-dao 的几何重排与 reed 的代数复合两条路线，结果等价。本书 flash\_attn.cuh 的 \texttt{convert\_\allowbreak{}layout\_\allowbreak{}acc\_\allowbreak{}Aregs}（被 ffpa\_attn.cuh 复用）采用的是几何路线。}
+\label{fig:20-3}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+% was: \includegraphics[width=0.95\textwidth]{figures/drawio/fig-20-4-tensor-addr/fig-20-4.png}
+\begin{tikzpicture}[font=\footnotesize, x=1cm, y=1cm,
+    cell/.style={draw=gray!45, fill=white, minimum width=0.985cm, minimum height=0.746cm, inner sep=0pt, font=\ttfamily},
+    hitcell/.style={draw=tkGreen, fill=tkFillGreen, text=tkGreen!80!black, minimum width=0.985cm, minimum height=0.746cm, inner sep=0pt, font=\ttfamily},
+    eqbox/.style={draw, fill=white, align=center, inner sep=2pt, minimum height=0.55cm}]
+  % 4x4 元素网格（字符字面量，逻辑视图）
+  \foreach \c/\ch in {0/a,1/b,2/c,3/d}{\node[cell] at ({2.9725+\c*0.985}, -2.133) {\texttt{'\ch'}};}
+  \foreach \c/\ch in {0/e,1/f,2/g,3/h}{\node[cell] at ({2.9725+\c*0.985}, -2.879) {\texttt{'\ch'}};}
+  \foreach \c/\ch in {0/A,1/B,2/C,3/D}{\node[cell] at ({2.9725+\c*0.985}, -3.625) {\texttt{'\ch'}};}
+  \foreach \c/\ch in {0/E,1/F,2/G,3/H}{\node[cell] at ({2.9725+\c*0.985}, -4.371) {\texttt{'\ch'}};}
+  \node[hitcell] at (3.9575, -2.879) {\texttt{'f'}};
+  % 维度标注：N（列，上边）、M（行，左边）
+  \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (2.48, -1.49) -- (6.42, -1.49);
+  \node[text=black!55] at (4.45, -1.33) {$N$};
+  \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (2.15, -1.76) -- (2.15, -4.74);
+  \node[text=black!55] at (1.88, -3.25) {$M$};
+  \node[anchor=west, text=tkRed, font=\scriptsize] at (2.48, -5.10) {layoutA（逻辑视图，元素带引号）};
+  % 右侧：Layout 的代数定义与一次样例求值
+  \node[anchor=west, text=tkBlue] at (8.00, -1.76) {shape: $(M, N)$, i.e. $(4, 4)$};
+  \node[anchor=west, text=tkBlue] at (8.00, -2.18) {stride: $(N, 1)$, i.e. $(4, 1)$};
+  \node[anchor=west, text=tkRed] at (8.00, -2.90) {offset $= m \times N + n \times 1$};
+  \node[anchor=west, text=tkBlue] at (8.00, -3.55) {e.g. given input $(1, 1)$,};
+  \node[anchor=west, text=tkBlue] at (8.00, -3.97) {we got offset $= 1 \times 4 + 1 \times 1 = 5$};
+  \draw[tkGreen, semithick, -{Stealth[length=3.5pt]}] (6.80, -3.82) -- (4.42, -2.87);
+  % 底部：Tensor = Layout + Engine
+  \node[eqbox, draw=tkGreen, text=tkGreen!80!black, minimum width=2.09cm] at (1.285, -6.66) {CuTe Tensor};
+  \node[eqbox, draw=tkRed, text=tkRed, minimum width=2.24cm] at (4.64, -5.82) {Layout};
+  \node[eqbox, draw=tkRed, text=tkRed, minimum width=2.24cm] at (4.64, -7.52) {Engine};
+  \node[anchor=west, text=black!55, font=\scriptsize] at (5.91, -5.76) {（算 offset）};
+  \node[anchor=west, text=black!55, font=\scriptsize] at (5.91, -7.46) {（给 base\_ptr）};
+  \draw[tkRed, dashed, -{Stealth[length=3pt]}] (2.33, -6.66) -- (3.37, -5.82);
+  \draw[tkRed, dashed, -{Stealth[length=3pt]}] (3.37, -6.66) -- (3.37, -7.49);
+  % 最底：解引用
+  \node[anchor=west, text=tkGreen!80!black] at (0.24, -8.51) {base\_ptr};
+  \draw[tkPurple, semithick, -{Stealth[length=3.5pt]}] (1.43, -8.51) -- (2.78, -8.51);
+  \node[anchor=west, text=tkPurple] at (3.07, -8.51)
+    {*(base\_ptr $+$ offset)——线性索引 5 命中行主序第 5 号元素 \texttt{'f'}};
+  % 标题
+  \node at (8.00, -0.19) {CuTe Tensor $=$ Layout $+$ Engine：坐标 $\to$ offset $\to$ 解引用取数};
+  \node[text=black!60, font=\scriptsize] at (8.00, -0.60)
+    {Layout 只定义「坐标 $\to$ 偏移」的映射规则，Engine 提供可寻址的存储（base\_ptr）；二者相加才是一次真实的访存};
+\end{tikzpicture}
+\caption{CuTe Tensor 的寻址分工：Layout 负责「坐标 $\to$ offset」的代数——shape 限定输入范围、stride 决定各 mode 步长；Engine 只持有 \texttt{base\_ptr}。$(1,1)\to 5$，命中行主序（$(4,4){:}(4,1)$，列连续）第 5 号元素 \texttt{f}。重建自 @竹熙佳处《写给大家看的 CuTe 教程：Layout Compose \& Inverse》。}
+\label{fig:20-4}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+% was: \includegraphics[width=0.95\textwidth]{figures/drawio/fig-20-5-compose-flow/fig-20-5.png}
+\begin{tikzpicture}[font=\footnotesize, x=1cm, y=1cm,
+    gcell/.style={draw=tkOrange!80, fill=white, minimum width=0.687cm, minimum height=0.448cm, inner sep=0pt},
+    hcell/.style={draw=tkGreen, fill=tkFillGreen, text=tkGreen!80!black, minimum width=0.687cm, minimum height=0.448cm, inner sep=0pt},
+    bgcell/.style={draw=gray!45, fill=white, minimum width=0.687cm, minimum height=0.448cm, inner sep=0pt},
+    bhcell/.style={draw=tkGreen, fill=tkFillGreen, text=tkGreen!80!black, minimum width=0.687cm, minimum height=0.448cm, inner sep=0pt}]
+  \def\gw{0.687}
+  \def\gh{0.448}
+  % 面板 1（step 1）：待填的 layoutC 网格，目标格未知
+  \begin{scope}[shift={(0.687, -1.313)}]
+    \foreach \c in {0,1}{\foreach \r in {0,...,7}{\draw[tkOrange!80, fill=white] (\c*\gw, -\r*\gh) rectangle ({\c*\gw+\gw}, {-\r*\gh-\gh});}}
+    \fill[tkFillGreen] (\gw, -4*\gh) rectangle (2*\gw, -5*\gh);
+    \draw[tkGreen, semithick] (\gw, -4*\gh) rectangle (2*\gw, -5*\gh);
+    \node[text=tkGreen] at (1.5*\gw, -4.5*\gh) {?};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (0, 0.238) -- (2*\gw, 0.238);
+    \node[text=black!55, font=\scriptsize] at (\gw, 0.40) {$Q$};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (-0.30, 0) -- (-0.30, -8*\gh);
+    \node[text=black!55, font=\scriptsize] at (-0.57, -4*\gh) {$P$};
+  \end{scope}
+  % 面板 2（step 3 的结果）：目标格已填 6
+  \begin{scope}[shift={(9.49, -1.313)}]
+    \foreach \c in {0,1}{\foreach \r in {0,...,7}{\draw[tkOrange!80, fill=white] (\c*\gw, -\r*\gh) rectangle ({\c*\gw+\gw}, {-\r*\gh-\gh});}}
+    \fill[tkFillGreen] (\gw, -4*\gh) rectangle (2*\gw, -5*\gh);
+    \draw[tkGreen, semithick] (\gw, -4*\gh) rectangle (2*\gw, -5*\gh);
+    \node[text=tkGreen!80!black] at (1.5*\gw, -4.5*\gh) {6};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (0, 0.238) -- (2*\gw, 0.238);
+    \node[text=black!55, font=\scriptsize] at (\gw, 0.40) {$Q$};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (-0.30, 0) -- (-0.30, -8*\gh);
+    \node[text=black!55, font=\scriptsize] at (-0.57, -4*\gh) {$P$};
+  \end{scope}
+  % 左下（step 2）：layoutB 的 8x2 元素带，查出 offset 9
+  \begin{scope}[shift={(0.687, -6.39)}]
+    \foreach \c in {0,1}{\foreach \r in {0,...,7}{%
+      \pgfmathsetmacro\val{int(2*\r+\c)}%
+      \draw[gray!45, fill=white] (\c*\gw, -\r*\gh) rectangle ({\c*\gw+\gw}, {-\r*\gh-\gh});
+      \node at ({\c*\gw+0.5*\gw}, {-\r*\gh-0.5*\gh}) {\val};}}
+    \fill[tkFillGreen] (\gw, -4*\gh) rectangle (2*\gw, -5*\gh);
+    \draw[tkGreen, semithick] (\gw, -4*\gh) rectangle (2*\gw, -5*\gh);
+    \node[text=tkGreen!80!black] at (1.5*\gw, -4.5*\gh) {9};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (0, 0.238) -- (2*\gw, 0.238);
+    \node[text=black!55, font=\scriptsize] at (\gw, 0.40) {$Q$};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (-0.30, 0) -- (-0.30, -8*\gh);
+    \node[text=black!55, font=\scriptsize] at (-0.57, -4*\gh) {$P$};
+  \end{scope}
+  % 右下（step 3）：layoutA 的 4x4 网格，按坐标 (1,2) 取值 6
+  \begin{scope}[shift={(9.49, -6.84)}]
+    \foreach \c in {0,...,3}{\foreach \r in {0,...,3}{%
+      \pgfmathsetmacro\val{int(4*\r+\c)}%
+      \draw[gray!45, fill=white] ({\c*0.806}, {-\r*0.627}) rectangle ({\c*0.806+0.806}, {-\r*0.627-0.627});
+      \node at ({\c*0.806+0.403}, {-\r*0.627-0.3135}) {\val};}}
+    \fill[tkFillGreen] ({2*0.806}, -0.627) rectangle ({3*0.806}, -2*0.627);
+    \draw[tkGreen, semithick] ({2*0.806}, -0.627) rectangle ({3*0.806}, -2*0.627);
+    \node[text=tkGreen!80!black] at ({2.5*0.806}, {-1.5*0.627}) {6};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (0, 0.238) -- ({4*0.806}, 0.238);
+    \node[text=black!55, font=\scriptsize] at ({2*0.806}, 0.40) {$N$};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (-0.30, 0) -- (-0.30, {-4*0.627});
+    \node[text=black!55, font=\scriptsize] at (-0.57, {-2*0.627}) {$M$};
+  \end{scope}
+  % 文字说明
+  \node[anchor=west, text=tkRed] at (3.07, -1.46) {layoutC $=$ compose(layoutA, layoutB)};
+  \node[anchor=west, text=tkRed] at (3.07, -1.88) {$=$ layoutA(layoutB(p, q))};
+  \node[anchor=west, text=tkGreen] at (3.07, -2.54) {how to fill coord $(4, 1)$ ?};
+  \node[anchor=west, text=tkPurple] at (3.07, -2.96) {access ``inside'' layout: layoutB$(4, 1)$};
+  \node[anchor=west, text=tkRed] at (11.88, -1.46) {layoutC $=$ compose(layoutA, layoutB)};
+  \node[anchor=west, text=tkGreen] at (11.88, -1.88) {for coord $(4, 1)$, we fill \texttt{'6'}};
+  \node[anchor=west, text=tkGreen] at (3.07, -6.48) {$\to$ given coord $(4, 1)$,};
+  \node[anchor=west, text=tkGreen] at (3.07, -6.90) {offset $= 4 \times 2 + 1 \times 1 = 9$};
+  \node[anchor=west, text=tkPurple] at (3.07, -7.55) {convert offset as col-major 2D-coord};
+  \node[anchor=west, text=tkPurple] at (3.07, -7.97) {of layoutA: $(9 \bmod 4,\ 9/4) = (1, 2)$};
+  \node[anchor=west, text=tkBlue] at (3.07, -8.92) {layoutB:};
+  \node[anchor=west, text=tkBlue] at (3.07, -9.28) {shape: $(P, Q)$, i.e. $(8, 2)$};
+  \node[anchor=west, text=tkBlue] at (3.07, -9.61) {stride: $(Q, 1)$, i.e. $(2, 1)$};
+  \node[anchor=west, text=tkRed] at (13.07, -6.84) {layoutA:};
+  \node[anchor=west, text=tkBlue] at (13.07, -7.19) {shape: $(M, N)$, i.e. $(4, 4)$};
+  \node[anchor=west, text=tkBlue] at (13.07, -7.52) {stride: $(N, 1)$, i.e. $(4, 1)$};
+  \node[anchor=west, text=tkPurple] at (13.07, -8.18) {$(1, 2)$ as input};
+  \node[anchor=west, text=tkOrange!90!black] at (13.07, -8.54) {we got \texttt{'6'}.};
+  % 步骤标签（与虚线同色）
+  \node[text=tkOrange!90!black, font=\scriptsize] at (2.03, -5.87) {step(1)};
+  \node[text=tkGreen, font=\scriptsize] at (8.90, -5.87) {step(3)};
+  \node[text=tkPurple, font=\scriptsize] at (6.51, -10.43) {step(2)};
+  % 分隔线：上半为「待填/结果」，下半为三层求值细节
+  \draw[gray!45, dashed] (0.24, -5.67) -- (15.91, -5.67);
+  % 步骤箭头（折线绕行，避免穿越网格）
+  \draw[tkOrange!90!black, semithick, dashed, -{Stealth[length=3.5pt]}]
+    (3.07, -3.16) -- (2.35, -3.16) -- (2.35, -6.05) -- (0.687, -6.05) -- (0.687, -6.39);
+  \draw[tkPurple, semithick, dashed, -{Stealth[length=3.5pt]}] (3.07, -8.18) -- (9.19, -8.18);
+  \draw[tkGreen, semithick, dashed, -{Stealth[length=3.5pt]}]
+    (11.91, -8.09) -- (12.85, -8.09) -- (12.85, -5.42) -- (10.40, -5.42);
+  % 标题
+  \node at (8.00, -0.19) {compose(layoutA, layoutB)：三步求 layoutC 的 coord $(4, 1)$};
+  \node[text=black!60, font=\scriptsize] at (8.00, -0.60)
+    {$C(p, q) = A(B(p, q))$：先在内层 $B$ 上查 offset，再按行主序换算成 $A$ 的坐标，最后在 $A$ 上取值回填};
+\end{tikzpicture}
+\caption{compose(A, B) 的三步求值：先查内层 B 得 offset，再按外层 A 的 shape 把 offset 换算回坐标，最后查 A 得最终值。例：$C(4,1)\to B(4,1)=9\to(9\bmod 4,\,9\div 4)=(1,2)\to A(1,2)=6$ 回填 $C$。重建自同上文。}
+\label{fig:20-5}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+% was: \includegraphics[width=0.95\textwidth]{figures/drawio/fig-20-6-inverse-reshape/fig-20-6.png}
+\begin{tikzpicture}[font=\footnotesize, x=1cm, y=1cm]
+  % 左：layoutA 的 4x4 矩阵（行主序）
+  \begin{scope}[shift={(0.687, -1.612)}]
+    \foreach \c in {0,...,3}{\foreach \r in {0,...,3}{%
+      \pgfmathsetmacro\val{int(4*\r+\c)}%
+      \draw[gray!45, fill=white] ({\c*0.866}, {-\r*0.687}) rectangle ({\c*0.866+0.866}, {-\r*0.687-0.687});
+      \node at ({\c*0.866+0.433}, {-\r*0.687-0.3435}) {\val};}}
+    \fill[tkFillGreen] (0.866, -2*0.687) rectangle (2*0.866, -3*0.687);
+    \draw[tkGreen, semithick] (0.866, -2*0.687) rectangle (2*0.866, -3*0.687);
+    \node[text=tkGreen!80!black] at (1.5*0.866, -2.5*0.687) {9};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (0, 0.239) -- ({4*0.866}, 0.239);
+    \node[text=black!55, font=\scriptsize] at ({2*0.866}, 0.40) {$N$};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (-0.30, 0) -- (-0.30, {-4*0.687});
+    \node[text=black!55, font=\scriptsize] at (-0.57, {-2*0.687}) {$M$};
+  \end{scope}
+  \node[anchor=west, text=tkRed] at (0.687, -4.60) {layoutA};
+  \node[anchor=west, text=tkBlue] at (0.687, -4.96) {shape: $(4, 4)$, stride: $(4, 1)$};
+  % 中：反查原始 offset
+  \node[anchor=west, text=tkGreen] at (4.60, -1.76) {e.g. given coord $(2, 1)$,};
+  \node[anchor=west, text=tkGreen] at (4.60, -2.18) {offset $= 2 \times 4 + 1 \times 1 = 9$};
+  \node[anchor=west, text=tkGreen] at (4.60, -2.84) {col-major coord: 6};
+  \node[anchor=west, text=tkGreen] at (4.60, -3.25) {so $6 \to 9$, inverse as $9 \to 6$};
+  % 中：拉直成 1D 长条（16 格），第 9 格为 inverse 结果
+  \begin{scope}[shift={(8.00, -0.418)}]
+    \foreach \k in {0,...,15}{\draw[tkOrange!80, fill=white] (0, {-\k*0.403}) rectangle (1.343, {-\k*0.403-0.403});}
+    \fill[tkFillGreen] (0, -8*0.403) rectangle (1.343, -9*0.403);
+    \draw[tkGreen, semithick] (0, -8*0.403) rectangle (1.343, -9*0.403);
+    \node[text=tkGreen!80!black] at (0.6715, -8.5*0.403) {6};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (-0.30, 0) -- (-0.30, {-16*0.403});
+  \end{scope}
+  \node[anchor=east, text=black!55, font=\scriptsize] at (7.65, -3.64) {$M \times N$};
+  \node[anchor=west, text=tkOrange!90!black] at (9.55, -3.24) {col-major reorder};
+  \node[anchor=west, text=tkOrange!90!black] at (9.55, -3.70) {with shape $(8, 2)$};
+  % 右：按 col-major 折回 (P, Q) = (8, 2)
+  \begin{scope}[shift={(11.58, -1.612)}]
+    \foreach \c in {0,1}{\foreach \r in {0,...,7}{\draw[tkOrange!80, fill=white] ({\c*0.925}, {-\r*0.597}) rectangle ({\c*0.925+0.925}, {-\r*0.597-0.597});}}
+    \fill[tkFillGreen] (0.925, 0) rectangle (2*0.925, -0.597);
+    \draw[tkGreen, semithick] (0.925, 0) rectangle (2*0.925, -0.597);
+    \node[text=tkGreen!80!black] at (1.5*0.925, -0.5*0.597) {6};
+    \draw[tkGreen, dashed, -{Stealth[length=3pt]}] (0.25, -0.10) -- (0.25, {-8*0.597+0.30});
+    \draw[tkGreen, dashed, -{Stealth[length=3pt]}] (1.62, -0.70) -- (1.62, {-8*0.597+0.30});
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (0, 0.272) -- ({2*0.925}, 0.272);
+    \node[text=black!55, font=\scriptsize] at (0.925, 0.43) {$Q$};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (-0.30, 0) -- (-0.30, {-8*0.597});
+    \node[text=black!55, font=\scriptsize] at (-0.57, {-4*0.597}) {$P$};
+  \end{scope}
+  \node[anchor=west, text=tkGreen] at (11.58, -0.88) {layoutB$(9)$ $=$ layoutB$(1, 1)$ $=$ 6};
+  \node[anchor=west, text=tkRed] at (11.58, -6.70) {layoutB $=$ inverse(layoutA)};
+  \node[anchor=west, text=tkRed] at (11.58, -7.20) {.with\_shape$(P, Q)$};
+  % 流程箭头
+  \draw[tkGreen, dashed, -{Stealth[length=3pt]}] (7.13, -3.49) -- (7.40, -4.22);
+  \draw[tkOrange!90!black, dashed, -{Stealth[length=3pt]}] (9.37, -4.22) -- (11.51, -6.09);
+  % 标题
+  \node at (8.00, -0.19) {inverse 与 with\_shape：先拉直成 1D，再按新 shape 重排};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (0.09, -0.58)
+    {inverse 把「值 $\to$ 坐标」倒过来查表；with\_shape 再把};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (0.09, -0.86)
+    {1D 长条按 col-major 折回 2D——完成任意布局间的元素搬运};
+\end{tikzpicture}
+\caption{inverse 与 with\_shape：inverse 把「值 $\to$ 坐标」倒过来查表（$9\leftrightarrow 6$ 互逆），with\_shape 再把 1D 长条按新 shape $(8,2)$ 沿 col-major 折回 2D，得 $B(1,1)=6$。重建自同上文。}
+\label{fig:20-6}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+% was: \includegraphics[width=0.95\textwidth]{figures/drawio/fig-20-7-left-right-inverse/fig-20-7.png}
+\begin{tikzpicture}[font=\footnotesize, x=1cm, y=1cm,
+    acell/.style={draw=gray!45, fill=white, minimum width=0.76cm, minimum height=0.535cm, inner sep=0pt},
+    ahit/.style={draw=tkBlue, fill=white, text=tkBlue, minimum width=0.76cm, minimum height=0.535cm, inner sep=0pt}]
+  % (a) broadcast case：layoutA 的 M 方向重复
+  \begin{scope}[shift={(0.60, -2.06)}]
+    \foreach \r in {0,...,3}{%
+      \node[acell] at ({0.5*0.76}, {-\r*0.535-0.2675}) {\r};
+      \node[acell] at ({1.5*0.76}, {-\r*0.535-0.2675}) {\r};}
+    \node[ahit] at ({1.5*0.76}, {-1*0.535-0.2675}) {1};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (0, 0.34) -- ({2*0.76}, 0.34);
+    \node[text=black!55, font=\scriptsize] at ({1*0.76}, 0.50) {$N$};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (-0.35, 0) -- (-0.35, {-4*0.535});
+    \node[text=black!55, font=\scriptsize] at (-0.62, {-2*0.535}) {$M$};
+  \end{scope}
+  \node[anchor=west, text=tkRed] at (0.30, -4.55) {layoutA};
+  \node[anchor=west, text=tkBlue] at (0.30, -4.86) {shape: $(4, 2)$, stride: $(1, 0)$};
+  % (a) 的两逆：均为去重投影后的 1D (4):(1)
+  \begin{scope}[shift={(4.70, -1.19)}]
+    \foreach \r in {0,...,3}{\draw[tkOrange!80, fill=white] (0, {-\r*0.50}) rectangle (0.75, {-\r*0.50-0.50});}
+    \foreach \r in {0,...,3}{\node at (0.375, {-\r*0.50-0.25}) {\r};}
+  \end{scope}
+  \begin{scope}[shift={(4.70, -5.20)}]
+    \foreach \r in {0,...,3}{\draw[tkBlue, fill=white] (0, {-\r*0.50}) rectangle (0.75, {-\r*0.50-0.50});}
+    \foreach \r in {0,...,3}{\node at (0.375, {-\r*0.50-0.25}) {\r};}
+  \end{scope}
+  \node[anchor=west, text=tkOrange!90!black, font=\scriptsize] at (2.00, -1.45) {left\_inverse(layoutA)};
+  \node[anchor=west, text=tkOrange!90!black, font=\scriptsize] at (5.65, -1.25) {left\_inv\_layoutA};
+  \node[anchor=west, text=tkOrange!90!black, font=\scriptsize] at (5.65, -1.55) {shape: $(4)$};
+  \node[anchor=west, text=tkOrange!90!black, font=\scriptsize] at (5.65, -1.85) {stride: $(1)$};
+  \node[anchor=west, text=tkBlue, font=\scriptsize] at (0.30, -5.60) {right\_inverse(layoutA)};
+  \node[anchor=west, text=tkBlue, font=\scriptsize] at (5.65, -5.60) {right\_inv\_layoutA};
+  \node[anchor=west, text=tkBlue, font=\scriptsize] at (5.65, -5.90) {shape: $(4)$};
+  \node[anchor=west, text=tkBlue, font=\scriptsize] at (5.65, -6.20) {stride: $(1)$};
+  % (b) stride case：layoutA 的双射跨步
+  \begin{scope}[shift={(8.90, -2.06)}]
+    \foreach \r in {0,...,3}{%
+      \node[acell] at ({0.5*0.76}, {-\r*0.535-0.2675}) {\pgfmathparse{int(4*\r)}\pgfmathresult};
+      \node[acell] at ({1.5*0.76}, {-\r*0.535-0.2675}) {\pgfmathparse{int(4*\r+1)}\pgfmathresult};}
+    \node[ahit] at ({1.5*0.76}, {-1*0.535-0.2675}) {5};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (0, 0.34) -- ({2*0.76}, 0.34);
+    \node[text=black!55, font=\scriptsize] at ({1*0.76}, 0.50) {$N$};
+    \draw[gray!70, {Stealth[length=2.5pt]}-{Stealth[length=2.5pt]}] (-0.35, 0) -- (-0.35, {-4*0.535});
+    \node[text=black!55, font=\scriptsize] at (-0.62, {-2*0.535}) {$M$};
+  \end{scope}
+  \node[anchor=west, text=tkRed] at (8.90, -4.55) {layoutA};
+  \node[anchor=west, text=tkBlue] at (8.90, -4.86) {shape: $(4, 2)$, stride: $(4, 1)$};
+  % (b) 的两逆：均为 layoutA 自身（对合）
+  \begin{scope}[shift={(12.40, -1.10)}]
+    \foreach \c in {0,...,3}{\foreach \r in {0,...,3}{%
+      \pgfmathsetmacro\val{int(4*\r+\c)}%
+      \draw[tkOrange!80, fill=white] ({\c*0.725}, {-\r*0.60}) rectangle ({\c*0.725+0.725}, {-\r*0.60-0.60});
+      \node at ({\c*0.725+0.3625}, {-\r*0.60-0.30}) {\val};}}
+  \end{scope}
+  \begin{scope}[shift={(12.40, -5.20)}]
+    \foreach \c in {0,...,3}{\foreach \r in {0,...,3}{%
+      \pgfmathsetmacro\val{int(4*\r+\c)}%
+      \draw[tkBlue, fill=white] ({\c*0.725}, {-\r*0.60}) rectangle ({\c*0.725+0.725}, {-\r*0.60-0.60});
+      \node at ({\c*0.725+0.3625}, {-\r*0.60-0.30}) {\val};}}
+  \end{scope}
+  \node[anchor=west, text=tkOrange!90!black, font=\scriptsize] at (11.60, -0.95) {left\_inverse(layoutA)};
+  \node[anchor=west, text=tkOrange!90!black, font=\scriptsize] at (15.55, -1.30) {left\_inv};
+  \node[anchor=west, text=tkOrange!90!black, font=\scriptsize] at (15.55, -1.60) {shape: $(4,4)$};
+  \node[anchor=west, text=tkOrange!90!black, font=\scriptsize] at (15.55, -1.90) {stride: $(4,1)$};
+  \node[anchor=west, text=tkBlue, font=\scriptsize] at (12.30, -4.95) {right\_inverse(layoutA)};
+  \node[anchor=west, text=tkBlue, font=\scriptsize] at (12.40, -7.90) {right\_inv $=$ layoutA 自身};
+  \node[anchor=west, text=tkBlue, font=\scriptsize] at (12.40, -8.20) {shape: $(4, 4)$, stride: $(4, 1)$};
+  % 求逆箭头（折线绕开文字）
+  \draw[tkOrange!90!black, dashed, -{Stealth[length=3pt]}] (2.12, -2.20) -- (4.70, -1.69);
+  \draw[tkBlue, dashed, -{Stealth[length=3pt]}]
+    (2.12, -4.20) -- (3.90, -4.20) -- (3.90, -6.20) -- (4.70, -6.20);
+  \draw[tkOrange!90!black, dashed, -{Stealth[length=3pt]}] (10.42, -2.60) -- (12.40, -2.30);
+  \draw[tkBlue, dashed, -{Stealth[length=3pt]}]
+    (10.42, -4.20) -- (12.10, -4.20) -- (12.10, -6.40) -- (12.40, -6.40);
+  % 标题与脚注
+  \node at (8.00, -0.19) {left\_inverse 与 right\_inverse：两种典型 layoutA 的求逆结果};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (0.30, -0.60)
+    {左逆对 $M$ 模式（行）求逆，右逆对 $N$ 模式（列）求逆；stride 出现 0（broadcast）与普通跨步两种情形的结果形状完全不同};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (0.30, -8.55)
+    {CuTe v4.6.1 实测：stride 0 广播布局的两逆相同——去重投影 $(4){:}(1)$；双射且对合的布局，两逆均为其自身};
+  \node[anchor=west, font=\scriptsize] at (0.30, -1.12) {(a) broadcast access case};
+  \node[anchor=west, font=\scriptsize] at (8.90, -1.12) {(b) stride access case};
+\end{tikzpicture}
+\caption{left\_inverse / right\_inverse 的两种情形（CuTe v4.6.1 实测）：stride $(1,0)$ 广播布局两逆相同，均为去重投影 $(4){:}(1)$——stride 为 0 的维度被投影掉，每行只保留代表坐标 $m$；stride $(4,1)$ 的双射布局两逆均为其自身 $(4,4){:}(4,1)$（该布局是对合，$f\circ f=\mathrm{id}$）。重建自 @竹熙佳处《写给大家看的 CuTe 教程：Layout Compose \& Inverse》（数值按 CuTe v4.6.1 实测校正）。}
+\label{fig:20-7}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+% was: \includegraphics[width=0.95\textwidth]{figures/drawio/fig-20-8-layout-product/fig-20-8.png}
+\begin{tikzpicture}[font=\footnotesize, x=1cm, y=1cm]
+  % 左：layoutA（外层，块位）
+  \begin{scope}[shift={(0.687, -1.76)}]
+    \foreach \c in {0,1}{\foreach \r in {0,1}{%
+      \pgfmathsetmacro\val{int(2*\r+\c)}%
+      \draw[tkRed, fill=white] ({\c*0.836}, {-\r*0.687}) rectangle ({\c*0.836+0.836}, {-\r*0.687-0.687});
+      \node at ({\c*0.836+0.418}, {-\r*0.687-0.3435}) {\val};}}
+    \node[anchor=west, text=black!55, font=\scriptsize] at (1.94, -0.34) {$m$};
+    \node[anchor=east, text=black!55, font=\scriptsize] at (-0.17, -1.03) {$n$};
+  \end{scope}
+  \node[anchor=west, text=tkRed] at (0.687, -3.42) {layoutA};
+  \node[anchor=west, text=tkBlue] at (0.687, -3.75) {shape: $(2, 2)$, stride: $(2, 1)$};
+  \node[anchor=center, text=black!60] at (1.90, -4.30) {product};
+  % 左下：layoutB（内层，块内）
+  \begin{scope}[shift={(0.687, -5.04)}]
+    \foreach \c in {0,1}{\foreach \r in {0,1}{%
+      \pgfmathsetmacro\val{int(2*\r+\c)}%
+      \draw[tkBlue, fill=white] ({\c*0.836}, {-\r*0.687}) rectangle ({\c*0.836+0.836}, {-\r*0.687-0.687});
+      \node at ({\c*0.836+0.418}, {-\r*0.687-0.3435}) {\val};}}
+    \node[anchor=west, text=black!55, font=\scriptsize] at (1.94, -0.34) {$p$};
+    \node[anchor=east, text=black!55, font=\scriptsize] at (-0.17, -1.03) {$q$};
+  \end{scope}
+  \node[anchor=west, text=tkBlue] at (0.687, -6.72) {layoutB};
+  \node[anchor=west, text=tkBlue] at (0.687, -7.05) {shape: $(2, 2)$, stride: $(2, 1)$};
+  % 「每格放一份 B」：外层 A 的四个坐标位各展开成一份 B
+  \draw[tkPurple, dashed, -{Stealth[length=3pt]}] (4.42, -2.45) -- (4.57, -5.73);
+  \node[anchor=west, text=tkPurple, font=\scriptsize] at (4.75, -3.90) {每格放一份 B};
+  % 右：layoutA (x) layoutB —— 四个 2x2 块按 A 的值序拼接
+  \begin{scope}[shift={(8.00, -1.46)}]
+    \fill[colorx1!20] (0, 0) rectangle ({2*1.045}, {-2*0.746});
+    \fill[colorx3!20] ({2*1.045}, 0) rectangle ({4*1.045}, {-2*0.746});
+    \fill[colorx5!20] (0, {-2*0.746}) rectangle ({2*1.045}, {-4*0.746});
+    \fill[colorx7!20] ({2*1.045}, {-2*0.746}) rectangle ({4*1.045}, {-4*0.746});
+    \foreach \c in {0,...,3}{\foreach \r in {0,...,3}{%
+      \pgfmathsetmacro\val{int(8*floor(\r/2)+4*floor(\c/2)+2*mod(\r,2)+mod(\c,2))}%
+      \draw[gray!50] ({\c*1.045}, {-\r*0.746}) rectangle ({\c*1.045+1.045}, {-\r*0.746-0.746});
+      \node at ({\c*1.045+0.5225}, {-\r*0.746-0.373}) {\val};}}
+    \fill[tkFillGreen] (1.045, {-3*0.746}) rectangle ({2*1.045}, {-4*0.746});
+    \draw[tkGreen, semithick] (1.045, {-3*0.746}) rectangle ({2*1.045}, {-4*0.746});
+    \draw[colorx1, semithick] (0, 0) rectangle ({2*1.045}, {-2*0.746});
+    \draw[colorx3, semithick] ({2*1.045}, 0) rectangle ({4*1.045}, {-2*0.746});
+    \draw[colorx5, semithick] (0, {-2*0.746}) rectangle ({2*1.045}, {-4*0.746});
+    \draw[colorx7, semithick] ({2*1.045}, {-2*0.746}) rectangle ({4*1.045}, {-4*0.746});
+  \end{scope}
+  \node[anchor=west, text=tkRed] at (8.00, -4.78) {layoutA (x) layoutB};
+  \node[anchor=west, text=tkBlue] at (8.00, -5.14) {shape: $((2,2), (2,2))$,  stride: $((8,4), (2,1))$};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (8.00, -5.49) {块序 $=$ A 的值序（row-major 扫描）：左上 $\to$ 右上 $\to$ 左下 $\to$ 右下};
+  % 右侧：求值样例（(m,n)=(1,0)、(p,q)=(1,1) 命中 11）
+  \node[anchor=west, text=black!60, font=\scriptsize] at (13.62, -1.97) {value $= 8m + 4n$};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (13.62, -2.33) {\qquad $+ 2p + 1q$};
+  \node[anchor=west, text=tkGreen, font=\scriptsize] at (13.62, -2.98) {e.g. $(m,n)=(1,0)$};
+  \node[anchor=west, text=tkGreen, font=\scriptsize] at (13.62, -3.25) {$(p,q)=(1,1)$};
+  \node[anchor=west, text=tkGreen, font=\scriptsize] at (13.62, -3.85) {$8+0+2+1 = 11$};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (13.62, -4.55) {flatten 后仍合法;};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (13.62, -4.80) {TiledCopy / TiledMMA};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (13.62, -5.05) {的层级结构由 product 搭出};
+  % 标题
+  \node at (8.00, -0.19) {layout product：外层定块位、内层定块内，size 相乘成嵌套布局};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (0.09, -0.60)
+    {A 的每个坐标位放一份 B 的拷贝：块偏移 $=$ A 的求值结果 $\times$ size(B)，块内排布即 B};
+\end{tikzpicture}
+\caption{layout product：A 的每个坐标位放一份 B 的拷贝（块偏移 $=$ A 的线性序号 $\times$ size(B)），得到嵌套布局 $((2,2),(2,2)){:}((8,4),(2,1))$。行值 $0,1,4,5\,/\,2,3,6,7\,/\cdots$ 的「块拷贝拼接」排布即 product 的几何特征——它不是 row-major。重建自 @竹熙佳处《写给大家看的 CuTe 教程：Layout Product \& Divide》。}
+\label{fig:20-8}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+% was: \includegraphics[width=0.95\textwidth]{figures/drawio/fig-20-9-layout-divide/fig-20-9.png}
+\begin{tikzpicture}[font=\footnotesize, x=1cm, y=1cm]
+  % 左：原始 row-major 4x4
+  \begin{scope}[shift={(0.687, -1.76)}]
+    \foreach \c in {0,...,3}{\foreach \r in {0,...,3}{%
+      \pgfmathsetmacro\val{int(4*\r+\c)}%
+      \draw[gray!45, fill=white] ({\c*0.866}, {-\r*0.68}) rectangle ({\c*0.866+0.866}, {-\r*0.68-0.68});
+      \node at ({\c*0.866+0.433}, {-\r*0.68-0.34}) {\val};}}
+  \end{scope}
+  \node[anchor=west, text=tkRed] at (0.687, -4.74) {$L = (4, 4) : (4, 1)$};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (0.687, -5.07) {16 格 row-major 0--15};
+  % 中：divide by (2,2) 的切块指示
+  \begin{scope}[shift={(5.46, -2.36)}]
+    \foreach \c in {0,1}{\foreach \r in {0,1}{\draw[tkOrange!80, fill=white] ({\c*0.567}, {-\r*0.478}) rectangle ({\c*0.567+0.567}, {-\r*0.478-0.478});}}
+  \end{scope}
+  \node[anchor=center, text=tkOrange!90!black] at (6.51, -3.70) {divide by $(2, 2)$};
+  \node[anchor=center, text=black!60, font=\scriptsize] at (6.66, -2.00) {每维切成 2 段};
+  \draw[tkOrange!90!black, dashed, -{Stealth[length=3pt]}] (6.96, -2.87) -- (7.70, -2.87);
+  % 右：同一网格按 2x2 重新分组（值排布不变）
+  \begin{scope}[shift={(8.90, -1.46)}]
+    \fill[colorx1!20] (0, 0) rectangle ({2*0.985}, {-2*0.74});
+    \fill[colorx3!20] ({2*0.985}, 0) rectangle ({4*0.985}, {-2*0.74});
+    \fill[colorx5!20] (0, {-2*0.74}) rectangle ({2*0.985}, {-4*0.74});
+    \fill[colorx7!20] ({2*0.985}, {-2*0.74}) rectangle ({4*0.985}, {-4*0.74});
+    \foreach \c in {0,...,3}{\foreach \r in {0,...,3}{%
+      \pgfmathsetmacro\val{int(4*\r+\c)}%
+      \draw[gray!50] ({\c*0.985}, {-\r*0.74}) rectangle ({\c*0.985+0.985}, {-\r*0.74-0.74});
+      \node at ({\c*0.985+0.4925}, {-\r*0.74-0.37}) {\val};}}
+    \fill[tkFillGreen] (0.985, {-3*0.74}) rectangle ({2*0.985}, {-4*0.74});
+    \draw[tkGreen, semithick] (0.985, {-3*0.74}) rectangle ({2*0.985}, {-4*0.74});
+    \node[text=tkGreen!80!black] at ({1.5*0.985}, {-3.5*0.74}) {13};
+    \draw[colorx1, semithick] (0, 0) rectangle ({2*0.985}, {-2*0.74});
+    \draw[colorx3, semithick] ({2*0.985}, 0) rectangle ({4*0.985}, {-2*0.74});
+    \draw[colorx5, semithick] (0, {-2*0.74}) rectangle ({2*0.985}, {-4*0.74});
+    \draw[colorx7, semithick] ({2*0.985}, {-2*0.74}) rectangle ({4*0.985}, {-4*0.74});
+  \end{scope}
+  % 两个 mode 层级：块位（外）与块内（内）
+  \node[anchor=west, text=tkPurple, font=\scriptsize] at (8.90, -1.00) {块位 $(2,2){:}(8,2)$};
+  \node[anchor=west, text=tkGreen, font=\scriptsize] at (12.93, -1.00) {块内 $(2,2){:}(4,1)$};
+  \draw[tkPurple, dashed, -{Stealth[length=3pt]}] (10.54, -1.25) -- (10.30, -1.42);
+  \draw[tkGreen, dashed, -{Stealth[length=3pt]}] (15.16, -1.25) -- (10.15, -1.42);
+  \node[anchor=west, text=tkRed] at (8.90, -4.78) {divide$(L, (2,2))$};
+  \node[anchor=west, text=tkBlue] at (8.90, -5.14) {shape: $((2,2), (2,2))$,  stride: $((4,1), (8,2))$};
+  \node[anchor=west, text=tkGreen, font=\scriptsize] at (8.90, -5.68)
+    {e.g. 同格 $(3,1)$: 块$(1,0)$ 内$(1,1)$ $\to$ $8\times1 + 2\times0 + 4\times1 + 1 = 13$};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (8.90, -6.04)
+    {对比 product：其同格值为 11——product 生成新排布；divide 只改分组};
+  % 标题
+  \node at (8.00, -0.19) {logical\_divide：按 2x2 子块重组为嵌套布局（值排布不变）};
+  \node[anchor=west, text=black!60, font=\scriptsize] at (0.09, -0.60)
+    {divide 是 product 的逆：外层 $(2,2){:}(8,2)$ 索引块、内层 $(2,2){:}(4,1)$ 索引块内——同一网格换一种分组解释};
+\end{tikzpicture}
+\caption{logical\_divide：按 $2\times2$ 子块把 $(4,4){:}(4,1)$ 重组为 $((2,2),(2,2)){:}((4,1),(8,2))$（CuTe 实测的 zipped 形式：块内 mode 在前、块位 mode 在后）——值排布不变（仍 row-major），改变的只是索引方式（一组 $(4,1)$ 索引块内、一组 $(8,2)$ 索引块位）。与上图对比：同物理格 $(3,1)$ 的 product 值为 11（新排布），divide 后仍为 13（原排布）。重建自同上文。}
+\label{fig:20-9}
+\end{figure}
+
+\section{性能分析}
+
+本章没有 kernel，性能一节只回答一个问题：\textbf{这套代数要付多少代价？}
+答案是三句话：编译期全折叠、运行期只剩加法与位运算、代价转移到编译时间。
+
+\textbf{证据一（编译期折叠）}：static layout（所有 shape/stride 都是
+\texttt{Int<N>}）上，\texttt{cosize}/\texttt{shape}/\texttt{compose}/
+\texttt{divide} 的结果都是 \texttt{constexpr}。本章测试把
+\texttt{tile\_\allowbreak{}to\_\allowbreak{}shape} 的结果直接写进了编译期断言：
+\begin{lstlisting}
+static_assert(cosize(decltype(atom){})  == 256,  "atom cosize folds");
+static_assert(cosize(decltype(tiled){}) == 8192, "tiled cosize folds");
+\end{lstlisting}
+编译通过即证明：$128\times32\times2$ 的 smem 布局的全部尺寸计算没有进入
+运行期一行代码。
+
+\textbf{证据二（运行期退化为机器指令）}：compose/divide 之后的地址计算在
+SASS 层面就是「基址 + 若干次加法/移位」。XOR swizzle 的复合在编译期折叠为
+位运算，本章测试对 $8\times32$ 布局逐点核对了 \texttt{Swizzle\allowbreak{}<3,\allowbreak{}3,\allowbreak{}3>} 的复合
+结果与位公式 $\mathrm{off}\oplus(((\mathrm{off}\gg6)\mathbin{\&}7)\ll3)$
+完全一致（256 点、0 差异）。这与第~\ref{ch:12}~章手写 XOR 的
+$30{,}720$ 点 v1/v2 等价性结论互相印证：\textbf{声明式的 Swizzle $\circ$ layout
+与手写位运算生成的是同一个函数}。
+
+\textbf{证据三（代码量口径）}：hgemm.cuh~L803--805 的注释声称手写版
+「$\sim$200 行」、CuTe 版「$\sim$80 行」。实测去注释非空行：手写 swizzle
+kernel（L434--716）235 行；CuTe kernel 本体（L821--1196）118 行，另有 launch
+wrapper（L1216--1427）86 行。所以「$\sim$80 行」低估了 CuTe kernel 本体的物理
+规模；真正成立的结论是\textbf{CuTe 版 kernel 里没有一行地址算术}：手写版用
+\texttt{LDMATRIX\_X4}/\texttt{LDMATRIX\_X2}/\texttt{HMMA16816} 宏直接编排 PTX
+与 lane 地址，CuTe 版的内联汇编为 0，地址全部由 layout 类型在编译期推出来。
+绝对性能的端到端对照（TFLOPS）在第~\ref{ch:24}~章给出，本章不展开。
+
+口径说明：本章测试是纯 host 断言（890 个），不产生 GPU 计时数据；上述
+「去注释行数」口径为 \texttt{sed} 去注释与空行后的物理行数（2026-09-11 实测）。
+
+\section{常见坑}
+
+\textbf{坑一：坐标的 rank 必须匹配 shape 的嵌套结构。}
+$\mathrm{make\_layout}(A,B)$ 的外层只有 2 个 mode（shape 为
+$\bigl(\mathrm{shape}(A),$ $\mathrm{shape}(B)\bigr)$），
+把它当 3 个 mode 索引
+（如 \texttt{P(a0,a1,b)}）会直接编译失败：CuTe 会打印
+\texttt{Mismatched Ranks}（\texttt{crd2idx} 的 \texttt{static\_\allowbreak{}assert}），
+报错位置在 \texttt{stride.hpp}，第一次遇到时不容易定位问题所在。正确写法是
+\texttt{P\allowbreak{}(make\_\allowbreak{}coord}\allowbreak\texttt{(a0,a1), b)}。另外：整数坐标可以展开
+「平坦」的 shape（如 $(4,8)$），但不能展开嵌套元组，这是本章测试实际踩过的
+编译错误。
+
+\textbf{坑二：\texttt{make\_\allowbreak{}layout\allowbreak{}(Shape)} 默认 column-major。}它按
+\texttt{LayoutLeft} 生成 stride（最后一个 mode 变得最快），与 C 数组的
+row-major 直觉相反。要 row-major 得写 \texttt{make\_\allowbreak{}layout\allowbreak{}(shape,\allowbreak{}
+Layout\allowbreak{}Right\{\})} 或显式给 stride。
+
+\textbf{坑三：divide 的 tile 必须与目标 layout 同 stride 族。}
+$L=(8,8){:}(1,8)$ 上用 compact tile $(4,4){:}(1,4)$，得到的不是 $4\times4$
+方块而是 16 个连续 offset 的条带（4.5 节反例）。判别方法：检查
+$T$ 的 stride 是否等于 $L$ 在对应方向上的 stride（本例应为 $(1,8)$）。
+
+\textbf{坑四：\texttt{right\_\allowbreak{}inverse} 对非满值域 layout 会静默退化。}
+值域含空洞（如 stride 2）时返回平凡右逆 $(1){:}(0)$，不报错。判断标准：
+$A$ 的像是否包含从 0 开始的连续段。需要「恢复坐标」时，通常用
+\texttt{left\_\allowbreak{}inverse}（准逆，带 stride-0 歧义位）更合适。
+
+\textbf{坑五：\texttt{Int<N>} 与 \texttt{int} 不只是「优化开关」。}
+\begin{sloppypar}
+动态值会让相关 layout 变成动态类型，编译期常量表达式（如
+\texttt{static\_\allowbreak{}assert}\allowbreak\texttt{\allowbreak{}(cosize\allowbreak{}(.\allowbreak{}.\allowbreak{}.\allowbreak{}))}）无法求值，
+运行期也会多出真实的算术。
+kernel 里能用静态量就用静态量；这也解释了 hgemm 模板参数为什么写
+\texttt{int BM, BN, BK} 再包成 \texttt{Int<BM>}（让上游保持可读、下游保持静态）。
+\end{sloppypar}
+
+\textbf{坑六：divide 结果的 shape 是嵌套的。}式~\eqref{eq:20-zd-example} 的
+shape $\bigl((4,4),(2,2)\bigr)$ 是「两个 mode，每个 mode 内含两个 mode」，
+不是 rank-4 的扁平 tuple。内层 mode 索引要按嵌套结构写（或用
+\texttt{flatten}/\texttt{group} 显式展开）；本章测试用线性索引
+\texttt{zd(t, r)} 能工作，是因为顶层恰好 rank 2 且内层是平坦 tuple。
+
+\section{面试要点速查}
+
+\textbf{Q1：CuTe 的 layout 是什么？为什么默认 column-major？}\\
+A：layout 是函数「坐标 $\to$ 线性 offset」，由 (Shape, Stride) 表示，
+$\mathrm{idx}=\sum_i d_i c_i$。默认 column-major（\texttt{LayoutLeft}）意味着
+第一个 mode 变化最快。这是早年 BLAS 与 Tensor Core（如 MMA 的 m8n8 片段）
+的通行约定，CuTe 全书沿用它；C 数组是 row-major，需要显式
+\texttt{LayoutRight}。
+
+\textbf{Q2：colex 是什么意思？整数坐标怎么参与？}\\
+A：colex $=$ 坐标按「最左 mode 最快」的字典序枚举。把整数 $x$ 传给 layout 时，
+CuTe 先用式~\eqref{eq:20-colex-decomp} 把 $x$ 分解回坐标，再算
+$\sum d_i c_i$，所以「线性索引」与「坐标」是同一个函数的两种输入形式；
+$f(x)$ 对 $x$ 一般不单调（row-major 即反例），仅当各 mode 的 stride 按
+colex 排序（如 compact col-major，$f(x)=x$）时才单调不减。
+
+\textbf{Q3：compose 的定义与前提？}\\
+A：$R=\mathrm{composition}(A,B)$ 满足 $R(c)=A(B(c))$，且 $R$ 的顶层 shape 与
+$B$ 一致（\texttt{compatible}）。前提是 divisibility：$B$ 的值域必须以整除
+方式落在 $A$ 的 mode 结构里；否则结果仍是合法 layout，但语义变成「按 $A$ 的
+colex 结构重解释 $B$」。例：$(6,2){:}(9,2)\circ(4){:}(1)=(4){:}(9)$。
+
+\textbf{Q4：右逆与左逆的区别？何时退化？}\\
+A：右逆满足 $A(R(i))=i$（从 offset 找坐标），值域不满时退化为 $(1){:}(0)$；
+左逆是准逆 $A(R(A(c)))=A(c)$（单射时为真左逆），用 stride-0 的 mode 编码
+「多对一」的歧义。colex compact（双射）时二者相等。
+
+\textbf{Q5：分块（tile）在数学上是什么？}\\
+A：\texttt{logical\_\allowbreak{}divide} $=$
+$L\circ\mathrm{make\_layout}\bigl(T,$
+$\mathrm{complement}(T,\mathrm{shape}(L))\bigr)$：
+\begin{sloppypar}
+tile 分量取 $T$、rest 分量取补空间；\texttt{zipped\_\allowbreak{}divide} 把结果整理成
+(tile, rest) 两个 mode；\texttt{tiled} / \texttt{flat\_divide} 是展平变体。
+语义上就是「按 $T$ 的 stride 结构把 $L$ 的地址空间切成
+$\mathrm{size}(L)/\mathrm{size}(T)$ 块」。
+\end{sloppypar}
+
+\textbf{Q6：product 家族有几种？}\\
+A：乘积（\texttt{make\_\allowbreak{}layout\allowbreak{}(A,\allowbreak{}B)}：mode 拼接、坐标分量相加）、\texttt{logical\_\allowbreak{}product}
+（block 铺在 tiler 上）、\texttt{blocked\_\allowbreak{}product}（重复 block）、
+\texttt{raked\_\allowbreak{}product}（交错重复）与 \texttt{tile\_\allowbreak{}to\_\allowbreak{}shape}（按目标 shape
+铺 atom，最常用于 smem 布局）。区别在「block 之间怎么排」。
+
+\textbf{Q7：为什么说 CuTe 是零成本抽象？}\\
+A：三点：static layout 的全部运算在编译期折叠（\texttt{static\_\allowbreak{}assert} 可证）；
+运行期只剩加法/移位/位运算（swizzle 复合与手写位公式逐点一致）；
+代价转移到编译时间与类型系统的复杂度。
+
+\textbf{Q8：size 与 cosize 什么时候不等？}\\
+A：layout 有「孔洞」（stride 跳跃、padding）时 $\mathrm{cosize}>\mathrm{size}$。
+对 kernel 的意义：\texttt{cosize} 就是这块布局实际占用的元素数（smem 分配
+依据），而 \texttt{size} 是有效元素数，两者之差即 padding 的开销。
+
+\begin{sloppypar}
+\textbf{Q9：FA2 里 C fragment 转 A fragment 需要什么样的 layout 变换？}\\
+A：QK 的累加器按 C fragment 排布 $(\mathrm{MMA},\mathrm{MMA}_M,
+\mathrm{MMA}_N)$，PV 的左操作数要 A fragment（形如
+$((4,2),\mathrm{MMA}_M,\mathrm{MMA}_N/2)$），两者寄存器对齐不同、不能互当。
+两条等价路线：tri-dao 的 \texttt{logical\_\allowbreak{}divide} 几何重排（本书
+flash\_attn.cuh 的 \texttt{convert\_\allowbreak{}layout\_\allowbreak{}}\allowbreak\texttt{acc\_Aregs}
+及复用它的 ffpa\_attn.cuh 采用，4.8 节），或 reed 的 inverse $+$ compose
+代数链（更通用但依赖静态 stride）。
+\end{sloppypar}
+
+\section{最小测试与动手实验}
+
+测试文件：\texttt{book/\allowbreak{}tests/\allowbreak{}ch20\_\allowbreak{}layout.\allowbreak{}cu}（host-only：不启动 kernel、
+不需要 GPU；main 不调用任何 CUDA API）。八个 case 覆盖本章全部代数结论：
+A 线性化（coord 与整数两种形式，128 断言）；B compose（14）；C right\_inverse
+（65）；D left\_inverse（64）；E product（24）；F zipped\_divide（76，含双射
+覆盖检查）；G tile\_to\_shape（261，含两条 \texttt{static\_\allowbreak{}assert} 编译期
+折叠证明）；H Swizzle 复合（258，位公式逐点核对与 codomain 双射）。合计
+\textbf{890 个断言}。
+
+运行命令（在 \texttt{book/tests/} 下；注意 \texttt{build\_\allowbreak{}tests.\allowbreak{}sh} 当前
+算出的 CUTLASS include 路径为
+\texttt{kernels/}\allowbreak\texttt{third-party/\allowbreak{}}\allowbreak\texttt{cutlass/\allowbreak{}include}，
+该目录不存在，故用 nvcc 的 \texttt{NVCC\_\allowbreak{}PREPEND\_\allowbreak{}FLAGS} 补上真实路径）：
+
+\begin{lstlisting}[style=console]
+cd kernels/interview/book/tests
+NVCC_PREPEND_FLAGS="-I<repo>/third-party/cutlass/include" \
+  CUDA_VISIBLE_DEVICES=6 ./build_tests.sh --arch sm_120a --ch ch20
+\end{lstlisting}
+
+本机运行输出（RTX PRO 5000，CUDA 13.2，CUTLASS v4.6.1，2026-09-11）：
+
+\begin{lstlisting}[style=console]
+== ch20_layout.cu (sm_120a)
+ch20 CuTe layout basics & algebra (host-only, no kernel launch)
+PASS case A colex idx=sum(s_i*c_i): mismatches=0 (128 checks)
+PASS case B composition R(c)==A(B(c)): mismatches=0 (14 checks)
+PASS case C right_inverse L(R(i))==i: mismatches=0 (65 checks)
+PASS case D left_inverse quasi-inverse: mismatches=0 (64 checks)
+PASS case E product make_layout(A,B): mismatches=0 (24 checks)
+PASS case F zipped_divide tile semantics: mismatches=0 (76 checks)
+PASS case G tile_to_shape atom->(128,32,2): mismatches=0 (261 checks)
+PASS case H Swizzle<3,3,3> o layout bit formula: mismatches=0 (258 checks)
+ALL OK
+\end{lstlisting}
+
+判据说明：所有断言都是「库计算 vs 手工数学」的逐点比较。例如 case A 的手工
+一侧直接用 $\sum d_i c_i$ 与式~\eqref{eq:20-colex-decomp} 的展开式；case F 的
+手工一侧用式~\eqref{eq:20-zd-coord}。任何一条不成立都会打印 FAIL 并以非零
+退出码结束。动手实验（三条，都在本章测试上改）：
+
+\begin{enumerate}
+  \item 把 case F 的 $T$ 从 $(4,4){:}(1,8)$ 换成 compact 的 $(4,4){:}(1,4)$，
+        观察结果变成 $\bigl((4,4),(4)\bigr){:}\bigl((1,4),(16)\bigr)$，
+        理解「tile 语义依赖 stride 族」（此时坐标公式与双射检查会 FAIL——
+        这正是要看的现象）；
+  \item 把 case B 的 $B$ 换成动态 shape（\texttt{int} 变量构造），观察
+        \texttt{composition} 结果退化为运行期计算，理解静态/动态分水岭；
+  \item 把 case H 的 \texttt{Swizzle\allowbreak{}<3,\allowbreak{}3,\allowbreak{}3>} 换成 \texttt{Swizzle\allowbreak{}<2,\allowbreak{}4,\allowbreak{}3>}
+        或 \texttt{Swizzle\allowbreak{}<1,\allowbreak{}5,\allowbreak{}3>}，对照第~\ref{ch:12}~章的 SW64/SW128 档位
+        公式，验证「$\langle$B,M,S$\rangle$ 三参数 $=$ 位域宽度」的对应关系。
+\end{enumerate}
+
+\section*{延伸阅读}
+
+\begin{itemize}
+  \item @reed《cute 之 Layout》，
+        \url{https://zhuanlan.zhihu.com/p/661182311}
+        （(Shape,Stride) 与坐标映射的入门第一文，本章 3.1 节同源）；
+  \item @reed《cute Layout 的代数和几何解释》，
+        \url{https://zhuanlan.zhihu.com/p/662089556}
+        （把 layout 运算解释成向量空间的代数结构，compose/divide 的几何直观）；
+  \item @竹熙佳处《CuTe 教程：Layout Compose \& Inverse》，
+        \url{https://zhuanlan.zhihu.com/p/1962625273636845008}
+        （compose/inverse 的逐坐标推导与实例，本章 4.2/4.3 节的对照读物）；
+  \item @竹熙佳处《CuTe 教程：Layout Product \& Divide》，
+        \url{https://zhuanlan.zhihu.com/p/1971945267294111573}
+        （product/divide 的图解与 kernel 用例，4.4/4.5 节对照）；
+  \item @melonedo《Cute 布局代数实战：除法》，
+        \url{https://zhuanlan.zhihu.com/p/1970274785691936058}
+        （divide 在真实 kernel 里的用法与踩坑，与本章坑三互为印证）。
+\end{itemize}

@@ -1,0 +1,6 @@
+[submodule "third-party/cutlass"]
+	path = third-party/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
+[submodule "third-party/cudnn-frontend"]
+	path = third-party/cudnn-frontend
+	url = https://github.com/NVIDIA/cudnn-frontend.git

@@ -1,0 +1,106 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+#include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/prim/builtin.h>
+#include <tvm/s_tir/stmt_functor.h>
+#include <tvm/s_tir/transform.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/stmt.h>
+
+namespace tvm {
+namespace s_tir {
+using namespace tvm::tirx;
+
+inline bool IsVtcmStorage(std::string scope) {
+  return scope.find("global.vtcm") != std::string::npos;
+}
+
+class VtcmAllocator : public StmtExprMutator {
+ public:
+  using StmtExprMutator::Mutate;
+  using StmtExprMutator::Mutate_;
+
+  VtcmAllocator() {}
+
+  UnchangedOr<Stmt> Mutate_(const BindNode* op, InplaceMode inplace_mode) final {
+    if (const auto* call = op->value.as<CallNode>();
+        call && call->op.same_as(tirx::builtin::alloc_tensor())) {
+      return Mutate_AllocTensor(op, call, inplace_mode);
+    }
+    return StmtExprMutator::Mutate_(op, inplace_mode);
+  }
+
+  UnchangedOr<Stmt> Mutate_AllocTensor(const BindNode* op, const CallNode* call,
+                                       InplaceMode inplace_mode) {
+    ffi::String scope = call->args[2].as_or_throw<StringImm>()->value;
+    if (IsVtcmStorage(scope)) {
+      tvm::Tuple shape = call->args[0].as_or_throw<tvm::Tuple>();
+      ffi::Array<Expr> args;
+      args.push_back(StringImm(scope));
+      args.push_back(IntImm::Int64(shape->fields.size()));
+      args.push_back(Call(PointerType(PrimType::Int(64)), tirx::builtin::tvm_stack_make_shape(),
+                          shape->fields));
+      BufferVar buffer = op->var.as_or_throw<BufferVar>();
+      return Bind(
+          buffer,
+          Call(buffer.type(), tirx::builtin::decl_tensor(),
+               {Call(buffer.DataPointerType(), tirx::builtin::nd_mem_alloc_with_scope(), args),
+                tvm::Tuple(buffer->shape), DataTypeImm(buffer->dtype->dtype),
+                StringImm(buffer.scope())},
+               {}, call->ty_args, call->span),
+          op->span);
+    }
+    return StmtExprMutator::Mutate_(op, inplace_mode);
+  }
+
+ protected:
+  std::string GetStorageScope(const Var& var) {
+    auto* ptr = var->ty.as<PointerTypeNode>();
+    TVM_FFI_ICHECK(ptr) << "Buffer Var's type annotation must be of PointerType";
+    return ptr->storage_scope;
+  }
+};
+
+PrimFunc LowerVtcmAlloc(PrimFunc func) {
+  auto fptr = func.CopyOnWrite();
+  fptr->body = ffi::make_object<VtcmAllocator>()
+                   ->Mutate(fptr->body, InplaceMode::kAllow)
+                   .ValueOrUnchanged(std::move(fptr->body));
+  return func;
+}
+
+namespace transform {
+
+Pass LowerVtcmAlloc() {
+  auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
+    return s_tir::LowerVtcmAlloc(std::move(f));
+  };
+  return CreatePrimFuncPass(pass_func, 0, "s_tir.LowerVtcmAlloc", {});
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("s_tir.transform.LowerVtcmAlloc", static_cast<Pass (*)()>(LowerVtcmAlloc));
+}
+
+}  // namespace transform
+
+}  // namespace s_tir
+}  // namespace tvm

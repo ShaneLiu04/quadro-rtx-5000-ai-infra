@@ -1,0 +1,132 @@
+PDF 与 PPTX 因 Gitee 单仓库 500MB 上限，拆成下列附件。
+在仓库根目录解压全部 zip，相对路径会还原到原来的位置。
+
+slides-01.zip  5 files  90.0 MB
+  39.2 MB  01-foundations/gpu-mode-lectures/lecture_035/SGLang-Performance-Optimization-YinengZhang.pdf
+  0.0 MB  02-handwritten-kernels/LeetCUDA/docs/leetcuda_bench_table.pdf
+  43.8 MB  02-handwritten-kernels/LeetCUDA/kernels/interview/book/cute-zhihu/cute-zhihu.pdf
+  6.7 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/s21745-developing-cuda-kernels-to-push-tensor-cores-to-the-absolute-limit-on-nvidia-a100.pdf
+  0.2 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/Inline_PTX_Assembly.pdf
+
+slides-02.zip  4 files  90.0 MB
+  1.2 MB  01-foundations/gpu-mode-lectures/lecture_002/cuda_mode_lecture2.pptx
+  15.1 MB  01-foundations/gpu-mode-lectures/lecture_037/sass_and_gpu_uarch.pdf
+  35.2 MB  01-foundations/gpu-mode-lectures/lecture_075/ThunderKittens.pdf
+  38.5 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/GPU Load Balancing.pdf
+
+slides-03.zip  8 files  90.0 MB
+  0.1 MB  02-handwritten-kernels/LeetCUDA/kernels/interview/book/figures/misc/cover.pdf
+  13.5 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance_ a Worklog.pdf
+  22.3 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/NVIDIA H100 Tensor Core GPU Architecture Overview.pdf
+  20.9 MB  02-handwritten-kernels/LeetCUDA/slides/vllm-slides/vLLM @ Ray Summit 2024 (Public).pptx
+  18.4 MB  02-handwritten-kernels/LeetCUDA/slides/vllm-slides/vLLM Project Update @ Third vLLM Meetup (Public).pptx
+  2.6 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/CUDA Docs for Humans.pdf
+  12.2 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/Speaking_Tensor_Cores_CUTLASS_2024.pdf
+  0.0 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/large-language-model/rl/20250519.pdf
+
+slides-04.zip  12 files  90.0 MB
+  6.7 MB  01-foundations/gpu-mode-lectures/lecture_013/ring_attention.pptx
+  7.8 MB  01-foundations/gpu-mode-lectures/lecture_057/CuTe - Copy for GPUMode.pdf
+  11.8 MB  01-foundations/gpu-mode-lectures/lecture_071/ScaleML_FlexOlmo.pdf
+  11.3 MB  01-foundations/gpu-mode-lectures/lecture_072/StreamingLLM.pdf
+  7.7 MB  01-foundations/gpu-mode-lectures/lecture_103/layout_algebra.pdf
+  0.1 MB  02-handwritten-kernels/LeetCUDA/docs/leetcuda_cover_bench.pdf
+  8.0 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/Nsight Systems - DL Profiling Argonne National Labs 2022-06-30.pdf
+  8.2 MB  02-handwritten-kernels/LeetCUDA/slides/vllm-slides/[Public] East Coast vLLM Meetup.pptx
+  10.0 MB  02-handwritten-kernels/LeetCUDA/slides/vllm-slides/[Public] vLLM Project Update @ Second vLLM Meetup.pptx
+  8.5 MB  02-handwritten-kernels/LeetCUDA/slides/vllm-slides/vLLM First SF Meetup Slides (Public).pptx
+  9.7 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/Lecture10.pptx
+  0.0 MB  05-inference/llama.cpp/docs/development/llama-star/idea-arch.pdf
+
+slides-05.zip  16 files  90.0 MB
+  6.1 MB  01-foundations/gpu-mode-lectures/lecture_033/GPUMODE_TALK_20241026.pdf
+  4.6 MB  01-foundations/gpu-mode-lectures/lecture_042/int8_mm_turing.pdf
+  4.5 MB  01-foundations/gpu-mode-lectures/lecture_104/gluon.pdf
+  6.0 MB  02-handwritten-kernels/LeetCUDA/kernels/interview/book/book.pdf
+  7.7 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/A41131 - CUTLASS_ Python API, Enhancements, and NVIDIA Hopper.pdf
+  4.9 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/NVIDIA-Torch-TensorRT.pdf
+  7.7 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/gtc22-whitepaper-hopper.pdf
+  7.6 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/nvidia-ampere-architecture-whitepaper.pdf
+  6.2 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/ptx_isa_8.5.pdf
+  5.5 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/pytorch-nsys-profiling.pdf
+  1.4 MB  02-handwritten-kernels/LeetCUDA/slides/vllm-slides/03 verl - A Hybrid Controller-based RLHF Framework.pdf
+  4.5 MB  02-handwritten-kernels/LeetCUDA/slides/vllm-slides/vLLM @ Google Cloud (Public).pptx
+  5.2 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/Lecture 8_ CUDA Performance.pptx
+  6.7 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/ring_attention.pptx
+  6.1 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/ptx-isa/ptx_isa_8.5.pdf
+  5.2 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/triton/meetup/Triton中国生态Meetup(第一期).pdf
+
+slides-06.zip  32 files  90.0 MB
+  1.8 MB  01-foundations/gpu-mode-lectures/lecture_001/CUDA MODE_ Lecture 1.pdf
+  2.1 MB  01-foundations/gpu-mode-lectures/lecture_004/cuda-mode-2024-02-03.pdf
+  2.0 MB  01-foundations/gpu-mode-lectures/lecture_011/sparsity.pptx
+  2.5 MB  01-foundations/gpu-mode-lectures/lecture_017/slides.pdf
+  1.9 MB  01-foundations/gpu-mode-lectures/lecture_025/AMD_ROCm_Speaking_Composable_Kernel_July_20_2024.pdf
+  4.1 MB  01-foundations/gpu-mode-lectures/lecture_029/presentation.pdf
+  2.0 MB  01-foundations/gpu-mode-lectures/lecture_036/flash_attn_3_gpu_mode_talk.pdf
+  1.8 MB  01-foundations/gpu-mode-lectures/lecture_075/GPU Programming Fundamentals.pdf
+  3.0 MB  01-foundations/gpu-mode-lectures/lecture_078/Awad-Osama-Potter - Iris Multi-GPU Programming Made Easier (GPU Mode) (1).pdf
+  2.0 MB  01-foundations/gpu-mode-lectures/lecture_079/Mirage-2025-09-13.pdf
+  3.3 MB  01-foundations/gpu-mode-lectures/lecture_084/numerics-and-ai.pdf
+  3.4 MB  01-foundations/gpu-mode-lectures/lecture_086/cute_dsl_introduce.pdf
+  2.1 MB  01-foundations/gpu-mode-lectures/lecture_114/GPUMODE_114_PyCuTe.pdf
+  1.9 MB  02-handwritten-kernels/LeetCUDA/kernels/interview/deprecated/tex/notes-v2.pdf
+  4.1 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUDA_C_Programming_Guide_125.pdf
+  4.1 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/Accelerating Backward Data Gradient by Increasing Tensor Core Utilization in CUTLASS_1647481957785001Hmln.pdf
+  4.3 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/S31883_ManishGupta_Accelerating_Convolution_with_Tensor_Cores_in_CUTLASS_1617596903236001ZNDn.pdf
+  3.1 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/TensorRT-Developer-Guide 10.1.pdf
+  1.8 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/s21417-faster-transformer.pdf
+  3.7 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/volta-architecture-whitepaper.pdf
+  3.0 MB  02-handwritten-kernels/LeetCUDA/slides/vllm-slides/01 vLLM Q1 Update.pdf
+  4.2 MB  02-handwritten-kernels/LeetCUDA/slides/vllm-slides/04 Best Practices for Efficient Fine-Tuning Framework LLaMA-Factory with vLLM.pdf
+  3.5 MB  02-handwritten-kernels/LeetCUDA/slides/vllm-slides/[Public] vLLM Meetup @ Meta.pptx
+  2.4 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/CUDAMODE_2024_Optimizing_optimizers.pptx
+  4.1 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/Lecture 29 presentation.pdf
+  2.8 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/Lecture10.pdf
+  2.5 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/lecture_017/slides.pdf
+  1.8 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/llmcccl.pptx
+  2.0 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/sparsity.pptx
+  3.7 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/triton/meetup/3_天数GPU上Triton适配及共享内存管理机制.pptx
+  3.0 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/triton/meetup/优化 softmax-陈飞宇终稿.pptx
+  1.8 MB  07-frameworks/tinygrad/docs/tinygrad_intro.pdf
+
+slides-07.zip  38 files  29.8 MB
+  0.8 MB  01-foundations/gpu-mode-lectures/lecture_030/[GPU-MODE] Quantized training (20241006).pdf
+  1.2 MB  01-foundations/gpu-mode-lectures/lecture_031/Beginner's guide to Metal kernels.pdf
+  0.5 MB  01-foundations/gpu-mode-lectures/lecture_038/lowbit_kernels.pdf
+  1.6 MB  01-foundations/gpu-mode-lectures/lecture_074/path_talk.pdf
+  1.1 MB  02-handwritten-kernels/LeetCUDA/kernels/interview/book/colfax/colfax-cute-zh.pdf
+  0.8 MB  02-handwritten-kernels/LeetCUDA/others/pytorch/slides/pytorch_2.pdf
+  1.3 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/ACCELERATING A TRITON FUSED KERNEL FOR W4A16 QUANTIZED INFERENCE WITH SPLITK WORK DECOMPOSITION.pdf
+  0.4 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/Exploiting Intra-SM Parallelism in GPUs via Persistent and Elastic Blocks.pdf
+  1.3 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/Graphene-CUTE-CUTLASS-2023.pdf
+  0.9 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/Kernel Fusion in Atomistic Spin Dynamics Simulations on Nvidia GPUs using Tensor Core.pdf
+  0.7 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/NVIDIA Tensor Core Programmability, Performance & Precision.pdf
+  0.6 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/colfax-gemm-kernels-hopper.pdf
+  0.5 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CUTLASS/layout_algebra.pdf
+  0.6 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/CWES52010- Connect with the ExpertsInter-GPU Communication Techniques and Libraries.pdf
+  1.3 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/Graphene-NV-Tensor-IR.pdf
+  0.2 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/Hopper_Tuning_Guide.pdf
+  0.4 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/MULTI-GPU TRAINING WITHNCCL.pdf
+  0.7 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/NCCL 2.0.pdf
+  1.1 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/ORT-Python-Docs.pdf
+  1.1 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/S31880 – NCCL- HIGH-SPEEDINTER-GPU COMMUNICATIONFOR LARGE-SCALE TRAINING.pdf
+  1.6 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/S41784- FAST INTER-GPU COMMUNICATION WITH NCCL FORDEEP LEARNING TRAINING, AND MORE.pdf
+  0.3 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/TORCH.FX.pdf
+  0.4 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/TensorRT-API.pdf
+  0.2 MB  02-handwritten-kernels/LeetCUDA/slides/cuda-slides/TensorRT-Operators.pdf
+  0.8 MB  02-handwritten-kernels/LeetCUDA/slides/vllm-slides/02 vLLM Hardware Plugin Mechanism and Ascend Best Practices.pdf
+  1.2 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/CUDA MODE_ Liger Kernel.pdf
+  0.3 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/Chapter_11_-_Prefix_Sum_Scan_-_Part_1 .pptx.pdf
+  1.2 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/Quantization Cuda vs Triton.pdf
+  1.2 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/cuda_mode_lecture2.pptx
+  1.5 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/cuda-mode/slides/llmcccl.pdf
+  0.5 MB  02-handwritten-kernels/how-to-optim-algorithm-in-cuda/pytorch/code/assets/flashattn_banner.pdf
+  0.8 MB  04-kernel-dsl/triton/docs/meetups/02-20-2024/Proton.pdf
+  0.4 MB  04-kernel-dsl/triton/docs/meetups/08-22-2023/amd-update.pdf
+  0.4 MB  04-kernel-dsl/triton/docs/meetups/08-22-2023/intel-xpu-update.pptx
+  0.2 MB  04-kernel-dsl/triton/docs/meetups/10-25-2023/intel-xpu-update.pdf
+  1.1 MB  04-kernel-dsl/triton/docs/meetups/10-25-2023/triton-shared.pptx
+  0.3 MB  05-inference/llama.cpp/tools/ui/tests/stories/fixtures/assets/example.pdf
+  0.1 MB  07-frameworks/tinygrad/spec/tinyspec.pdf
+

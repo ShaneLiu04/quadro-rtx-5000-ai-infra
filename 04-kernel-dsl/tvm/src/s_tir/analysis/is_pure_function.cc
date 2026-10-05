@@ -1,0 +1,119 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+/*!
+ * \file is_pure_function.cc
+ * \brief PrimFunc purity analysis
+ */
+#include <tvm/ffi/cast.h>
+#include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/op.h>
+#include <tvm/s_tir/analysis.h>
+#include <tvm/s_tir/stmt_functor.h>
+#include <tvm/tirx/analysis.h>
+#include <tvm/tirx/builtin.h>
+
+#include "../ir/tir_visitor_with_path.h"
+
+namespace tvm {
+namespace s_tir {
+using namespace tvm::tirx;
+
+namespace {
+class PurityChecker : TIRVisitorWithPath {
+ public:
+  static bool Check(const PrimFunc& func, bool assert_on_error) {
+    PurityChecker visitor(assert_on_error);
+    visitor(func);
+    return visitor.is_pure_;
+  }
+
+ private:
+  explicit PurityChecker(bool assert_on_error) : assert_on_error_(assert_on_error) {}
+
+  void Dispatch_(const BindNode* op, ffi::reflection::AccessPath path) final {
+    if (const auto* call = op->value.as<CallNode>();
+        call && call->op.same_as(tirx::builtin::alloc_tensor())) {
+      return DispatchAllocTensor(op, call, path);
+    }
+    return TIRVisitorWithPath::Dispatch_(op, path);
+  }
+
+  void DispatchAllocTensor(const BindNode* op, const CallNode* call,
+                           ffi::reflection::AccessPath path) {
+    internal_allocations_.insert(op->var);
+    allocation_calls_.insert(call);
+    TIRVisitorWithPath::Dispatch_(op, path);
+  }
+
+  void Dispatch_(const BufferStoreNode* op, ffi::reflection::AccessPath path) override {
+    TIRVisitorWithPath::Dispatch_(op, path);
+
+    if (!internal_allocations_.count(op->buffer.var())) {
+      is_pure_ = false;
+      if (assert_on_error_) {
+        TVM_FFI_THROW(AssertionError) << "Pure functions must not write to buffers, "
+                                      << ", but function contains store to " << op->buffer
+                                      << op->indices << " of value " << op->value;
+      }
+    }
+  }
+
+  void Dispatch_(const CallNode* call, ffi::reflection::AccessPath path) override {
+    TIRVisitorWithPath::Dispatch_(call, path);
+    if (allocation_calls_.count(call)) return;
+
+    static auto op_call_effect = Op::GetAttrMap<TCallEffectKind>("TCallEffectKind");
+    CallEffectKind effect = [&]() {
+      if (auto opt = call->op.as<Op>()) {
+        return static_cast<CallEffectKind>(op_call_effect[opt.value()]);
+      } else {
+        return CallEffectKind::kOpaque;
+      }
+    }();
+
+    if (effect == CallEffectKind::kUpdateState || effect == CallEffectKind::kOpaque) {
+      is_pure_ = false;
+      if (assert_on_error_) {
+        TVM_FFI_THROW(AssertionError)
+            << "Pure functions must not contain calls to impure operators, "
+            << "but " << ffi::GetRef<Call>(call) << " calls operator " << call->op
+            << ", which has side effect " << effect;
+      }
+    }
+  }
+
+  bool assert_on_error_{false};
+  bool is_pure_{true};
+  std::unordered_set<Var> internal_allocations_;
+  std::unordered_set<const CallNode*> allocation_calls_;
+};
+}  // namespace
+
+bool IsPureFunction(const PrimFunc& func, bool assert_on_error) {
+  return PurityChecker::Check(func, assert_on_error);
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("s_tir.analysis.is_pure_function", IsPureFunction);
+}
+
+}  // namespace s_tir
+}  // namespace tvm

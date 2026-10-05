@@ -1,0 +1,14 @@
+Windows 不能创建文件名中带冒号的路径。下面 11 篇笔记已写成冒号替换为 " -" 的副本，正文与上游 blob 相同。
+这 11 个原路径在 index 里标记了 skip-worktree，避免 git status 反复尝试检出。
+
+cuda-mode/lectures/Lecture 40: CUDA Docs for Humans.md  =>  cuda-mode/lectures/Lecture 40 - CUDA Docs for Humans.md
+cuda-mode/lectures/Lecture 76: BackendBench 修复大模型kernel正确性问题.md  =>  cuda-mode/lectures/Lecture 76 - BackendBench 修复大模型kernel正确性问题.md
+cuda-mode/lectures/Lecture 77: Domain Specific Languages for GPU Kernels.md  =>  cuda-mode/lectures/Lecture 77 - Domain Specific Languages for GPU Kernels.md
+cutlass/tma/CUTLASS Tutorial: Mastering the NVIDIA® Tensor Memory Accelerator (TMA).md  =>  cutlass/tma/CUTLASS Tutorial - Mastering the NVIDIA® Tensor Memory Accelerator (TMA).md
+cutlass/tutorials/Tutorial: Matrix Transpose in CUTLASS.md  =>  cutlass/tutorials/Tutorial - Matrix Transpose in CUTLASS.md
+cutlass/tutorials/Tutorial: Python bindings for CUDA libraries in PyTorch.md  =>  cutlass/tutorials/Tutorial - Python bindings for CUDA libraries in PyTorch.md
+cutlass/wgmma/Tutorial: 在Hopper GPU上使用WGMMA的快速矩阵乘.md  =>  cutlass/wgmma/Tutorial - 在Hopper GPU上使用WGMMA的快速矩阵乘.md
+large-language-model/rl/verl: Flexible and Efficient RL for LLMs.md  =>  large-language-model/rl/verl - Flexible and Efficient RL for LLMs.md
+large-language-model/sglang/DeepSeek-V3 + SGLang: 推理优化 (v0.4.3.post2+sgl-kernel:0.0.3.post6).md  =>  large-language-model/sglang/DeepSeek-V3 + SGLang - 推理优化 (v0.4.3.post2+sgl-kernel -0.0.3.post6).md
+pytorch/inference/Accelerating Generative AI Part III: Diffusion, Fast.md  =>  pytorch/inference/Accelerating Generative AI Part III - Diffusion, Fast.md
+pytorch/inference/【博客翻译】Presenting Flux Fast: 让 Flux 在 H100 上疾速飞驰.md  =>  pytorch/inference/【博客翻译】Presenting Flux Fast - 让 Flux 在 H100 上疾速飞驰.md

@@ -1,0 +1,376 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+/*!
+ * \file storage_access.cc
+ */
+#include "storage_access.h"
+
+#include <tvm/ffi/cast.h>
+#include <tvm/s_tir/stmt.h>
+#include <tvm/tirx/builtin.h>
+#include <tvm/tirx/op.h>
+
+#include <string>
+#include <utility>
+
+#include "../../tirx/transform/ir_utils.h"
+
+namespace tvm {
+namespace s_tir {
+using namespace tvm::tirx;
+
+namespace {
+
+ffi::Optional<Var> GetBufferDataVar(const ffi::Any& data) {
+  if (auto var = data.as<Var>()) {
+    return var;
+  }
+  if (const auto* call = data.as<CallNode>();
+      call && call->op.same_as(tirx::builtin::buffer_data()) && call->args.size() == 1) {
+    return call->args[0].as<Var>();
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
+ffi::Optional<VisitInterrupt> StorageAccessVisitor::Visit_(const TensorLoadNode* op) {
+  Var buf = ResolveBuffer(op->source.as_or_throw<tvm::tirx::BufferVar>().var());
+  StorageScope scope = StorageScope::Create(op->source.as_or_throw<tvm::tirx::BufferVar>().scope());
+  if (Enabled(buf.get(), scope)) {
+    TVM_FFI_ICHECK(allow_append_) << op << " " << scope.to_string();
+    AccessEntry e;
+    e.threads = env_threads();
+    e.buffer = buf;
+    e.dtype = op->ty.as_or_throw<PrimType>().WithLanes(1);
+    for (const auto& index : op->indices) {
+      e.touched.push_back(sym::IntSet::Vector(index));
+    }
+    e.type = kRead;
+    e.scope = scope;
+    curr_stmt_.access.emplace_back(std::move(e));
+  }
+  // traverse child
+  return StmtExprVisitor::Visit_(op);
+}
+
+ffi::Optional<VisitInterrupt> StorageAccessVisitor::Visit_(const BufferStoreNode* op) {
+  allow_append_ = true;
+  TVM_FFI_ICHECK_EQ(curr_stmt_.access.size(), 0U);
+  curr_stmt_.stmt = op;
+
+  Var buf = ResolveBuffer(op->buffer.var());
+  StorageScope scope = StorageScope::Create(op->buffer.scope());
+  if (Enabled(buf.get(), scope)) {
+    AccessEntry e;
+    e.threads = env_threads();
+    e.buffer = buf;
+    e.dtype = op->value.ty().WithLanes(1);
+    for (const auto& index : op->indices) {
+      e.touched.push_back(sym::IntSet::Vector(index));
+    }
+    e.type = kWrite;
+    e.scope = scope;
+    curr_stmt_.access.emplace_back(std::move(e));
+  }
+  // traverse child
+  TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(StmtExprVisitor::Visit_(op));
+  // push to the scope
+  scope_.back().push_back(curr_stmt_);
+  // clear access entry.
+  curr_stmt_.access.clear();
+  allow_append_ = false;
+  return std::nullopt;
+}
+
+ffi::Optional<VisitInterrupt> StorageAccessVisitor::Visit_(const EvaluateNode* op) {
+  allow_append_ = true;
+  TVM_FFI_ICHECK_EQ(curr_stmt_.access.size(), 0U);
+  curr_stmt_.stmt = op;
+  TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(StmtExprVisitor::Visit_(op));
+  // push to the scope
+  if (curr_stmt_.access.size() != 0) {
+    scope_.back().push_back(curr_stmt_);
+    curr_stmt_.access.clear();
+  }
+  allow_append_ = false;
+  return std::nullopt;
+}
+
+ffi::Optional<VisitInterrupt> StorageAccessVisitor::Visit_(const BindNode* op) {
+  if (const auto* call = op->value.as<CallNode>();
+      call && call->op.same_as(tirx::builtin::decl_tensor())) {
+    if (auto source = GetBufferDataVar(call->args[0])) {
+      buffer_aliases_.insert_or_assign(op->var.as_or_throw<BufferVar>().get(),
+                                       ResolveBuffer(source.value()));
+    }
+    return StmtExprVisitor::Visit_(op);
+  }
+  if (const auto* call = op->value.as<CallNode>();
+      call && call->op.same_as(tirx::builtin::alloc_tensor()))
+    return StmtExprVisitor::Visit_(op);
+  allow_append_ = true;
+  TVM_FFI_ICHECK_EQ(curr_stmt_.access.size(), 0U);
+  curr_stmt_.stmt = op;
+  TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(this->Visit(op->value));
+  // push to the scope
+  scope_.back().push_back(curr_stmt_);
+  // clear access entry.
+  curr_stmt_.access.clear();
+  allow_append_ = false;
+  return std::nullopt;
+}
+
+ffi::Optional<VisitInterrupt> StorageAccessVisitor::Visit_(const AttrStmtNode* op) {
+  if (op->attr_key == s_tir::attr::double_buffer_write) {
+    TVM_FFI_ICHECK(double_buffer_write_ == nullptr);
+    auto buffer = GetBufferDataVar(op->node);
+    TVM_FFI_ICHECK(buffer.has_value())
+        << "Expected a buffer data expression for double-buffer writes, but received " << op->node;
+    double_buffer_write_ = ResolveBuffer(buffer.value()).get();
+    scope_.push_back(std::vector<StmtEntry>());
+    TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(StmtExprVisitor::Visit_(op));
+    StmtEntry s;
+    s.stmt = op;
+    s.access = Summarize(std::move(scope_.back()), nullptr);
+    scope_.pop_back();
+    if (!s.access.empty()) {
+      for (AccessEntry& e : s.access) {
+        if (e.type == kWrite && e.buffer.get() == double_buffer_write_) {
+          e.double_buffer_write = true;
+        }
+      }
+      scope_.back().emplace_back(std::move(s));
+    }
+    double_buffer_write_ = nullptr;
+  } else if (op->attr_key == tirx::attr::thread_extent) {
+    IterVar iv = op->node.as_or_throw<IterVar>();
+    env_threads_.push_back(iv);
+    if (!in_device_env_) {
+      in_device_env_ = true;
+      scope_.push_back(std::vector<StmtEntry>());
+      TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(StmtExprVisitor::Visit_(op));
+      // no need to take the result as the thread barrier automatically syncs.
+      Summarize(std::move(scope_.back()), nullptr);
+      in_device_env_ = false;
+      scope_.pop_back();
+    } else {
+      TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(StmtExprVisitor::Visit_(op));
+    }
+    env_threads_.pop_back();
+  } else if (op->attr_key == s_tir::attr::hand_threaded) {
+    // skip this pass on blocks that were hand_threaded
+    // this avoids control flow and read/write conflicts
+    // between hand-threaded kernels and automatic threading
+  } else {
+    TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(StmtExprVisitor::Visit_(op));
+  }
+  return std::nullopt;
+}
+
+ffi::Optional<VisitInterrupt> StorageAccessVisitor::Visit_(const ForNode* op) {
+  scope_.push_back(std::vector<StmtEntry>());
+  TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(StmtExprVisitor::Visit_(op));
+  StmtEntry s;
+  s.stmt = op;
+  s.access = Summarize(std::move(scope_.back()), op);
+  scope_.pop_back();
+  if (s.access.size() != 0) {
+    // relax the touched set to contain all ranges in the loop.
+    std::unordered_map<const VarNode*, sym::IntSet> relax_map;
+    relax_map[op->loop_var.get()] =
+        sym::IntSet::FromRange(Range::FromMinExtent(op->min, op->extent));
+    for (AccessEntry& e : s.access) {
+      if (e.buffer.defined()) {
+        TVM_FFI_ICHECK(e.touched.size());
+        ffi::Array<sym::IntSet> new_touched;
+        for (const auto& touched : e.touched) {
+          new_touched.push_back(sym::EvalSet(touched, relax_map));
+        }
+        e.touched = std::move(new_touched);
+      }
+    }
+  }
+  if (!s.access.empty()) {
+    scope_.back().emplace_back(std::move(s));
+  }
+  return std::nullopt;
+}
+
+bool IsThreadInvariant(const PrimExpr& cond) {
+  if (auto call = cond.as<CallNode>()) {
+    if (auto opt_call_op = call->op.as<Op>()) {
+      auto call_op = opt_call_op.value();
+      if (call_op.same_as(tirx::builtin::tvm_thread_invariant())) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+ffi::Optional<VisitInterrupt> StorageAccessVisitor::Visit_(const IfThenElseNode* op) {
+  bool is_thread_invariant = IsThreadInvariant(op->condition);
+  if (!is_thread_invariant) {
+    ++condition_counter_;
+  }
+  TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(this->Visit(op->condition));
+  scope_.push_back(std::vector<StmtEntry>());
+  TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(this->Visit(op->then_case));
+  StmtEntry s;
+  s.stmt = op;
+  s.access = Summarize(std::move(scope_.back()), nullptr);
+  scope_.pop_back();
+  if (op->else_case) {
+    scope_.push_back(std::vector<StmtEntry>());
+    TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(this->Visit(op->else_case.value()));
+    auto v = Summarize(std::move(scope_.back()), nullptr);
+    scope_.pop_back();
+    s.access.insert(s.access.end(), v.begin(), v.end());
+  }
+  scope_.back().emplace_back(std::move(s));
+  if (!is_thread_invariant) {
+    --condition_counter_;
+  }
+  return std::nullopt;
+}
+
+ffi::Optional<VisitInterrupt> StorageAccessVisitor::Visit_(const WhileNode* op) {
+  bool is_thread_invariant = IsThreadInvariant(op->condition);
+  if (!is_thread_invariant) {
+    ++condition_counter_;
+  }
+  TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(this->Visit(op->condition));
+  scope_.push_back(std::vector<StmtEntry>());
+  TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(this->Visit(op->body));
+  StmtEntry s;
+  s.stmt = op;
+  s.access = Summarize(std::move(scope_.back()), nullptr);
+  scope_.pop_back();
+  scope_.back().emplace_back(std::move(s));
+  if (!is_thread_invariant) {
+    --condition_counter_;
+  }
+  return std::nullopt;
+}
+
+ffi::Optional<VisitInterrupt> StorageAccessVisitor::Visit_(const CallNode* op) {
+  Call call = ffi::GetRef<Call>(op);
+  if (op->op.same_as(tirx::builtin::masked_load()) ||
+      op->op.same_as(tirx::builtin::masked_store())) {
+    bool is_load = op->op.same_as(tirx::builtin::masked_load());
+    BufferVar buffer = op->args[0].as_or_throw<BufferVar>();
+    PrimType value_dtype =
+        is_load ? op->ty.as_or_throw<PrimType>() : op->args[1].as_or_throw<PrimExpr>().ty();
+    Var buf = ResolveBuffer(buffer.var());
+    StorageScope scope = StorageScope::Create(buffer.scope());
+    if (Enabled(buf.get(), scope)) {
+      TVM_FFI_ICHECK(allow_append_) << call << " " << scope.to_string();
+      AccessEntry e;
+      e.threads = env_threads();
+      e.buffer = buf;
+      e.dtype = value_dtype.WithLanes(1);
+      for (size_t i = is_load ? 1 : 2; i + 1 < op->args.size(); ++i) {
+        e.touched.push_back(sym::IntSet::Vector(op->args[i].as_or_throw<PrimExpr>()));
+      }
+      e.type = is_load ? kRead : kWrite;
+      e.scope = scope;
+      curr_stmt_.access.emplace_back(std::move(e));
+    }
+    TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(StmtExprVisitor::Visit_(op));
+  } else if (op->op.same_as(tirx::builtin::address_of())) {
+    if (const auto* load = op->args[0].as<TensorLoadNode>()) {
+      // Taking an address does not read the buffer value.  Visit only the
+      // load's children so index expressions still contribute accesses.
+      TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(StmtExprVisitor::Visit_(load));
+    } else {
+      // address_of also accepts scalar variables (e.g. tcgen registers).
+      // Recurse without assuming the argument is a BufferLoad.
+      TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(StmtExprVisitor::Visit_(op));
+    }
+  } else if (op->op.same_as(tirx::builtin::tvm_access_ptr())) {
+    TVM_FFI_ICHECK_EQ(op->args.size(), 5U);
+    PrimType dtype = op->args[0].as_or_throw<PrimExpr>().ty();
+    auto buffer_var = GetBufferDataVar(op->args[1]);
+    if (!buffer_var.has_value()) {
+      // args[1] is not a raw Var — e.g. a nested tvm_access_ptr or some
+      // other PrimExpr. Recurse into sub-exprs so any inner buffer var
+      // refs still get visited, but don't try to record an access entry
+      // here (GetScope on a null Var would dereference a null pointer).
+      return StmtExprVisitor::Visit_(op);
+    }
+    Var buffer = ResolveBuffer(buffer_var.value());
+    PrimExpr offset = op->args[2].as_or_throw<PrimExpr>();
+    PrimExpr extent = op->args[3].as_or_throw<PrimExpr>();
+    const IntImmNode* flag = op->args[4].as<IntImmNode>();
+    StorageScope scope = GetScope(buffer_var.value());
+    // The buffer scope.
+    if (Enabled(buffer.get(), scope)) {
+      TVM_FFI_ICHECK(allow_append_);
+      AccessEntry e;
+      e.threads = env_threads();
+      e.dtype = dtype;
+      e.buffer = buffer;
+      e.touched = {sym::IntSet::FromRange(Range::FromMinExtent(offset, extent))};
+      e.scope = scope;
+      if (flag->value & 1) {
+        e.type = kRead;
+        curr_stmt_.access.emplace_back(e);
+      }
+      if (flag->value & 2) {
+        e.type = kWrite;
+        curr_stmt_.access.emplace_back(e);
+      }
+    }
+    TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(StmtExprVisitor::Visit_(op));
+  } else if (op->op.same_as(tirx::builtin::tvm_storage_sync())) {
+    TVM_FFI_ICHECK(allow_append_);
+    const std::string& s = op->args[0].as<StringImmNode>()->value;
+    if (s != "warp") {
+      StorageScope scope = StorageScope::Create(s);
+      AccessEntry e;
+      e.threads = env_threads();
+      e.type = kSync;
+      e.scope = StorageScope::Create(s);
+      curr_stmt_.access.emplace_back(std::move(e));
+    }
+  } else {
+    TVM_FFI_S_VISIT_MAYBE_EARLY_RETURN(StmtExprVisitor::Visit_(op));
+  }
+  return std::nullopt;
+}
+
+StorageScope StorageAccessVisitor::GetScope(Var buffer_var) const {
+  if (auto buffer_type = buffer_var->ty.as<TensorType>()) {
+    return StorageScope::Create(buffer_type.value()->storage_scope);
+  }
+  if (buffer_var->ty.as<PointerTypeNode>()) {
+    return StorageScope::Create(GetPtrStorageScope(buffer_var));
+  }
+  return StorageScope();  // global by default
+}
+
+Var StorageAccessVisitor::ResolveBuffer(Var buffer_var) const {
+  auto it = buffer_aliases_.find(buffer_var.get());
+  return it == buffer_aliases_.end() ? buffer_var : it->second;
+}
+
+}  // namespace s_tir
+}  // namespace tvm

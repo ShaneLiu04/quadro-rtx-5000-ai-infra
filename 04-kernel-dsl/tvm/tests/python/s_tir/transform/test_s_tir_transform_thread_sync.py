@@ -1,0 +1,255 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+# ruff: noqa: F821, F841
+import pytest
+
+import tvm
+import tvm.testing
+from tvm import s_tir
+from tvm.script import s_tir as Ts
+from tvm.script import tirx as T
+from tvm.testing import env
+
+
+def run_passes(func: tvm.tirx.PrimFunc):
+    mod = tvm.IRModule.from_expr(func)
+
+    cuda_target = tvm.target.Target("cuda", host="llvm")
+
+    mod = tvm.tirx.transform.Apply(
+        lambda f: f.with_attr({"global_symbol": "test", "target": cuda_target})
+    )(mod)
+
+    mod = tvm.tirx.transform.SplitHostDevice()(mod)
+    return tvm.s_tir.transform.ThreadSync("shared")(mod)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not env.has_cuda(), reason="need cuda")
+def test_sync_read_thread_id_independent_location():
+    @Ts.prim_func(check_well_formed=False)
+    def func(p0_arg: T.Tensor((1, 2, 1, 1), "float32"), p1: T.Tensor(2, "float32")) -> None:
+        threadIdx_x = T.env_thread("threadIdx.x")
+        blockIdx_x = T.env_thread("blockIdx.x")
+        p0 = T.buffer([2], dtype="float32", data=p0_arg.data)
+        result_local = Ts.sblock_alloc_buffer([1], dtype="float32", scope="local")
+        temp_shared = Ts.sblock_alloc_buffer([1], dtype="float32", scope="shared")
+        T.launch_thread(blockIdx_x, 8)
+        T.launch_thread(threadIdx_x, 4)
+        result_local[0] = T.float32(0)
+        if threadIdx_x < 1:
+            temp_shared[0] = p0[0]
+        result_local[0] = result_local[0] + temp_shared[0] * p1[0]
+        if threadIdx_x < 1:
+            temp_shared[0] = p0[1]
+        result_local[0] = result_local[0] + temp_shared[0] * p1[1]
+
+    mod = run_passes(func)
+    assert 'T.tvm_storage_sync("shared", None, None, dtype="int32")' in str(mod)
+
+
+def test_sync_inside_condition():
+    @Ts.prim_func
+    def func1(A: T.Tensor((4, 4), "float32")) -> None:
+        A_shared = T.alloc_tensor((4, 4), "float32", scope="shared")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 32)
+        if A[0, 0] > 1.0:
+            for i, j in T.grid(4, 4):
+                A_shared[i, j] = A[i, j]
+            for i, j in T.grid(4, 4):
+                A[i, j] = A_shared[i, j] + 1.0
+
+    @Ts.prim_func
+    def func2(A: T.Tensor((4, 4), "float32")) -> None:
+        A_shared = T.alloc_tensor((4, 4), "float32", scope="shared")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 32)
+        if T.tvm_thread_invariant(A[0, 0] > 1.0):
+            for i, j in T.grid(4, 4):
+                A_shared[i, j] = A[i, j]
+            for i, j in T.grid(4, 4):
+                A[i, j] = A_shared[i, j] + 1.0
+
+    @Ts.prim_func
+    def func3(A: T.Tensor((4, 4), "float32")) -> None:
+        A_shared = T.alloc_tensor((4, 4), "float32", scope="shared")
+        bx = T.launch_thread("blockIdx.x", 1)
+        tx = T.launch_thread("threadIdx.x", 32)
+        while T.tvm_thread_invariant(A[0, 0] > 1.0):
+            for i, j in T.grid(4, 4):
+                A_shared[i, j] = A[i, j]
+            for i, j in T.grid(4, 4):
+                A[i, j] = A_shared[i, j] + 1.0
+
+    with pytest.raises(tvm.error.InternalError):
+        s_tir.transform.ThreadSync("shared")(tvm.IRModule.from_expr(func1))
+
+    for func in (func2, func3):
+        mod = s_tir.transform.ThreadSync("shared")(tvm.IRModule.from_expr(func))
+        assert 'T.tvm_storage_sync("shared", None, None, dtype="int32")' in mod.script()
+
+
+def test_sync_shared_dyn():
+    @Ts.prim_func(private=True)
+    def func(A: T.Tensor((4, 4), "float32"), E: T.Tensor((4, 4), "float32")):
+        blockIdx_x = T.launch_thread("blockIdx.x", 1)
+        B = T.alloc_tensor((24,), "float32", scope="shared.dyn")
+        C = T.alloc_tensor((1,), "float32", scope="local")
+        D = T.alloc_tensor((16,), "float32", scope="shared.dyn")
+        threadIdx_x = T.launch_thread("threadIdx.x", 16)
+        B_1 = T.decl_tensor((24,), data=B.data, scope="shared.dyn")
+        A_1 = T.decl_tensor((16,), data=A.data)
+        B_1[threadIdx_x // 4 * 6 + threadIdx_x % 4] = A_1[threadIdx_x]
+        C_1 = T.decl_tensor((1,), data=C.data, scope="local")
+        C_1[0] = B_1[threadIdx_x // 4 * 6 + threadIdx_x % 4]
+        D_1 = T.decl_tensor((16,), data=D.data, scope="shared.dyn")
+        D_1[threadIdx_x] = C_1[0]
+        E_1 = T.decl_tensor((16,), data=E.data)
+        E_1[threadIdx_x] = D_1[threadIdx_x]
+
+    @Ts.prim_func(private=True)
+    def expected(A: T.Tensor((4, 4), "float32"), E: T.Tensor((4, 4), "float32")):
+        blockIdx_x = T.launch_thread("blockIdx.x", 1)
+        B_1 = T.alloc_tensor((24,), "float32", scope="shared.dyn")
+        C_1 = T.alloc_tensor((1,), "float32", scope="local")
+        D_1 = T.alloc_tensor((16,), "float32", scope="shared.dyn")
+        threadIdx_x = T.launch_thread("threadIdx.x", 16)
+        B_1_1 = T.decl_tensor((24,), data=B_1.data, scope="shared.dyn")
+        A_1 = T.decl_tensor((16,), data=A.data)
+        B_1_1[threadIdx_x // 4 * 6 + threadIdx_x % 4] = A_1[threadIdx_x]
+        C_1_1 = T.decl_tensor((1,), data=C_1.data, scope="local")
+        C_1_1[0] = B_1_1[threadIdx_x // 4 * 6 + threadIdx_x % 4]
+        D_1_1 = T.decl_tensor((16,), data=D_1.data, scope="shared.dyn")
+        T.evaluate(T.call_intrin("int32", "tirx.tvm_storage_sync", "shared.dyn"))
+        D_1_1[threadIdx_x] = C_1_1[0]
+        E_1 = T.decl_tensor((16,), data=E.data)
+        E_1[threadIdx_x] = D_1_1[threadIdx_x]
+
+    mod = tvm.IRModule({"main": func})
+    mod = tvm.s_tir.transform.ThreadSync("shared.dyn")(mod)
+    tvm.ir.assert_structural_equal(mod["main"], expected)
+
+
+def test_sync_shared_aliasing_buffer_views():
+    @Ts.prim_func(private=True)
+    def func(A: T.Tensor((64,), "float32")):
+        blockIdx_x = T.launch_thread("blockIdx.x", 1)
+        shared_storage = T.alloc_tensor((32,), "float16", scope="shared")
+        local = T.alloc_tensor((1,), "float32", scope="local")
+        threadIdx_x = T.launch_thread("threadIdx.x", 32)
+        shared_half = T.decl_tensor((32,), "float16", data=shared_storage.data, scope="shared")
+        shared_float = T.decl_tensor((16,), "float32", data=shared_storage.data, scope="shared")
+        for i in range(2):
+            shared_half[threadIdx_x] = T.Cast("float16", A[i * 32 + threadIdx_x])
+            T.tvm_storage_sync("shared")
+            local[0] = shared_float[threadIdx_x % 16]
+            A[i * 32 + threadIdx_x] = local[0]
+
+    mod = tvm.IRModule({"main": func})
+    mod = tvm.s_tir.transform.ThreadSync("shared")(mod)
+
+    # In addition to the explicit write-to-read barrier, the shared physical
+    # storage needs a read-to-next-write barrier across loop iterations.
+    assert str(mod["main"]).count("T.tvm_storage_sync") == 2
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not env.has_cuda(), reason="need cuda")
+def test_sync_bind():
+    @Ts.prim_func(private=True)
+    def func(A: T.Tensor((16 * 512), "float32")):
+        blockIdx_x = T.launch_thread("blockIdx.x", 16)
+        A_shared = T.alloc_tensor((512,), "float32", scope="shared")
+        in_thread_A_temp = T.alloc_tensor((1,), "float32", scope="local")
+        cross_thread_A_temp = T.alloc_tensor((1,), "float32", scope="local")
+        threadIdx_x = T.launch_thread("threadIdx.x", 128)
+        A_shared_1 = T.decl_tensor((512,), data=A_shared.data, scope="shared")
+        for ax0 in range(512):
+            A_shared_1[ax0] = A[blockIdx_x * 512 + ax0]
+        in_thread_A_temp_1 = T.decl_tensor((1,), data=in_thread_A_temp.data, scope="local")
+        in_thread_A_temp_1[0] = T.float32(0)
+        A_temp_1 = T.bind(in_thread_A_temp_1[0] + A_shared_1[threadIdx_x])
+        in_thread_A_temp_1[0] = A_temp_1
+        A_temp_2 = T.bind(in_thread_A_temp_1[0] + A_shared_1[threadIdx_x + 128])
+        in_thread_A_temp_1[0] = A_temp_2
+        A_temp_3 = T.bind(in_thread_A_temp_1[0] + A_shared_1[threadIdx_x + 256])
+        in_thread_A_temp_1[0] = A_temp_3
+        A_temp_4 = T.bind(in_thread_A_temp_1[0] + A_shared_1[threadIdx_x + 384])
+        in_thread_A_temp_1[0] = A_temp_4
+        cross_thread_A_temp_1 = T.decl_tensor((1,), data=cross_thread_A_temp.data, scope="local")
+        with T.attr(
+            T.comm_reducer(lambda x0, y0: x0 + y0, [T.float32(0)]),
+            "reduce_scope",
+            T.int32(0),
+        ):
+            T.tvm_thread_allreduce(
+                T.uint32(1),
+                in_thread_A_temp_1[0],
+                T.bool(True),
+                cross_thread_A_temp_1[0],
+                threadIdx_x,
+            )
+
+    @Ts.prim_func(private=True)
+    def expected(A: T.Tensor((8192,), "float32")):
+        blockIdx_x = T.launch_thread("blockIdx.x", 16)
+        A_shared_1 = T.alloc_tensor((512,), "float32", scope="shared")
+        in_thread_A_temp_1 = T.alloc_tensor((1,), "float32", scope="local")
+        cross_thread_A_temp_1 = T.alloc_tensor((1,), "float32", scope="local")
+        threadIdx_x = T.launch_thread("threadIdx.x", 128)
+        A_shared_1_1 = T.decl_tensor((512,), data=A_shared_1.data, scope="shared")
+        for ax0 in range(512):
+            A_shared_1_1[ax0] = A[blockIdx_x * 512 + ax0]
+        in_thread_A_temp_1_1 = T.decl_tensor((1,), data=in_thread_A_temp_1.data, scope="local")
+        in_thread_A_temp_1_1[0] = T.float32(0)
+        T.evaluate(T.call_intrin("int32", "tirx.tvm_storage_sync", "shared"))
+        A_temp_1 = T.bind(in_thread_A_temp_1_1[0] + A_shared_1_1[threadIdx_x])
+        in_thread_A_temp_1_1[0] = A_temp_1
+        A_temp_2 = T.bind(in_thread_A_temp_1_1[0] + A_shared_1_1[threadIdx_x + 128])
+        in_thread_A_temp_1_1[0] = A_temp_2
+        A_temp_3 = T.bind(in_thread_A_temp_1_1[0] + A_shared_1_1[threadIdx_x + 256])
+        in_thread_A_temp_1_1[0] = A_temp_3
+        A_temp_4 = T.bind(in_thread_A_temp_1_1[0] + A_shared_1_1[threadIdx_x + 384])
+        in_thread_A_temp_1_1[0] = A_temp_4
+        cross_thread_A_temp_1_1 = T.decl_tensor(
+            (1,), data=cross_thread_A_temp_1.data, scope="local"
+        )
+        T.attr(
+            T.comm_reducer(lambda x0, y0: x0 + y0, [T.float32(0)]),
+            "reduce_scope",
+            T.int32(0),
+        )
+        T.tvm_thread_allreduce(
+            T.uint32(1),
+            in_thread_A_temp_1_1[0],
+            T.bool(True),
+            cross_thread_A_temp_1_1[0],
+            threadIdx_x,
+        )
+
+    mod = tvm.IRModule({"main": func})
+    mod = tvm.s_tir.transform.ThreadSync("shared")(mod)
+    tvm.ir.assert_structural_equal(mod["main"], expected)
+
+
+if __name__ == "__main__":
+    test_thread_storage_sync()
+    test_sync_else_branch()
+    test_sync_read_thread_id_independent_location()
+    test_sync_shared_dyn()
+    test_sync_bind()

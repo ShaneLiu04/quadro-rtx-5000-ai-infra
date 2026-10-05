@@ -1,0 +1,652 @@
+% ch01-arch-roofline.tex — GPU 架构、执行模型与 Roofline（RFC-C1）
+% 源码区间: base.cuh L1-86（Phase 0 面试速查表扩写）；无编译宏限定，全 arch 通用
+\chapter{GPU 架构、执行模型与 Roofline}\label{ch:01}
+
+\section{本章导读}
+
+这是全书的第一章。动手写任何 kernel 之前，先回答一个更基本的问题：
+GPU 到底是怎么跑代码的，瓶颈到底在哪里？这一章把 base.cuh 开头的
+Phase 0「面试速查表」（L1--86）扩写成一篇完整的第一课：从 SM（Streaming
+Multiprocessor，流式多处理器）的内部结构讲起，穿过 SIMT 执行模型与内存层级，
+最后落到 \textbf{Roofline 模型}：只靠乘除法就能预估 kernel 的性能上限。
+
+本章不引入任何新的编译宏与架构限定（全 arch 通用），也没有 device kernel，
+配套的最小测试 ch01\_roofline.cu 是一个 host 侧演示程序：对一组典型算子计算
+算术强度并与解析期望值核对，同时打印本机 GPU 的资源与理论带宽。后续所有章节
+的「性能分析」节都会反复使用本章建立的词汇表：算术强度（AI）、ridge point、
+memory-bound 与 compute-bound、occupancy 与延迟隐藏。
+
+\textbf{前置}：无。\textbf{源码区间}：base.cuh L1--86。
+
+\section{问题与动机}
+
+先建立一个直觉：CPU 和 GPU 是两种设计哲学的产物。CPU 的目标是\textbf{尽快完成
+一个任务}（低延迟），于是它把晶体管花在大容量 cache、复杂的分支预测与乱序执行
+引擎上；GPU 的目标是\textbf{同时完成海量任务}（高吞吐），于是它把晶体管花在
+成千上万个算术逻辑单元（ALU）上，寄存器文件巨大而 cache 相对很小，分支预测
+几乎不存在：GPU 根本不打算「预测」分支，它靠成千上万个线程之间的快速
+切换把内存延迟藏起来。
+
+直接后果是：\textbf{同一个算法在 GPU 上快慢与否，几乎完全由它的
+「访存-计算比例」决定}。一个向量加法（读两个数、加一次、写一个数）与一个
+矩阵乘法（读两个数要做几十上百次乘加）在 CPU 上差异不大，在 GPU 上差异
+极大：前者把大部分时间花在等数据上（memory-bound），后者才能让计算单元
+饱和（compute-bound）。base.cuh L22--30 把这种判断浓缩成三条判据，外加一条
+occupancy 公式：
+
+\begin{itemize}
+\item \textbf{Memory-bound}：AI（Arithmetic Intensity，算术强度）低于
+  机器的 FLOPS$/$带宽比值；
+\item \textbf{Compute-bound}：AI 足够大，受限于计算吞吐；
+\item \textbf{Latency-bound}：线程不够多，无法隐藏内存延迟。
+\end{itemize}
+
+\begin{equation*}
+  \mathrm{occupancy} = \frac{\text{active\ warps}}{\text{max\ warps\ per\ SM}},
+\end{equation*}
+受三类资源分别取下限：每线程寄存器数 $\to$ threads/SM；每 block 的
+shared memory $\to$ blocks/SM；block 大小 $\to$ blocks/SM。
+
+这三条判据就是本章的路线图。前两条给出判断标准，即比较算术强度与
+机器的「转折点」；第三条是容易被忽略的瓶颈：latency-bound，它甚至
+与算法无关，纯粹是并行度不够、延迟藏不住的问题。要把这三条判据看懂，我们
+需要先弄清两件事：机器的算力与带宽从哪里来（\S\ref{sec:ch01-sm}），以及
+「算术强度」怎么算（\S\ref{sec:ch01-math}）。
+
+\section{SM 内部结构与内存层级}\label{sec:ch01-sm}
+
+\subsection{SM：GPU 的基本计算单元}
+
+GPU 是由大量 SM 组成的阵列。以本章测试机 RTX PRO 5000（Blackwell，sm\_120）
+为例，一块芯片上有 110 个 SM；base.cuh L7--21 为 SM 内部结构与内存层级留了
+一份速查清单，部件规格如下：
+
+\begin{center}
+\begin{tabular}{lp{10.6cm}}
+\toprule
+部件 & 规格（速查口径） \\
+\midrule
+Warp Scheduler $\times$ 4 & 每 SM 4 个 warp scheduler，每个每周期可发射 1 条指令 \\
+Register File & 每 SM $65536 \times 32$-bit（4 bytes）$= 256$ KB \\
+Shared Memory / L1 & 可配置划分，最大 shared memory $\sim$228 KB（Hopper） \\
+Tensor Cores & Hopper 每 SM 4 个；Blackwell 数量随型号/定义不同，建议以官方 ISV guide 为准 \\
+Warp & 32 threads，最小调度单元，SIMT 执行模型 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+清单的另一半是内存层级带宽数量级（H100 参考：HBM3 $\sim$3.35 TB/s 理论、
+L2 $\sim$12 TB/s、L1/SMEM $\sim$19 TB/s、Register $\sim$100+ TB/s），
+见下一小节的速率/容量金字塔。部件清单逐条展开：
+
+\begin{itemize}
+\item \textbf{Warp Scheduler $\times$ 4}：每个 SM 有 4 个 warp scheduler，
+  每个每周期可以发射 1 条指令。这意味着一个 SM 每周期最多发出 4 条指令，
+  「发射带宽」本身就是一种资源。
+\item \textbf{Register File}：每 SM $65536 \times 32$-bit $= 256$ KB。
+  这是 GPU 上最快也最稀缺的存储：所有活跃线程的寄存器都从这里分配。寄存器
+  分配以 warp 为粒度均分，若 kernel 每线程用 64 个寄存器，一个 256 线程的
+  block 就要占 $256 \times 64 \times 4\,\mathrm{B} = 64$ KB，SM 里最多驻留
+  4 个这样的 block。
+\item \textbf{Shared Memory / L1}：同一块片上 SRAM 中可配置划分出
+  的共享内存部分（Hopper 上这块 SRAM 为 256 KB，SM120 本机为 128 KB 量级），
+  Hopper 上最多约 228 KB/SM 可用作 smem（SM80 为 164 KB/SM，per-block
+  opt-in 上限 163 KB；SM120 本机实测
+  opt-in 上限为 99 KB，见 \S\ref{sec:ch01-test}）。block 内线程交换数据
+  靠的就是它，后续章节 bank conflict（ch07）、swizzle（ch12）也都在这块
+  SRAM 上展开。
+\item \textbf{Tensor Cores}：Hopper 每 SM 4 个第四代 Tensor Core，专门执行
+  矩阵乘加（MMA）；Blackwell 的数量与形态随型号有差异，源码注释提醒「以
+  官方 ISV guide 为准」，本书 Part II--IV 的大量篇幅都在围绕
+  如何充分利用这些 Tensor Core。
+\item \textbf{Warp = 32 threads}：warp 是\textbf{最小调度与指令发射单元}，
+  32 个线程锁步执行同一条指令（SIMT）。注意区分两个概念：线程是\textbf{执行}
+  的最小粒度，warp 是\textbf{调度与发射}的最小粒度。硬件把 32 条「线程通道」
+  捆绑成一个 warp，用一套取指-译码-发射逻辑服务 32 个计算 lane，控制逻辑
+  的开销因此被摊薄，能以少量控制电路驱动大量 ALU。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize]
+  \draw[very thick] (0, 0) rectangle (13.2, 8.6);
+  \node[anchor=south west, font=\footnotesize\bfseries] at (0.25, 8.15)
+    {SM（Streaming Multiprocessor）};
+  \foreach \i in {0,...,3}
+    \node[draw=tkBlue, fill=tkFillBlue, minimum width=1.9cm, minimum height=1.3cm,
+      align=center] at (3.25+2.15*\i, 7.0)
+      {Warp\\Scheduler \i\\{\scriptsize 每周期发射 1 条}};
+  \foreach \i in {0,...,3}
+    \draw[-{Stealth[length=1.8mm]}, semithick, draw=tkBlue!70] (3.25+2.15*\i, 6.35)
+      -- (3.25+2.15*\i, 1.58);
+  \draw[thick, fill=tkFillPurple] (0.35, 2.2) rectangle (1.75, 7.4);
+  \node[rotate=90, font=\footnotesize\bfseries, text=tkPurple] at (1.05, 4.8)
+    {Register File\ \ 256KB};
+  \draw[thick, fill=tkFillGreen] (11.45, 2.2) rectangle (12.85, 7.4);
+  \node[rotate=90, font=\footnotesize\bfseries, text=tkGreen] at (12.15, 4.8)
+    {Shared Memory / L1};
+  \node[font=\scriptsize, text=black!55, align=center] at (6.6, 4.5)
+    {驻留 warp 池\\occupancy $\le$ min(regs, smem, block 大小)};
+  \foreach \i in {0,...,3}
+    \node[draw=tkOrange, fill=tkFillOrange, minimum width=1.55cm, minimum height=1.0cm,
+      align=center, font=\scriptsize] at (3.075+1.75*\i, 1.0) {Tensor\\Core};
+  \node[draw, fill=gray!60, minimum width=2.1cm, minimum height=1.0cm,
+    align=center, font=\scriptsize] at (10.2, 1.0) {CUDA Core\\ALU / LSU};
+  \node[anchor=north, font=\scriptsize, align=center, text width=3.8cm]
+    at (1.05, -0.35) {64 regs/thread $\times$ 256T = 64KB/block\\$\to$ SM 最多驻留 4 个 block};
+  \node[anchor=north, font=\scriptsize\bfseries, align=center]
+    at (6.6, -0.35) {warp = 32 线程锁步执行（SIMT）};
+  \node[anchor=north, font=\scriptsize, align=center, text width=3.8cm]
+    at (12.15, -0.35) {SM120：SRAM 128KB 量级\\smem per-block opt-in 上限 99KB};
+\end{tikzpicture}
+\caption{SM 内部结构示意（Blackwell sm\_120 口径）：顶部 4 个 warp scheduler（各每周期发射 1 条指令），左侧 256KB 寄存器文件与右侧 smem/L1 共池 SRAM 共同钳制驻留 block 数，底部 4 个 Tensor Core 与 CUDA Core 阵列执行发射来的指令。}
+\label{fig:1-4}
+\end{figure}
+
+\subsection{内存层级：带宽与容量的权衡}
+
+base.cuh L16--21 给出了 H100 参考下的带宽数量级：HBM3 约 3.35 TB/s（理论值，
+实际约 2.5--3.0 TB/s）、L2 约 12 TB/s、L1/SMEM 约 19 TB/s、寄存器等效带宽
+100+ TB/s。把这些数字画成金字塔（图 ch01-1），层级规律直接呈现出来：\textbf{越靠近
+计算单元，带宽越高、容量越小}，相邻层级的带宽差从 1.5 倍到 5 倍不等；
+容量上寄存器与 smem 同量级，再往上每升一级差两个数量级以上。
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.95\textwidth}{!}{%
+\begin{tikzpicture}[font=\scriptsize,
+  tier/.style={draw=black!55, line width=0.5pt, anchor=west,
+    minimum height=0.9cm, inner xsep=4pt, font=\small\bfseries},
+  tag/.style={anchor=west, inner sep=1pt}]
+  \node[anchor=west, font=\small\bfseries] at (0.67, 5.24)
+    {速率/容量金字塔（H100 数量级参考，base.cuh L16--21）};
+  \node[tier, fill=gray!12, minimum width=3.17cm] at (1.33, 4.05) {Register};
+  \node[tier, fill=gray!25, minimum width=5.00cm] at (1.33, 2.95) {SMEM / L1};
+  \node[tier, fill=gray!40, minimum width=7.50cm] at (1.33, 1.85) {L2 Cache};
+  \node[tier, fill=gray!55, minimum width=10.67cm] at (1.33, 0.75) {HBM3};
+  \node[tag] at (4.85, 4.24) {$\sim$100+ TB/s};
+  \node[tag] at (4.85, 3.87) {256 KB/SM};
+  \node[tag] at (6.70, 3.14) {$\sim$19 TB/s};
+  \node[tag] at (6.70, 2.77) {$\sim$228 KB/SM};
+  \node[tag] at (9.20, 2.04) {$\sim$12 TB/s};
+  \node[tag] at (9.20, 1.67) {50 MB};
+  \node[tag] at (12.36, 0.94) {$\sim$3.35 TB/s};
+  \node[tag] at (12.36, 0.57) {80 GB};
+  \node[tag, text=black!55] at (14.15, 4.07) {(thread)};
+  \node[tag, text=black!55] at (14.15, 2.97) {(block)};
+  \node[tag, text=black!55] at (14.15, 1.87) {(device)};
+  \node[tag, text=black!55] at (14.15, 0.77) {(device)};
+  \draw[-{Stealth}, black!55, line width=0.8pt] (0.80, 4.60) -- (0.80, 0.27);
+  \node[anchor=center, text=black!70] at (8.17, -0.42)
+    {离 SM 越远：带宽越低、容量越大};
+\end{tikzpicture}}
+\caption{GPU 内存层级金字塔：离 SM 越远带宽越低、容量越大（H100 数量级）。}
+\label{fig:1-1}
+\end{figure}
+
+这张图给出 GPU 编程的一条基本规律：\textbf{数据每上移一层，带宽就高一级；
+kernel 优化的本质就是让数据尽量驻留在高层级}。ch02 让归约的中间量全部驻留寄存器
+（warp shuffle），ch09--12 用 tiling 把矩阵块搬进 smem 复用，ch13--14 用
+TMA+Warp Specialization 把「搬运」与「计算」解耦成流水线，走的都是同一条路。
+
+\section{数学原理：Roofline 与算术强度}\label{sec:ch01-math}
+
+\subsection{算术强度（Arithmetic Intensity, AI）}
+
+定义一个算法（或一段 kernel）的算术强度：
+\begin{equation}
+  AI \;=\; \frac{\mathrm{FLOPs}}{\mathrm{Bytes}},
+  \label{eq:ch01-ai}
+\end{equation}
+其中 FLOPs 是算法需要的浮点运算次数（\textbf{总量}，单位 FLOP，不是每秒），
+Bytes 是它必然要在\textbf{最外层存储}（通常是 HBM）上搬运的字节数，口径是
+「每个数据读一次、写一次」。AI 的单位是 FLOP/Byte，物理含义是：\textbf{每
+搬运 1 字节，能换来多少次浮点运算}。
+
+三个注意点。第一，FLOPs 数「算法固有」的量：乘加各记 1 次，因此一个点积
+$a\cdot b$（$N$ 项）是 $2N$ 次。第二，Bytes 是\textbf{不可再省的下界}：
+若算法要读一遍 $a$ 写一遍 $y$，无论 cache 命中率多高，HBM 流量都不会低于
+$4(|a|+|y|)$ 字节（fp32）。第三，中间量不算：softmax 的逐元素 max、exp、
+sum 都在寄存器里完成，不出 HBM，所以不计入 Bytes。
+
+\subsection{三个典型算子的 AI 逐项推导}
+
+\textbf{GEMM（$C = AB$，尺寸 $M{\times}K$ 乘 $K{\times}N$）。}输出 $C$ 有
+$M \times N$ 个元素，每个元素 $c\sb{ij} = \sum\sb{k} a\sb{ik} b\sb{kj}$ 需要
+$K$ 次乘与 $K$ 次加，共 $2K$ 次；所以
+\begin{equation}
+  \mathrm{FLOPs} = 2MNK .
+\end{equation}
+Bytes 按「三个矩阵各读写一次」计：
+\begin{equation}
+  \mathrm{Bytes} = 4\,(MK + KN + MN).
+\end{equation}
+当 $M = N = K$ 时有简洁的解析形式：
+\begin{equation}
+  AI\sb{\mathrm{GEMM}} = \frac{2K^3}{3K^2 \cdot 4} = \frac{K}{6},
+  \label{eq:ch01-gemm-ai}
+\end{equation}
+$K = 4096$ 时 $AI = 682.7$ FLOP/Byte，base.cuh L75--79 注释中
+「$\approx 685$」由此而来（注释取了 $137\mathrm{G}/200\mathrm{M}$ 的粗略值，
+精确值是 682.67，见 \S\ref{sec:ch01-kaogu}）。AI 随 $K$ \textbf{线性增长}：
+GEMM 天然是 compute-bound 算法，矩阵越大每字节访存对应的计算量越多，这也是它适合 GPU 与
+Tensor Core 的根本原因。
+
+\textbf{GEMV（$y = Ax$）。}$A$ 是 $M{\times}K$，$x$ 是 $K$ 维向量，$y$ 是
+$M$ 维输出。$y$ 的每个元素要 $K$ 次乘 $K$ 次加，$\mathrm{FLOPs} = 2MK$；
+而 $\mathrm{Bytes} = 4(MK + K + M)$。大 $MK$ 主导下：
+\begin{equation}
+  AI\sb{\mathrm{GEMV}} \approx \frac{2MK}{4MK} = 0.5 \ \mathrm{FLOP/Byte}.
+\end{equation}
+矩阵 $A$ 的每个元素只读取一次，没有任何复用，AI 被「读一次只用
+一次」固定在 0.5，比 GEMM 低三个数量级，是彻底的 memory-bound。ch08 将看到
+三种 warp 划分方式如何逼近这 0.5 对应的理论带宽。
+
+\textbf{Softmax（逐 token，宽度 $N$）。}对长度 $N$ 的行做 softmax：1 次 max
+比较、$N$ 次减法与 exp（计 $2N$）、$N$ 次求和、$N$ 次除法，共约 $5N$
+FLOPs；访存是读入 $x$、写出 $y$ 各一次，$4 \times 2N$ 字节：
+\begin{equation}
+  AI\sb{\mathrm{softmax}} = \frac{5N}{8N} = \frac{5}{8} = 0.625,
+\end{equation}
+与 base.cuh L85 的口径一致。ch04 的三级递进（naive $\to$ safe $\to$ online）
+优化的是访存\textbf{趟数}（3-pass $\to$ 1-pass），而 AI 的上限 0.625 告诉
+我们：无论怎么优化，它始终是 memory-bound，最终性能用「离理论带宽多近」来
+衡量。
+
+\subsection{Roofline 模型与 ridge point}
+
+把峰值算力 $P\sb{peak}$（FLOP/s）与峰值带宽 $BW$（Byte/s）放在一起，
+Roofline 模型给出任意算子的可达性能上界：
+\begin{equation}
+  P \;=\; \min\bigl(P\sb{peak},\; AI \times BW\bigr).
+  \label{eq:ch01-roofline}
+\end{equation}
+它的图像（图 ch01-2）是一整条「屋顶线」：左边是一段斜率为 $BW$ 的斜坡
+（强度每多 1 FLOP/Byte，性能就多 $BW$，带宽是瓶颈），右边是一段水平
+的「天花板」（$P\sb{peak}$，算力是瓶颈）。两段交点的横坐标叫
+\textbf{ridge point}：
+\begin{equation}
+  AI^{*} \;=\; \frac{P\sb{peak}}{BW}.
+  \label{eq:ch01-ridge}
+\end{equation}
+判断规则由此而来：$AI < AI^{*}$ 则 memory-bound，$AI > AI^{*}$ 则
+compute-bound。
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.95\textwidth}{!}{%
+\begin{tikzpicture}[font=\scriptsize,
+  axlab/.style={anchor=west, black!65},
+  note/.style={anchor=west, black!70}]
+  \node[anchor=west, font=\small\bfseries] at (0.62, 7.75)
+    {Roofline 模型：$P = \min(P_{\mathrm{peak}},\ \mathrm{AI}\times\mathrm{BW})$};
+  \draw[-{Stealth}, black!65, line width=0.8pt] (1.85, 0.92) -- (13.54, 0.92);
+  \draw[-{Stealth}, black!65, line width=0.8pt] (1.85, 0.92) -- (1.85, 6.77);
+  \node[axlab] at (12.60, 0.66) {AI (FLOP/Byte)};
+  \node[axlab] at (1.20, 6.62) {P (TFLOPS)};
+  \draw[red, line width=1.2pt] (1.85, 0.92) -- (5.08, 6.77);
+  \draw[red, line width=1.2pt] (5.08, 6.77) -- (13.08, 6.77);
+  \draw[black!45, dashed, line width=0.6pt] (5.08, 0.92) -- (5.08, 6.77);
+  \node[anchor=west, red, font=\bfseries] at (6.00, 7.06)
+    {compute-bound: $P = P_{\mathrm{peak}}$};
+  \node[anchor=west, orange!85!black, font=\bfseries, align=left] at (3.22, 2.88)
+    {memory-bound: \\ $P = \mathrm{AI}\times\mathrm{BW}$};
+  \node[anchor=west, orange!85!black] at (2.90, 2.28) {(斜率 $=$ BW)};
+  \node[axlab] at (4.40, 0.66)
+    {$\mathrm{AI}^* = P_{\mathrm{peak}}/\mathrm{BW}$};
+  \fill[blue!65!black] (10.25, 6.31) circle (2.2pt);
+  \node[anchor=west, blue!65!black, align=left, text width=5.8cm] at (7.70, 5.74)
+    {GEMM $K{=}4096$：$\mathrm{AI}{=}683$ 高于 $\mathrm{AI}^*{=}295$
+     $\to$ compute-bound};
+  \fill[green!50!black] (3.11, 1.51) circle (2.2pt);
+  \node[anchor=west, green!40!black, align=left, text width=3.4cm] at (3.30, 1.72)
+    {softmax $\mathrm{AI}{=}0.625$ 远低于 $\mathrm{AI}^*{=}20$
+     $\to$ 严重 memory-bound};
+  \node[note] at (0.62, 0.20)
+    {例：H100 SXM（base.cuh L84--86 口径）FP16 TC dense $P_{\mathrm{peak}}$ 约 989 TFLOPS，BW${=}3.35$ TB/s $\to$ $\mathrm{AI}^*$ 约 295；};
+  \node[note] at (0.62, -0.10)
+    {FP32 CUDA core 约 67 TFLOPS $\to$ $\mathrm{AI}^*$ 约 20};
+\end{tikzpicture}}
+\caption{Roofline 模型：$P = \min(P_{\mathrm{peak}}, \mathrm{AI} \times \mathrm{BW})$，脊点 $\mathrm{AI}^* = P_{\mathrm{peak}} / \mathrm{BW}$。GEMM $K{=}4096$（AI$=683$）落在计算屋顶，softmax（AI$=0.625$）落在带宽斜线区。}
+\label{fig:1-2}
+\end{figure}
+
+\textbf{同一个 GPU 有多条屋顶线}。FP32 CUDA core 与 FP16 Tensor Core 的
+$P\sb{peak}$ 相差约 15 倍，于是 ridge point 也相差 15 倍：在 H100 上，
+AI=100 的算子用 FP32 跑是 compute-bound（$100 > 20$），切到 FP16 TC 反而是
+memory-bound（$100 < 295$）。这解释了一个反直觉的现象：\textbf{把 kernel
+迁移到 Tensor Core 上未必变快}：如果它本是 memory-bound，算力提高 15 倍也
+无法提升性能。同理，把 ridge point 算错（比如把 sparse 峰值当 dense 用，见
+\S\ref{sec:ch01-pitfall}）会把 bound 类别判反，整个优化方向就全错了。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize,
+  lab/.style={font=\scriptsize, inner sep=1pt}]
+  \draw[-{Stealth[length=1.8mm]}] (0, 0) -- (13.2, 0);
+  \draw[-{Stealth[length=1.8mm]}] (0, 0) -- (0, 6.7);
+  \foreach \x/\t in {3.1/100, 6.2/200, 9.3/300, 12.4/400}
+    {
+      \draw (\x, 0) -- (\x, -0.08);
+      \node[lab, anchor=north] at (\x, -0.1) {\t};
+    }
+  \foreach \y/\t in {1.45/250, 2.9/500, 4.35/750, 5.8/1000}
+    {
+      \draw (0, \y) -- (-0.08, \y);
+      \node[lab, anchor=east] at (-0.1, \y) {\t};
+    }
+  \draw[tkBlue, thick] (0,0) -- (9.145,5.736) -- (12.4,5.736);
+  \draw[tkOrange, thick] (0,0) -- (0.62,0.389) -- (12.4,0.389);
+  \fill[tkOrange] (0.62,0.389) circle (0.055);
+  \fill[tkBlue] (9.145,5.736) circle (0.055);
+  \node[lab, anchor=north west, text=tkOrange] at (0.72, 0.33) {ridge = 20};
+  \node[lab, anchor=south east, text=tkBlue] at (8.55, 5.8) {ridge = 295};
+  \node[lab, anchor=south, text=tkOrange] at (11.2, 0.45) {FP32 屋顶 $P_{peak}=67$};
+  \node[lab, anchor=south, text=tkBlue] at (10.9, 5.82)
+    {FP16 TC 屋顶 $P_{peak}=989$（dense）};
+  \draw[dashed, black!60] (3.1, 0) -- (3.1, 2.1);
+  \fill[tkOrange] (3.1, 0.389) circle (0.055);
+  \fill[tkBlue] (3.1, 1.943) circle (0.055);
+  \node[lab, anchor=south west, align=left, text=tkOrange] at (3.5, 0.58)
+    {FP32：$100 > 20$\\compute-bound（落在 67 屋顶）};
+  \node[lab, anchor=west, align=left, text=tkBlue] at (3.75, 1.94)
+    {FP16 TC：$100 < 295$\\memory-bound（仍在斜坡：$P=335$）};
+  \node[lab, anchor=north west, align=left] at (0.4, 4.6)
+    {两条斜坡共线\\（同一带宽 BW = 3.35 TB/s，\\$P = AI \times BW$，H100 SXM）};
+  \node[lab, anchor=west, align=left, font=\scriptsize\bfseries]
+    at (6.9, 3.5) {算力差 15 倍 $\ne$ 更快\\（若 kernel 本就 memory-bound）};
+  \node[lab, anchor=north] at (6.6, -0.42) {算术强度 AI（FLOP/Byte）};
+  \node[lab, rotate=90, anchor=south] at (-0.95, 3.3) {可达性能 P（TFLOP/s）};
+\end{tikzpicture}
+\caption{同一 GPU 的两条屋顶线（H100 SXM）：FP32（$P_{peak}=67$ TFLOP/s，ridge $=20$）与 FP16 TC dense（$P_{peak}=989$，ridge $=295$）共用同一条带宽斜坡（BW = 3.35 TB/s），脊点相差约 15 倍。AI=100 的竖虚线在两条线上落点相反：FP32 侧已 compute-bound（$100>20$），FP16 TC 侧仍 memory-bound（$100<295$）——把 kernel 迁到 Tensor Core 未必变快；ridge 口径算错（如 sparse 当 dense）会把 bound 类别判反。}
+\label{fig:1-5}
+\end{figure}
+
+\subsection{Occupancy 与延迟隐藏}
+
+Roofline 描述「算法-机器」的匹配，occupancy 描述「实现」的并行度。
+GPU 隐藏内存延迟靠的不是 cache（容量太小），而是\textbf{warp 切换}：当
+warp A 因等 HBM 数据而停顿时，scheduler 立刻切到 warp B 发射指令；等到
+A 的数据到了再切回来。设单次 HBM 访问约 $500 \sim 800$ 个时钟周期，若要
+发射口持续有指令可发，SM 上必须常驻足够多的活跃 warp。活跃 warp 数与硬件上限之比
+就是 occupancy（base.cuh L27--30）：
+\begin{equation}
+  \mathrm{occupancy} = \frac{\text{active warps / SM}}
+                            {\text{max warps / SM}},
+\end{equation}
+它同时受三类资源钳制，实际值取各约束下的最小值：每线程寄存器数（寄存器
+用得越多，能驻留的 warp 越少）、每 block 的 smem 用量（smem 用得多，
+block 数就少）、block 大小（block 太小则凑不满 SM 的线程槽位）。本书后续
+反复出现这类权衡：ch12 的寄存器双缓冲用更多寄存器换流水线，ch14 的
+setmaxnreg 干脆在 producer/consumer 之间\textbf{动态重新分配}寄存器池，
+都是在 occupancy 这个维度上做取舍。
+
+\section{设计与实现}
+
+本章没有 device kernel，Phase 0 的资产是一张「速查表」，它的「实现」就是
+把 9 条优化手段清单（base.cuh L32--69）与全书章节对应起来，形成一张路线图。
+先把前三条摘出来：
+
+\begin{itemize}
+\item \textbf{Coalesced Memory Access（合并访问）}：同一 warp 的线程访问
+  连续的 128B 对齐地址，只需 1 次内存事务；否则产生多次事务（最坏 32 次）。
+\item \textbf{Tiling（分块）}：将数据从 HBM 分块加载到 shared memory 复用，
+  减少 HBM 访问；GEMM 的形态是 Block Tile（BM$\times$BN）加 K Tile（BK）。
+\item \textbf{Vectorized Memory Access（向量化）}：使用 \texttt{float4}/
+  \texttt{half2} 等向量类型，减少 load/store 指令数；\texttt{float4} 是
+  128-bit，单条指令加载 16 bytes。
+\end{itemize}
+
+清单的第 1--3 条构成 Part I 前三章的骨架：coalescing 是 ch03 的主题，
+vectorize 也在 ch03，tiling 的初级形态（warp/block reduce 中的两级结构）
+在 ch02 就能见到。第 4--6 条（thread tile、bank conflict、pipeline）在
+Part II GEMM 篇逐一兑现；第 7--9 条（Tensor Core、Warp Specialization、
+TMA）属于 Part II 后半与 Part III/IV。读到这里建议翻回本表：本书的章节
+顺序，就是这张清单逐条展开的顺序。
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\footnotesize,
+  item/.style={draw, fill=white, align=center, inner sep=2.5pt,
+    font=\scriptsize, text width=2.55cm, minimum height=0.95cm},
+  tag/.style={font=\scriptsize, anchor=west},
+  ar/.style={-{Stealth[length=1.6mm]}, semithick}]
+  \fill[gray!15, rounded corners=3pt] (0.7, 3.5) rectangle (14.9, 5.0);
+  \fill[gray!40, rounded corners=3pt] (0.7, 1.7) rectangle (14.9, 3.2);
+  \fill[gray!65, rounded corners=3pt] (0.7, -0.1) rectangle (14.9, 1.4);
+  \node[rotate=90, align=center, font=\scriptsize\bfseries] at (1.05, 4.25)
+    {Part I\\（基础篇）};
+  \node[rotate=90, align=center, font=\scriptsize\bfseries] at (1.05, 2.45)
+    {Part II\\（GEMM 篇）};
+  \node[rotate=90, align=center, font=\scriptsize\bfseries] at (1.05, 0.65)
+    {Part II 后半\\+ III/IV};
+  \node[item] (i1) at (3.05, 4.25) {\textbf{1}~Coalescing\\（合并访问）};
+  \node[item] (i2) at (7.35, 4.25) {\textbf{2}~Tiling\\（分块复用）};
+  \node[item] (i3) at (11.65, 4.25) {\textbf{3}~Vectorize\\（向量化）};
+  \node[item] (i4) at (3.05, 2.45) {\textbf{4}~Thread Tile\\（寄存器分块）};
+  \node[item] (i5) at (7.35, 2.45) {\textbf{5}~Bank Conflict\\（冲突避免）};
+  \node[item] (i6) at (11.65, 2.45) {\textbf{6}~Pipeline\\（双缓冲）};
+  \node[item] (i7) at (3.05, 0.65) {\textbf{7}~Tensor Core\\（MMA / WGMMA）};
+  \node[item] (i8) at (7.35, 0.65) {\textbf{8}~Warp Spec.\\（warp 专业化）};
+  \node[item] (i9) at (11.65, 0.65) {\textbf{9}~TMA\\（硬件 DMA）};
+  \node[tag] (t1) at (4.5, 4.25) {ch03};
+  \node[tag] (t2) at (8.8, 4.25) {ch02, 09--12};
+  \node[tag] (t3) at (13.1, 4.25) {ch03};
+  \node[tag] (t4) at (4.5, 2.45) {ch09--11};
+  \node[tag] (t5) at (8.8, 2.45) {ch12};
+  \node[tag] (t6) at (13.1, 2.45) {ch13--14};
+  \node[tag] (t7) at (4.5, 0.65) {ch10--11+};
+  \node[tag] (t8) at (8.8, 0.65) {ch14, 17--18};
+  \node[tag] (t9) at (13.1, 0.65) {ch13--14, 17};
+  \draw[ar] (i1) -- (t1);
+  \draw[ar] (i2) -- (t2);
+  \draw[ar] (i3) -- (t3);
+  \draw[ar] (i4) -- (t4);
+  \draw[ar] (i5) -- (t5);
+  \draw[ar] (i6) -- (t6);
+  \draw[ar] (i7) -- (t7);
+  \draw[ar] (i8) -- (t8);
+  \draw[ar] (i9) -- (t9);
+  \node[font=\scriptsize, anchor=north west, align=left, text width=13.5cm]
+    at (0.75, -0.35)
+    {行分组沿用 base.cuh 清单 1--3 / 4--6 / 7--9：第 1--3 条是 Part I 前三章
+     骨架；第 7--9 条的兑现章节横跨 Part II 后半（ch13--14）与 Part III/IV};
+\end{tikzpicture}
+\caption{base.cuh 九条优化手段与全书章节路线图：第 1--3 条构成 Part I 前三章的骨架（coalescing 与 vectorize 在 ch03，tiling 的初级形态在 ch02）；第 4--6 条在 Part II GEMM 篇兑现；第 7--9 条横跨 Part II 后半与 Part III/IV。泳道灰度随 Part 递增（15\%/40\%/65\%）。}
+\label{fig:1-6}
+\end{figure}
+
+\section{图示}
+
+图 ch01-1（内存层级金字塔）与图 ch01-2（Roofline 示意）已分别在
+\S\ref{sec:ch01-sm} 与 \S\ref{sec:ch01-math} 给出 ASCII 占位版，二者将随
+RFC-H 升级为正式图（FIG-1-1、FIG-1-2）。这里补充一张「一次 HBM 读的全程」，
+把本章的概念串成时间线：
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  font=\footnotesize,
+  seg/.style={draw, minimum height=0.75cm, inner sep=2pt, align=center,
+    font=\scriptsize},
+  bar/.style={draw, minimum height=0.5cm, inner sep=0pt},
+  lab/.style={font=\scriptsize, align=right, anchor=east},
+  tlab/.style={font=\scriptsize, anchor=west}
+]
+  \node[lab] at (-0.4, 3.3) {warp A\\（发射视角）};
+  \node[seg, draw=tkBlue, fill=tkFillBlue, minimum width=1.15cm] at (0.575, 3.3) {发射\\LDG};
+  \node[seg, draw=tkOrange, fill=tkFillOrange, minimum width=6.0cm] at (4.15, 3.3) {stall：等数据（warp 挂起）};
+  \node[seg, draw=tkGreen, fill=tkFillGreen, minimum width=1.45cm] at (7.875, 3.3) {数据到达\\恢复执行};
+  \draw[{Stealth[length=1.5mm]}-{Stealth[length=1.5mm]}] (0, 4.2) -- (8.6, 4.2);
+  \draw (0, 4.05) -- (0, 4.35);
+  \draw (8.6, 4.05) -- (8.6, 4.35);
+  \node[anchor=south, font=\scriptsize] at (4.3, 4.3)
+    {一次 HBM 读全程 $\approx 0.5\,\mu\mathrm{s}$（H100 参考）};
+  \node[lab] at (-0.4, 1.45) {访存路径\\（三档延迟）};
+  \node[bar, draw=tkGreen, fill=tkFillGreen, minimum width=0.9cm] at (1.6, 2.15) {};
+  \node[tlab] at (2.25, 2.15) {L1 命中：$\sim$30 cycle（最快，就地结束）};
+  \node[bar, draw=tkOrange, fill=tkFillOrange, minimum width=2.6cm] at (2.45, 1.45) {};
+  \node[tlab] at (3.95, 1.45) {L2 命中：$\sim$200 cycle（回填 L1）};
+  \node[bar, draw=tkRed, fill=tkFillRed, minimum width=6.0cm] at (4.15, 0.75) {};
+  \node[tlab] at (7.35, 0.75) {HBM：$\sim$500--800 cycle（经 L2 回填）};
+  \node[font=\scriptsize, anchor=east, text=black!60] at (8.6, 2.75) {（横轴不按比例）};
+  \node[lab] at (-0.4, 0) {scheduler\\（发射口）};
+  \node[seg, draw=tkBlue, fill=tkFillBlue, minimum width=1.15cm, minimum height=0.6cm] at (0.575, 0) {A};
+  \node[seg, draw=tkGreen!75, fill=tkFillGreen!55, minimum width=1.4cm, minimum height=0.6cm] at (1.85, 0) {B};
+  \node[seg, draw=tkGreen, fill=tkFillGreen, minimum width=1.4cm, minimum height=0.6cm] at (3.25, 0) {C};
+  \node[seg, draw=tkGreen!75, fill=tkFillGreen!55, minimum width=1.4cm, minimum height=0.6cm] at (4.65, 0) {B};
+  \node[seg, draw=tkGreen, fill=tkFillGreen, minimum width=1.4cm, minimum height=0.6cm] at (6.05, 0) {C};
+  \node[seg, draw=tkGreen!75, fill=tkFillGreen!55, minimum width=0.4cm, minimum height=0.6cm, inner sep=1pt] at (6.95, 0) {B};
+  \node[seg, draw=tkBlue, fill=tkFillBlue, minimum width=1.45cm, minimum height=0.6cm] at (7.875, 0) {A};
+  \draw[dashed, black!50] (7.15, -0.5) -- (7.15, 4.05);
+  \node[anchor=north, font=\scriptsize, align=center] at (4.3, -0.55)
+    {occupancy = 可切换的 warp 数：A 挂起期间切到 warp B / C，发射口不空转};
+  \draw[-{Stealth[length=1.8mm]}] (0, -1.25) -- (9.3, -1.25);
+  \node[anchor=west, font=\scriptsize] at (9.35, -1.25) {时间};
+\end{tikzpicture}
+\caption{一次访存的全程与延迟隐藏（蓝=发射/执行，橙=等待/过渡延迟，绿=命中与恢复，红=直达 HBM 的最长延迟）}
+\label{fig:1-3}
+\end{figure}
+
+\section{性能分析}\label{sec:ch01-perf}
+
+本章无 kernel，性能分析给两张「标尺」表，供全书各章对照。
+
+\textbf{表 1：H100 SXM 参考口径}（取自 base.cuh L16--21 与 L84--86，
+官方 spec 与微基准口径混排，见 \S\ref{sec:ch01-kaogu}）：
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+层级 & 带宽 & 容量 & 作用域 \\
+\midrule
+Register & $\sim$100+ TB/s & 256 KB/SM & thread \\
+SMEM/L1 & $\sim$19 TB/s & $\sim$228 KB/SM & block \\
+L2 & $\sim$12 TB/s & 50 MB & device \\
+HBM3 & $\sim$3.35 TB/s（理论） & 80 GB & device \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+ridge point：FP16 TC dense $989/3.35 \approx 295$，FP32 $67/3.35 \approx 20$。
+对照三个算子：GEMM $K{=}4096$（AI 683）在两条线上都 compute-bound；GEMV
+（AI 0.5）与 softmax（AI 0.625）远低于 $AI^{*}$，天花板是带宽本身。
+
+\textbf{表 2：本机 RTX PRO 5000（sm\_120a，2026-09-11 实测，来自
+ch01\_roofline.cu 属性查询）}：110 SM，L2 96 MB，smem/block opt-in 99 KB，
+GDDR7 理论带宽 1344 GB/s（14 GHz $\times$ 384-bit $\times$ 2），FP32 峰值
+估算 66.9 TFLOPS（128 FMA/clk/SM 口径），ridge point $\approx 49.8$
+FLOP/Byte。后续各章 bench 都在这台机器上完成，请用这张表换算各章 kernel
+「达到了理论带宽的百分之几」。特别注意：ch03 的 bench（\S\ref{sec:ch03-perf}）
+会在\textbf{只有 16 MB 数据}的情况下测出 1862 GB/s，超过 HBM 理论值，
+原因是数据集装进了 96 MB 的 L2，实测反映的是 L2 带宽。这里得出一条硬约束：
+\textbf{roofline 里的 $BW$ 必须用「数据实际所在层级」的带宽}，小数据集的
+bench 对 HBM 口径失真。
+
+\section{实践经验}\label{sec:ch01-kaogu}
+
+本章对 base.cuh L1--86 注释逐条核查（F1 架构事实/F3 数学/F4 性能断言），
+以下两条记在此处，全量记录见 book/CHECKLOG.md：
+
+\begin{kaogu}[F4]{L16--21 内存层级带宽数量级}
+「L2 约 12 TB/s、L1/SMEM 约 19 TB/s」属于微基准口径的数量级估计，随测量
+方法（读/写比例、跨 SM 通信模式）浮动明显；HBM 3.35 TB/s 则是 H100 SXM 的
+官方 spec 值。混排时建议在正文口径中分别标注「官方 spec」与「微基准量级」，
+避免读者按同一精度理解这组数字。
+\end{kaogu}
+
+\begin{kaogu}[F3]{L89 GEMM 算例单位}
+注释「FLOPs $= 2 \times 4096^3 \approx 137$ GFLOPS」中单位应为
+GFLOP（运算\textbf{量}），FLOPS（每秒）是速率单位；该段实为 Roofline 的
+静态算例，与时间无关。精确值 $2 \times 4096^3 / (3 \times 4096^2 \times 4)
+= 682.7$ FLOP/Byte，注释的 685 为四舍五入口径。
+\end{kaogu}
+
+\section{常见坑}\label{sec:ch01-pitfall}
+
+\begin{enumerate}
+\item \textbf{Bytes 漏算写回}。AI 分母必须包含输出写回（读 $a,b$ 写 $y$
+  是 $3 \times 4N$ 字节，不是 $2 \times 4N$）；漏算会把 memory-bound 算成
+  compute-bound。
+\item \textbf{sparse 峰值当 dense 用}。NVIDIA 规格表上带 sparsity 的
+  TFLOPS 是稠密口径的两倍；ridge point 差一倍，bound 类别可能判反
+  （H100 FP16 TC：1979 sparse vs 989 dense，对应 $AI^{*}$ 590 vs 295）。
+\item \textbf{把 occupancy 当唯一 KPI}。occupancy 上限 100\% 需要「少用
+  寄存器/少用 smem」，但 GEMM 类 kernel 恰恰要用大 thread tile 与多级
+  smem 流水换性能；低 occupancy + 高 ILP 常优于高 occupancy + 低 ILP。
+  occupancy 是手段，roofline 位置才是目标。
+\item \textbf{用小数据集标定带宽}。16 MB 的输入永远命中 96 MB 的 L2，
+  测出的「带宽」是 L2 的（ch03 实测 1862 GB/s $>$ HBM 理论 1344 GB/s）。
+  标定 HBM 带宽时数据集至少要数倍于 L2 容量。
+\item \textbf{混淆 FLOP 与 FLOPS}。AI 的分子是运算量（FLOP），roofline
+  纵轴是速率（FLOP/s）；单位写错，量纲就全乱了（参见
+  \S\ref{sec:ch01-kaogu} 第二条）。
+\end{enumerate}
+
+\section{面试要点速查}
+
+\begin{itemize}
+\item \textbf{Q：warp 是什么？为什么是 32？}\\
+  A：最小调度与指令发射单元，32 线程锁步（SIMT）。32 与 warp scheduler 的
+  每周期发射粒度、寄存器文件 bank 宽度匹配；发散（divergence）会让一个
+  warp 内的分支两条路径串行执行，等效指令数翻倍。
+\item \textbf{Q：怎么区分 memory-bound 与 compute-bound？}\\
+  A：算 AI，与 ridge point $AI^{*} = P\sb{peak}/BW$ 比较：低于则带宽瓶颈，
+  高于则算力瓶颈。优化方向完全不同：前者靠 coalescing/向量化/tiling，
+  后者靠 Tensor Core/指令效率。
+\item \textbf{Q：为什么需要 occupancy？}\\
+  A：延迟隐藏。GPU 不做分支预测与深级乱序，靠大量活跃 warp 之间的快速切换
+  填满发射口；occupancy 低则切换不了，HBM 延迟（约 500--800 cycle）直接
+  暴露。但 occupancy 受寄存器/smem/block 大小三重钳制，是权衡不是越大越好。
+\item \textbf{Q：寄存器溢出（spill）是什么？}\\
+  A：每线程寄存器需求超过分配上限时，编译器把局部变量挪到 local memory
+  （实际在 HBM/L1），访存量大幅增加、延迟暴露。用
+  \texttt{-{}-ptxas-options=\allowbreak{}-v} 观察 spill 次数，出现即优先 reconsider
+  thread tile 大小。
+\item \textbf{Q：L1 与 shared memory 的关系？}\\
+  A：同一块片上 SRAM 的两种角色，可配置划分。L1 对所有访存透明缓存；
+  smem 由程序员显式管理、block 内共享。Hopper 起 smem 上限约 228 KB/SM。
+\end{itemize}
+
+\section{最小测试与动手实验}\label{sec:ch01-test}
+
+测试文件：book/tests/ch01\_roofline.cu（host 侧演示，无 GPU kernel）。
+它做两件事：(1) 对 GEMM/GEMV/softmax/eadd/relu/dot 六个算子，按
+\S\ref{sec:ch01-math} 的口径计算 FLOPs、Bytes 与 AI，并与解析期望常数
+（682.67、0.5、0.625、1/12、1/8、0.25）核对；(2) 打印本机 GPU 的 SM 数、
+L2、smem 上限、GDDR7 理论带宽与 FP32 峰值估算，是全书 bench 的标尺来源。
+
+编译与运行（CWD：book/tests/）：\texttt{.\allowbreak{}/\allowbreak{}build\_\allowbreak{}tests.\allowbreak{}sh -{}-ch ch01}。
+
+实测输出（RTX PRO 5000，sm\_120a，2026-09-11；末行设备名照录自驱动返回，
+含架构代号 sm120）：
+\begin{lstlisting}[style=console]
+  PASS GEMM     FLOPs=1.3744e+11 Bytes=2.0133e+08 AI= 682.6667
+  PASS GEMV     FLOPs=3.3554e+07 Bytes=6.7142e+07 AI=   0.4998
+  PASS softmax  FLOPs=2.0480e+04 Bytes=3.2768e+04 AI=   0.6250
+  PASS eadd     FLOPs=4.0960e+03 Bytes=4.9152e+04 AI=   0.0833
+  PASS relu     FLOPs=4.0960e+03 Bytes=3.2768e+04 AI=   0.1250
+  PASS dot      FLOPs=8.1920e+03 Bytes=3.2768e+04 AI=   0.2500
+  name=NVIDIA RTX PRO 5000 72GB Blackwell sm120 SMs=110
+  mem-theoretical-BW ~ 1344 GB/s   fp32-peak ~ 66.9 TFLOPS
+  ridge-point ~ 49.8 FLOP/Byte
+\end{lstlisting}
+
+\textbf{动手实验}：把 softmax 的 FLOPs 口径从 $5N$ 改成 $3N$（不含减法与
+除法的近似），观察 AI 变为 0.375，结论不变（仍然 memory-bound）：roofline
+对 FLOPs 计数的容错性很高，AI 相差一倍通常不会翻转 bound 类别，
+但把分母的 Bytes 算漏一项就可能翻转。
+
+\section*{延伸阅读}
+\begin{itemize}
+\item @reed《GPU 指令集架构-前言》：
+  \href{https://zhuanlan.zhihu.com/p/686198447}{zhuanlan.zhihu.com/p/686198447}
+\item @reed《GPU 指令集架构-寄存器》：
+  \href{https://zhuanlan.zhihu.com/p/688616037}{zhuanlan.zhihu.com/p/688616037}
+\item @reed《GPU 指令集架构-Load 和 Cache》：
+  \href{https://zhuanlan.zhihu.com/p/692445145}{zhuanlan.zhihu.com/p/692445145}
+\item @紫气东来《CUDA（一）编程基础》：
+  \href{https://zhuanlan.zhihu.com/p/645330027}{zhuanlan.zhihu.com/p/645330027}
+\item @紫气东来《CUDA（二）内存体系》：
+  \href{https://zhuanlan.zhihu.com/p/654027980}{zhuanlan.zhihu.com/p/654027980}
+\end{itemize}
