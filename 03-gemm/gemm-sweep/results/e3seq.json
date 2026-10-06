@@ -1,0 +1,63 @@
+{
+  "env": {
+    "torch": "2.5.1+cu121",
+    "gpu": "Quadro RTX 5000",
+    "cc": "7.5",
+    "sm_count": 48,
+    "total_mem_gb": 16.0
+  },
+  "experiments": {
+    "E3seq": {
+      "exp": "E3seq",
+      "env": {
+        "torch": "2.5.1+cu121",
+        "gpu": "Quadro RTX 5000",
+        "cc": "7.5",
+        "sm_count": 48,
+        "total_mem_gb": 16.0
+      },
+      "records": [
+        {
+          "M": 256,
+          "N": 256,
+          "K": 16384,
+          "split_s": 2,
+          "variant": "sequential",
+          "time_ms": 0.283712,
+          "tflops": 7.569,
+          "reps": 10
+        },
+        {
+          "M": 256,
+          "N": 256,
+          "K": 16384,
+          "split_s": 4,
+          "variant": "sequential",
+          "time_ms": 0.321312,
+          "tflops": 6.683,
+          "reps": 10
+        },
+        {
+          "M": 256,
+          "N": 256,
+          "K": 16384,
+          "split_s": 8,
+          "variant": "sequential",
+          "time_ms": 0.405094,
+          "tflops": 5.301,
+          "reps": 10
+        },
+        {
+          "M": 256,
+          "N": 256,
+          "K": 16384,
+          "split_s": 16,
+          "variant": "sequential",
+          "time_ms": 0.603315,
+          "tflops": 3.559,
+          "reps": 10
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "env": {
+    "torch": "2.5.1+cu121",
+    "gpu": "Quadro RTX 5000",
+    "cc": "7.5",
+    "sm_count": 48,
+    "total_mem_gb": 16.0
+  },
+  "experiments": {
+    "E3": {
+      "exp": "E3",
+      "env": {
+        "torch": "2.5.1+cu121",
+        "gpu": "Quadro RTX 5000",
+        "cc": "7.5",
+        "sm_count": 48,
+        "total_mem_gb": 16.0
+      },
+      "records": [
+        {
+          "M": 256,
+          "N": 256,
+          "K": 16384,
+          "split_s": 1,
+          "variant": "single",
+          "time_ms": 0.261766,
+          "tflops": 8.204,
+          "reps": 10,
+          "baseline_tiles": 4
+        },
+        {
+          "M": 256,
+          "N": 256,
+          "K": 16384,
+          "split_s": 2,
+          "variant": "stream-parallel",
+          "time_ms": 0.314528,
+          "tflops": 6.828,
+          "reps": 10,
+          "baseline_tiles": 4
+        },
+        {
+          "M": 256,
+          "N": 256,
+          "K": 16384,
+          "split_s": 4,
+          "variant": "stream-parallel",
+          "time_ms": 0.385229,
+          "tflops": 5.575,
+          "reps": 10,
+          "baseline_tiles": 4
+        },
+        {
+          "M": 256,
+          "N": 256,
+          "K": 16384,
+          "split_s": 8,
+          "variant": "stream-parallel",
+          "time_ms": 0.575107,
+          "tflops": 3.734,
+          "reps": 10,
+          "baseline_tiles": 4
+        },
+        {
+          "M": 256,
+          "N": 256,
+          "K": 16384,
+          "split_s": 16,
+          "variant": "stream-parallel",
+          "time_ms": 1.074586,
+          "tflops": 1.998,
+          "reps": 10,
+          "baseline_tiles": 4
+        }
+      ],
+      "extra": {
+        "note": "s>1: K split into s chunks, each on own CUDA stream, partial C summed on default stream (includes sum cost)"
+      }
+    }
+  }
+}

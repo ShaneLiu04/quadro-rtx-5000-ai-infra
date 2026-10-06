@@ -1,0 +1,562 @@
+{
+  "env": {
+    "torch": "2.5.1+cu121",
+    "gpu": "Quadro RTX 5000",
+    "cc": "7.5",
+    "sm_count": 48,
+    "total_mem_gb": 16.0
+  },
+  "experiments": {
+    "E1a": {
+      "exp": "E1a",
+      "env": {
+        "torch": "2.5.1+cu121",
+        "gpu": "Quadro RTX 5000",
+        "cc": "7.5",
+        "sm_count": 48,
+        "total_mem_gb": 16.0
+      },
+      "records": [
+        {
+          "M": 64,
+          "N": 64,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.031334,
+          "tflops": 0.535,
+          "reps": 10,
+          "model_tiles": 1,
+          "model_waves": 0.021
+        },
+        {
+          "M": 64,
+          "N": 128,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.030742,
+          "tflops": 1.091,
+          "reps": 10,
+          "model_tiles": 1,
+          "model_waves": 0.021
+        },
+        {
+          "M": 64,
+          "N": 256,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.029286,
+          "tflops": 2.291,
+          "reps": 10,
+          "model_tiles": 2,
+          "model_waves": 0.042
+        },
+        {
+          "M": 64,
+          "N": 512,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.034483,
+          "tflops": 3.892,
+          "reps": 10,
+          "model_tiles": 4,
+          "model_waves": 0.083
+        },
+        {
+          "M": 64,
+          "N": 1024,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.050582,
+          "tflops": 5.307,
+          "reps": 10,
+          "model_tiles": 8,
+          "model_waves": 0.167
+        },
+        {
+          "M": 64,
+          "N": 2048,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.078102,
+          "tflops": 6.874,
+          "reps": 10,
+          "model_tiles": 16,
+          "model_waves": 0.333
+        },
+        {
+          "M": 64,
+          "N": 4096,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.134758,
+          "tflops": 7.968,
+          "reps": 10,
+          "model_tiles": 32,
+          "model_waves": 0.667
+        },
+        {
+          "M": 128,
+          "N": 64,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.030787,
+          "tflops": 1.09,
+          "reps": 10,
+          "model_tiles": 1,
+          "model_waves": 0.021
+        },
+        {
+          "M": 128,
+          "N": 128,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.028886,
+          "tflops": 2.323,
+          "reps": 10,
+          "model_tiles": 1,
+          "model_waves": 0.021
+        },
+        {
+          "M": 128,
+          "N": 256,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.032896,
+          "tflops": 4.08,
+          "reps": 10,
+          "model_tiles": 2,
+          "model_waves": 0.042
+        },
+        {
+          "M": 128,
+          "N": 512,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.042202,
+          "tflops": 6.361,
+          "reps": 10,
+          "model_tiles": 4,
+          "model_waves": 0.083
+        },
+        {
+          "M": 128,
+          "N": 1024,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.07912,
+          "tflops": 6.786,
+          "reps": 10,
+          "model_tiles": 8,
+          "model_waves": 0.167
+        },
+        {
+          "M": 128,
+          "N": 2048,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.125123,
+          "tflops": 8.581,
+          "reps": 10,
+          "model_tiles": 16,
+          "model_waves": 0.333
+        },
+        {
+          "M": 128,
+          "N": 4096,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.223456,
+          "tflops": 9.61,
+          "reps": 10,
+          "model_tiles": 32,
+          "model_waves": 0.667
+        },
+        {
+          "M": 256,
+          "N": 64,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.031094,
+          "tflops": 2.158,
+          "reps": 10,
+          "model_tiles": 2,
+          "model_waves": 0.042
+        },
+        {
+          "M": 256,
+          "N": 128,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.03031,
+          "tflops": 4.428,
+          "reps": 10,
+          "model_tiles": 2,
+          "model_waves": 0.042
+        },
+        {
+          "M": 256,
+          "N": 256,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.04713,
+          "tflops": 5.696,
+          "reps": 10,
+          "model_tiles": 4,
+          "model_waves": 0.083
+        },
+        {
+          "M": 256,
+          "N": 512,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.071264,
+          "tflops": 7.534,
+          "reps": 10,
+          "model_tiles": 8,
+          "model_waves": 0.167
+        },
+        {
+          "M": 256,
+          "N": 1024,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.121037,
+          "tflops": 8.871,
+          "reps": 10,
+          "model_tiles": 16,
+          "model_waves": 0.333
+        },
+        {
+          "M": 256,
+          "N": 2048,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.228352,
+          "tflops": 9.404,
+          "reps": 10,
+          "model_tiles": 32,
+          "model_waves": 0.667
+        },
+        {
+          "M": 256,
+          "N": 4096,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.454493,
+          "tflops": 9.45,
+          "reps": 10,
+          "model_tiles": 64,
+          "model_waves": 1.333
+        },
+        {
+          "M": 512,
+          "N": 64,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.042973,
+          "tflops": 3.123,
+          "reps": 10,
+          "model_tiles": 4,
+          "model_waves": 0.083
+        },
+        {
+          "M": 512,
+          "N": 128,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.046563,
+          "tflops": 5.765,
+          "reps": 10,
+          "model_tiles": 4,
+          "model_waves": 0.083
+        },
+        {
+          "M": 512,
+          "N": 256,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.072131,
+          "tflops": 7.443,
+          "reps": 10,
+          "model_tiles": 8,
+          "model_waves": 0.167
+        },
+        {
+          "M": 512,
+          "N": 512,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.125133,
+          "tflops": 8.581,
+          "reps": 10,
+          "model_tiles": 16,
+          "model_waves": 0.333
+        },
+        {
+          "M": 512,
+          "N": 1024,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.214771,
+          "tflops": 9.999,
+          "reps": 10,
+          "model_tiles": 32,
+          "model_waves": 0.667
+        },
+        {
+          "M": 512,
+          "N": 2048,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.424573,
+          "tflops": 10.116,
+          "reps": 10,
+          "model_tiles": 64,
+          "model_waves": 1.333
+        },
+        {
+          "M": 512,
+          "N": 4096,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.852998,
+          "tflops": 10.07,
+          "reps": 10,
+          "model_tiles": 128,
+          "model_waves": 2.667
+        },
+        {
+          "M": 1024,
+          "N": 64,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.055082,
+          "tflops": 4.873,
+          "reps": 10,
+          "model_tiles": 8,
+          "model_waves": 0.167
+        },
+        {
+          "M": 1024,
+          "N": 128,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.082534,
+          "tflops": 6.505,
+          "reps": 10,
+          "model_tiles": 8,
+          "model_waves": 0.167
+        },
+        {
+          "M": 1024,
+          "N": 256,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.130234,
+          "tflops": 8.245,
+          "reps": 10,
+          "model_tiles": 16,
+          "model_waves": 0.333
+        },
+        {
+          "M": 1024,
+          "N": 512,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.243302,
+          "tflops": 8.826,
+          "reps": 10,
+          "model_tiles": 32,
+          "model_waves": 0.667
+        },
+        {
+          "M": 1024,
+          "N": 1024,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.428896,
+          "tflops": 10.014,
+          "reps": 10,
+          "model_tiles": 64,
+          "model_waves": 1.333
+        },
+        {
+          "M": 1024,
+          "N": 2048,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.838963,
+          "tflops": 10.239,
+          "reps": 10,
+          "model_tiles": 128,
+          "model_waves": 2.667
+        },
+        {
+          "M": 1024,
+          "N": 4096,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 1.930848,
+          "tflops": 8.898,
+          "reps": 10,
+          "model_tiles": 256,
+          "model_waves": 5.333
+        },
+        {
+          "M": 2048,
+          "N": 64,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.092234,
+          "tflops": 5.821,
+          "reps": 10,
+          "model_tiles": 16,
+          "model_waves": 0.333
+        },
+        {
+          "M": 2048,
+          "N": 128,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.120237,
+          "tflops": 8.93,
+          "reps": 10,
+          "model_tiles": 16,
+          "model_waves": 0.333
+        },
+        {
+          "M": 2048,
+          "N": 256,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.241059,
+          "tflops": 8.909,
+          "reps": 10,
+          "model_tiles": 32,
+          "model_waves": 0.667
+        },
+        {
+          "M": 2048,
+          "N": 512,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.439731,
+          "tflops": 9.767,
+          "reps": 10,
+          "model_tiles": 64,
+          "model_waves": 1.333
+        },
+        {
+          "M": 2048,
+          "N": 1024,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.881728,
+          "tflops": 9.742,
+          "reps": 10,
+          "model_tiles": 128,
+          "model_waves": 2.667
+        },
+        {
+          "M": 2048,
+          "N": 2048,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 1.896621,
+          "tflops": 9.058,
+          "reps": 10,
+          "model_tiles": 256,
+          "model_waves": 5.333
+        },
+        {
+          "M": 2048,
+          "N": 4096,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 3.554713,
+          "tflops": 9.666,
+          "reps": 10,
+          "model_tiles": 512,
+          "model_waves": 10.667
+        },
+        {
+          "M": 4096,
+          "N": 64,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.181424,
+          "tflops": 5.918,
+          "reps": 10,
+          "model_tiles": 32,
+          "model_waves": 0.667
+        },
+        {
+          "M": 4096,
+          "N": 128,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.236451,
+          "tflops": 9.082,
+          "reps": 10,
+          "model_tiles": 32,
+          "model_waves": 0.667
+        },
+        {
+          "M": 4096,
+          "N": 256,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.469475,
+          "tflops": 9.148,
+          "reps": 10,
+          "model_tiles": 64,
+          "model_waves": 1.333
+        },
+        {
+          "M": 4096,
+          "N": 512,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 0.925901,
+          "tflops": 9.277,
+          "reps": 10,
+          "model_tiles": 128,
+          "model_waves": 2.667
+        },
+        {
+          "M": 4096,
+          "N": 1024,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 1.728541,
+          "tflops": 9.939,
+          "reps": 10,
+          "model_tiles": 256,
+          "model_waves": 5.333
+        },
+        {
+          "M": 4096,
+          "N": 2048,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 3.609219,
+          "tflops": 9.52,
+          "reps": 10,
+          "model_tiles": 512,
+          "model_waves": 10.667
+        },
+        {
+          "M": 4096,
+          "N": 4096,
+          "K": 2048,
+          "dtype": "fp32",
+          "time_ms": 7.102464,
+          "tflops": 9.675,
+          "reps": 10,
+          "model_tiles": 1024,
+          "model_waves": 21.333
+        }
+      ]
+    }
+  }
+}

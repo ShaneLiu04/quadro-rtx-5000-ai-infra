@@ -1,0 +1,100 @@
+{
+  "env": {
+    "torch": "2.5.1+cu121",
+    "gpu": "Quadro RTX 5000",
+    "cc": "7.5",
+    "sm_count": 48,
+    "total_mem_gb": 16.0
+  },
+  "experiments": {
+    "E4": {
+      "exp": "E4",
+      "env": {
+        "torch": "2.5.1+cu121",
+        "gpu": "Quadro RTX 5000",
+        "cc": "7.5",
+        "sm_count": 48,
+        "total_mem_gb": 16.0
+      },
+      "records": [
+        {
+          "batch": 1,
+          "dims": 256,
+          "bmm_time_ms": 0.030125,
+          "bmm_tflops": 1.114,
+          "flat_time_ms": 0.031053,
+          "flat_tflops": 1.081,
+          "bmm_reps": 10,
+          "flat_reps": 10,
+          "bmm_tiles": 4
+        },
+        {
+          "batch": 2,
+          "dims": 256,
+          "bmm_time_ms": 0.025523,
+          "bmm_tflops": 2.629,
+          "flat_time_ms": 0.028051,
+          "flat_tflops": 2.392,
+          "bmm_reps": 10,
+          "flat_reps": 10,
+          "bmm_tiles": 8
+        },
+        {
+          "batch": 4,
+          "dims": 256,
+          "bmm_time_ms": 0.042202,
+          "bmm_tflops": 3.18,
+          "flat_time_ms": 0.025773,
+          "flat_tflops": 5.208,
+          "bmm_reps": 10,
+          "flat_reps": 10,
+          "bmm_tiles": 16
+        },
+        {
+          "batch": 8,
+          "dims": 256,
+          "bmm_time_ms": 0.044749,
+          "bmm_tflops": 5.999,
+          "flat_time_ms": 0.039952,
+          "flat_tflops": 6.719,
+          "bmm_reps": 10,
+          "flat_reps": 10,
+          "bmm_tiles": 32
+        },
+        {
+          "batch": 16,
+          "dims": 256,
+          "bmm_time_ms": 0.082979,
+          "bmm_tflops": 6.47,
+          "flat_time_ms": 0.077302,
+          "flat_tflops": 6.945,
+          "bmm_reps": 10,
+          "flat_reps": 10,
+          "bmm_tiles": 64
+        },
+        {
+          "batch": 32,
+          "dims": 256,
+          "bmm_time_ms": 0.126762,
+          "bmm_tflops": 8.471,
+          "flat_time_ms": 0.120675,
+          "flat_tflops": 8.898,
+          "bmm_reps": 10,
+          "flat_reps": 10,
+          "bmm_tiles": 128
+        },
+        {
+          "batch": 64,
+          "dims": 256,
+          "bmm_time_ms": 0.249386,
+          "bmm_tflops": 8.611,
+          "flat_time_ms": 0.220218,
+          "flat_tflops": 9.752,
+          "bmm_reps": 10,
+          "flat_reps": 10,
+          "bmm_tiles": 256
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "env": {
+    "torch": "2.5.1+cu121",
+    "gpu": "Quadro RTX 5000",
+    "cc": "7.5",
+    "sm_count": 48,
+    "total_mem_gb": 16.0
+  },
+  "experiments": {
+    "E5": {
+      "exp": "E5",
+      "env": {
+        "torch": "2.5.1+cu121",
+        "gpu": "Quadro RTX 5000",
+        "cc": "7.5",
+        "sm_count": 48,
+        "total_mem_gb": 16.0
+      },
+      "records": [
+        {
+          "N": 512,
+          "fp32_time_ms": 0.04993,
+          "fp32_tflops": 5.376,
+          "fp32_reps": 10,
+          "fp16_time_ms": 0.038298,
+          "fp16_tflops": 7.009,
+          "fp16_reps": 10
+        },
+        {
+          "N": 1024,
+          "fp32_time_ms": 0.225245,
+          "fp32_tflops": 9.534,
+          "fp32_reps": 10,
+          "fp16_time_ms": 0.048486,
+          "fp16_tflops": 44.29,
+          "fp16_reps": 10
+        },
+        {
+          "N": 2048,
+          "fp32_time_ms": 1.64201,
+          "fp32_tflops": 10.463,
+          "fp32_reps": 10,
+          "fp16_time_ms": 0.254771,
+          "fp16_tflops": 67.433,
+          "fp16_reps": 10
+        },
+        {
+          "N": 4096,
+          "fp32_time_ms": 14.188753,
+          "fp32_tflops": 9.686,
+          "fp32_reps": 10,
+          "fp16_time_ms": 2.265498,
+          "fp16_tflops": 60.666,
+          "fp16_reps": 10
+        }
+      ],
+      "extra": {
+        "int_mm": {
+          "available": false,
+          "error": "RuntimeError: \"addmm_cuda\" not implemented for 'Int'"
+        }
+      }
+    }
+  }
+}

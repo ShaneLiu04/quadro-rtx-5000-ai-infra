@@ -1,0 +1,106 @@
+{
+  "env": {
+    "torch": "2.5.1+cu121",
+    "gpu": "Quadro RTX 5000",
+    "cc": "7.5",
+    "sm_count": 48,
+    "total_mem_gb": 16.0
+  },
+  "experiments": {
+    "E6": {
+      "exp": "E6",
+      "env": {
+        "torch": "2.5.1+cu121",
+        "gpu": "Quadro RTX 5000",
+        "cc": "7.5",
+        "sm_count": 48,
+        "total_mem_gb": 16.0
+      },
+      "records": [
+        {
+          "N": 512,
+          "working_set_mb": 3.0,
+          "l2_mb": 4.0,
+          "flush_time_ms": 0.070528,
+          "flush_tflops": 3.806,
+          "noflush_time_ms": 0.062816,
+          "noflush_tflops": 4.273,
+          "flush_passes_ms": [
+            0.075776,
+            0.069376,
+            0.070528
+          ],
+          "noflush_passes_ms": [
+            0.063392,
+            0.062688,
+            0.062816
+          ],
+          "speedup_noflush_vs_flush": 1.1228
+        },
+        {
+          "N": 1024,
+          "working_set_mb": 12.0,
+          "l2_mb": 4.0,
+          "flush_time_ms": 0.249376,
+          "flush_tflops": 8.611,
+          "noflush_time_ms": 0.24464,
+          "noflush_tflops": 8.778,
+          "flush_passes_ms": [
+            0.249376,
+            0.248032,
+            0.249568
+          ],
+          "noflush_passes_ms": [
+            0.260096,
+            0.244128,
+            0.24464
+          ],
+          "speedup_noflush_vs_flush": 1.0194
+        },
+        {
+          "N": 2048,
+          "working_set_mb": 48.0,
+          "l2_mb": 4.0,
+          "flush_time_ms": 1.644896,
+          "flush_tflops": 10.444,
+          "noflush_time_ms": 1.681472,
+          "noflush_tflops": 10.217,
+          "flush_passes_ms": [
+            1.651072,
+            1.642496,
+            1.644896
+          ],
+          "noflush_passes_ms": [
+            1.681472,
+            1.666016,
+            1.697632
+          ],
+          "speedup_noflush_vs_flush": 0.9782
+        },
+        {
+          "N": 4096,
+          "working_set_mb": 192.0,
+          "l2_mb": 4.0,
+          "flush_time_ms": 13.256256,
+          "flush_tflops": 10.368,
+          "noflush_time_ms": 13.328384,
+          "noflush_tflops": 10.312,
+          "flush_passes_ms": [
+            13.256256,
+            15.423392,
+            13.164352
+          ],
+          "noflush_passes_ms": [
+            15.6384,
+            13.328384,
+            13.311168
+          ],
+          "speedup_noflush_vs_flush": 0.9946
+        }
+      ],
+      "extra": {
+        "flush_method": "64MB fp32 buffer fill before each timed iteration, per-iter events both variants"
+      }
+    }
+  }
+}

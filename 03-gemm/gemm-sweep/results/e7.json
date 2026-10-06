@@ -1,0 +1,75 @@
+{
+  "env": {
+    "torch": "2.5.1+cu121",
+    "gpu": "Quadro RTX 5000",
+    "cc": "7.5",
+    "sm_count": 48,
+    "total_mem_gb": 16.0
+  },
+  "experiments": {
+    "E7": {
+      "exp": "E7",
+      "env": {
+        "torch": "2.5.1+cu121",
+        "gpu": "Quadro RTX 5000",
+        "cc": "7.5",
+        "sm_count": 48,
+        "total_mem_gb": 16.0
+      },
+      "records": [
+        {
+          "variant": "AB",
+          "N": 2048,
+          "time_ms": 1.680589,
+          "tflops": 10.223,
+          "reps": 10
+        },
+        {
+          "variant": "AtB",
+          "N": 2048,
+          "time_ms": 1.666586,
+          "tflops": 10.308,
+          "reps": 10
+        },
+        {
+          "variant": "ABt",
+          "N": 2048,
+          "time_ms": 1.727229,
+          "tflops": 9.946,
+          "reps": 10
+        },
+        {
+          "variant": "AtBt",
+          "N": 2048,
+          "time_ms": 1.671715,
+          "tflops": 10.277,
+          "reps": 10
+        },
+        {
+          "variant": "colA_colB",
+          "N": 2048,
+          "time_ms": 1.674621,
+          "tflops": 10.259,
+          "reps": 10
+        },
+        {
+          "variant": "colA_B",
+          "N": 2048,
+          "time_ms": 1.6544,
+          "tflops": 10.384,
+          "reps": 10
+        },
+        {
+          "variant": "A_colB",
+          "N": 2048,
+          "time_ms": 1.738381,
+          "tflops": 9.883,
+          "reps": 10
+        }
+      ],
+      "extra": {
+        "note": "AB/AtB/ABt/AtBt are 4 distinct products (same shape/flops) = cuBLAS op flag combos; colA/colB variants preserve math of AB with col-major-stored operands"
+      }
+    }
+  }
+}
