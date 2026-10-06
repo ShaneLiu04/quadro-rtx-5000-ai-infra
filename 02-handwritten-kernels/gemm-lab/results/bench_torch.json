@@ -1,0 +1,91 @@
+{
+  "env": {
+    "python": "3.11.9",
+    "lib": "torch 2.5.1+cu121 (cuBLAS)",
+    "gpu": "Quadro RTX 5000",
+    "cc": "7.5",
+    "timing": "torch.cuda.Event; 3 full passes x 5 reps = 15 samples per config, median; sustained warmup ~1s per config per pass (clock ramp)"
+  },
+  "series": [
+    {
+      "kernel": "cublas_fp32",
+      "dtype": "fp32",
+      "N": 256,
+      "time_ms": 0.0568,
+      "tflops": 0.5911,
+      "reps": 15
+    },
+    {
+      "kernel": "cublas_fp32",
+      "dtype": "fp32",
+      "N": 512,
+      "time_ms": 0.0866,
+      "tflops": 3.1011,
+      "reps": 15
+    },
+    {
+      "kernel": "cublas_fp32",
+      "dtype": "fp32",
+      "N": 1024,
+      "time_ms": 0.2948,
+      "tflops": 7.2834,
+      "reps": 15
+    },
+    {
+      "kernel": "cublas_fp32",
+      "dtype": "fp32",
+      "N": 2048,
+      "time_ms": 1.8146,
+      "tflops": 9.4678,
+      "reps": 15
+    },
+    {
+      "kernel": "cublas_fp32",
+      "dtype": "fp32",
+      "N": 4096,
+      "time_ms": 16.8243,
+      "tflops": 8.1691,
+      "reps": 15
+    },
+    {
+      "kernel": "cublas_fp16",
+      "dtype": "fp16",
+      "N": 256,
+      "time_ms": 0.0495,
+      "tflops": 0.6774,
+      "reps": 15
+    },
+    {
+      "kernel": "cublas_fp16",
+      "dtype": "fp16",
+      "N": 512,
+      "time_ms": 0.0384,
+      "tflops": 6.9963,
+      "reps": 15
+    },
+    {
+      "kernel": "cublas_fp16",
+      "dtype": "fp16",
+      "N": 1024,
+      "time_ms": 0.1024,
+      "tflops": 20.9715,
+      "reps": 15
+    },
+    {
+      "kernel": "cublas_fp16",
+      "dtype": "fp16",
+      "N": 2048,
+      "time_ms": 0.3131,
+      "tflops": 54.8723,
+      "reps": 15
+    },
+    {
+      "kernel": "cublas_fp16",
+      "dtype": "fp16",
+      "N": 4096,
+      "time_ms": 2.1768,
+      "tflops": 63.1381,
+      "reps": 15
+    }
+  ]
+}

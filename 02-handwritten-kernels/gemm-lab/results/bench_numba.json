@@ -1,0 +1,219 @@
+{
+  "env": {
+    "python": "3.11.9",
+    "lib": "numba 0.68.0 (numba-cuda) + numpy",
+    "gpu": "Quadro RTX 5000",
+    "cc": "7.5",
+    "timing": "cuda.event; 3 consecutive passes x 5 reps = 15 samples per config, median; sustained warmup ~1s per pass (clock ramp)"
+  },
+  "series": [
+    {
+      "kernel": "K0_naive",
+      "dtype": "fp32",
+      "N": 128,
+      "time_ms": 0.0699,
+      "tflops": 0.06,
+      "reps": 15
+    },
+    {
+      "kernel": "K0_naive",
+      "dtype": "fp32",
+      "N": 256,
+      "time_ms": 0.1439,
+      "tflops": 0.2332,
+      "reps": 15
+    },
+    {
+      "kernel": "K0_naive",
+      "dtype": "fp32",
+      "N": 512,
+      "time_ms": 0.662,
+      "tflops": 0.4055,
+      "reps": 15
+    },
+    {
+      "kernel": "K0_naive",
+      "dtype": "fp32",
+      "N": 1024,
+      "time_ms": 4.8497,
+      "tflops": 0.4428,
+      "reps": 15
+    },
+    {
+      "kernel": "K1_tiled_T8",
+      "dtype": "fp32",
+      "N": 256,
+      "time_ms": 0.1042,
+      "tflops": 0.3219,
+      "reps": 15
+    },
+    {
+      "kernel": "K1_tiled_T8",
+      "dtype": "fp32",
+      "N": 512,
+      "time_ms": 0.4303,
+      "tflops": 0.6239,
+      "reps": 15
+    },
+    {
+      "kernel": "K1_tiled_T8",
+      "dtype": "fp32",
+      "N": 1024,
+      "time_ms": 2.9511,
+      "tflops": 0.7277,
+      "reps": 15
+    },
+    {
+      "kernel": "K1_tiled_T8",
+      "dtype": "fp32",
+      "N": 2048,
+      "time_ms": 26.5139,
+      "tflops": 0.648,
+      "reps": 15
+    },
+    {
+      "kernel": "K1_tiled_T16",
+      "dtype": "fp32",
+      "N": 256,
+      "time_ms": 0.0979,
+      "tflops": 0.3428,
+      "reps": 15
+    },
+    {
+      "kernel": "K1_tiled_T16",
+      "dtype": "fp32",
+      "N": 512,
+      "time_ms": 0.3264,
+      "tflops": 0.8225,
+      "reps": 15
+    },
+    {
+      "kernel": "K1_tiled_T16",
+      "dtype": "fp32",
+      "N": 1024,
+      "time_ms": 2.089,
+      "tflops": 1.028,
+      "reps": 15
+    },
+    {
+      "kernel": "K1_tiled_T16",
+      "dtype": "fp32",
+      "N": 2048,
+      "time_ms": 19.415,
+      "tflops": 0.8849,
+      "reps": 15
+    },
+    {
+      "kernel": "K1_tiled_T32",
+      "dtype": "fp32",
+      "N": 256,
+      "time_ms": 0.1043,
+      "tflops": 0.3217,
+      "reps": 15
+    },
+    {
+      "kernel": "K1_tiled_T32",
+      "dtype": "fp32",
+      "N": 512,
+      "time_ms": 0.3292,
+      "tflops": 0.8155,
+      "reps": 15
+    },
+    {
+      "kernel": "K1_tiled_T32",
+      "dtype": "fp32",
+      "N": 1024,
+      "time_ms": 2.2551,
+      "tflops": 0.9523,
+      "reps": 15
+    },
+    {
+      "kernel": "K1_tiled_T32",
+      "dtype": "fp32",
+      "N": 2048,
+      "time_ms": 20.4996,
+      "tflops": 0.8381,
+      "reps": 15
+    },
+    {
+      "kernel": "K2a_regblock_32x32_2x2",
+      "dtype": "fp32",
+      "N": 256,
+      "time_ms": 0.1001,
+      "tflops": 0.3352,
+      "reps": 15
+    },
+    {
+      "kernel": "K2a_regblock_32x32_2x2",
+      "dtype": "fp32",
+      "N": 512,
+      "time_ms": 0.2847,
+      "tflops": 0.9428,
+      "reps": 15
+    },
+    {
+      "kernel": "K2a_regblock_32x32_2x2",
+      "dtype": "fp32",
+      "N": 1024,
+      "time_ms": 1.6445,
+      "tflops": 1.3058,
+      "reps": 15
+    },
+    {
+      "kernel": "K2a_regblock_32x32_2x2",
+      "dtype": "fp32",
+      "N": 2048,
+      "time_ms": 12.6553,
+      "tflops": 1.3575,
+      "reps": 15
+    },
+    {
+      "kernel": "K2a_regblock_32x32_2x2",
+      "dtype": "fp32",
+      "N": 4096,
+      "time_ms": 109.4471,
+      "tflops": 1.2558,
+      "reps": 15
+    },
+    {
+      "kernel": "K2b_regblock_64x64_4x4",
+      "dtype": "fp32",
+      "N": 256,
+      "time_ms": 0.1119,
+      "tflops": 0.2998,
+      "reps": 15
+    },
+    {
+      "kernel": "K2b_regblock_64x64_4x4",
+      "dtype": "fp32",
+      "N": 512,
+      "time_ms": 0.2392,
+      "tflops": 1.1222,
+      "reps": 15
+    },
+    {
+      "kernel": "K2b_regblock_64x64_4x4",
+      "dtype": "fp32",
+      "N": 1024,
+      "time_ms": 1.333,
+      "tflops": 1.611,
+      "reps": 15
+    },
+    {
+      "kernel": "K2b_regblock_64x64_4x4",
+      "dtype": "fp32",
+      "N": 2048,
+      "time_ms": 8.4398,
+      "tflops": 2.0356,
+      "reps": 15
+    },
+    {
+      "kernel": "K2b_regblock_64x64_4x4",
+      "dtype": "fp32",
+      "N": 4096,
+      "time_ms": 77.7179,
+      "tflops": 1.7684,
+      "reps": 15
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+# tool state
+.opencode/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# regenerable artifacts (upload-channel constrained; see README "产物再生成")
+# figures: python plot_results.py (each lab)
+figs/
+# corpora & tokenized data: python corpus_prep.py
+data/
+# trained checkpoints / exported quantized models: charlm.py / gpt_lab.py / quant_gguf.py
+*.pt
+*.gguf
+*.npy
+# full-quality cover (repo copy is the quantized docs/cover.png)
+docs/cover_hires.png
