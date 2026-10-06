@@ -1,0 +1,181 @@
+{
+  "exp": "E2",
+  "env": {
+    "triton": "3.8.0",
+    "triton_path": "C:\\Python311\\Lib\\site-packages\\triton",
+    "torch": "2.5.1+cu121",
+    "gpu": "Quadro RTX 5000",
+    "cc": "7.5",
+    "sm_count": 48,
+    "total_mem_gb": 16.0,
+    "shared_per_block_kb": 64
+  },
+  "records": [
+    {
+      "variant": "triton_nw4",
+      "M": 1024,
+      "N": 1024,
+      "time_ms": 0.058912,
+      "gbps_eff": 142.39,
+      "reps": 10
+    },
+    {
+      "variant": "triton_nw8",
+      "M": 1024,
+      "N": 1024,
+      "time_ms": 0.057216,
+      "gbps_eff": 146.61,
+      "reps": 10
+    },
+    {
+      "variant": "torch_native",
+      "M": 1024,
+      "N": 1024,
+      "time_ms": 0.037888,
+      "gbps_eff": 221.41,
+      "reps": 10
+    },
+    {
+      "variant": "naive_5pass",
+      "M": 1024,
+      "N": 1024,
+      "time_ms": 0.140384,
+      "gbps_eff": 59.75,
+      "gbps_actual": 239.14,
+      "reps": 10
+    },
+    {
+      "variant": "triton_nw4",
+      "M": 512,
+      "N": 2048,
+      "time_ms": 0.057312,
+      "gbps_eff": 146.37,
+      "reps": 10
+    },
+    {
+      "variant": "triton_nw8",
+      "M": 512,
+      "N": 2048,
+      "time_ms": 0.057344,
+      "gbps_eff": 146.29,
+      "reps": 10
+    },
+    {
+      "variant": "torch_native",
+      "M": 512,
+      "N": 2048,
+      "time_ms": 0.041248,
+      "gbps_eff": 203.37,
+      "reps": 10
+    },
+    {
+      "variant": "naive_5pass",
+      "M": 512,
+      "N": 2048,
+      "time_ms": 0.138656,
+      "gbps_eff": 60.5,
+      "gbps_actual": 242.06,
+      "reps": 10
+    },
+    {
+      "variant": "triton_nw4",
+      "M": 256,
+      "N": 4096,
+      "time_ms": 0.056608,
+      "gbps_eff": 148.19,
+      "reps": 10
+    },
+    {
+      "variant": "triton_nw8",
+      "M": 256,
+      "N": 4096,
+      "time_ms": 0.078048,
+      "gbps_eff": 107.48,
+      "reps": 10
+    },
+    {
+      "variant": "torch_native",
+      "M": 256,
+      "N": 4096,
+      "time_ms": 0.039712,
+      "gbps_eff": 211.24,
+      "reps": 10
+    },
+    {
+      "variant": "naive_5pass",
+      "M": 256,
+      "N": 4096,
+      "time_ms": 0.139168,
+      "gbps_eff": 60.28,
+      "gbps_actual": 241.14,
+      "reps": 10
+    },
+    {
+      "variant": "triton_nw4",
+      "M": 128,
+      "N": 8192,
+      "time_ms": 0.057312,
+      "gbps_eff": 146.37,
+      "reps": 10
+    },
+    {
+      "variant": "triton_nw8",
+      "M": 128,
+      "N": 8192,
+      "time_ms": 0.055872,
+      "gbps_eff": 150.14,
+      "reps": 10
+    },
+    {
+      "variant": "torch_native",
+      "M": 128,
+      "N": 8192,
+      "time_ms": 0.040832,
+      "gbps_eff": 205.44,
+      "reps": 10
+    },
+    {
+      "variant": "naive_5pass",
+      "M": 128,
+      "N": 8192,
+      "time_ms": 0.133408,
+      "gbps_eff": 62.88,
+      "gbps_actual": 251.53,
+      "reps": 10
+    },
+    {
+      "variant": "triton_nw4",
+      "M": 64,
+      "N": 16384,
+      "time_ms": 0.05616,
+      "gbps_eff": 149.37,
+      "reps": 10
+    },
+    {
+      "variant": "triton_nw8",
+      "M": 64,
+      "N": 16384,
+      "time_ms": 0.054528,
+      "gbps_eff": 153.84,
+      "reps": 10
+    },
+    {
+      "variant": "torch_native",
+      "M": 64,
+      "N": 16384,
+      "time_ms": 0.045664,
+      "gbps_eff": 183.7,
+      "reps": 10
+    },
+    {
+      "variant": "naive_5pass",
+      "M": 64,
+      "N": 16384,
+      "time_ms": 0.137216,
+      "gbps_eff": 61.13,
+      "gbps_actual": 244.54,
+      "reps": 10
+    }
+  ],
+  "clock_after": "1920 MHz, 61, 79.37 W"
+}

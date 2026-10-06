@@ -1,0 +1,79 @@
+{
+ "exp": "e3_quant_inference",
+ "ppl_fp16": 15.603060435519124,
+ "ppl_q8_0": 15.593292943742703,
+ "ppl_q4_K": 16.58059587182951,
+ "ppl_delta_q8_0": -0.009767491776420556,
+ "ppl_delta_q4_K": 0.9775354363103848,
+ "dequant_q4_K_4096blocks": {
+  "naive_ms": 9204.5556640625,
+  "vec_ms": 2.200816035270691,
+  "speedup": 4182.337604119819,
+  "vec_gbps_achieved": 2.173797320325128,
+  "note": "4096 super-blocks = 1.05M weights; launch-bound at this size"
+ },
+ "dequant_q8_0_torch_vec_fp32": {
+  "ms_median": 0.749536007642746,
+  "ms_min": 0.7354559898376465,
+  "gbps_median": 113.31631187021331,
+  "gbps_min": 115.48570842253866,
+  "pct_hbm_min": 25.77805991574524
+ },
+ "dequant_q8_0_torch_vec_fp16": {
+  "ms_median": 1.0096640586853027,
+  "ms_min": 1.0055999755859375,
+  "gbps_median": 50.88843517605538,
+  "gbps_min": 51.09409829695158,
+  "pct_hbm_min": 11.404932655569548
+ },
+ "dequant_q8_0_triton_fp32": {
+  "ms_median": 0.333840012550354,
+  "ms_min": 0.32873600721359253,
+  "gbps_median": 254.41724420972182,
+  "gbps_min": 258.36736510830303,
+  "pct_hbm_min": 57.67128685453192
+ },
+ "dequant_q8_0_triton_fp16": {
+  "ms_median": 0.24054399877786636,
+  "ms_min": 0.20678399503231049,
+  "gbps_median": 213.6001075106753,
+  "gbps_min": 248.47292457025853,
+  "pct_hbm_min": 55.46270637728985
+ },
+ "dequant_q4_K_torch_vec_fp32": {
+  "ms_median": 4.360400199890137,
+  "ms_min": 3.9633278846740723,
+  "gbps_median": 17.55482168859836,
+  "gbps_min": 19.313579453266666,
+  "pct_hbm_min": 4.3110668422470235
+ },
+ "dequant_q4_K_torch_vec_fp16": {
+  "ms_median": 4.317376136779785,
+  "ms_min": 3.5891520977020264,
+  "gbps_median": 9.95781109590009,
+  "gbps_min": 11.97820956864035,
+  "pct_hbm_min": 2.673707493000078
+ },
+ "dequant_q4_K_triton_fp32": {
+  "ms_median": 0.2951360046863556,
+  "ms_min": 0.28966400027275085,
+  "gbps_median": 259.3585560031768,
+  "gbps_min": 264.2580642673007,
+  "pct_hbm_min": 58.986175059665335
+ },
+ "dequant_q4_K_triton_fp16": {
+  "ms_median": 0.2784319967031479,
+  "ms_min": 0.2743360102176666,
+  "gbps_median": 154.40616203975938,
+  "gbps_min": 156.7115303816263,
+  "pct_hbm_min": 34.9802523173273
+ },
+ "dequant_finding": "torch multi-op dequant is launch-bound under WDDM (dozens of kernel launches dominate); the fused triton kernel approaches memory bandwidth - the same reason llama.cpp fuses dequant into mmvq/mmq GEMM kernels; sub-ms kernel gates use min-of-20",
+ "decode_fp16_tokens_per_s": 123.27932871305475,
+ "dequant_all_weights_ms": 66.86924743652344,
+ "decode_q4K_predequant_tokens_per_s": 129.5206502218861,
+ "decode_q4K_onthefly_est_tokens_per_s": 13.406618558997422,
+ "dequant_all_weights_triton_ms": 1.8868800401687622,
+ "decode_q4K_onthefly_triton_est_tokens_per_s": 104.0836534684933,
+ "dequant_all_weights_ms_check": 65.71141878763835
+}

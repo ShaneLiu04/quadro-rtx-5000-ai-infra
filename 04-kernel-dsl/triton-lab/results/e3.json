@@ -1,0 +1,111 @@
+{
+  "exp": "E3",
+  "env": {
+    "triton": "3.8.0",
+    "triton_path": "C:\\Python311\\Lib\\site-packages\\triton",
+    "torch": "2.5.1+cu121",
+    "gpu": "Quadro RTX 5000",
+    "cc": "7.5",
+    "sm_count": 48,
+    "total_mem_gb": 16.0,
+    "shared_per_block_kb": 64
+  },
+  "records": [
+    {
+      "N": 256,
+      "variant": "triton_best_gm1",
+      "config": "64x128x32_w8_s2_G1",
+      "time_ms": 0.060224,
+      "tflops": 0.557,
+      "reps": 10
+    },
+    {
+      "N": 256,
+      "variant": "triton_best_gm8",
+      "config": "64x128x32_w8_s2_G8",
+      "time_ms": 0.06016,
+      "tflops": 0.558,
+      "reps": 10
+    },
+    {
+      "N": 256,
+      "variant": "cublas",
+      "config": "heuristic",
+      "time_ms": 0.03792,
+      "tflops": 0.885,
+      "reps": 10
+    },
+    {
+      "N": 512,
+      "variant": "triton_best_gm1",
+      "config": "64x128x32_w8_s2_G1",
+      "time_ms": 0.091136,
+      "tflops": 2.945,
+      "reps": 10
+    },
+    {
+      "N": 512,
+      "variant": "triton_best_gm8",
+      "config": "64x128x32_w8_s2_G8",
+      "time_ms": 0.0912,
+      "tflops": 2.943,
+      "reps": 10
+    },
+    {
+      "N": 512,
+      "variant": "cublas",
+      "config": "heuristic",
+      "time_ms": 0.064256,
+      "tflops": 4.178,
+      "reps": 10
+    },
+    {
+      "N": 1024,
+      "variant": "triton_best_gm1",
+      "config": "64x128x16_w4_s2_G1",
+      "time_ms": 0.33536,
+      "tflops": 6.404,
+      "reps": 10
+    },
+    {
+      "N": 1024,
+      "variant": "triton_best_gm8",
+      "config": "64x128x16_w4_s2_G8",
+      "time_ms": 0.329728,
+      "tflops": 6.513,
+      "reps": 10
+    },
+    {
+      "N": 1024,
+      "variant": "cublas",
+      "config": "heuristic",
+      "time_ms": 0.2512,
+      "tflops": 8.549,
+      "reps": 10
+    },
+    {
+      "N": 2048,
+      "variant": "triton_best_gm1",
+      "config": "128x64x16_w4_s3_G1",
+      "time_ms": 1.982464,
+      "tflops": 8.666,
+      "reps": 10
+    },
+    {
+      "N": 2048,
+      "variant": "triton_best_gm8",
+      "config": "128x64x16_w4_s3_G8",
+      "time_ms": 2.076224,
+      "tflops": 8.275,
+      "reps": 10
+    },
+    {
+      "N": 2048,
+      "variant": "cublas",
+      "config": "heuristic",
+      "time_ms": 1.726656,
+      "tflops": 9.95,
+      "reps": 10
+    }
+  ]
+}

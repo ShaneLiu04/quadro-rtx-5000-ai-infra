@@ -1,0 +1,1 @@
+{"exp": "cache_consistency_gate", "prompt": "The llama", "n_new": 48, "batch": 4, "prefill_maxdiff": 0.0, "decode_maxdiff": 1.71661376953125e-05, "greedy_ids_equal_cache_vs_full": true, "fixed_seed_deterministic": true, "batch_rows_identical": true, "gate": {"maxdiff_tol": 0.0001}, "pass": true}

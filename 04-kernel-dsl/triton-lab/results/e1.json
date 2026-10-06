@@ -1,0 +1,436 @@
+{
+  "exp": "E1",
+  "env": {
+    "triton": "3.8.0",
+    "triton_path": "C:\\Python311\\Lib\\site-packages\\triton",
+    "torch": "2.5.1+cu121",
+    "gpu": "Quadro RTX 5000",
+    "cc": "7.5",
+    "sm_count": 48,
+    "total_mem_gb": 16.0,
+    "shared_per_block_kb": 64
+  },
+  "records": [
+    {
+      "variant": "torch",
+      "n": 4096,
+      "time_ms": 0.028096,
+      "gbps": 1.75,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 4096,
+      "time_ms": 0.047808,
+      "gbps": 1.03,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 4096,
+      "time_ms": 0.046784,
+      "gbps": 1.05,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 4096,
+      "time_ms": 0.045856,
+      "gbps": 1.07,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 8192,
+      "time_ms": 0.026464,
+      "gbps": 3.71,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 8192,
+      "time_ms": 0.047136,
+      "gbps": 2.09,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 8192,
+      "time_ms": 0.0456,
+      "gbps": 2.16,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 8192,
+      "time_ms": 0.045984,
+      "gbps": 2.14,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 16384,
+      "time_ms": 0.039104,
+      "gbps": 5.03,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 16384,
+      "time_ms": 0.04672,
+      "gbps": 4.21,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 16384,
+      "time_ms": 0.046752,
+      "gbps": 4.21,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 16384,
+      "time_ms": 0.046592,
+      "gbps": 4.22,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 32768,
+      "time_ms": 0.039904,
+      "gbps": 9.85,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 32768,
+      "time_ms": 0.046464,
+      "gbps": 8.46,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 32768,
+      "time_ms": 0.046848,
+      "gbps": 8.39,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 32768,
+      "time_ms": 0.046592,
+      "gbps": 8.44,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 65536,
+      "time_ms": 0.025568,
+      "gbps": 30.76,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 65536,
+      "time_ms": 0.046848,
+      "gbps": 16.79,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 65536,
+      "time_ms": 0.046496,
+      "gbps": 16.91,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 65536,
+      "time_ms": 0.079488,
+      "gbps": 9.89,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 131072,
+      "time_ms": 0.04048,
+      "gbps": 38.86,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 131072,
+      "time_ms": 0.073728,
+      "gbps": 21.33,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 131072,
+      "time_ms": 0.08544,
+      "gbps": 18.41,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 131072,
+      "time_ms": 0.049088,
+      "gbps": 32.04,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 262144,
+      "time_ms": 0.038912,
+      "gbps": 80.84,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 262144,
+      "time_ms": 0.045056,
+      "gbps": 69.82,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 262144,
+      "time_ms": 0.04512,
+      "gbps": 69.72,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 262144,
+      "time_ms": 0.044896,
+      "gbps": 70.07,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 524288,
+      "time_ms": 0.028672,
+      "gbps": 219.43,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 524288,
+      "time_ms": 0.08192,
+      "gbps": 76.8,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 524288,
+      "time_ms": 0.074816,
+      "gbps": 84.09,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 524288,
+      "time_ms": 0.074688,
+      "gbps": 84.24,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 1048576,
+      "time_ms": 0.073184,
+      "gbps": 171.94,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 1048576,
+      "time_ms": 0.093664,
+      "gbps": 134.34,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 1048576,
+      "time_ms": 0.09216,
+      "gbps": 136.53,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 1048576,
+      "time_ms": 0.09296,
+      "gbps": 135.36,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 2097152,
+      "time_ms": 0.106208,
+      "gbps": 236.95,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 2097152,
+      "time_ms": 0.12736,
+      "gbps": 197.6,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 2097152,
+      "time_ms": 0.132416,
+      "gbps": 190.05,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 2097152,
+      "time_ms": 0.154528,
+      "gbps": 162.86,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 4194304,
+      "time_ms": 0.15968,
+      "gbps": 315.2,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 4194304,
+      "time_ms": 0.165728,
+      "gbps": 303.7,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 4194304,
+      "time_ms": 0.163136,
+      "gbps": 308.53,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 4194304,
+      "time_ms": 0.163616,
+      "gbps": 307.62,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 8388608,
+      "time_ms": 0.302528,
+      "gbps": 332.74,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 8388608,
+      "time_ms": 0.299008,
+      "gbps": 336.66,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 8388608,
+      "time_ms": 0.296832,
+      "gbps": 339.13,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 8388608,
+      "time_ms": 0.29696,
+      "gbps": 338.98,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 16777216,
+      "time_ms": 0.559104,
+      "gbps": 360.09,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 16777216,
+      "time_ms": 0.563648,
+      "gbps": 357.18,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 16777216,
+      "time_ms": 0.563424,
+      "gbps": 357.33,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 16777216,
+      "time_ms": 0.599232,
+      "gbps": 335.97,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 33554432,
+      "time_ms": 1.074432,
+      "gbps": 374.76,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 33554432,
+      "time_ms": 1.124352,
+      "gbps": 358.12,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 33554432,
+      "time_ms": 1.105984,
+      "gbps": 364.07,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 33554432,
+      "time_ms": 1.102912,
+      "gbps": 365.08,
+      "reps": 10
+    },
+    {
+      "variant": "torch",
+      "n": 67108864,
+      "time_ms": 2.132512,
+      "gbps": 377.63,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs256",
+      "n": 67108864,
+      "time_ms": 2.157664,
+      "gbps": 373.23,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs1024",
+      "n": 67108864,
+      "time_ms": 2.1616,
+      "gbps": 372.55,
+      "reps": 10
+    },
+    {
+      "variant": "triton_bs4096",
+      "n": 67108864,
+      "time_ms": 2.180192,
+      "gbps": 369.37,
+      "reps": 10
+    }
+  ],
+  "clock_after": "1920 MHz, 52, 117.05 W"
+}

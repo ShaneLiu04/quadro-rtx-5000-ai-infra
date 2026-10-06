@@ -1,0 +1,127 @@
+{
+ "exp": "e4_decode_kv",
+ "decode_vs_batch": [
+  {
+   "batch": 1,
+   "time_ms": 397.9530334472656,
+   "reps": 3,
+   "tokens_per_s_total": 120.61724868434926,
+   "tokens_per_s_per_seq": 120.61724868434926
+  },
+  {
+   "batch": 2,
+   "time_ms": 391.3352966308594,
+   "reps": 3,
+   "tokens_per_s_total": 245.3139311135416,
+   "tokens_per_s_per_seq": 122.6569655567708
+  },
+  {
+   "batch": 4,
+   "time_ms": 381.7998962402344,
+   "reps": 3,
+   "tokens_per_s_total": 502.88122624106387,
+   "tokens_per_s_per_seq": 125.72030656026597
+  },
+  {
+   "batch": 8,
+   "time_ms": 387.92279052734375,
+   "reps": 3,
+   "tokens_per_s_total": 989.8877028544492,
+   "tokens_per_s_per_seq": 123.73596285680615
+  },
+  {
+   "batch": 16,
+   "time_ms": 395.8966369628906,
+   "reps": 3,
+   "tokens_per_s_total": 1939.900287842022,
+   "tokens_per_s_per_seq": 121.24376799012637
+  },
+  {
+   "batch": 32,
+   "time_ms": 394.49591064453125,
+   "reps": 3,
+   "tokens_per_s_total": 3893.5764821756156,
+   "tokens_per_s_per_seq": 121.67426506798799
+  },
+  {
+   "batch": 64,
+   "time_ms": 399.0256042480469,
+   "reps": 3,
+   "tokens_per_s_total": 7698.754083184967,
+   "tokens_per_s_per_seq": 120.29303254976512
+  }
+ ],
+ "weight_bytes_fp16": 6417920,
+ "single_seq_floor_tokens_per_s": 69804.54726765057,
+ "kv_cache_check": [
+  {
+   "batch": 1,
+   "ctx": 128,
+   "measured_bytes": 262144,
+   "formula_bytes": 262144,
+   "err_pct": 0.0
+  },
+  {
+   "batch": 1,
+   "ctx": 256,
+   "measured_bytes": 524288,
+   "formula_bytes": 524288,
+   "err_pct": 0.0
+  },
+  {
+   "batch": 1,
+   "ctx": 512,
+   "measured_bytes": 1048576,
+   "formula_bytes": 1048576,
+   "err_pct": 0.0
+  },
+  {
+   "batch": 1,
+   "ctx": 1024,
+   "measured_bytes": 2097152,
+   "formula_bytes": 2097152,
+   "err_pct": 0.0
+  },
+  {
+   "batch": 16,
+   "ctx": 128,
+   "measured_bytes": 4194304,
+   "formula_bytes": 4194304,
+   "err_pct": 0.0
+  },
+  {
+   "batch": 16,
+   "ctx": 256,
+   "measured_bytes": 8388608,
+   "formula_bytes": 8388608,
+   "err_pct": 0.0
+  },
+  {
+   "batch": 16,
+   "ctx": 512,
+   "measured_bytes": 16777216,
+   "formula_bytes": 16777216,
+   "err_pct": 0.0
+  },
+  {
+   "batch": 16,
+   "ctx": 1024,
+   "measured_bytes": 33554432,
+   "formula_bytes": 33554432,
+   "err_pct": 0.0
+  }
+ ],
+ "prefill_vs_decode": {
+  "n_tokens": 256,
+  "prefill_ms": 7.674607992172241,
+  "decode_ms": 2019.33154296875,
+  "ratio_decode_over_prefill": 263.11852605740626,
+  "prefill_us_per_token": 29.978937469422817,
+  "decode_us_per_token": 7888.01383972168,
+  "flops_per_token": 6417920,
+  "prefill_tflops": 0.21408096956558229,
+  "decode_tflops": 0.0008136294041069341,
+  "prefill_arith_intensity": 256,
+  "decode_arith_intensity": 1
+ }
+}

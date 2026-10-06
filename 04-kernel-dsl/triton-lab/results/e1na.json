@@ -1,0 +1,117 @@
+{
+  "exp": "E1numba",
+  "env": {
+    "runtime": "numba-venv",
+    "numba": "0.68.0",
+    "device": "Quadro RTX 5000",
+    "cc": "7.5"
+  },
+  "records": [
+    {
+      "variant": "numba",
+      "n": 4096,
+      "time_ms": 0.069952,
+      "gbps": 0.7,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 8192,
+      "time_ms": 0.0704,
+      "gbps": 1.4,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 16384,
+      "time_ms": 0.069536,
+      "gbps": 2.83,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 32768,
+      "time_ms": 0.108512,
+      "gbps": 3.62,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 65536,
+      "time_ms": 0.069408,
+      "gbps": 11.33,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 131072,
+      "time_ms": 0.190464,
+      "gbps": 8.26,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 262144,
+      "time_ms": 0.091744,
+      "gbps": 34.29,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 524288,
+      "time_ms": 0.078176,
+      "gbps": 80.48,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 1048576,
+      "time_ms": 0.104224,
+      "gbps": 120.73,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 2097152,
+      "time_ms": 0.129376,
+      "gbps": 194.52,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 4194304,
+      "time_ms": 0.194112,
+      "gbps": 259.29,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 8388608,
+      "time_ms": 0.319488,
+      "gbps": 315.08,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 16777216,
+      "time_ms": 0.730624,
+      "gbps": 275.55,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 33554432,
+      "time_ms": 1.112064,
+      "gbps": 362.08,
+      "reps": 10
+    },
+    {
+      "variant": "numba",
+      "n": 67108864,
+      "time_ms": 2.183168,
+      "gbps": 368.87,
+      "reps": 10
+    }
+  ],
+  "same_session": true
+}

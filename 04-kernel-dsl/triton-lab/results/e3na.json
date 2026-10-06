@@ -1,0 +1,68 @@
+{
+  "exp": "E3numba",
+  "env": {
+    "runtime": "numba-venv",
+    "numba": "0.68.0",
+    "device": "Quadro RTX 5000",
+    "cc": "7.5"
+  },
+  "records": [
+    {
+      "variant": "K1_tiled_T16",
+      "N": 256,
+      "time_ms": 0.085472,
+      "tflops": 0.393,
+      "reps": 10
+    },
+    {
+      "variant": "K1_tiled_T16",
+      "N": 512,
+      "time_ms": 0.301056,
+      "tflops": 0.892,
+      "reps": 10
+    },
+    {
+      "variant": "K1_tiled_T16",
+      "N": 1024,
+      "time_ms": 2.002912,
+      "tflops": 1.072,
+      "reps": 10
+    },
+    {
+      "variant": "K1_tiled_T16",
+      "N": 2048,
+      "time_ms": 18.192961,
+      "tflops": 0.944,
+      "reps": 10
+    },
+    {
+      "variant": "K2b_regblock_64x64_4x4",
+      "N": 256,
+      "time_ms": 0.105152,
+      "tflops": 0.319,
+      "reps": 10
+    },
+    {
+      "variant": "K2b_regblock_64x64_4x4",
+      "N": 512,
+      "time_ms": 0.231136,
+      "tflops": 1.161,
+      "reps": 10
+    },
+    {
+      "variant": "K2b_regblock_64x64_4x4",
+      "N": 1024,
+      "time_ms": 1.293216,
+      "tflops": 1.661,
+      "reps": 10
+    },
+    {
+      "variant": "K2b_regblock_64x64_4x4",
+      "N": 2048,
+      "time_ms": 8.554496,
+      "tflops": 2.008,
+      "reps": 10
+    }
+  ],
+  "same_session": true
+}
