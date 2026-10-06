@@ -1,130 +1,258 @@
-# AI Infra 资料库
+<p align="center">
+  <img src="docs/cover.png" alt="Quadro RTX 5000 AI Infra Lab" width="100%">
+</p>
 
-面向这台机器整理的一套代码，从 GPU 编程入门到可以改的训练、推理和编译器。全部是 2026-10-05 从 GitHub 浅克隆的快照（`--depth 1`，未拉取子模块），合计约 1.9 GB。
+<p align="center">
+  <a href="https://gitee.com/liu-xingyan04/quadro-rtx-5000-ai-infra/releases"><img src="https://img.shields.io/badge/slides-%E9%99%84%E4%BB%B6-2f6bff" alt="slides"></a>
+  <img src="https://img.shields.io/badge/GPU-Quadro%20RTX%205000-38bdf8" alt="gpu">
+  <img src="https://img.shields.io/badge/arch-Turing%20sm__75-818cf8" alt="arch">
+  <img src="https://img.shields.io/badge/Python-3.11-3776ab" alt="python">
+  <img src="https://img.shields.io/badge/PyTorch-2.5.1%2Bcu121-ee4c2c" alt="pytorch">
+  <img src="https://img.shields.io/badge/labs-7%20%E4%B8%AA%E5%AE%9E%E9%AA%8C%E7%AB%99-22c55e" alt="labs">
+  <img src="https://img.shields.io/badge/figures-56%20%E5%BC%A0-f59e0b" alt="figures">
+</p>
 
-在这台 Windows 环境的 PATH 里没有 `nvidia-smi`。阅读可以在这里进行；编译、跑 kernel、记时，需要在已经装好 Quadro RTX 5000 驱动和 CUDA Toolkit 的系统上做。
+# 单卡 AI Infra 实验室
 
-个人版 Gitee 的单仓库上限是 500MB，单文件上限是 50MB。推送到 [quadro-rtx-5000-ai-infra](https://gitee.com/liu-xingyan04/quadro-rtx-5000-ai-infra) 时，仓库正文包含源码、笔记、图片和 llama.cpp 自带的词表。PDF 与 PPTX 合计约 570MB，放在同一仓库的 Release 附件里，压缩包内的相对路径与本目录一致。把附件解压到仓库根目录后，笔记里的幻灯片链接会重新对上。附件清单见 `SLIDES-MANIFEST.txt`。
+一台 **Quadro RTX 5000**（Turing sm_75，16 GB），七个实验站，把 AI Infra
+面试要考的东西**全部真机做一遍**：从 GPU 编程手感、手写 GEMM、Triton DSL、
+GGUF 量化推理、nanoGPT 训练，到 bitsandbytes / tinygrad 框架拆解与量化算法复刻。
 
-## 这台机器的边界
+每一站都遵循同一条纪律：**预注册门 + 诚实修订**——先写下预期数字，跑出来不达门
+就如实记录原因；计时用多轮中位数 + 烧机拉频；文档里的每个数字都有 JSON 快照支撑，
+并有自动断言脚本对账（合计 **165+ 项**）。
 
-| 部件 | 规格 | 做研究时意味着什么 |
-| --- | --- | --- |
-| CPU | Xeon Gold 6234，8 核 16 线程，基频 3.3 GHz | 数据预处理和 CPU 侧参考实现够用。核数少，训练时的数据加载要先放进内存 |
-| 内存 | 128 GB | 数据集和 tokenizer 缓存可以常驻内存。权重大到放不进显存时，也可以从内存分段送到 GPU |
-| GPU | Quadro RTX 5000，Turing TU104，sm_75 | 48 个 SM，3072 个 CUDA Core，384 个第二代 Tensor Core |
-| 显存 | 16 GB GDDR6，带宽 448 GB/s | 工作集要以这 16 GB 为准 |
-| 算力 | FP32 约 11.2 TFLOPS；FP16 Tensor Core 约 89.2 TFLOPS | FP32 的算术强度拐点约 25 FLOP/byte，FP16 Tensor Core 约 199 FLOP/byte。大 GEMM 才吃得满 Tensor Core，softmax、归一化、访存型算子先看带宽 |
-| 片上存储 | 每 SM 的 shared memory 上限 64 KB，L2 4 MB | kernel 设计按 64 KB shared memory 分块，不要按 Hopper 的 228 KB 来写 |
-| 互联 | 到 GPU 是 PCIe 3.0 | 主机到设备实际大约 12 GB/s。一层一层把权重从内存换进显存，解码会被这条总线卡住 |
-
-Turing 的 Tensor Core 做 FP16、INT8、INT4。BF16、FP8、FP4、TMA、WGMMA 属于 Ampere 之后的硬件。官方 FlashAttention 2/3、DeepGEMM、ThunderKittens、当前主线的 vLLM kernel，都默认 sm_80 或更高。这些仓库没有放进本目录。
-
-16 GB 上比较现实的模型尺度：
-
-- 从头训练：GPT-2 small / medium 这一档（约 1.2 亿到 3.5 亿参数）。7B 的 FP16 权重本身约 14 GB，再加梯度和优化器状态放不下。
-- 微调：4-bit QLoRA 可以放下 7B，13B 需要短序列、小 batch 和 gradient checkpointing。
-- 推理：7B FP16 或 13B 的 4-bit 比较从容。32B 的 4-bit 权重大约 18 GB，已经超过显存。
+---
 
 ## 目录
 
-每类 1 到 2 个仓库。提交号是浅克隆时的 `HEAD`。
+- [实验站地图](#实验站地图)
+- [亮点数字速查](#亮点数字速查)
+- [方法论纪律](#方法论纪律)
+- [仓库结构](#仓库结构)
+- [快速复现](#快速复现)
+- [上游快照与提交号](#上游快照与提交号)
+- [讲义附件](#讲义附件)
+- [工程流程：SDD 归档](#工程流程sdd-归档)
+- [这台机器的边界](#这台机器的边界)
+- [面试笔记索引](#面试笔记索引)
 
-### 01 入门：建立 GPU 编程手感
+## 实验站地图
 
-| 目录 | 上游 | 提交 | 在这台机器上怎么用 |
-| --- | --- | --- | --- |
-| `01-foundations/GPU-Puzzles` | [srush/GPU-Puzzles](https://github.com/srush/GPU-Puzzles) | `b3c4b23` | Sasha Rush 的交互式练习。用 Numba 写 CUDA，几个小时内从线程索引走到分块 GEMM。任何 sm_75 都能跑 |
-| `01-foundations/gpu-mode-lectures` | [gpu-mode/lectures](https://github.com/gpu-mode/lectures) | `77a8df4` | GPU MODE 的讲义。先看 `lecture_001` 到 `lecture_004`，再看 `lecture_014`（Triton）和 `lecture_012`（FlashAttention 的算法）。后面大量讲义针对 Hopper，当作下一档硬件的预习 |
+| 站 | 目录 | 一句话 | 标志性结果 |
+|---|---|---|---|
+| AR001 | [`01-foundations/`](01-foundations/) | GPU-Puzzles 14 题独立解答 + 双通道验证器 | CPU 线程仿真 / GPU 真编译**双通道全过**，自带负向自检 |
+| AR002 | [`02-handwritten-kernels/gemm-lab/`](02-handwritten-kernels/gemm-lab/) | FP32 SGEMM 手写三级优化 vs cuBLAS | K0→K2 **3.6×**，cuBLAS 再 **4.65×**，FP16 TC 再 **5.8×** 三个断层 |
+| AR003 | [`03-gemm/gemm-sweep/`](03-gemm/gemm-sweep/) | cuBLAS 形状×调度×dtype 八组扫描 + CUTLASS 拆解 | M,N≥512 中位 **9.71 TF**；FP32→FP16 **6.4-6.9×**；split-K 手工全败 |
+| AR004 | [`04-kernel-dsl/triton-lab/`](04-kernel-dsl/triton-lab/) | Triton / cuBLAS / numba 三方同协议对照 | Triton FP32 = **87% cuBLAS**；fp16 26 config **全未触发 mma**（PTX 取证） |
+| AR005 | [`05-inference/gguf-lab/`](05-inference/gguf-lab/) | 自训 char-LM → 自实现 Q8_0/Q4_K → GPU 量化推理全链路 | `ggml-quants.c` 逐行移植 **bit-exact**；triton fused dequant **264 GB/s** |
+| AR006 | [`06-training/nanogpt-lab/`](06-training/nanogpt-lab/) | nanoGPT 零改动导入，精度/预算/扫描/profiler 七组实验 | fp16 = **2.67× fp32**；**bf16 反慢 0.57×**（sm_75 无 BF16 TC）；MFU 7.5→29.9% |
+| AR007 | [`07-frameworks/frameworks-lab/`](07-frameworks/frameworks-lab/) | bnb/tinygrad 只读拆解 + NF4/LLM.int8/Adam8bit 纯 torch 复刻 | NF4 **0.092 < INT4 0.100**；τ=8 分解 **4.2× 回 int8 本底**；Adam8bit 状态显存 **0.254×**；7.5B QLoRA **4.0 GB** |
 
-### 02 手写算子：从朴素实现走到 Tensor Core
+`08-kernel-research/` 放的是算子研究的题库与起点：
+[KernelBench](08-kernel-research/KernelBench/)（记分板）与
+[flash-attention-sm75](08-kernel-research/flash-attention-sm75/)（WMMA 前向，
+"做到接近 SDPA 再补反向"是一条完整的算子研究线）。
 
-| 目录 | 上游 | 提交 | 在这台机器上怎么用 |
-| --- | --- | --- | --- |
-| `02-handwritten-kernels/LeetCUDA` | [xlite-dev/LeetCUDA](https://github.com/xlite-dev/LeetCUDA) | `c5e985f` | 200 多个 kernel，按难度排好。从 `kernels/` 里的 FP32 SGEMM 和 FP16 WMMA HGEMM 做起。仓库里的 FP8、BF16 示例在这张卡上没有对应硬件 |
-| `02-handwritten-kernels/how-to-optim-algorithm-in-cuda` | [BBuf/how-to-optim-algorithm-in-cuda](https://github.com/BBuf/how-to-optim-algorithm-in-cuda) | `5c85a89` | 同一条路线的中文笔记：CUDA、CuTe、Triton、PTX、PyTorch、推理。有 11 个文件名含冒号，Windows 无法原样检出，已写成冒号替换成 ` -` 的副本，说明在该目录的 `WINDOWS-CHECKOUT.txt` |
+## 亮点数字速查
 
-### 03 GEMM：工业级线性代数
+全部为 Quadro RTX 5000 真机实测（[实测] = JSON 快照可溯源，[源码] = file:line 可定位）：
 
-| 目录 | 上游 | 提交 | 在这台机器上怎么用 |
-| --- | --- | --- | --- |
-| `03-gemm/cutlass` | [NVIDIA/cutlass](https://github.com/NVIDIA/cutlass) | `0b55a2f` | 本卡对应的例子是 `examples/08_turing_tensorop_gemm` 和 `examples/09_turing_tensorop_conv2dfprop`。单测在 `test/unit/gemm/device/` 下文件名带 `sm75` 的那一组。`examples/` 里带 hopper、blackwell 的目录是给更新架构看的源码 |
+| 数字 | 值 | 出处 |
+|---|---|---|
+| cuBLAS FP32 @2048 | **9.47-10.46 TF**（跨观测带 84.5% 峰值） | AR002/AR003 |
+| cuBLAS FP16 TC @2048 | **54.9-67.4 TF**（跨会话时钟态 ±10%） | AR002/AR003 |
+| 手写 SGEMM 最好（寄存器分块 64×64） | **2.04 TF**（18.2% 峰值） | AR002 |
+| Triton FP32 matmul @2048 | **8.67 TF** = cuBLAS 的 87% | AR004 |
+| Triton fp16 dot 在 sm_75 | 26 config 全部 `mma.sync=0`（标量 FMA） | AR004 PTX 取证 |
+| 访存型 kernel 带宽天花板 | **369-378 GB/s**（82-84% HBM） | AR004 |
+| GGUF triton fused dequant | **264 GB/s** | AR005 |
+| nanoGPT fp16 加速比 | **2.67×** fp32；bf16 反慢 **0.57×** | AR006 |
+| eager 训练一步 GEMM 占比 | 仅 **27%**（transpose 245 次/步） | AR006 profiler |
+| NF4 vs INT4（N(0,1)） | rel-RMSE **0.092 < 0.100** | AR007 |
+| LLM.int8 离群分解 | τ=8（0.4% 列 fp16）误差 **4.86e-2 → 1.14e-2** | AR007 |
+| int8 GEMM 吞吐 | default **0.59×** fp16 → TN 布局 **1.29×**（配对 1.83×） | AR007 诚实 FAIL + 修订 |
+| 8-bit Adam 收敛 | 与 fp32 终值差 **0.0207**（< 训练噪声门 0.05） | AR007 |
+| 优化器状态显存 | **0.254×** fp32 | AR007 |
+| 显存账本 | **16.78 → 0.5315** B/param（fp32 训练 → NF4 存储） | AR007 |
+| 7.5B 外推 | fp32 训练 **125.8 GB** → QLoRA **4.0 GB** | AR007 |
 
-这一类只放了 CUTLASS。它同时覆盖 SIMT、Turing WMMA 和后面几代 Tensor Core，没有第二个仓库能替换这个位置。
+## 方法论纪律
 
-### 04 Kernel 语言与编译器
+七个站共用一套从 AR002 起打磨的纪律，这本身就是本仓库的核心产出之一：
 
-| 目录 | 上游 | 提交 | 在这台机器上怎么用 |
-| --- | --- | --- | --- |
-| `04-kernel-dsl/triton` | [triton-lang/triton](https://github.com/triton-lang/triton) | `fa8415b` | Triton 支持 sm_75。先跑 `python/tutorials` 里的向量加、softmax、matmul。教程里使用 TMA 的新示例需要 Hopper。这个克隆没有带 LLVM 子模块，读代码和跑官方教程够用；要改编译器本身，再单独拉取子模块 |
-| `04-kernel-dsl/tvm` | [apache/tvm](https://github.com/apache/tvm) | `a771de8` | 经典编译器栈，调度和代码生成可以指定 sm_75。`3rdparty/` 是空的子模块指针，当前副本用于阅读 Relax、MetaSchedule 和 codegen，不能直接编译 |
+1. **预注册门 + 诚实修订** — 每个关键结论先写下预期（如 "int8 ≥ 1.2× fp16"），
+   不达门就完整记录归因与修订（AR007 G2：default 布局落 cuBLAS int8 慢路径 NT，
+   TN 修订后 1.29×，四布局归因实测支撑）。verify 脚本里内置
+   "恰好一 FAIL 门" 断言防止无脑全绿。
+2. **计时纪律** — CUDA Event，3 遍 × 5 样本中位数；每遍前 ~1s 持续发射 warmup
+   （显示 GPU 闲时降频，2 次发射拉不回 boost 时钟）；pinned memory H2D；
+   复现性 <4%。跨会话时钟态噪声（FP16 TC ±10%）单独标定口径。
+3. **JSON 单一真值源** — 全部图从 `results/*.json` 取数；`verify_numbers.py`
+   把 results.md / notes 里的数字与 JSON 逐项断言（AR006 84 项 + AR007 81 项）。
+4. **上游零改动** — bnb / tinygrad / nanoGPT / llama.cpp / CUTLASS 等克隆只读
+   （mtime 核查 0 修改），复刻算法全部写在独立 `*_lab` / `quant_ops.py` 里，
+   与官方码本逐值对齐。
+5. **[实测] / [源码] 分级** — 笔记里每个结论标注来源：真机实测还是 file:line
+   源码拆解，不编造未运行验证的运行时行为。
 
-### 05 推理系统：16 GB 里把模型跑起来
+## 仓库结构
 
-| 目录 | 上游 | 提交 | 在这台机器上怎么用 |
-| --- | --- | --- | --- |
-| `05-inference/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | `d89651a` | GGUF 推理，CUDA 后端包含面向 Turing 64 KB shared memory 的 FlashAttention。看 `ggml/src/ggml-cuda/` 里的量化 GEMM 和 attention。7B、13B 量化模型是这张卡的主场 |
-| `05-inference/exllamav2` | [turboderp-org/exllamav2](https://github.com/turboderp-org/exllamav2) | `7dc12af` | 面向消费级显卡的 GPTQ / EXL2 推理，Turing 用 xformers 路径。仓库后加的 paged attention 依赖 FlashAttention 2，那条路径要求 sm_80。EXL3 在另一个仓库，不支持 Turing |
+```
+├── docs/cover.png              # 封面（make_cover.py 可重生成）
+├── specs/archive/              # AR001-007 需求/设计/ST 用例归档（SDD 流程）
+├── 01-foundations/             # GPU-Puzzles 解答 + GPU MODE 讲义笔记
+├── 02-handwritten-kernels/
+│   ├── gemm-lab/               # AR002：手写 SGEMM 三级 + cuBLAS 对照
+│   └── LeetCUDA/               # 上游快照（200+ kernel 题库）
+├── 03-gemm/
+│   ├── gemm-sweep/             # AR003：cuBLAS 八组扫描 + CUTLASS 拆解
+│   └── cutlass/                # 上游快照
+├── 04-kernel-dsl/
+│   ├── triton-lab/             # AR004：Triton 三方对照 + PTX 取证
+│   ├── triton/  tvm/           # 上游快照
+├── 05-inference/
+│   ├── gguf-lab/               # AR005：GGUF 量化复刻 + GPU 推理全链路
+│   └── llama.cpp/  exllamav2/  # 上游快照
+├── 06-training/
+│   ├── nanogpt-lab/            # AR006：nanoGPT 训练七组实验
+│   └── nanoGPT/  llm.c/        # 上游快照
+├── 07-frameworks/
+│   ├── frameworks-lab/         # AR007：bnb/tinygrad 拆解 + 量化算法复刻
+│   └── bitsandbytes/  tinygrad/# 上游快照
+└── 08-kernel-research/         # KernelBench + flash-attention-sm75
+```
 
-两个代码库代表两种权重布局：GGUF 和 EXL2。比较它们的 KV cache、量化分组和 batch 方式，就是这张卡上的推理系统研究。
+每个 lab 目录内：`README.md`（复现步骤）、`results.md`（逐图中文分析）、
+`results/*.json`（原始数据）、`verify_numbers.py`（文档-JSON 断言）。
 
-### 06 训练算法：单卡能做完的实验
+> **产物再生成**：`figs/`（56 张 300 DPI 图）、`data/`（语料与 token）、
+> `*.pt` / `*.gguf`（训练 checkpoint 与导出模型）均为**可再生产物，不入库**
+> （见各 lab README 的一键命令：`plot_results.py` / `corpus_prep.py` /
+> `charlm.py`）——入库的是全部代码、JSON 原始数据、笔记与断言脚本，
+> 任何一张图都能从 `results/*.json` 一条命令复原。
 
-| 目录 | 上游 | 提交 | 在这台机器上怎么用 |
-| --- | --- | --- | --- |
-| `06-training/nanoGPT` | [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT) | `3adf61e` | 一份短的 GPT 训练代码。改深度、注意力、优化器、数据顺序，几个小时能看到 loss。用 FP16，先跑 small 和 medium |
-| `06-training/llm.c` | [karpathy/llm.c](https://github.com/karpathy/llm.c) | `f1e2ace` | 同一类模型的纯 C / CUDA 训练。`dev/cuda/` 把每一步访存写开，方便对照 roofline，确认时间花在算力上还是带宽上 |
+## 快速复现
 
-### 07 框架与显存：改运行时，而不是只调参
+环境：Windows + Quadro RTX 5000（驱动 556.18 / CUDA 12.5）+ 全局 Python 3.11
+（torch 2.5.1+cu121 + triton 3.8 + matplotlib）。仅 AR001/AR002 的 numba CUDA
+路线需要专用 venv（`numba-cuda` 工具链 pin 到 12.5.x，见
+[01-foundations/GPU-Puzzles/solutions/README.md](01-foundations/GPU-Puzzles/solutions/README.md)）。
 
-| 目录 | 上游 | 提交 | 在这台机器上怎么用 |
-| --- | --- | --- | --- |
-| `07-frameworks/tinygrad` | [tinygrad/tinygrad](https://github.com/tinygrad/tinygrad) | `246ca9a` | 一个能读完的深度学习框架：调度、内存规划、kernel 融合、CUDA 后端都在同一棵树里。改一处就能在 sm_75 上测量 |
-| `07-frameworks/bitsandbytes` | [bitsandbytes-foundation/bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) | `8336490` | 8-bit 优化器、LLM.int8()、4-bit QLoRA。官方硬件表把 sm_75 列为推荐档。这是 16 GB 上微调 7B 的主要手段 |
+```powershell
+# AR002 手写 GEMM（~7 分钟）
+cd 02-handwritten-kernels/gemm-lab; python bench_torch.py; python plot_results.py
 
-### 08 算子研究的题目和记分板
+# AR003 cuBLAS 扫描（~3 分钟）
+cd 03-gemm/gemm-sweep; python bench_sweep.py --exp all; python plot_results.py
 
-| 目录 | 上游 | 提交 | 在这台机器上怎么用 |
-| --- | --- | --- | --- |
-| `08-kernel-research/KernelBench` | [ScalingIntelligence/KernelBench](https://github.com/ScalingIntelligence/KernelBench) | `423217d` | 用 PyTorch 算子当题目，比对自己的 CUDA / Triton 和 `torch.compile`。评测跑在本机 GPU 上，不依赖 Hopper |
-| `08-kernel-research/flash-attention-sm75` | [JohnScheuer/flash-attention-sm75](https://github.com/JohnScheuer/flash-attention-sm75) | `e2d4fb2` | 专门给 sm_75 写的 FlashAttention 前向，用 WMMA，支持 head dim 64 和 128。作者给出的测量慢于 PyTorch SDPA，且没有反向。把它做到接近 SDPA，再补上反向，是这张卡上一条完整的算子研究线 |
+# AR004 Triton 三方对照（~4 分钟）
+cd 04-kernel-dsl/triton-lab; python bench_dsl.py --exp E1; python bench_dsl.py --exp E3; python plot_results.py
 
-## 建议顺序
+# AR005 GGUF 量化推理全链路（~15 分钟）
+cd 05-inference/gguf-lab; python charlm.py; python bench_infer.py all; python plot_results.py
 
-1. 做完 `GPU-Puzzles`，接着看 `gpu-mode-lectures` 的 `lecture_001` 到 `lecture_004`。
-2. 在 `LeetCUDA` 里把 FP32 GEMM 从朴素版写到分块、向量化、双缓冲，用 cuBLAS 做对照。再写 FP16 WMMA，对照 `cutlass/examples/08_turing_tensorop_gemm`。
-3. 用 Triton 把同一个 matmul 和 softmax 重写一遍，看和手写 CUDA 的差距。
-4. 用 `nanoGPT` 跑一个 small GPT，确认 16 GB 上的 batch、序列长度和 FP16 占用。需要看带宽时切到 `llm.c`。
-5. 用 `llama.cpp` 跑一个 7B 或 13B 的 GGUF，记下 prefill 和 decode 的 token/s，以及 KV cache 随上下文的增长。
-6. 选 `KernelBench` 的一道题，或者以 `flash-attention-sm75` 为起点，用 Nsight Compute 看是算力、带宽还是 shared memory 容量卡住了。
+# AR006 nanoGPT 训练（~15 分钟）
+cd 06-training/nanogpt-lab; python corpus_prep.py; python gpt_lab.py all; python plot_results.py; python verify_numbers.py
 
-计时工具随 CUDA Toolkit 安装，不在这个目录里：Nsight Systems 看时间线，Nsight Compute 看单个 kernel 的 roofline。PyTorch 自带的 profiler 用来对上框架里的算子名。
+# AR007 框架与量化（~10 分钟）
+cd 07-frameworks/frameworks-lab; python corpus_prep.py; python framework_lab.py all; python plot_results.py; python verify_numbers.py
+```
 
-## 三条可以同时做的研究
+## 上游快照与提交号
 
-算子。目标是这张卡上的 cuBLAS 和 PyTorch SDPA。FP16 GEMM 的天花板是约 89.2 TFLOPS，访存型算子的天花板是 448 GB/s。`flash-attention-sm75` 目前两项都没碰到，而且只有前向。
+以下目录为 2026-10-05 从 GitHub 浅克隆的只读快照（`--depth 1`，未拉取子模块），
+零改动，仅作源码拆解与对照的底座；各自遵循上游 LICENSE：
 
-算法。在 `nanoGPT` 里改结构或优化器，用 small / medium 把实验做完。要上 7B，走 `bitsandbytes` 的 4-bit QLoRA，基座权重量化，可训练的是 LoRA。优化器状态因此小一个数量级。
+| 目录 | 上游 | 提交 |
+|---|---|---|
+| `01-foundations/GPU-Puzzles` | [srush/GPU-Puzzles](https://github.com/srush/GPU-Puzzles) | `b3c4b23` |
+| `01-foundations/gpu-mode-lectures` | [gpu-mode/lectures](https://github.com/gpu-mode/lectures) | `77a8df4` |
+| `02-handwritten-kernels/LeetCUDA` | [xlite-dev/LeetCUDA](https://github.com/xlite-dev/LeetCUDA) | `c5e985f` |
+| `02-handwritten-kernels/how-to-optim-algorithm-in-cuda` | [BBuf/how-to-optim-algorithm-in-cuda](https://github.com/BBuf/how-to-optim-algorithm-in-cuda) | `5c85a89` |
+| `03-gemm/cutlass` | [NVIDIA/cutlass](https://github.com/NVIDIA/cutlass) | `0b55a2f` |
+| `04-kernel-dsl/triton` | [triton-lang/triton](https://github.com/triton-lang/triton) | `fa8415b` |
+| `04-kernel-dsl/tvm` | [apache/tvm](https://github.com/apache/tvm) | `a771de8` |
+| `05-inference/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | `d89651a` |
+| `05-inference/exllamav2` | [turboderp-org/exllamav2](https://github.com/turboderp-org/exllamav2) | `7dc12af` |
+| `06-training/nanoGPT` | [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT) | `3adf61e` |
+| `06-training/llm.c` | [karpathy/llm.c](https://github.com/karpathy/llm.c) | `f1e2ace` |
+| `07-frameworks/tinygrad` | [tinygrad/tinygrad](https://github.com/tinygrad/tinygrad) | `246ca9a` |
+| `07-frameworks/bitsandbytes` | [bitsandbytes-foundation/bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) | `8336490` |
+| `08-kernel-research/KernelBench` | [ScalingIntelligence/KernelBench](https://github.com/ScalingIntelligence/KernelBench) | `423217d` |
+| `08-kernel-research/flash-attention-sm75` | [JohnScheuer/flash-attention-sm75](https://github.com/JohnScheuer/flash-attention-sm75) | `e2d4fb2` |
 
-架构。推理侧对照 `llama.cpp` 和 `exllamav2` 的权重格式与 KV cache。编译器侧改 `tinygrad` 的调度或内存规划，在同一张卡上 A/B。`tvm` 用来对照工业界的编译器是怎么划分这些层的。
+> `how-to-optim-algorithm-in-cuda` 有 11 个文件名含冒号，Windows 检出时已按
+> `WINDOWS-CHECKOUT.txt` 的对应关系写成冒号替换为 ` -` 的副本。
 
-## 没有放进来的项目
+## 讲义附件
 
-这些项目质量很高，和这张卡的硬件对不上，克隆下来也无法作为实验底座。
+各上游仓库随附的 PDF/PPTX 讲义合计约 570 MB，因 Gitee 单仓库体积上限不入库，
+打包放在本仓库的 **Release 附件**（`slides-01.zip` ~ `slides-07.zip`，tag
+`slides-2026-10-05`）。解压到仓库根目录后相对路径还原，笔记中的幻灯片链接
+重新对上。清单见 [SLIDES-MANIFEST.txt](SLIDES-MANIFEST.txt)。
 
-| 项目 | 原因 |
-| --- | --- |
-| [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention) | 当前开发转向 CuTe DSL，作者明确不为 Turing 维护 kernel |
-| [vllm-project/vllm](https://github.com/vllm-project/vllm)、[sgl-project/sglang](https://github.com/sgl-project/sglang)、TensorRT-LLM | 服务系统的调度思想值得读论文和文档；仓库里的融合 kernel 按 Ampere 及更新的架构编译 |
-| DeepGEMM、FlashMLA、ThunderKittens | FP8、TMA、WGMMA，需要 Hopper 或更新 |
-| TorchTitan、Megatron-LM、DeepSpeed 的多卡路径 | 这台机器是单卡，没有 NVLink |
-| PyTorch 本体 | 体积大，而且应当作为已经安装好的基线去对比，不需要把源码树放在这里 |
-| [NVIDIA/cuda-samples](https://github.com/NVIDIA/cuda-samples) | 官方 API 示例。入门手感由 GPU-Puzzles 和 GPU MODE 覆盖，需要查某个 CUDA API 时再单独克隆 |
+## 工程流程：SDD 归档
 
-## 更新快照
+七个实验站不是随手写的脚本堆，每一站都走了完整的需求-设计-开发-审查-验收
+流程，产物归档在 [`specs/archive/`](specs/archive/)：
 
-这些目录是浅克隆。在能访问 GitHub 的机器上，进入对应目录执行 `git pull`。公司网络克隆时使用了临时代理 `http://proxy.ai.yinwang.com:8080`，没有写入 git 配置。
+```
+specs/archive/AR001-gpu-puzzles-solutions/   srs.md + design.md + st-cases.md
+specs/archive/AR002-gemm-lab/                （同上，ST 用例 + 执行报告）
+specs/archive/AR003-cublas-gemm-sweep/
+specs/archive/AR004-triton-dsl-lab/
+specs/archive/AR005-llamacpp-inference-lab/
+specs/archive/AR006-nanogpt-training-lab/
+specs/archive/AR007-quant-frameworks-lab/
+```
 
-`how-to-optim-algorithm-in-cuda` 再次检出时，Windows 仍会拒绝那 11 个带冒号的文件名。按 `WINDOWS-CHECKOUT.txt` 里的对应关系，用 `git cat-file` 取出 blob 后写入替换过冒号的文件名即可。
+`srs.md` 里的每条验收标准（Given/When/Then）都能在 `st-cases.md` 中找到
+对应的 ST 用例与实际执行结果（AR007：12/12 PASS，需求覆盖 100%）。
 
-Triton 和 TVM 都没有拉取子模块。阅读和跑 Triton 自带教程不需要它们。要在本地编译这两棵源码树时，再按各自 README 初始化子模块，LLVM 那一份会占用几十 GB。
+## 这台机器的边界
+
+| 部件 | 规格 | 对实验设计的影响 |
+|---|---|---|
+| CPU | Xeon Gold 6234，8C16T @3.3 GHz | 数据预处理够用；数据加载先进内存 |
+| 内存 | 128 GB | 语料/tokenizer 缓存常驻 |
+| GPU | Quadro RTX 5000（TU104，sm_75） | 48 SM / 3072 CUDA Core / 384 第二代 Tensor Core |
+| 显存 | 16 GB GDDR6，448 GB/s | 工作集以 16 GB 为准 |
+| 算力 | FP32 ~11.2 TF；FP16 TC ~89.2 TF | FP32 拐点 ~25 FLOP/byte，FP16 TC ~199 FLOP/byte |
+| 片上 | shared 64 KB/SM，L2 4 MB | kernel 按 64 KB 分块，不按 Hopper 228 KB 写 |
+| 互联 | PCIe 3.0（~12 GB/s H2D） | 大权重分层换入显存，decode 被总线卡住 |
+
+Turing Tensor Core 只做 FP16/INT8/INT4；BF16/FP8/TMA/WGMMA 是 Ampere 之后的
+硬件——这正是 AR006 "bf16 反慢 0.57×" 与 AR004 "Triton fp16 未触发 mma"
+两组反直觉实测的根源，也是本仓库反复出现的主题：**硬件边界决定软件行为**。
+
+16 GB 上现实的模型尺度：从头训练 GPT-2 small/medium 一档；微调 7B 走
+bitsandbytes 4-bit QLoRA（AR007 账本：7.5B QLoRA 4.0 GB）；推理 7B FP16
+或 13B 4-bit。
+
+## 面试笔记索引
+
+每站配六段结构面试笔记（高频问法 / 追问链 / 数字卡片 / 手写骨架 / 红线清单 /
+60 秒电梯陈述），全部数字 [本机实测] 或 [源码 file:line]：
+
+- [INTERVIEW-INDEX.md](01-foundations/notes/INTERVIEW-INDEX.md) — 跨站主题索引（七站数字总卡片）
+- AR001-AR004 讲义笔记：[01-foundations/notes/](01-foundations/notes/)
+- [AR002 gemm-lab-notes](02-handwritten-kernels/notes/gemm-lab-notes.md) ·
+  [AR003 gemm-sweep-notes](03-gemm/notes/gemm-sweep-notes.md) ·
+  [AR03 CUTLASS 拆解](03-gemm/notes/cutlass-turing-dissection.md)
+- [AR04 triton-notes](04-kernel-dsl/notes/triton-notes.md) ·
+  [tl.dot lowering 取证](04-kernel-dsl/notes/triton-lowering-sm75.md)
+- [AR05 llamacpp-notes](05-inference/notes/llamacpp-notes.md) ·
+  [llama.cpp 内部件拆解](05-inference/notes/llamacpp-internals.md)
+- [AR06 nanogpt-training-notes](06-training/notes/nanogpt-training-notes.md) ·
+  [llm.c 内部件拆解](06-training/notes/llmc-internals.md)
+- [AR07 frameworks-notes（六段）](07-frameworks/frameworks-lab/notes/frameworks-notes.md) ·
+  [bnb 内部件拆解](07-frameworks/frameworks-lab/notes/bnb-internals.md) ·
+  [tinygrad 内部件拆解](07-frameworks/frameworks-lab/notes/tinygrad-internals.md)
+
+---
+
+<p align="center">
+  自研实验代码（<code>*-lab/</code>、<code>specs/</code>、<code>docs/</code>）仅供学习参考；<br>
+  上游克隆目录版权归各自作者所有，遵循其原 LICENSE。
+</p>

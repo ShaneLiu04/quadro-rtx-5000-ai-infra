@@ -1,0 +1,51 @@
+{
+ "exp": "e5_ledger",
+ "env": {
+  "timestamp": "2026-10-06T20:41:04",
+  "seed": 20261006,
+  "python": "3.11.9",
+  "torch": "2.5.1+cu121",
+  "cuda_runtime": "12.1",
+  "gpu": "Quadro RTX 5000",
+  "gpu_cc": "7.5",
+  "cpu_capability": "AVX512",
+  "cpu": "Intel64 Family 6 Model 85 Stepping 7, GenuineIntel"
+ },
+ "measured_bytes": {
+  "fp32_training": 67108864,
+  "amp_mixed": 58331648,
+  "int8_optim_states": 8126464,
+  "int8_optim_full_P32_G16": 32126464,
+  "nf4_params_storage": 2125824
+ },
+ "bytes_per_param": {
+  "fp32_training": 16.777216,
+  "amp_mixed": 14.582912,
+  "int8_optim_states": 2.031616,
+  "int8_optim_full_P32_G16": 8.031616,
+  "nf4_params_storage": 0.531456
+ },
+ "theory_bytes_per_param": {
+  "fp32_training": 16.0,
+  "amp_mixed": 14.0,
+  "int8_optim_full_P32_G16": 8.03125,
+  "nf4_params_storage": 0.53125
+ },
+ "consistency_ratio": {
+  "fp32_training": 1.048576,
+  "amp_mixed": 1.0416365714285714,
+  "int8_optim_full_P32_G16": 1.0000455719844357,
+  "nf4_params_storage": 1.0003877647058825
+ },
+ "projection_7p5B": {
+  "fp32_training_GB": 125.82912,
+  "amp_mixed_GB": 109.37184,
+  "int8_optim_GB": 60.23712,
+  "qlora_base_nf4_GB": 3.9859200000000006,
+  "qlora_total_example_GB": 4.43817,
+  "note": "qlora_total_example assumes 1% trainable LoRA params (fp16 P+G + 8bit m/v)"
+ },
+ "gates": {
+  "g5_consistency_within_10pct": true
+ }
+}

@@ -1,0 +1,119 @@
+{
+ "exp": "e2_llmint8",
+ "env": {
+  "timestamp": "2026-10-06T21:06:51",
+  "seed": 20261006,
+  "python": "3.11.9",
+  "torch": "2.5.1+cu121",
+  "cuda_runtime": "12.1",
+  "gpu": "Quadro RTX 5000",
+  "gpu_cc": "7.5",
+  "cpu_capability": "AVX512",
+  "cpu": "Intel64 Family 6 Model 85 Stepping 7, GenuineIntel"
+ },
+ "uniform": {
+  "rel_err_int8": 0.011678093113005161,
+  "rel_err_fp16": 0.00035932930768467486,
+  "shape": [
+   2048,
+   2048,
+   2048
+  ]
+ },
+ "threshold_sweep": {
+  "0.0": {
+   "rel_err": 0.04858245328068733,
+   "outlier_cols": null,
+   "outlier_frac": 0.0,
+   "kept_int8_cols": 2048
+  },
+  "2.0": {
+   "rel_err": 0.0003585212689358741,
+   "outlier_cols": 2048,
+   "outlier_frac": 1.0,
+   "kept_int8_cols": 0
+  },
+  "4.0": {
+   "rel_err": 0.007778043393045664,
+   "outlier_cols": 239,
+   "outlier_frac": 0.11669921875,
+   "kept_int8_cols": 1809
+  },
+  "8.0": {
+   "rel_err": 0.011447561904788017,
+   "outlier_cols": 8,
+   "outlier_frac": 0.00390625,
+   "kept_int8_cols": 2040
+  },
+  "16.0": {
+   "rel_err": 0.021890640258789062,
+   "outlier_cols": 8,
+   "outlier_frac": 0.00390625,
+   "kept_int8_cols": 2040
+  },
+  "32.0": {
+   "rel_err": 0.03960878774523735,
+   "outlier_cols": 8,
+   "outlier_frac": 0.00390625,
+   "kept_int8_cols": 2040
+  }
+ },
+ "outlier_feature_cols": 8,
+ "scaling_compare": {
+  "per_tensor": 0.017605304718017578,
+  "per_row_act": 0.011678093113005161,
+  "per_row_heavytail": 0.04858245328068733
+ },
+ "throughput": {
+  "2048": {
+   "fp16_kernel_ms": 0.32569991890341043,
+   "fp16_tflops": 52.74753902869366,
+   "int8_kernel_ms": 0.552099896594882,
+   "int8_top_int32": 31.117320053776766,
+   "int8_e2e_ms": 2.1266499534249306,
+   "int8_e2e_top": 8.078371880775272,
+   "ratio_kernel": 0.5899293242259044,
+   "ratio_e2e": 0.1531516356882696
+  },
+  "4096": {
+   "fp16_kernel_ms": 2.019149949774146,
+   "fp16_tflops": 68.06772993128786,
+   "int8_kernel_ms": 3.3273999579250813,
+   "int8_top_int32": 41.305209836482945,
+   "int8_e2e_ms": 9.467449970543385,
+   "int8_e2e_top": 14.516998125115173,
+   "ratio_kernel": 0.6068251413434708,
+   "ratio_e2e": 0.21327284073921088
+  }
+ },
+ "layout_attribution": {
+  "rowA_rowB": {
+   "ms": 0.4635000368580222,
+   "tops": 37.06551848508801
+  },
+  "rowA_colB": {
+   "ms": 0.2528500044718385,
+   "tops": 67.94490361938448
+  },
+  "colA_rowB": {
+   "ms": 0.5026500439271331,
+   "tops": 34.17858884438989
+  },
+  "colA_colB": {
+   "ms": 0.4778000293299556,
+   "tops": 35.956191145681274
+  },
+  "fp16_reference_ms": 0.32569991890341043
+ },
+ "gate_int8_ratio": false,
+ "gate_int8_revision": {
+  "pre_registered": "int8 kernel-only >= 1.2x fp16 (row-major default)",
+  "result": "FAILED at 0.59x: default layout lands on cuBLAS int8 SLOW path (NT)",
+  "revised_finding": "with column-major B (TN layout) _int_mm hits the IMMA path: 67.9 TOPS = 1.83x vs default, but only 1.29x of fp16 — sm_75 torch._int_mm does not reach the 2x paper peak; bnb's custom igemmlt layouts exist precisely for this reason"
+ },
+ "gates": {
+  "g2_int8_kernel_ge_1p2x_fp16": false,
+  "g_threshold_sweep_recorded": true,
+  "g_uniform_err_sane": true
+ }
+}

@@ -1,0 +1,510 @@
+{
+ "exp": "doc_check",
+ "n_checks": 81,
+ "all_pass": true,
+ "n_fail": 0,
+ "checks": [
+  {
+   "check": "corpus total chars (17.66M)",
+   "doc_value": 17664897,
+   "json_value": 17664897,
+   "pass": true
+  },
+  {
+   "check": "corpus vocab (142)",
+   "doc_value": 142,
+   "json_value": 142,
+   "pass": true
+  },
+  {
+   "check": "corpus entropy (5.732)",
+   "doc_value": 5.732,
+   "json_value": 5.7323,
+   "pass": true
+  },
+  {
+   "check": "e0 det graph nodes (56)",
+   "doc_value": 56,
+   "json_value": 56,
+   "pass": true
+  },
+  {
+   "check": "e0 rand graph nodes (236)",
+   "doc_value": 236,
+   "json_value": 236,
+   "pass": true
+  },
+  {
+   "check": "e0 THREEFRY count (4)",
+   "doc_value": 4,
+   "json_value": 4,
+   "pass": true
+  },
+  {
+   "check": "e0 bnb degraded (True)",
+   "doc_value": true,
+   "json_value": true,
+   "pass": true
+  },
+  {
+   "check": "e0 int_mm cuda bitexact (True)",
+   "doc_value": true,
+   "json_value": true,
+   "pass": true
+  },
+  {
+   "check": "e0 nf4 map == our official table (True)",
+   "doc_value": true,
+   "json_value": true,
+   "pass": true
+  },
+  {
+   "check": "e0 nf4 map != raw ndtri (False)",
+   "doc_value": false,
+   "json_value": false,
+   "pass": true
+  },
+  {
+   "check": "e0 bnb version (0.50.3.dev0)",
+   "doc_value": "0.50.3.dev0",
+   "json_value": "0.50.3.dev0",
+   "pass": true
+  },
+  {
+   "check": "e1 NF4 @64 (0.092)",
+   "doc_value": 0.092,
+   "json_value": 0.09199454635381699,
+   "pass": true
+  },
+  {
+   "check": "e1 INT4 @64 (0.100)",
+   "doc_value": 0.1,
+   "json_value": 0.10039769113063812,
+   "pass": true
+  },
+  {
+   "check": "e1 nf4_raw @64 (0.127)",
+   "doc_value": 0.127,
+   "json_value": 0.1273697167634964,
+   "pass": true
+  },
+  {
+   "check": "e1 FP4 @64 (0.377)",
+   "doc_value": 0.377,
+   "json_value": 0.37687331438064575,
+   "pass": true
+  },
+  {
+   "check": "e1 NF4 block32 (0.0873)",
+   "doc_value": 0.0873,
+   "json_value": 0.08732278645038605,
+   "pass": true
+  },
+  {
+   "check": "e1 NF4 block1024 (0.1043)",
+   "doc_value": 0.1043,
+   "json_value": 0.10425932705402374,
+   "pass": true
+  },
+  {
+   "check": "e1 head kurtosis (8.4)",
+   "doc_value": 8.4,
+   "json_value": 8.422739028930664,
+   "pass": true
+  },
+  {
+   "check": "e1 head NF4 (0.1046)",
+   "doc_value": 0.1046,
+   "json_value": 0.10462111979722977,
+   "pass": true
+  },
+  {
+   "check": "e1 head INT4 (0.1291)",
+   "doc_value": 0.1291,
+   "json_value": 0.12909482419490814,
+   "pass": true
+  },
+  {
+   "check": "e1 G1 gate (True)",
+   "doc_value": true,
+   "json_value": true,
+   "pass": true
+  },
+  {
+   "check": "e1 absmax mean (3.80)",
+   "doc_value": 3.8,
+   "json_value": 3.8023934364318848,
+   "pass": true
+  },
+  {
+   "check": "e1 NF4 official endpoints (-1, 1)",
+   "doc_value": [
+    -1.0,
+    1.0
+   ],
+   "json_value": [
+    -1.0,
+    1.0
+   ],
+   "pass": true
+  },
+  {
+   "check": "e1 nf4_raw endpoints (~±1.863)",
+   "doc_value": [
+    -1.8627,
+    1.8627
+   ],
+   "json_value": [
+    -1.8627,
+    1.8627
+   ],
+   "pass": true
+  },
+  {
+   "check": "e2 tau0 err (4.86e-2)",
+   "doc_value": 0.0486,
+   "json_value": 0.04858245328068733,
+   "pass": true
+  },
+  {
+   "check": "e2 tau8 err (1.14e-2)",
+   "doc_value": 0.0114,
+   "json_value": 0.011447561904788017,
+   "pass": true
+  },
+  {
+   "check": "e2 tau2 err = fp16 (3.6e-4)",
+   "doc_value": 0.00036,
+   "json_value": 0.0003585212689358741,
+   "pass": true
+  },
+  {
+   "check": "e2 tau16 err (2.19e-2)",
+   "doc_value": 0.0219,
+   "json_value": 0.021890640258789062,
+   "pass": true
+  },
+  {
+   "check": "e2 tau32 err (3.96e-2)",
+   "doc_value": 0.0396,
+   "json_value": 0.03960878774523735,
+   "pass": true
+  },
+  {
+   "check": "e2 tau2 degenerate frac (1.0)",
+   "doc_value": 1.0,
+   "json_value": 1.0,
+   "pass": true
+  },
+  {
+   "check": "e2 tau8 outlier cols (8)",
+   "doc_value": 8,
+   "json_value": 8,
+   "pass": true
+  },
+  {
+   "check": "e2 tau8 frac (0.0039)",
+   "doc_value": 0.0039,
+   "json_value": 0.00390625,
+   "pass": true
+  },
+  {
+   "check": "e2 improvement tau0->tau8 (4.2x)",
+   "doc_value": 4.2,
+   "json_value": 4.243912693790929,
+   "pass": true
+  },
+  {
+   "check": "e2 per-tensor (1.76e-2)",
+   "doc_value": 0.0176,
+   "json_value": 0.017605304718017578,
+   "pass": true
+  },
+  {
+   "check": "e2 per-row (1.17e-2)",
+   "doc_value": 0.0117,
+   "json_value": 0.011678093113005161,
+   "pass": true
+  },
+  {
+   "check": "e2 per-row heavytail (4.86e-2)",
+   "doc_value": 0.0486,
+   "json_value": 0.04858245328068733,
+   "pass": true
+  },
+  {
+   "check": "e2 fp16 TFLOPS (52.7)",
+   "doc_value": 52.7,
+   "json_value": 52.74753902869366,
+   "pass": true
+  },
+  {
+   "check": "e2 int8 default TOPS (31.1)",
+   "doc_value": 31.1,
+   "json_value": 31.117320053776766,
+   "pass": true
+  },
+  {
+   "check": "e2 int8 e2e TOPS (8.1)",
+   "doc_value": 8.1,
+   "json_value": 8.078371880775272,
+   "pass": true
+  },
+  {
+   "check": "e2 default ratio (0.59)",
+   "doc_value": 0.59,
+   "json_value": 0.5899293242259044,
+   "pass": true
+  },
+  {
+   "check": "e2 e2e ratio (0.15)",
+   "doc_value": 0.15,
+   "json_value": 0.1531516356882696,
+   "pass": true
+  },
+  {
+   "check": "e2 TN TOPS (67.9)",
+   "doc_value": 67.9,
+   "json_value": 67.94490361938448,
+   "pass": true
+  },
+  {
+   "check": "e2 TN vs default (1.83x, layout-paired)",
+   "doc_value": 1.83,
+   "json_value": 1.8331027433683325,
+   "pass": true
+  },
+  {
+   "check": "e2 TN vs fp16 (1.29x)",
+   "doc_value": 1.29,
+   "json_value": 1.288115139976933,
+   "pass": true
+  },
+  {
+   "check": "e2 rowA_rowB TOPS (37.1)",
+   "doc_value": 37.1,
+   "json_value": 37.06551848508801,
+   "pass": true
+  },
+  {
+   "check": "e2 colA_rowB TOPS (34.2)",
+   "doc_value": 34.2,
+   "json_value": 34.17858884438989,
+   "pass": true
+  },
+  {
+   "check": "e2 colA_colB TOPS (36.0)",
+   "doc_value": 36.0,
+   "json_value": 35.956191145681274,
+   "pass": true
+  },
+  {
+   "check": "e2 fp16 baseline err (3.6e-4)",
+   "doc_value": 0.00036,
+   "json_value": 0.00035932930768467486,
+   "pass": true
+  },
+  {
+   "check": "e2 G2 gate (False - honest FAIL)",
+   "doc_value": false,
+   "json_value": false,
+   "pass": true
+  },
+  {
+   "check": "e3 final loss diff (0.0207)",
+   "doc_value": 0.0207,
+   "json_value": 0.02073979377746582,
+   "pass": true
+  },
+  {
+   "check": "e3 fp32 final (1.1353)",
+   "doc_value": 1.1353,
+   "json_value": 1.1353224515914917,
+   "pass": true
+  },
+  {
+   "check": "e3 int8 final (1.1561)",
+   "doc_value": 1.1561,
+   "json_value": 1.1560622453689575,
+   "pass": true
+  },
+  {
+   "check": "e3 fp32 state MB (26.09)",
+   "doc_value": 26.09,
+   "json_value": 26.091728,
+   "pass": true
+  },
+  {
+   "check": "e3 int8 state MB (6.62)",
+   "doc_value": 6.62,
+   "json_value": 6.6248,
+   "pass": true
+  },
+  {
+   "check": "e3 mem ratio (0.254)",
+   "doc_value": 0.254,
+   "json_value": 0.2539042258910564,
+   "pass": true
+  },
+  {
+   "check": "e3 fp32 step ms (33.9)",
+   "doc_value": 33.9,
+   "json_value": 33.89449999667704,
+   "pass": true
+  },
+  {
+   "check": "e3 int8 step ms (62.5)",
+   "doc_value": 62.5,
+   "json_value": 62.4997999984771,
+   "pass": true
+  },
+  {
+   "check": "e3 step time ratio (1.84)",
+   "doc_value": 1.84,
+   "json_value": 1.843951083644971,
+   "pass": true
+  },
+  {
+   "check": "e3 params (3261440)",
+   "doc_value": 3261440,
+   "json_value": 3261440,
+   "pass": true
+  },
+  {
+   "check": "e3 G3 gate (True)",
+   "doc_value": true,
+   "json_value": true,
+   "pass": true
+  },
+  {
+   "check": "e5 fp32 B/param (16.777)",
+   "doc_value": 16.777,
+   "json_value": 16.777216,
+   "pass": true
+  },
+  {
+   "check": "e5 amp B/param (14.583)",
+   "doc_value": 14.583,
+   "json_value": 14.582912,
+   "pass": true
+  },
+  {
+   "check": "e5 int8 optim B/param (8.032)",
+   "doc_value": 8.032,
+   "json_value": 8.031616,
+   "pass": true
+  },
+  {
+   "check": "e5 nf4 B/param (0.5315)",
+   "doc_value": 0.5315,
+   "json_value": 0.531456,
+   "pass": true
+  },
+  {
+   "check": "e5 fp32 theory (16.0)",
+   "doc_value": 16.0,
+   "json_value": 16.0,
+   "pass": true
+  },
+  {
+   "check": "e5 nf4 theory (0.53125)",
+   "doc_value": 0.53125,
+   "json_value": 0.53125,
+   "pass": true
+  },
+  {
+   "check": "e5 fp32 ratio (1.049)",
+   "doc_value": 1.049,
+   "json_value": 1.048576,
+   "pass": true
+  },
+  {
+   "check": "e5 amp ratio (1.042)",
+   "doc_value": 1.042,
+   "json_value": 1.0416365714285714,
+   "pass": true
+  },
+  {
+   "check": "e5 7.5B fp32 GB (125.8)",
+   "doc_value": 125.8,
+   "json_value": 125.82912,
+   "pass": true
+  },
+  {
+   "check": "e5 7.5B amp GB (109.4)",
+   "doc_value": 109.4,
+   "json_value": 109.37184,
+   "pass": true
+  },
+  {
+   "check": "e5 7.5B int8 GB (60.2)",
+   "doc_value": 60.2,
+   "json_value": 60.23712,
+   "pass": true
+  },
+  {
+   "check": "e5 7.5B QLoRA base GB (4.0)",
+   "doc_value": 4.0,
+   "json_value": 3.9859200000000006,
+   "pass": true
+  },
+  {
+   "check": "e5 7.5B QLoRA total GB (4.4)",
+   "doc_value": 4.4,
+   "json_value": 4.43817,
+   "pass": true
+  },
+  {
+   "check": "e5 G5 gate (True)",
+   "doc_value": true,
+   "json_value": true,
+   "pass": true
+  },
+  {
+   "check": "e5 projection = bpp * 7.5e9 (fp32)",
+   "doc_value": 125.82912,
+   "json_value": 125.82912,
+   "pass": true
+  },
+  {
+   "check": "e5 projection = bpp * 7.5e9 (nf4)",
+   "doc_value": 3.9859200000000006,
+   "json_value": 3.9859200000000006,
+   "pass": true
+  },
+  {
+   "check": "dynamic_map(signed=True) == bnb create_dynamic_map, 256 levels exact",
+   "doc_value": true,
+   "json_value": true,
+   "pass": true
+  },
+  {
+   "check": "dynamic_map(signed=True) nonzero levels (255)",
+   "doc_value": 255,
+   "json_value": 255,
+   "pass": true
+  },
+  {
+   "check": "dynamic_map(signed=False) == bnb create_dynamic_map, 256 levels exact",
+   "doc_value": true,
+   "json_value": true,
+   "pass": true
+  },
+  {
+   "check": "dynamic_map(signed=False) nonzero levels (255)",
+   "doc_value": 255,
+   "json_value": 255,
+   "pass": true
+  },
+  {
+   "check": "gates: exactly one FAIL (G2)",
+   "doc_value": [
+    "g2"
+   ],
+   "json_value": [
+    "g2"
+   ],
+   "pass": true
+  }
+ ]
+}
