@@ -1,0 +1,560 @@
+{
+ "exp": "doc_number_check",
+ "n_checks": 92,
+ "n_pass": 92,
+ "all_pass": true,
+ "checks": [
+  {
+   "check": "corpus total chars",
+   "doc_value": 898703,
+   "json_value": 898703,
+   "pass": true
+  },
+  {
+   "check": "corpus vocab",
+   "doc_value": 124,
+   "json_value": 124,
+   "pass": true
+  },
+  {
+   "check": "corpus entropy bits/char",
+   "doc_value": 5.162,
+   "json_value": 5.1624,
+   "pass": true
+  },
+  {
+   "check": "train chars",
+   "doc_value": 853768,
+   "json_value": 853768,
+   "pass": true
+  },
+  {
+   "check": "val chars",
+   "doc_value": 44935,
+   "json_value": 44935,
+   "pass": true
+  },
+  {
+   "check": "e1 final train loss (0.085)",
+   "doc_value": 0.085,
+   "json_value": 0.08519082143902779,
+   "pass": true
+  },
+  {
+   "check": "e1 val min (1.468)",
+   "doc_value": 1.468,
+   "json_value": 1.4678617119789124,
+   "pass": true
+  },
+  {
+   "check": "e1 val min step (750)",
+   "doc_value": 750,
+   "json_value": 750,
+   "pass": true
+  },
+  {
+   "check": "e1 final val (2.348)",
+   "doc_value": 2.348,
+   "json_value": 2.3481663316488266,
+   "pass": true
+  },
+  {
+   "check": "e1 tok/s (300163)",
+   "doc_value": 300163,
+   "json_value": 300163.41891827766,
+   "pass": true
+  },
+  {
+   "check": "e1 ms/step (54.6)",
+   "doc_value": 54.6,
+   "json_value": 54.58360002376139,
+   "pass": true
+  },
+  {
+   "check": "e1 MFU pct (23.9)",
+   "doc_value": 23.9,
+   "json_value": 23.923740572714372,
+   "pass": true
+  },
+  {
+   "check": "e1 scaler init (65536)",
+   "doc_value": 65536,
+   "json_value": 65536.0,
+   "pass": true
+  },
+  {
+   "check": "e1 scaler final (131072)",
+   "doc_value": 131072,
+   "json_value": 131072.0,
+   "pass": true
+  },
+  {
+   "check": "e1 scaler backoffs (0)",
+   "doc_value": 0,
+   "json_value": 0,
+   "pass": true
+  },
+  {
+   "check": "e1 params non-embed (10669440)",
+   "doc_value": 10669440,
+   "json_value": 10669440,
+   "pass": true
+  },
+  {
+   "check": "e1 epochs (~58)",
+   "doc_value": 58,
+   "json_value": 57.57067493745373,
+   "pass": true
+  },
+  {
+   "check": "e2 fp32 tok/s (255305)",
+   "doc_value": 255305,
+   "json_value": 255304.69384918528,
+   "pass": true
+  },
+  {
+   "check": "e2 fp32 ms/step (64.2)",
+   "doc_value": 64.2,
+   "json_value": 64.17429994326085,
+   "pass": true
+  },
+  {
+   "check": "e2 fp32 final loss (0.727)",
+   "doc_value": 0.727,
+   "json_value": 0.7269116938114166,
+   "pass": true
+  },
+  {
+   "check": "e2 fp32 MFU (50.7)",
+   "doc_value": 50.7,
+   "json_value": 50.66062100988154,
+   "pass": true
+  },
+  {
+   "check": "e2 fp16 tok/s (682175)",
+   "doc_value": 682175,
+   "json_value": 682174.9324891082,
+   "pass": true
+  },
+  {
+   "check": "e2 fp16 ms/step (24.0)",
+   "doc_value": 24.0,
+   "json_value": 24.017299991101027,
+   "pass": true
+  },
+  {
+   "check": "e2 fp16 final loss (0.729)",
+   "doc_value": 0.729,
+   "json_value": 0.7288428544998169,
+   "pass": true
+  },
+  {
+   "check": "e2 fp16 MFU (17.0)",
+   "doc_value": 17.0,
+   "json_value": 16.99654445606728,
+   "pass": true
+  },
+  {
+   "check": "e2 bf16 tok/s (146872)",
+   "doc_value": 146872,
+   "json_value": 146871.89057449394,
+   "pass": true
+  },
+  {
+   "check": "e2 bf16 ms/step (111.6)",
+   "doc_value": 111.6,
+   "json_value": 111.55299993697554,
+   "pass": true
+  },
+  {
+   "check": "e2 bf16 final loss (0.728)",
+   "doc_value": 0.728,
+   "json_value": 0.7276997566223145,
+   "pass": true
+  },
+  {
+   "check": "e2 bf16 MFU (3.7)",
+   "doc_value": 3.7,
+   "json_value": 3.659346743199029,
+   "pass": true
+  },
+  {
+   "check": "e2 fp16 speedup (2.67)",
+   "doc_value": 2.67,
+   "json_value": 2.672003096394638,
+   "pass": true
+  },
+  {
+   "check": "e2 bf16/fp32 ratio (0.575)",
+   "doc_value": 0.575,
+   "json_value": 0.5752808080420753,
+   "pass": true
+  },
+  {
+   "check": "e3 0.5M val (1.755)",
+   "doc_value": 1.755,
+   "json_value": 1.755247250199318,
+   "pass": true
+  },
+  {
+   "check": "e3 0.5M MFU (7.5)",
+   "doc_value": 7.5,
+   "json_value": 7.512012403604397,
+   "pass": true
+  },
+  {
+   "check": "e3 0.5M tok/s (2065063)",
+   "doc_value": 2065063,
+   "json_value": 2065062.5813656074,
+   "pass": true
+  },
+  {
+   "check": "e3 0.5M non-embed params (409728)",
+   "doc_value": 409728,
+   "json_value": 409728,
+   "pass": true
+  },
+  {
+   "check": "e3 3M val (1.576)",
+   "doc_value": 1.576,
+   "json_value": 1.5760010704398155,
+   "pass": true
+  },
+  {
+   "check": "e3 3M MFU (17.1)",
+   "doc_value": 17.1,
+   "json_value": 17.09297904230497,
+   "pass": true
+  },
+  {
+   "check": "e3 3M tok/s (686045)",
+   "doc_value": 686045,
+   "json_value": 686045.4402576933,
+   "pass": true
+  },
+  {
+   "check": "e3 3M non-embed params (3179776)",
+   "doc_value": 3179776,
+   "json_value": 3179776,
+   "pass": true
+  },
+  {
+   "check": "e3 10.5M val (1.912)",
+   "doc_value": 1.912,
+   "json_value": 1.9122818633913994,
+   "pass": true
+  },
+  {
+   "check": "e3 10.5M MFU (23.7)",
+   "doc_value": 23.7,
+   "json_value": 23.700687457162406,
+   "pass": true
+  },
+  {
+   "check": "e3 10.5M tok/s (297365)",
+   "doc_value": 297365,
+   "json_value": 297364.84377234866,
+   "pass": true
+  },
+  {
+   "check": "e3 10.5M non-embed params (10669440)",
+   "doc_value": 10669440,
+   "json_value": 10669440,
+   "pass": true
+  },
+  {
+   "check": "e3 25M val (2.063)",
+   "doc_value": 2.063,
+   "json_value": 2.062527760863304,
+   "pass": true
+  },
+  {
+   "check": "e3 25M MFU (29.9)",
+   "doc_value": 29.9,
+   "json_value": 29.87676544202764,
+   "pass": true
+  },
+  {
+   "check": "e3 25M tok/s (162490)",
+   "doc_value": 162490,
+   "json_value": 162489.549325181,
+   "pass": true
+  },
+  {
+   "check": "e3 25M non-embed params (25238016)",
+   "doc_value": 25238016,
+   "json_value": 25238016,
+   "pass": true
+  },
+  {
+   "check": "e3 10.5M pred ms (43.7)",
+   "doc_value": 43.7,
+   "json_value": 43.70767274078281,
+   "pass": true
+  },
+  {
+   "check": "e3 10.5M meas ms (55.1)",
+   "doc_value": 55.1,
+   "json_value": 55.097299977205694,
+   "pass": true
+  },
+  {
+   "check": "e3 pred ratio (1.26)",
+   "doc_value": 1.26,
+   "json_value": 1.2605864490651646,
+   "pass": true
+  },
+  {
+   "check": "e3 0.5M pred ms (~2.0)",
+   "doc_value": 2.0,
+   "json_value": 1.9948463053203205,
+   "pass": true
+  },
+  {
+   "check": "e3 3M pred ms (~13.7)",
+   "doc_value": 13.7,
+   "json_value": 13.663162694286257,
+   "pass": true
+  },
+  {
+   "check": "e3 0.5M meas/pred (3.98)",
+   "doc_value": 3.98,
+   "json_value": 3.9771986302488314,
+   "pass": true
+  },
+  {
+   "check": "e3 3M meas/pred (1.75)",
+   "doc_value": 1.75,
+   "json_value": 1.747896921191029,
+   "pass": true
+  },
+  {
+   "check": "e1 first val (2.193)",
+   "doc_value": 2.193,
+   "json_value": 2.19328510761261,
+   "pass": true
+  },
+  {
+   "check": "e2 fp32 vram peak MB (1225)",
+   "doc_value": 1225,
+   "json_value": 1225.421312,
+   "pass": true
+  },
+  {
+   "check": "e2 fp16 vram peak MB (774)",
+   "doc_value": 774,
+   "json_value": 774.218752,
+   "pass": true
+  },
+  {
+   "check": "e2 bf16 vram peak MB (1226)",
+   "doc_value": 1226,
+   "json_value": 1225.500672,
+   "pass": true
+  },
+  {
+   "check": "e4 lr0.0001_cosine (2.424)",
+   "doc_value": 2.424,
+   "json_value": 2.4236286878585815,
+   "pass": true
+  },
+  {
+   "check": "e4 lr0.0001_constant (2.107)",
+   "doc_value": 2.107,
+   "json_value": 2.107247471809387,
+   "pass": true
+  },
+  {
+   "check": "e4 lr0.0003_cosine (1.84)",
+   "doc_value": 1.84,
+   "json_value": 1.840097427368164,
+   "pass": true
+  },
+  {
+   "check": "e4 lr0.0003_constant (1.498)",
+   "doc_value": 1.498,
+   "json_value": 1.4978792071342468,
+   "pass": true
+  },
+  {
+   "check": "e4 lr0.001_cosine (1.109)",
+   "doc_value": 1.109,
+   "json_value": 1.108830451965332,
+   "pass": true
+  },
+  {
+   "check": "e4 lr0.001_constant (1.025)",
+   "doc_value": 1.025,
+   "json_value": 1.0247915387153625,
+   "pass": true
+  },
+  {
+   "check": "e4 lr0.003_cosine (0.822)",
+   "doc_value": 0.822,
+   "json_value": 0.8222397863864899,
+   "pass": true
+  },
+  {
+   "check": "e4 lr0.003_constant (0.972)",
+   "doc_value": 0.972,
+   "json_value": 0.97159743309021,
+   "pass": true
+  },
+  {
+   "check": "e4 B16 steps (3198)",
+   "doc_value": 3198,
+   "json_value": 3198,
+   "pass": true
+  },
+  {
+   "check": "e4 B16 tok/s (364884)",
+   "doc_value": 364884,
+   "json_value": 364883.5232204621,
+   "pass": true
+  },
+  {
+   "check": "e4 B16 final loss (0.706)",
+   "doc_value": 0.706,
+   "json_value": 0.7059999704360962,
+   "pass": true
+  },
+  {
+   "check": "e4 B64 steps (800)",
+   "doc_value": 800,
+   "json_value": 800,
+   "pass": true
+  },
+  {
+   "check": "e4 B64 tok/s (685883)",
+   "doc_value": 685883,
+   "json_value": 685883.1731960922,
+   "pass": true
+  },
+  {
+   "check": "e4 B64 final loss (1.102)",
+   "doc_value": 1.102,
+   "json_value": 1.1017284989356995,
+   "pass": true
+  },
+  {
+   "check": "e4 B256 steps (200)",
+   "doc_value": 200,
+   "json_value": 200,
+   "pass": true
+  },
+  {
+   "check": "e4 B256 tok/s (768968)",
+   "doc_value": 768968,
+   "json_value": 768968.1194182577,
+   "pass": true
+  },
+  {
+   "check": "e4 B256 final loss (2.411)",
+   "doc_value": 2.411,
+   "json_value": 2.4110645055770874,
+   "pass": true
+  },
+  {
+   "check": "e5 linear/matmul pct (27.0)",
+   "doc_value": 27.0,
+   "json_value": 26.996736153929554,
+   "pass": true
+  },
+  {
+   "check": "e5 top5 pct sum (50.9)",
+   "doc_value": 50.9,
+   "json_value": 50.850814897292274,
+   "pass": true
+  },
+  {
+   "check": "e5 elementwise/copy (11.3)",
+   "doc_value": 11.3,
+   "json_value": 11.262630193003917,
+   "pass": true
+  },
+  {
+   "check": "e5 attention (9.9)",
+   "doc_value": 9.9,
+   "json_value": 9.871222083207789,
+   "pass": true
+  },
+  {
+   "check": "e5 layernorm (9.5)",
+   "doc_value": 9.5,
+   "json_value": 9.52169057515393,
+   "pass": true
+  },
+  {
+   "check": "e5 eager overhead (9.1)",
+   "doc_value": 9.1,
+   "json_value": 9.055094280387458,
+   "pass": true
+  },
+  {
+   "check": "e5 activation (5.9)",
+   "doc_value": 5.9,
+   "json_value": 5.934519545495966,
+   "pass": true
+  },
+  {
+   "check": "e5 optimizer (2.4)",
+   "doc_value": 2.4,
+   "json_value": 2.4127983738636902,
+   "pass": true
+  },
+  {
+   "check": "e5 transpose count (4900)",
+   "doc_value": 4900,
+   "json_value": 4900,
+   "pass": true
+  },
+  {
+   "check": "e5 mm count (1500)",
+   "doc_value": 1500,
+   "json_value": 1500,
+   "pass": true
+  },
+  {
+   "check": "e5 mm pct (25.7)",
+   "doc_value": 25.7,
+   "json_value": 25.68102107099647,
+   "pass": true
+  },
+  {
+   "check": "e5 fresh tok/s (301651)",
+   "doc_value": 301651,
+   "json_value": 301651.4057859628,
+   "pass": true
+  },
+  {
+   "check": "e5 fresh vs e1 within 10%",
+   "doc_value": 1.0,
+   "json_value": 1,
+   "pass": true
+  },
+  {
+   "check": "e7 fp16 flash (0= False)",
+   "doc_value": 0,
+   "json_value": 0,
+   "pass": true
+  },
+  {
+   "check": "e7 fp16 mem_efficient (1= True)",
+   "doc_value": 1,
+   "json_value": 1,
+   "pass": true
+  },
+  {
+   "check": "e7 fp32 flash (0= False)",
+   "doc_value": 0,
+   "json_value": 0,
+   "pass": true
+  },
+  {
+   "check": "e7 compile failed (1)",
+   "doc_value": 1,
+   "json_value": 1,
+   "pass": true
+  }
+ ]
+}

@@ -1,0 +1,45 @@
+{
+ "exp": "t013_spot_check",
+ "sdpa_probe": {
+  "fresh": {
+   "fp16": {
+    "flash": false,
+    "mem_efficient": true
+   },
+   "fp32": {
+    "flash": false,
+    "mem_efficient": true
+   }
+  },
+  "archived": {
+   "fp16": {
+    "flash": false,
+    "mem_efficient": true
+   },
+   "fp32": {
+    "flash": false,
+    "mem_efficient": true
+   }
+  },
+  "identical_to_archived": true
+ },
+ "fresh_200step": {
+  "tokens_per_s": 300720.4150746728,
+  "step_time_ms_median": 54.48249995242804,
+  "final_train_loss_200": 2.4614458084106445,
+  "e1_tokens_per_s": 300163.41891827766,
+  "ratio_vs_e1": 1.0018556430307277,
+  "within_15pct": true,
+  "loss_finite_and_decreased": true
+ },
+ "verify_numbers": {
+  "exit_code": 0,
+  "tail": "92/92 checks pass, all_pass=True"
+ },
+ "gates": {
+  "sdpa_backend_identical": true,
+  "fresh_within_15pct_of_e1": true,
+  "loss_sane": true,
+  "verify_numbers_all_pass": true
+ }
+}
