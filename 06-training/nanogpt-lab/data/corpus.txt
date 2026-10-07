@@ -6882,4 +6882,3325 @@ Depending on the build target, another backend may have higher priority than the
 
 KleidiAI microkernels use Arm CPU features such as dotprod, i8mm, SVE, and SME/SME2. Build-time configuration makes the kernels available. Runtime dispatch selects a compatible kernel for the detected CPU and operation. Older or lower-feature CPUs fall back automatically to compatible kernels.
 
-KleidiAI accelerates selected `GGML_O
+KleidiAI accelerates selected `GGML_OP_MUL_MAT` paths for F32 and common quantized formats. Exact coverage depends on the bundled KleidiAI version and the llama.cpp runtime selector, so unsupported tensor types, unsupported operation shapes, or higher priority backends may bypass KleidiAI even when the CPU supports the required Arm feature. This is also why a model may not use SME-family kernels on SME-capable hardware.
+
+The current llama.cpp KleidiAI SVE selector only enables SVE kernels when the runtime SVE vector length is known to be QK8_0 bytes, currently 32 bytes. Linux and Android query this at runtime. Apple reports SVE capability separately from userspace non-streaming SVE availability, so llama.cpp treats the SVE vector length as unknown there. Windows exposes SVE feature presence but not the runtime SVE vector length used by this selector, so that value is also treated as unknown. Windows arm64 also treats SMCU count as unknown until a detection mechanism is verified.
+
+The set of available SME-family kernels depends on the bundled KleidiAI version and the detected CPU capabilities. Production configuration does not require any KleidiAI runtime environment variables.
+
+### Diagnostics and debug overrides
+
+KleidiAI runtime environment variables are diagnostics/debug overrides, not production configuration. Leave them unset for normal use.
+
+`GGML_KLEIDIAI_SME` controls SME-family kernel selection and overrides the maximum number of threads assigned to selected quantized SME-family kernels:
+
+- Not set: use automatic runtime detection.
+- `0`: disable SME-family kernels.
+- `<n> > 0`: enable compatible SME-family kernels and allow up to `<n>` threads for quantized SME-family kernels.
+
+On Windows arm64, use `GGML_KLEIDIAI_SME=<n>` as the temporary diagnostics/debug override for SME thread-cap calibration until automatic SMCU count detection is verified.
+
+If the CPU does not support the required SME-family capability for a bundled kernel, that kernel is disabled regardless of the environment variable.
+
+## OpenCL
+
+This provides GPU acceleration through OpenCL on recent Adreno GPU.
+More information about OpenCL backend can be found in [OPENCL.md](./backend/OPENCL.md) for more information.
+
+### Android
+
+Assume NDK is available in `$ANDROID_NDK`. First, install OpenCL headers and ICD loader library if not available,
+
+```sh
+mkdir -p ~/dev/llm
+cd ~/dev/llm
+
+git clone https://github.com/KhronosGroup/OpenCL-Headers && \
+cd OpenCL-Headers && \
+cp -r CL $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include
+
+cd ~/dev/llm
+
+git clone https://github.com/KhronosGroup/OpenCL-ICD-Loader && \
+cd OpenCL-ICD-Loader && \
+mkdir build_ndk && cd build_ndk && \
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+  -DOPENCL_ICD_LOADER_HEADERS_DIR=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=24 \
+  -DANDROID_STL=c++_shared && \
+ninja && \
+cp libOpenCL.so $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android
+```
+
+Then build llama.cpp with OpenCL enabled,
+
+```sh
+cd ~/dev/llm
+
+git clone https://github.com/ggml-org/llama.cpp && \
+cd llama.cpp && \
+mkdir build-android && cd build-android
+
+cmake .. -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-28 \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DGGML_OPENCL=ON
+
+ninja
+```
+
+### Windows Arm64
+
+First, install OpenCL headers and ICD loader library if not available,
+
+```powershell
+mkdir -p ~/dev/llm
+
+cd ~/dev/llm
+git clone https://github.com/KhronosGroup/OpenCL-Headers && cd OpenCL-Headers
+mkdir build && cd build
+cmake .. -G Ninja `
+  -DBUILD_TESTING=OFF `
+  -DOPENCL_HEADERS_BUILD_TESTING=OFF `
+  -DOPENCL_HEADERS_BUILD_CXX_TESTS=OFF `
+  -DCMAKE_INSTALL_PREFIX="$HOME/dev/llm/opencl"
+cmake --build . --target install
+
+cd ~/dev/llm
+git clone https://github.com/KhronosGroup/OpenCL-ICD-Loader && cd OpenCL-ICD-Loader
+mkdir build && cd build
+cmake .. -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_PREFIX_PATH="$HOME/dev/llm/opencl" `
+  -DCMAKE_INSTALL_PREFIX="$HOME/dev/llm/opencl"
+cmake --build . --target install
+```
+
+Then build llama.cpp with OpenCL enabled,
+
+```powershell
+cmake .. -G Ninja `
+  -DCMAKE_TOOLCHAIN_FILE="$HOME/dev/llm/llama.cpp/cmake/arm64-windows-llvm.cmake" `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_PREFIX_PATH="$HOME/dev/llm/opencl" `
+  -DBUILD_SHARED_LIBS=OFF `
+  -DGGML_OPENCL=ON
+ninja
+```
+
+## Android
+
+To read documentation for how to build on Android, [click here](./android.md)
+
+## WebGPU
+
+The WebGPU backend relies on [Dawn](https://dawn.googlesource.com/dawn). Follow the instructions [here](https://dawn.googlesource.com/dawn/+/refs/heads/main/docs/quickstart-cmake.md) to install Dawn locally so that llama.cpp can find it using CMake. The current implementation is up-to-date with Dawn commit `94c3c9c`.
+
+In the llama.cpp directory, build with CMake:
+
+```
+cmake -B build -DGGML_WEBGPU=ON
+cmake --build build --config Release
+```
+
+### Browser Support
+
+WebGPU allows cross-platform access to the GPU from supported browsers. We utilize [Emscripten](https://emscripten.org/) to compile ggml's WebGPU backend to WebAssembly. Emscripten does not officially support WebGPU bindings yet, but Dawn currently maintains its own WebGPU bindings called emdawnwebgpu.
+
+Follow the instructions [here](https://dawn.googlesource.com/dawn/+/refs/heads/main/src/emdawnwebgpu/) to download or build the emdawnwebgpu package (Note that it might be safer to build the emdawnwebgpu package locally, so that it stays in sync with the version of Dawn you have installed above). When building using CMake, the path to the emdawnwebgpu port file needs to be set with the flag `EMDAWNWEBGPU_DIR`.
+
+## IBM Z & LinuxONE
+
+To read documentation for how to build on IBM Z & LinuxONE, [click here](./build-s390x.md)
+
+## OpenVINO
+
+[OpenVINO](https://docs.openvino.ai/) is an open-source toolkit for optimizing and deploying high-performance AI inference, specifically designed for Intel hardware (CPUs, GPUs, and NPUs).
+
+For build instructions and usage examples, refer to [OPENVINO.md](backend/OPENVINO.md).
+
+### Hexagon
+
+Check [README.md](./backend/snapdragon/README.md) for target specific build and run info.
+
+---
+## Notes about GPU-accelerated backends
+
+The GPU may still be used to accelerate some parts of the computation even when using the `-ngl 0` option. You can fully disable GPU acceleration by using `--device none`.
+
+In most cases, it is possible to build and use multiple backends at the same time. For example, you can build llama.cpp with both CUDA and Vulkan support by using the `-DGGML_CUDA=ON -DGGML_VULKAN=ON` options with CMake. At runtime, you can specify which backend devices to use with the `--device` option. To see a list of available devices, use the `--list-devices` option.
+
+Backends can be built as dynamic libraries that can be loaded dynamically at runtime. This allows you to use the same llama.cpp binary on different machines with different GPUs. To enable this feature, use the `GGML_BACKEND_DL` option when building.
+
+# Completions
+
+Command-line completion is available for some environments.
+
+## Bash Completion
+
+```bash
+$ build/bin/llama-cli --completion-bash > ~/.llama-completion.bash
+$ source ~/.llama-completion.bash
+```
+
+Optionally this can be added to your `.bashrc` or `.bash_profile` to load it
+automatically. For example:
+
+```console
+$ echo "source ~/.llama-completion.bash" >> ~/.bashrc
+```
+
+# Debugging Tests Tips
+
+## How to run & execute or debug a specific test without anything else to keep the feedback loop short?
+
+There is a script called debug-test.sh in the scripts folder whose parameter takes a REGEX and an optional test number.
+
+For example, running the following command will output an interactive list from which you can select a test. It takes this form:
+
+`debug-test.sh [OPTION]... <test_regex> <test_number>`
+
+It will then build & run in the debugger for you.
+
+To just execute a test and get back a PASS or FAIL message run:
+
+```bash
+./scripts/debug-test.sh test-tokenizer
+```
+
+To test in GDB use the `-g` flag to enable gdb test mode.
+
+```bash
+./scripts/debug-test.sh -g test-tokenizer
+
+# Once in the debugger, i.e. at the chevrons prompt, setting a breakpoint could be as follows:
+>>> b main
+```
+
+To speed up the testing loop, if you know your test number you can just run it similar to below:
+
+```bash
+./scripts/debug-test.sh test 23
+```
+
+For further reference use `debug-test.sh -h` to print help.
+
+&nbsp;
+
+### How does the script work?
+If you want to be able to use the concepts contained in the script separately, the important ones are briefly outlined below.
+
+#### Step 1: Reset and Setup folder context
+
+From base of this repository, let's create `build-ci-debug` as our build context.
+
+```bash
+rm -rf build-ci-debug && mkdir build-ci-debug && cd build-ci-debug
+```
+
+#### Step 2: Setup Build Environment and Compile Test Binaries
+
+Setup and trigger a build under debug mode. You may adapt the arguments as needed, but in this case these are sane defaults.
+
+```bash
+cmake -DCMAKE_BUILD_TYPE=Debug -DLLAMA_CUDA=1 -DLLAMA_FATAL_WARNINGS=ON ..
+make -j
+```
+
+#### Step 3: Find all tests available that matches REGEX
+
+The output of this command will give you the command & arguments needed to run GDB.
+
+* `-R test-tokenizer` : looks for all the test files named `test-tokenizer*` (R=Regex)
+* `-N` : "show-only" disables test execution & shows test commands that you can feed to GDB.
+* `-V` : Verbose Mode
+
+```bash
+ctest -R "test-tokenizer" -V -N
+```
+
+This may return output similar to below (focusing on key lines to pay attention to):
+
+```bash
+...
+1: Test command: ~/llama.cpp/build-ci-debug/bin/test-tokenizer-0 "~/llama.cpp/tests/../models/ggml-vocab-llama-spm.gguf"
+1: Working Directory: .
+Labels: main
+  Test  #1: test-tokenizer-0-llama-spm
+...
+4: Test command: ~/llama.cpp/build-ci-debug/bin/test-tokenizer-0 "~/llama.cpp/tests/../models/ggml-vocab-falcon.gguf"
+4: Working Directory: .
+Labels: main
+  Test  #4: test-tokenizer-0-falcon
+...
+```
+
+#### Step 4: Identify Test Command for Debugging
+
+So for test #1 above we can tell these two pieces of relevant information:
+* Test Binary: `~/llama.cpp/build-ci-debug/bin/test-tokenizer-0`
+* Test GGUF Model: `~/llama.cpp/tests/../models/ggml-vocab-llama-spm.gguf`
+
+#### Step 5: Run GDB on test command
+
+Based on the ctest 'test command' report above we can then run a gdb session via this command below:
+
+```bash
+gdb --args ${Test Binary} ${Test GGUF Model}
+```
+
+Example:
+
+```bash
+gdb --args ~/llama.cpp/build-ci-debug/bin/test-tokenizer-0 "~/llama.cpp/tests/../models/ggml-vocab-llama-spm.gguf"
+```
+
+# Add a new model architecture to `llama.cpp`
+
+Adding a model requires few steps:
+
+1. Convert the model to GGUF
+2. Define the model architecture in `llama.cpp`
+3. Build the GGML graph implementation
+4. Optional: Add multimodal encoder implementation
+
+After following these steps, you can open PR.
+
+Also, it is important to check that the examples and main ggml backends (CUDA, METAL, CPU) are working with the new architecture, especially:
+- [cli](/tools/cli/)
+- [completion](/tools/completion/)
+- [imatrix](/tools/imatrix/)
+- [quantize](/tools/quantize/)
+- [server](/tools/server/)
+
+### 1. Convert the model to GGUF
+
+This step is done in python with a `convert` script using the [gguf](https://pypi.org/project/gguf/) library.
+Depending on the model architecture, you can use either [convert_hf_to_gguf.py](/convert_hf_to_gguf.py) or [examples/convert_legacy_llama.py](/examples/convert_legacy_llama.py) (for `llama/llama2` models in `.pth` format).
+
+The convert script reads the model configuration, tokenizer, tensor names+data and converts them to GGUF metadata and tensors.
+
+The required steps to implement for an HF model are:
+
+1. Define the model `ModelBase.register` annotation in a new `TextModel` or `MmprojModel` subclass in the [conversion](/conversion) folder, example:
+
+```python
+@ModelBase.register("MyModelForCausalLM")
+@ModelBase.example("user/model")
+class MyModel(TextModel):
+    model_arch = gguf.MODEL_ARCH.MYMODEL
+```
+
+or
+
+```python
+@ModelBase.register("MyModelForConditionalGeneration")
+@ModelBase.example("user/model")
+class MyModel(MmprojModel):
+    model_arch = gguf.MODEL_ARCH.MYMODEL
+```
+
+The `example` should point to a valid Hugging Face model that will be used for testing. You can add multiple models if necessary. Prefer a non-gated model, or tiny random weights if no such model exists.
+
+2. Define the layout of the GGUF tensors in [constants.py](/gguf-py/gguf/constants.py)
+
+Add an enum entry in `MODEL_ARCH`, the model human friendly name in `MODEL_ARCH_NAMES` and the GGUF tensor names in `MODEL_TENSORS`.
+
+NOTE: Pick the GGUF arch string (and the matching `src/models/<name>.cpp` filename, see section 3) carefully up front, following existing naming conventions. Once GGUF files are published under a given arch string, renaming it later breaks the community's existing files, so this is not something to leave for cleanup in a follow-up PR.
+
+Example for `falcon` model:
+```python
+    MODEL_ARCH.FALCON: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_NORM_2,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+    ]
+```
+
+3. Map the original tensor names to the standardize equivalent in GGUF
+
+As a general rule, before adding a new tensor name to GGUF, be sure the equivalent naming does not already exist.
+
+Once you have found the GGUF tensor name equivalent, add it to the [tensor_mapping.py](/gguf-py/gguf/tensor_mapping.py) file.
+
+If the tensor name is part of a repetitive layer/block, the key word `bid` substitutes it.
+
+Example for the normalization tensor in attention layers:
+
+```python
+block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
+        # Attention norm
+        MODEL_TENSOR.ATTN_NORM: (
+            "gpt_neox.layers.{bid}.input_layernorm",                # gptneox
+            "transformer.h.{bid}.ln_1",                             # gpt2 gpt-j refact qwen
+            "transformer.blocks.{bid}.norm_1",                      # mpt
+            ...
+        )
+}
+```
+
+`transformer.blocks.{bid}.norm_1` will be mapped to `blk.{bid}.attn_norm` in GGUF.
+
+Depending on the model configuration, tokenizer, code and tensors layout, you will have to override:
+- `TextModel#set_gguf_parameters`
+- `MmprojModel#set_gguf_parameters`
+- `ModelBase#set_vocab`
+- `ModelBase#modify_tensors`
+
+NOTE: Tensor names must end with `.weight` or `.bias` suffixes, that is the convention and several tools like `quantize` expect this to proceed the weights.
+
+### 2. Define the model architecture in `llama.cpp`
+
+The model params and tensors layout must be defined in `llama.cpp` source files:
+1. Define a new `llm_arch` enum value in `src/llama-arch.h`.
+2. In `src/llama-arch.cpp`:
+    - Add the architecture name to the `LLM_ARCH_NAMES` map.
+    - You may also need to update `LLM_KV_NAMES`, `LLM_TENSOR_NAMES` and `LLM_TENSOR_INFOS`
+3. Add any non-standard metadata loading in the `llama_model_loader` constructor in `src/llama-model-loader.cpp`.
+4. If the model has a RoPE operation, add a case for the architecture in `llama_model_rope_type` function in `src/llama-model.cpp`.
+5. Check for other places that switch/iterate over every `llm_arch` value, e.g. `src/llama-model-saver.cpp` and any mandatory-hparam lists (such as which archs require MoE metadata). Grep for `LLM_ARCH_` usages to find them. Missing one of these is a common cause of CI test failures (e.g. `test-llama-archs`) after adding a new arch.
+
+NOTE: The dimensions in `ggml` are typically in the reverse order of the `pytorch` dimensions.
+
+### 3. Build the GGML graph implementation
+
+This is the funniest part, you have to provide the inference graph implementation of the new model architecture in `src/llama-model.cpp`:
+1. Create a new struct that inherits from `llama_model_base`.
+2. Implement the graph-building logic in its `build_arch_graph` method.
+3. The `build_arch_graph` method should return a constructed graph (inherited from `llm_graph_context`). Have a look at existing implementations like `llama_model_llama`, `llama_model_dbrx` or `llama_model_bert`.
+4. Then, in the `llama_model_mapping` function, add a case for your architecture to instantiate your new graph-building struct.
+
+Some `ggml` backends do not support all operations. Backend implementations can be added in a separate PR.
+
+Note: to debug the inference graph: you can use [llama-eval-callback](/examples/eval-callback/).
+
+### 4. Optional: Add multimodal encoder implementation
+
+If the new model supports multimodal inputs, you will need to add a new encoder definition in `libmtmd`. You can find more information about llama.cpp's multimodal support in [the docs](../multimodal.md) and in the `tools/mtmd` source directory.
+
+1. In the conversion script, make sure you add a subclass that extends `MmprojModel` or another class that inherits from the same base class.
+2. Add the encoder definition in `clip.cpp`.
+3. Implement the preprocessor in `mtmd.cpp`. In most cases, you can reuse an existing preprocessor.
+4. Implement the encoder GGML graph, either in a dedicated file if the model is truly different from existing ones, or by reusing an existing implementation (for example: siglip, pixtral, or qwen) and adding a model-specific projector.
+
+Note:
+- Many multimodal encoders are based on models that are already supported. Make sure to read the existing encoder definitions in `tools/mtmd/models` before adding a new one. In `libmtmd`, it is generally better to extend an existing model than to duplicate code.
+- To debug the multimodal preprocessor and encoder, you can use [llama-mtmd-debug](tools/mtmd/debug/mtmd-debug.cpp).
+- Adding a model-specific API or CLI is an anti-pattern in `libmtmd`. The goal of `libmtmd` is to provide an easy-to-use, model-agnostic library for multimodal pipeline.
+- In most cases, `llama-mtmd-cli` should not be modified. If a model requires a specific prompt, either let the user provide it or bake it into the Jinja chat template.
+- For audio generation models, see `tools/mtmd/README-dev.md`
+
+## Add a decision model
+
+A decision model answers typed questions about a state in one forward pass. It is served by `POST /v1/systemone` in `llama-server`, see [the server docs](../../tools/server/README.md).
+
+The conversion is the same as above, but a new model needs its own `DecisionType` in `gguf-py/gguf/constants.py`. See the existing models and follow the pattern.
+
+> [!IMPORTANT]
+>
+> Most of the logic is handled in `tools/server/server-decision.cpp`, to avoid too many changes to `libllama`.
+
+Note:
+- If a new public API is needed in `libllama`, add it to `llama-ext.h`.
+- Metadata with a single use case must be hard-coded in `server-decision.cpp` instead of being saved to the GGUF. This avoids bloating the conversion code.
+- Most importantly, keep your change as small and as self-contained as possible. Reuse the existing infrastructure whenever you can.
+
+For more information, see [PR #29818](https://github.com/ggml-org/llama.cpp/pull/29818).
+
+## Tips and tricks
+
+### Prefer conversion-time tensor modifications over graph-time ones
+
+If the model contains constant modifications of tensors in the graph (for example, `norm(1 + weight)`) or performs tensor permutations/chunking, perform the modifications during conversion rather than in the graph code. This keeps the inference graph simpler and avoids extra runtime ops.
+
+Examples:
+- Gemma 3 folds the `1 +` of its `norm(1 + weight)` normalization into the weights at conversion time, so the graph just does a plain RMS norm.
+- Qwen3-Next applies its tensor permutation during conversion (in `modify_tensors`), so the graph can consume the already-permuted weights directly.
+
+Exception: a plain `weight * scale` with a constant scale is usually better left to inference time rather than folded into the weight at conversion. The scale conceptually applies to the activation, not the weight, so folding it into the weight can hurt numerical stability, and it shifts the weight's value range in a way that can make quantization worse. In this case, write the scale to GGUF as its own metadata key (e.g. `%s.attention.output_scale`, `%s.attention.value_scale`, `%s.embedding_scale`) and apply it in the graph, instead of pre-multiplying the weight tensor during conversion.
+
+### Working with ggml_rope_ext
+
+PyTorch implementations usually prefer explicitly calculating `freq_cis`/`sin`/`cos` components. However, in llama.cpp, most RoPE operations can be handled via `ggml_rope_ext`, which does not require a sin/cos matrix. This saves memory while allowing the GGML RoPE kernel to be fused with other ops.
+
+However, since `ggml_rope_ext` only provides a subset of the RoPE implementations that models use, converting models from PyTorch to llama.cpp may require some creative adaptations.
+
+For more information about `ggml_rope_ext`, please refer to the in-code documentation in `ggml.h`.
+
+Examples:
+- `libmtmd` implements 2D RoPE with `GGML_ROPE_TYPE_NORMAL` ordering by splitting the input tensor in half, applying `ggml_rope_ext` separately to each half, then joining them back together using `ggml_concat`.
+- The [Kimi-K2.5](https://github.com/ggml-org/llama.cpp/pull/19170) vision encoder uses vision RoPE with interleaved frequencies. The weights must be permuted during conversion in order to reuse the `build_rope_2d()` function.
+- [Gemma 4](https://github.com/ggml-org/llama.cpp/pull/21309) uses "proportional" RoPE. We employ a trick where `rope_freqs` is set to a very large value in the last dimensions to prevent those dimensions from being rotated. See the `Gemma4Model` class in `convert_hf_to_gguf.py`.
+- Some models require scaling the input position. For example, `[0, 1, 2, ...]` becomes `[0, 0.5, 1, ...]`. In this case, you can provide the scaling via `freq_scale = 0.5f`.
+- Some models use learned RoPE frequencies instead of relying on `powf(freq_base, -2.0 * i / n_dims)`. In this case, you can provide the learned frequencies via the `rope_freqs` tensor (corresponding to the `c` argument in `ggml_rope_ext`), then set `freq_base = 1.0f`. An important note is that `rope_freqs` in GGML is the **inverse** (`theta = pos[i] / rope_freqs`), so you may need to invert `rope_freqs` during conversion.
+
+### Rotating only a part of the head
+
+Many models rotate only a part of each head and leave the rest untouched (often called the "nope" part). Do not build this with views plus `ggml_concat`, it's not efficient. Both layouts can be done with a single RoPE op:
+
+- `[rope|nope]`, rotated dims first: pass `n_dims` smaller than the head size to `ggml_rope_ext`. Dims from `n_dims` to the end are copied as-is.
+- `[nope|rope]`, rotated dims last: call `ggml_rope_set_offset(cur, n_offs)` on the result of the RoPE, where `n_offs` is the size of the leading untouched part. Dims outside `[n_offs, n_offs + n_dims)` are copied as-is.
+
+`n_offs` must be even, `n_offs + n_dims` must fit in the row, and vision RoPE is not supported. Note that the frequencies are computed relative to the rotated window.
+
+Example: DeepSeek-V4 uses `[nope|rope]` for its query, key and compressed KV tensors, so `src/models/deepseek4.cpp` ropes the whole tensor and then calls `ggml_rope_set_offset(cur, n_embd_head_nope)`.
+
+Exception: some models apply an extra op to the `nope` part, for example `deepseek32.cpp`, and may not use this optimization. While RoPE can be applied selectively to a part of the head, the extra op may not, so these models still need views plus `ggml_concat`.
+
+## GGUF specification
+
+https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
+
+## Resources
+
+- YaRN RoPE scaling https://github.com/ggml-org/llama.cpp/pull/2268
+- support Baichuan serial models https://github.com/ggml-org/llama.cpp/pull/3009
+- support attention bias https://github.com/ggml-org/llama.cpp/pull/4283
+- Mixtral support https://github.com/ggml-org/llama.cpp/pull/4406
+- BERT embeddings https://github.com/ggml-org/llama.cpp/pull/5423
+- Grok-1 support https://github.com/ggml-org/llama.cpp/pull/6204
+- Command R Plus support https://github.com/ggml-org/llama.cpp/pull/6491
+- support arch DBRX https://github.com/ggml-org/llama.cpp/pull/6515
+- How to convert HuggingFace model to GGUF format https://github.com/ggml-org/llama.cpp/discussions/2948
+
+# Parsing Model Output
+
+The `common` library contains a PEG parser implementation suitable for parsing
+model output.
+
+Types with the prefix `common_peg_*` are intended for general use and may have
+applications beyond parsing model output, such as parsing user-provided regex
+patterns.
+
+Types with the prefix `common_chat_peg_*` are specialized helpers for model
+output.
+
+The parser features:
+
+- Partial parsing of streaming input
+- Built-in JSON parsers
+- AST generation with semantics via "tagged" nodes
+
+## Example
+
+Below is a contrived example demonstrating how to use the PEG parser to parse
+output from a model that emits arguments as JSON.
+
+```cpp
+auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    // Build a choice of all available tools
+    auto tool_choice = p.choice();
+    for (const auto & tool : tools) {
+        const auto & function = tool.at("function");
+        std::string name = function.at("name");
+        const auto   schema = common_chat_tool_parameters(function);
+
+        auto tool_name = p.json_member("name", "\"" + p.literal(name) + "\"");
+        auto tool_args = p.json_member("arguments", p.schema(p.json(), "tool-" + name + "-schema", schema));
+
+        tool_choice |= p.rule("tool-" + name, "{" << tool_name << "," << tool_args << "}");
+    }
+
+    // Define the tool call structure: <tool_call>[{tool}]</tool_call>
+    auto tool_call = p.trigger_rule("tool-call",
+        p.sequence({
+            p.literal("<tool_call>["),
+            tool_choice,
+            p.literal("]</tool_call>")
+        })
+    );
+
+    // Parser accepts content, optionally followed by a tool call
+    return p.sequence({
+        p.content(p.until("<tool_call>")),
+        p.optional(tool_call),
+        p.end()
+    });
+});
+```
+
+For a more complete example, see `test_example_native()` in
+[tests/test-chat-peg-parser.cpp](/tests/test-chat-peg-parser.cpp).
+
+## Parsers/Combinators
+
+### Basic Matchers
+
+- **`eps()`** - Matches nothing and always succeeds (epsilon/empty match)
+- **`start()`** - Matches the start of input (anchor `^`)
+- **`end()`** - Matches the end of input (anchor `$`)
+- **`literal(string)`** - Matches an exact literal string
+- **`any()`** - Matches any single character (`.`)
+
+### Combinators
+
+- **`sequence(...)`** - Matches parsers in order; all must succeed
+- **`choice(...)`** - Matches the first parser that succeeds from alternatives (ordered choice)
+- **`one_or_more(p)`** - Matches one or more repetitions (`+`)
+- **`zero_or_more(p)`** - Matches zero or more repetitions (`*`)
+- **`optional(p)`** - Matches zero or one occurrence (`?`)
+- **`repeat(p, min, max)`** - Matches between min and max repetitions (use `-1` for unbounded)
+- **`repeat(p, n)`** - Matches exactly n repetitions
+
+### Lookahead
+
+- **`peek(p)`** - Positive lookahead: succeeds if parser succeeds without consuming input (`&`)
+- **`negate(p)`** - Negative lookahead: succeeds if parser fails without consuming input (`!`)
+
+### Character Classes & Utilities
+
+- **`chars(classes, min, max)`** - Matches repetitions of characters from a character class
+- **`space()`** - Matches zero or more whitespace characters (space, tab, newline)
+- **`until(delimiter)`** - Matches characters until delimiter is found (delimiter not consumed)
+- **`until_one_of(delimiters)`** - Matches characters until any delimiter in the list is found
+- **`rest()`** - Matches everything remaining (`.*`)
+
+### JSON Parsers
+
+- **`json()`** - Complete JSON parser (objects, arrays, strings, numbers, booleans, null)
+- **`json_object()`** - JSON object parser
+- **`json_array()`** - JSON array parser
+- **`json_string()`** - JSON string parser
+- **`json_number()`** - JSON number parser
+- **`json_bool()`** - JSON boolean parser
+- **`json_null()`** - JSON null parser
+- **`json_string_content()`** - JSON string content without surrounding quotes
+- **`json_member(key, p)`** - JSON object member with specific key and value parser
+
+### Grammar Building
+
+- **`ref(name)`** - Creates a lightweight reference to a named rule (for recursive grammars)
+- **`rule(name, p, trigger)`** - Creates a named rule and returns a reference
+- **`trigger_rule(name, p)`** - Creates a trigger rule (entry point for lazy grammar generation)
+- **`schema(p, name, schema, raw)`** - Wraps parser with JSON schema metadata for grammar generation
+- **`schema(p, name, doc, node, raw)`** - Same, for a node of a `common_chat_schema_document` built earlier, e.g. one tool parameter
+
+### AST Control
+
+- **`atomic(p)`** - Prevents AST node creation for partial parses
+- **`tag(tag, p)`** - Creates AST nodes with semantic tags (multiple nodes can share tags)
+
+## GBNF Grammar Generation
+
+The PEG parser also acts as a convenient DSL for generating GBNF grammars, with
+some exceptions.
+
+```cpp
+data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+    parser.build_grammar(builder, data.grammar_lazy);
+});
+```
+
+The notable exception is the `negate(p)` lookahead parser, which cannot be
+defined as a CFG grammar and therefore does not produce a rule. Its usage
+should be limited and preferably hidden behind a `schema()` parser. In many
+cases, `until(delimiter)` or `until_one_of(delimiters)` is a better choice.
+
+Another limitation is that the PEG parser requires an unambiguous grammar. In
+contrast, the `llama-grammar` implementation can support ambiguous grammars,
+though they are difficult to parse.
+
+### Lazy Grammars
+
+During lazy grammar generation, only rules reachable from a `trigger_rule(p)`
+are emitted in the grammar. All trigger rules are added as alternations in the
+root rule. It is still necessary to define trigger patterns, as the parser has
+no interaction with the grammar sampling.
+
+### JSON Schema
+
+The `schema(p, name, schema, raw)` parser will use the `json-schema-to-grammar`
+implementation to generate the grammar instead of the underlying parser.
+
+The `raw` option emits a grammar suitable for a raw string instead of a JSON
+string. In other words, it won't be wrapped in quotes or require escaping
+quotes. It only takes effect when the schema may be a string, as reported by
+`common_chat_schema::may_be_string()`, otherwise the JSON grammar is used.
+
+The downside is that it can potentially lead to ambiguous grammars. For
+example, if a user provides the pattern `^.*$`, the following grammar may be
+generated:
+
+```
+root ::= "<arg>" .* "</arg>"
+```
+
+This creates an ambiguous grammar that cannot be parsed by the PEG parser. To
+help mitigate this, if `.*` is found in the pattern, the grammar from the
+underlying parser will be emitted instead.
+
+## Common AST Shapes for Chat Parsing
+
+Most model output can be placed in one of the following categories:
+
+- Content only
+- Tool calling with arguments emitted as a single JSON object
+- Tool calling with arguments emitted as separate entities, either XML
+  (Qwen3-Coder, MiniMax M2) or pseudo-function calls (LFM2)
+
+To provide broad coverage,
+[`common/chat-peg-parser.h`](/common/chat-peg-parser.h) contains builders and
+mappers that help create parsers and visitors/extractors for these types. They
+require parsers to tag nodes to conform to an AST "shape". This normalization
+makes it easy to extract information and generalize parsing.
+
+### Simple
+
+The `common_chat_peg_builder` builds a `simple` parser that supports
+content-only models with optional reasoning.
+
+- **`reasoning(p)`** - Tag node for extracting `reasoning_content`
+- **`content(p)`** - Tag node for extracting `content`
+
+```cpp
+build_chat_peg_parser([&](common_chat_peg_parser & p) {
+    return p.sequence({
+        p.optional("<think>" + p.reasoning(p.until("</think>")) + "</think>"),
+        p.content(p.until("<tool_call>")),
+        p.end()
+    });
+});
+```
+
+Use `common_chat_peg_mapper` to extract the content. Note that this is already
+done for you in `common_chat_peg_parser` when
+`chat_format == COMMON_CHAT_FORMAT_PEG_SIMPLE`.
+
+```cpp
+auto result = parser.parse(ctx);
+
+common_chat_msg msg;
+auto mapper = common_chat_peg_mapper(msg);
+mapper.from_ast(ctx.ast, result);
+```
+
+### Native
+
+The `common_chat_peg_builder` builds a `native` parser suitable for
+models that emit tool arguments as a direct JSON object.
+
+- **`reasoning(p)`** - Tag node for `reasoning_content`
+- **`content(p)`** - Tag node for `content`
+- **`tool(p)`** - Tag entirety of a single tool call
+- **`tool_open(p)`** - Tag start of a tool call
+- **`tool_close(p)`** - Tag end of a tool call
+- **`tool_id(p)`** - Tag the tool call ID (optional)
+- **`tool_name(p)`** - Tag the tool name
+- **`tool_args(p)`** - Tag the tool arguments
+
+```cpp
+build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    auto get_weather_tool = p.tool(p.sequence({
+        p.tool_open(p.literal("{")),
+        p.json_member("name", "\"" + p.tool_name(p.literal("get_weather")) + "\""),
+        p.literal(","),
+        p.json_member("arguments", p.tool_args(p.json())),
+        p.tool_close(p.literal("}"))
+    }));
+
+    return p.sequence({
+        p.content(p.until("<tool_call>")),
+        p.literal("<tool_call>"),
+        get_weather_tool,
+        p.literal("</tool_call>"),
+        p.end()
+    });
+});
+```
+
+### Constructed
+
+The `common_chat_peg_builder` builds a `constructed` parser
+suitable for models that emit tool arguments as separate entities, such as XML
+tags.
+
+- **`reasoning(p)`** - Tag node for `reasoning_content`
+- **`content(p)`** - Tag node for `content`
+- **`tool(p)`** - Tag entirety of a single tool call
+- **`tool_open(p)`** - Tag start of a tool call
+- **`tool_close(p)`** - Tag end of a tool call
+- **`tool_name(p)`** - Tag the tool name
+- **`tool_arg(p)`** - Tag a complete tool argument (name + value)
+- **`tool_arg_open(p)`** - Tag start of a tool argument
+- **`tool_arg_close(p)`** - Tag end of a tool argument
+- **`tool_arg_name(p)`** - Tag the argument name
+- **`tool_arg_string_value(p)`** - Tag string value for the argument
+- **`tool_arg_json_value(p)`** - Tag JSON value for the argument
+
+```cpp
+build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    auto location_arg = p.tool_arg(
+        p.tool_arg_open("<parameter name=\"" + p.tool_arg_name(p.literal("location")) + "\">"),
+        p.tool_arg_string_value(p.until("</parameter>")),
+        p.tool_arg_close(p.literal("</parameter>"))
+    );
+
+    auto get_weather_tool = p.tool(p.sequence({
+        p.tool_open("<function name=\"" + p.tool_name(p.literal("get_weather")) + "\">"),
+        location_arg,
+        p.tool_close(p.literal("</function>"))
+    }));
+
+    return p.sequence({
+        p.content(p.until("<tool_call>")),
+        p.literal("<tool_call>"),
+        get_weather_tool,
+        p.literal("</tool_call>"),
+        p.end()
+    });
+});
+```
+
+# Token generation performance troubleshooting
+
+## Verifying that the model is running on the GPU with CUDA
+Make sure you compiled llama with the correct env variables according to [this guide](/docs/build.md#cuda), so that llama accepts the `-ngl N` (or `--n-gpu-layers N`) flag. When running llama, you may configure `N` to be very large, and llama will offload the maximum possible number of layers to the GPU, even if it's less than the number you configured. For example:
+```shell
+./llama-cli -m "path/to/model.gguf" -ngl 200000 -p "Please sir, may I have some "
+```
+
+When running llama, before it starts the inference work, it will output diagnostic information that shows whether cuBLAS is offloading work to the GPU. Look for these lines:
+```shell
+llama_model_load_internal: [cublas] offloading 60 layers to GPU
+llama_model_load_internal: [cublas] offloading output layer to GPU
+llama_model_load_internal: [cublas] total VRAM used: 17223 MB
+... rest of inference
+```
+
+If you see these lines, then the GPU is being used.
+
+## Verifying that the CPU is not oversaturated
+llama accepts a `-t N` (or `--threads N`) parameter. It's extremely important that this parameter is not too large. If your token generation is extremely slow, try setting this number to 1. If this significantly improves your token generation speed, then your CPU is being oversaturated and you need to explicitly set this parameter to the number of the physical CPU cores on your machine (even if you utilize a GPU). If in doubt, start with 1 and double the amount until you hit a performance bottleneck, then scale the number down.
+
+# Example of runtime flags effect on inference speed benchmark
+These runs were tested on the following machine:
+GPU: A6000 (48GB VRAM)
+CPU: 7 physical cores
+RAM: 32GB
+
+Model: `TheBloke_Wizard-Vicuna-30B-Uncensored-GGML/Wizard-Vicuna-30B-Uncensored.q4_0.gguf` (30B parameters, 4bit quantization, GGML)
+
+Run command: `./llama-cli -m "path/to/model.gguf" -p "An extremely detailed description of the 10 best ethnic dishes will follow, with recipes: " -n 1000 [additional benchmark flags]`
+
+Result:
+
+| command | tokens/second (higher is better) |
+| - | - |
+| -ngl 2000000 | N/A (less than 0.1) |
+| -t 7 | 1.7 |
+| -t 1 -ngl 2000000 | 5.5 |
+| -t 7 -ngl 2000000 | 8.7 |
+| -t 4 -ngl 2000000 | 9.1 |
+
+# Docker
+
+## Prerequisites
+* Docker must be installed and running on your system.
+* Create a folder to store big models & intermediate files (ex. /llama/models)
+
+## Images
+We have three Docker images available for this project:
+
+1. `ghcr.io/ggml-org/llama.cpp:full`: This image includes both the `llama-cli` and `llama-completion` executables and the tools to convert LLaMA models into ggml and convert into 4-bit quantization. (platforms: `linux/amd64`, `linux/arm64`, `linux/s390x`)
+2. `ghcr.io/ggml-org/llama.cpp:light`: This image only includes the `llama-cli` and `llama-completion` executables. (platforms: `linux/amd64`, `linux/arm64`, `linux/s390x`)
+3. `ghcr.io/ggml-org/llama.cpp:server`: This image only includes the `llama-server` executable. (platforms: `linux/amd64`, `linux/arm64`, `linux/s390x`)
+
+Additionally, there the following images, similar to the above:
+
+- `ghcr.io/ggml-org/llama.cpp:full-cuda`: Same as `full` but compiled with CUDA 12 support. (platforms: `linux/amd64`, `linux/arm64`)
+- `ghcr.io/ggml-org/llama.cpp:full-cuda13`: Same as `full` but compiled with CUDA 13 support. (platforms: `linux/amd64`, `linux/arm64`)
+- `ghcr.io/ggml-org/llama.cpp:light-cuda`: Same as `light` but compiled with CUDA 12 support. (platforms: `linux/amd64`, `linux/arm64`)
+- `ghcr.io/ggml-org/llama.cpp:light-cuda13`: Same as `light` but compiled with CUDA 13 support. (platforms: `linux/amd64`, `linux/arm64`)
+- `ghcr.io/ggml-org/llama.cpp:server-cuda`: Same as `server` but compiled with CUDA 12 support. (platforms: `linux/amd64`, `linux/arm64`)
+- `ghcr.io/ggml-org/llama.cpp:server-cuda13`: Same as `server` but compiled with CUDA 13 support. (platforms: `linux/amd64`, `linux/arm64`)
+- `ghcr.io/ggml-org/llama.cpp:full-rocm`: Same as `full` but compiled with ROCm support. (platforms: `linux/amd64`)
+- `ghcr.io/ggml-org/llama.cpp:light-rocm`: Same as `light` but compiled with ROCm support. (platforms: `linux/amd64`)
+- `ghcr.io/ggml-org/llama.cpp:server-rocm`: Same as `server` but compiled with ROCm support. (platforms: `linux/amd64`)
+- `ghcr.io/ggml-org/llama.cpp:full-musa`: Same as `full` but compiled with MUSA support. (platforms: `linux/amd64`)
+- `ghcr.io/ggml-org/llama.cpp:light-musa`: Same as `light` but compiled with MUSA support. (platforms: `linux/amd64`)
+- `ghcr.io/ggml-org/llama.cpp:server-musa`: Same as `server` but compiled with MUSA support. (platforms: `linux/amd64`)
+- `ghcr.io/ggml-org/llama.cpp:full-intel`: Same as `full` but compiled with SYCL support. (platforms: `linux/amd64`)
+- `ghcr.io/ggml-org/llama.cpp:light-intel`: Same as `light` but compiled with SYCL support. (platforms: `linux/amd64`)
+- `ghcr.io/ggml-org/llama.cpp:server-intel`: Same as `server` but compiled with SYCL support. (platforms: `linux/amd64`)
+- `ghcr.io/ggml-org/llama.cpp:full-vulkan`: Same as `full` but compiled with Vulkan support. (platforms: `linux/amd64`, `linux/arm64`)
+- `ghcr.io/ggml-org/llama.cpp:light-vulkan`: Same as `light` but compiled with Vulkan support. (platforms: `linux/amd64`, `linux/arm64`)
+- `ghcr.io/ggml-org/llama.cpp:server-vulkan`: Same as `server` but compiled with Vulkan support. (platforms: `linux/amd64`, `linux/arm64`)
+- `ghcr.io/ggml-org/llama.cpp:full-openvino`: Same as `full` but compiled with OpenVino support. (platforms: `linux/amd64`)
+- `ghcr.io/ggml-org/llama.cpp:light-openvino`: Same as `light` but compiled with OpenVino support. (platforms: `linux/amd64`)
+- `ghcr.io/ggml-org/llama.cpp:server-openvino`: Same as `server` but compiled with OpenVino support. (platforms: `linux/amd64`)
+- `ghcr.io/ggml-org/llama.cpp:full-s390x`: Identical to `full`, an alias for the `s390x` platform. (platforms: `linux/s390x`)
+- `ghcr.io/ggml-org/llama.cpp:light-s390x`: Identical to `light`, an alias for the `s390x` platform. (platforms: `linux/s390x`)
+- `ghcr.io/ggml-org/llama.cpp:server-s390x`: Identical to `server`, an alias for the `s390x` platform. (platforms: `linux/s390x`)
+
+The GPU enabled images are not currently tested by CI beyond being built. They are not built with any variation from the ones in the Dockerfiles defined in [.devops/](../.devops/) and the GitHub Action defined in [.github/workflows/docker.yml](../.github/workflows/docker.yml). If you need different settings (for example, a different CUDA, ROCm or MUSA library, you'll need to build the images locally for now).
+
+## Usage
+
+The easiest way to download the models, convert them to ggml and optimize them is with the --all-in-one command which includes the full docker image.
+
+Replace `/path/to/models` below with the actual path where you downloaded the models.
+
+```bash
+docker run -v /path/to/models:/models ghcr.io/ggml-org/llama.cpp:full --all-in-one "/models/" 7B
+```
+
+On completion, you are ready to play!
+
+```bash
+docker run -v /path/to/models:/models ghcr.io/ggml-org/llama.cpp:full --run -m /models/7B/ggml-model-q4_0.gguf
+docker run -v /path/to/models:/models ghcr.io/ggml-org/llama.cpp:full --run-legacy -m /models/32B/ggml-model-q8_0.gguf -no-cnv -p "Building a mobile app can be done in 15 steps:" -n 512
+```
+
+or with a light image:
+
+```bash
+docker run -v /path/to/models:/models --entrypoint /app/llama-cli ghcr.io/ggml-org/llama.cpp:light -m /models/7B/ggml-model-q4_0.gguf
+docker run -v /path/to/models:/models --entrypoint /app/llama-completion ghcr.io/ggml-org/llama.cpp:light -m /models/32B/ggml-model-q8_0.gguf -no-cnv -p "Building a mobile app can be done in 15 steps:" -n 512
+```
+
+or with a server image:
+
+```bash
+docker run -v /path/to/models:/models -p 8080:8080 ghcr.io/ggml-org/llama.cpp:server -m /models/7B/ggml-model-q4_0.gguf --port 8080 --host 0.0.0.0 -n 512
+```
+
+In the above examples, `--entrypoint /app/llama-cli` is specified for clarity, but you can safely omit it since it's the default entrypoint in the container.
+
+## Docker With CUDA
+
+Assuming one has the [nvidia-container-toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) properly installed on Linux, or is using a GPU enabled cloud, `cuBLAS` should be accessible inside the container.
+
+## Building Docker locally
+
+```bash
+docker build -t local/llama.cpp:full-cuda --target full -f .devops/cuda.Dockerfile .
+docker build -t local/llama.cpp:light-cuda --target light -f .devops/cuda.Dockerfile .
+docker build -t local/llama.cpp:server-cuda --target server -f .devops/cuda.Dockerfile .
+```
+
+You may want to pass in some different `ARGS`, depending on the CUDA environment supported by your container host, as well as the GPU architecture.
+
+The defaults are:
+
+- `CUDA_VERSION` set to `12.8.1`
+- `CUDA_DOCKER_ARCH` set to the cmake build default, which includes all the supported architectures
+
+The resulting images, are essentially the same as the non-CUDA images:
+
+1. `local/llama.cpp:full-cuda`: This image includes both the `llama-cli` and `llama-completion` executables and the tools to convert LLaMA models into ggml and convert into 4-bit quantization.
+2. `local/llama.cpp:light-cuda`: This image only includes the `llama-cli` and `llama-completion` executables.
+3. `local/llama.cpp:server-cuda`: This image only includes the `llama-server` executable.
+
+## Usage
+
+After building locally, Usage is similar to the non-CUDA examples, but you'll need to add the `--gpus` flag. You will also want to use the `--n-gpu-layers` flag.
+
+```bash
+docker run --gpus all -v /path/to/models:/models local/llama.cpp:full-cuda --run -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 1
+docker run --gpus all -v /path/to/models:/models local/llama.cpp:light-cuda -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 1
+docker run --gpus all -v /path/to/models:/models local/llama.cpp:server-cuda -m /models/7B/ggml-model-q4_0.gguf --port 8080 --host 0.0.0.0 -n 512 --n-gpu-layers 1
+```
+
+## Docker With MUSA
+
+Assuming one has the [mt-container-toolkit](https://developer.mthreads.com/musa/native) properly installed on Linux, `muBLAS` should be accessible inside the container.
+
+## Building Docker locally
+
+```bash
+docker build -t local/llama.cpp:full-musa --target full -f .devops/musa.Dockerfile .
+docker build -t local/llama.cpp:light-musa --target light -f .devops/musa.Dockerfile .
+docker build -t local/llama.cpp:server-musa --target server -f .devops/musa.Dockerfile .
+```
+
+You may want to pass in some different `ARGS`, depending on the MUSA environment supported by your container host, as well as the GPU architecture.
+
+The defaults are:
+
+- the base image is the MUSA 5.2.0 image from the Moore Threads registry
+
+The resulting images, are essentially the same as the non-MUSA images:
+
+1. `local/llama.cpp:full-musa`: This image includes both the `llama-cli` and `llama-completion` executables and the tools to convert LLaMA models into ggml and convert into 4-bit quantization.
+2. `local/llama.cpp:light-musa`: This image only includes the `llama-cli` and `llama-completion` executables.
+3. `local/llama.cpp:server-musa`: This image only includes the `llama-server` executable.
+
+## Usage
+
+After building locally, Usage is similar to the non-MUSA examples, but you'll need to set `mthreads` as default Docker runtime. This can be done by executing `(cd /usr/bin/musa && sudo ./docker setup $PWD)` and verifying the changes by executing `docker info | grep mthreads` on the host machine. You will also want to use the `--n-gpu-layers` flag.
+
+```bash
+docker run -v /path/to/models:/models local/llama.cpp:full-musa --run -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 1
+docker run -v /path/to/models:/models local/llama.cpp:light-musa -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 1
+docker run -v /path/to/models:/models local/llama.cpp:server-musa -m /models/7B/ggml-model-q4_0.gguf --port 8080 --host 0.0.0.0 -n 512 --n-gpu-layers 1
+```
+
+## Docker With SYCL
+
+## Building Docker locally
+
+```bash
+docker build -t local/llama.cpp:full-intel --target full -f .devops/intel.Dockerfile .
+docker build -t local/llama.cpp:light-intel --target light -f .devops/intel.Dockerfile .
+docker build -t local/llama.cpp:server-intel --target server -f .devops/intel.Dockerfile .
+```
+
+You may want to pass in some different `ARGS`, depending on the SYCL environment supported by your container host, as well as the GPU architecture.
+Refer to [.devops/intel.Dockerfile](../.devops/intel.Dockerfile) for the available `ARGS` and their defaults.
+
+The resulting images, are essentially the same as the non-SYCL images:
+
+1. `local/llama.cpp:full-intel`: This image includes both the `llama-cli` and `llama-completion` executables and the tools to convert LLaMA models into ggml and convert into 4-bit quantization.
+2. `local/llama.cpp:light-intel`: This image only includes the `llama-cli` and `llama-completion` executables.
+3. `local/llama.cpp:server-intel`: This image only includes the `llama-server` executable.
+
+## Usage
+
+After building locally, usage is similar to the non-SYCL examples, but you'll need to add the `--device` flag.
+
+```bash
+# First, find all the DRI cards
+ls -la /dev/dri
+# Then, pick the card that you want to use (here for e.g. /dev/dri/card0).
+docker run --device /dev/dri/renderD128:/dev/dri/renderD128 --device /dev/dri/card0:/dev/dri/card0 -v /path/to/models:/models local/llama.cpp:full-intel -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 99
+docker run --device /dev/dri/renderD128:/dev/dri/renderD128 --device /dev/dri/card0:/dev/dri/card0 -v /path/to/models:/models local/llama.cpp:light-intel -m /models/7B/ggml-model-q4_0.gguf -p "Building a website can be done in 10 simple steps:" -n 512 --n-gpu-layers 99
+docker run --device /dev/dri/renderD128:/dev/dri/renderD128 --device /dev/dri/card0:/dev/dri/card0 -v /path/to/models:/models local/llama.cpp:server-intel -m /models/7B/ggml-model-q4_0.gguf --port 8080 --host 0.0.0.0 -n 512 --n-gpu-layers 99
+```
+
+*Notes:*
+- Docker has been tested successfully on native Linux. WSL support has not been verified yet.
+- You may need to install Intel GPU driver on the **host** machine *(Please refer to the [Linux configuration](./backend/SYCL.md#linux) for details)*.
+
+# Function Calling
+
+[chat.h](../common/chat.h) (https://github.com/ggml-org/llama.cpp/pull/9639) adds support for [OpenAI-style function calling](https://platform.openai.com/docs/guides/function-calling) and is used in:
+- `llama-server` when started w/ `--jinja` flag
+
+## Universal support w/ Native & Generic handlers
+
+Function calling is supported for all models (see https://github.com/ggml-org/llama.cpp/pull/9639):
+
+- Native tool call formats supported:
+  - Llama 3.1 / 3.3 (including builtin tools support - tool names for `wolfram_alpha`, `web_search` / `brave_search`, `code_interpreter`), Llama 3.2
+  - Functionary v3.1 / v3.2
+  - Hermes 2/3, Qwen 2.5
+  - Qwen 2.5 Coder
+  - Mistral Nemo
+  - Firefunction v2
+  - Command R7B
+  - DeepSeek R1 (WIP / seems reluctant to call any tools?)
+  - GPT-OSS (Harmony), LLM-jp-4.1 (Harmony dialect)
+
+- Generic tool call is supported when the template isn't recognized by native format handlers (you'll see `Chat format: Generic` in the logs).
+  - Use `--chat-template-file` to override the template when appropriate (see examples below)
+  - Generic support may consume more tokens and be less efficient than a model's native format.
+
+- Multiple/parallel tool calling is supported on some models but disabled by default, enable it by passing `"parallel_tool_calls": true` in the completion endpoint payload.
+
+<details>
+<summary>Show some common templates and which format handler they use</summary>
+
+| Template | Format |
+|----------|--------|
+| Almawave-Velvet-14B.jinja | Hermes 2 Pro |
+| AtlaAI-Selene-1-Mini-Llama-3.1-8B.jinja | Llama 3.x |
+| CohereForAI-aya-expanse-8b.jinja | Generic |
+| CohereForAI-c4ai-command-r-plus-default.jinja | Generic |
+| CohereForAI-c4ai-command-r-plus-rag.jinja | Generic |
+| CohereForAI-c4ai-command-r-plus-tool_use.jinja | Generic |
+| CohereForAI-c4ai-command-r7b-12-2024-default.jinja | Command R7B (extract reasoning) |
+| CohereForAI-c4ai-command-r7b-12-2024-rag.jinja | Command R7B (extract reasoning) |
+| CohereForAI-c4ai-command-r7b-12-2024-tool_use.jinja | Command R7B (extract reasoning) |
+| CohereForAI-c4ai-command-r7b-12-2024.jinja | Generic |
+| DavieLion-Llama-3.2-1B-SPIN-iter3.jinja | Generic |
+| Delta-Vector-Rei-12B.jinja | Mistral Nemo |
+| EpistemeAI-Mistral-Nemo-Instruct-12B-Philosophy-Math.jinja | Mistral Nemo |
+| FlofloB-83k_continued_pretraining_Qwen2.5-0.5B-Instruct_Unsloth_merged_16bit.jinja | Hermes 2 Pro |
+| FlofloB-test_continued_pretraining_Phi-3-mini-4k-instruct_Unsloth_merged_16bit.jinja | Generic |
+| HelpingAI-HAI-SER.jinja | Generic |
+| HuggingFaceTB-SmolLM2-1.7B-Instruct.jinja | Generic |
+| HuggingFaceTB-SmolLM2-135M-Instruct.jinja | Generic |
+| HuggingFaceTB-SmolLM2-360M-Instruct.jinja | Generic |
+| INSAIT-Institute-BgGPT-Gemma-2-27B-IT-v1.0.jinja | Generic |
+| Ihor-Text2Graph-R1-Qwen2.5-0.5b.jinja | Hermes 2 Pro |
+| Infinigence-Megrez-3B-Instruct.jinja | Generic |
+| Josephgflowers-TinyLlama_v1.1_math_code-world-test-1.jinja | Generic |
+| LGAI-EXAONE-EXAONE-3.5-2.4B-Instruct.jinja | Generic |
+| LGAI-EXAONE-EXAONE-3.5-7.8B-Instruct.jinja | Generic |
+| LatitudeGames-Wayfarer-12B.jinja | Generic |
+| Magpie-Align-Llama-3-8B-Magpie-Align-v0.1.jinja | Generic |
+| Magpie-Align-Llama-3.1-8B-Magpie-Align-v0.1.jinja | Generic |
+| MaziyarPanahi-calme-3.2-instruct-78b.jinja | Generic |
+| MiniMaxAI-MiniMax-Text-01.jinja | Generic |
+| MiniMaxAI-MiniMax-VL-01.jinja | Generic |
+| NaniDAO-deepseek-r1-qwen-2.5-32B-ablated.jinja | DeepSeek R1 (extract reasoning) |
+| NexaAIDev-Octopus-v2.jinja | Generic |
+| NousResearch-Hermes-2-Pro-Llama-3-8B-default.jinja | Generic |
+| NousResearch-Hermes-2-Pro-Llama-3-8B-tool_use.jinja | Hermes 2 Pro |
+| NousResearch-Hermes-2-Pro-Mistral-7B-default.jinja | Generic |
+| NousResearch-Hermes-2-Pro-Mistral-7B-tool_use.jinja | Hermes 2 Pro |
+| NousResearch-Hermes-3-Llama-3.1-70B-default.jinja | Generic |
+| NousResearch-Hermes-3-Llama-3.1-70B-tool_use.jinja | Hermes 2 Pro |
+| NovaSky-AI-Sky-T1-32B-Flash.jinja | Hermes 2 Pro |
+| NovaSky-AI-Sky-T1-32B-Preview.jinja | Hermes 2 Pro |
+| OnlyCheeini-greesychat-turbo.jinja | Generic |
+| Orenguteng-Llama-3.1-8B-Lexi-Uncensored-V2.jinja | Llama 3.x |
+| OrionStarAI-Orion-14B-Chat.jinja | Generic |
+| PowerInfer-SmallThinker-3B-Preview.jinja | Generic |
+| PrimeIntellect-INTELLECT-1-Instruct.jinja | Generic |
+| Qwen-QVQ-72B-Preview.jinja | Generic |
+| Qwen-QwQ-32B-Preview.jinja | Hermes 2 Pro |
+| Qwen-Qwen1.5-7B-Chat.jinja | Generic |
+| Qwen-Qwen2-7B-Instruct.jinja | Generic |
+| Qwen-Qwen2-VL-72B-Instruct.jinja | Generic |
+| Qwen-Qwen2-VL-7B-Instruct.jinja | Generic |
+| Qwen-Qwen2.5-0.5B.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-1.5B-Instruct.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-14B-Instruct-1M.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-14B.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-32B-Instruct.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-32B.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-3B-Instruct.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-72B-Instruct.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-7B-Instruct-1M.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-7B-Instruct.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-7B.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-Coder-32B-Instruct.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-Coder-7B-Instruct.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-Math-1.5B.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-Math-7B-Instruct.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-VL-3B-Instruct.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-VL-72B-Instruct.jinja | Hermes 2 Pro |
+| Qwen-Qwen2.5-VL-7B-Instruct.jinja | Hermes 2 Pro |
+| RWKV-Red-Team-ARWKV-7B-Preview-0.1.jinja | Hermes 2 Pro |
+| SakanaAI-TinySwallow-1.5B-Instruct.jinja | Hermes 2 Pro |
+| SakanaAI-TinySwallow-1.5B.jinja | Hermes 2 Pro |
+| Sao10K-70B-L3.3-Cirrus-x1.jinja | Llama 3.x |
+| SentientAGI-Dobby-Mini-Leashed-Llama-3.1-8B.jinja | Llama 3.x |
+| SentientAGI-Dobby-Mini-Unhinged-Llama-3.1-8B.jinja | Llama 3.x |
+| Steelskull-L3.3-Damascus-R1.jinja | Llama 3.x |
+| Steelskull-L3.3-MS-Nevoria-70b.jinja | Llama 3.x |
+| Steelskull-L3.3-Nevoria-R1-70b.jinja | Llama 3.x |
+| THUDM-glm-4-9b-chat.jinja | Generic |
+| THUDM-glm-edge-1.5b-chat.jinja | Generic |
+| Tarek07-Progenitor-V1.1-LLaMa-70B.jinja | Llama 3.x |
+| TheBloke-FusionNet_34Bx2_MoE-AWQ.jinja | Generic |
+| TinyLlama-TinyLlama-1.1B-Chat-v1.0.jinja | Generic |
+| UCLA-AGI-Mistral7B-PairRM-SPPO-Iter3.jinja | Generic |
+| ValiantLabs-Llama3.1-8B-Enigma.jinja | Llama 3.x |
+| abacusai-Fewshot-Metamath-OrcaVicuna-Mistral.jinja | Generic |
+| ai21labs-AI21-Jamba-1.5-Large.jinja | Generic |
+| allenai-Llama-3.1-Tulu-3-405B-SFT.jinja | Generic |
+| allenai-Llama-3.1-Tulu-3-405B.jinja | Generic |
+| allenai-Llama-3.1-Tulu-3-8B.jinja | Generic |
+| arcee-ai-Virtuoso-Lite.jinja | Hermes 2 Pro |
+| arcee-ai-Virtuoso-Medium-v2.jinja | Hermes 2 Pro |
+| arcee-ai-Virtuoso-Small-v2.jinja | Hermes 2 Pro |
+| avemio-GRAG-NEMO-12B-ORPO-HESSIAN-AI.jinja | Generic |
+| bespokelabs-Bespoke-Stratos-7B.jinja | Hermes 2 Pro |
+| bfuzzy1-acheron-m1a-llama.jinja | Generic |
+| bofenghuang-vigogne-2-70b-chat.jinja | Generic |
+| bytedance-research-UI-TARS-72B-DPO.jinja | Generic |
+| bytedance-research-UI-TARS-7B-DPO.jinja | Generic |
+| bytedance-research-UI-TARS-7B-SFT.jinja | Generic |
+| carsenk-phi3.5_mini_exp_825_uncensored.jinja | Generic |
+| cyberagent-DeepSeek-R1-Distill-Qwen-14B-Japanese.jinja | DeepSeek R1 (extract reasoning) |
+| cyberagent-DeepSeek-R1-Distill-Qwen-32B-Japanese.jinja | DeepSeek R1 (extract reasoning) |
+| databricks-dbrx-instruct.jinja | Generic |
+| deepseek-ai-DeepSeek-Coder-V2-Instruct.jinja | Generic |
+| deepseek-ai-DeepSeek-Coder-V2-Lite-Base.jinja | Generic |
+| deepseek-ai-DeepSeek-Coder-V2-Lite-Instruct.jinja | Generic |
+| deepseek-ai-DeepSeek-R1-Distill-Llama-70B.jinja | DeepSeek R1 (extract reasoning) |
+| deepseek-ai-DeepSeek-R1-Distill-Llama-8B.jinja | DeepSeek R1 (extract reasoning) |
+| deepseek-ai-DeepSeek-R1-Distill-Qwen-1.5B.jinja | DeepSeek R1 (extract reasoning) |
+| deepseek-ai-DeepSeek-R1-Distill-Qwen-14B.jinja | DeepSeek R1 (extract reasoning) |
+| deepseek-ai-DeepSeek-R1-Distill-Qwen-32B.jinja | DeepSeek R1 (extract reasoning) |
+| deepseek-ai-DeepSeek-R1-Distill-Qwen-7B.jinja | DeepSeek R1 (extract reasoning) |
+| deepseek-ai-DeepSeek-R1-Zero.jinja | DeepSeek R1 (extract reasoning) |
+| deepseek-ai-DeepSeek-R1.jinja | DeepSeek R1 (extract reasoning) |
+| deepseek-ai-DeepSeek-V2-Lite.jinja | Generic |
+| deepseek-ai-DeepSeek-V2.5.jinja | DeepSeek R1 (extract reasoning) |
+| deepseek-ai-DeepSeek-V3.jinja | DeepSeek R1 (extract reasoning) |
+| deepseek-ai-deepseek-coder-33b-instruct.jinja | Generic |
+| deepseek-ai-deepseek-coder-6.7b-instruct.jinja | Generic |
+| deepseek-ai-deepseek-coder-7b-instruct-v1.5.jinja | Generic |
+| deepseek-ai-deepseek-llm-67b-chat.jinja | Generic |
+| deepseek-ai-deepseek-llm-7b-chat.jinja | Generic |
+| dicta-il-dictalm2.0-instruct.jinja | Generic |
+| ehristoforu-Falcon3-8B-Franken-Basestruct.jinja | Hermes 2 Pro |
+| fireworks-ai-llama-3-firefunction-v2.jinja | FireFunction v2 |
+| godlikehhd-alpaca_data_sampled_ifd_new_5200.jinja | Hermes 2 Pro |
+| godlikehhd-alpaca_data_score_max_0.7_2600.jinja | Hermes 2 Pro |
+| google-gemma-2-27b-it.jinja | Generic |
+| google-gemma-2-2b-it.jinja | Generic |
+| google-gemma-2-2b-jpn-it.jinja | Generic |
+| google-gemma-7b-it.jinja | Generic |
+| huihui-ai-DeepSeek-R1-Distill-Llama-70B-abliterated.jinja | DeepSeek R1 (extract reasoning) |
+| huihui-ai-DeepSeek-R1-Distill-Llama-8B-abliterated.jinja | DeepSeek R1 (extract reasoning) |
+| huihui-ai-DeepSeek-R1-Distill-Qwen-14B-abliterated-v2.jinja | DeepSeek R1 (extract reasoning) |
+| huihui-ai-DeepSeek-R1-Distill-Qwen-32B-abliterated.jinja | DeepSeek R1 (extract reasoning) |
+| huihui-ai-DeepSeek-R1-Distill-Qwen-7B-abliterated-v2.jinja | DeepSeek R1 (extract reasoning) |
+| huihui-ai-Qwen2.5-14B-Instruct-1M-abliterated.jinja | Hermes 2 Pro |
+| ibm-granite-granite-3.1-8b-instruct.jinja | Generic |
+| indischepartij-MiniCPM-3B-OpenHermes-2.5-v2.jinja | Generic |
+| inflatebot-MN-12B-Mag-Mell-R1.jinja | Generic |
+| jinaai-ReaderLM-v2.jinja | Generic |
+| kms7530-chemeng_qwen-math-7b_24_1_100_1_nonmath.jinja | Hermes 2 Pro |
+| knifeayumu-Cydonia-v1.3-Magnum-v4-22B.jinja | Mistral Nemo |
+| langgptai-qwen1.5-7b-chat-sa-v0.1.jinja | Generic |
+| lightblue-DeepSeek-R1-Distill-Qwen-7B-Japanese.jinja | DeepSeek R1 (extract reasoning) |
+| mattshumer-Reflection-Llama-3.1-70B.jinja | Generic |
+| meetkai-functionary-medium-v3.1.jinja | Functionary v3.1 Llama 3.1 |
+| meetkai-functionary-medium-v3.2.jinja | Functionary v3.2 |
+| meta-llama-Llama-2-7b-chat-hf.jinja | Generic |
+| meta-llama-Llama-3.1-8B-Instruct.jinja | Llama 3.x |
+| meta-llama-Llama-3.2-11B-Vision-Instruct.jinja | Llama 3.x |
+| meta-llama-Llama-3.2-1B-Instruct.jinja | Llama 3.x |
+| meta-llama-Llama-3.2-3B-Instruct.jinja | Llama 3.x |
+| meta-llama-Llama-3.3-70B-Instruct.jinja | Llama 3.x |
+| meta-llama-Meta-Llama-3-8B-Instruct.jinja | Generic |
+| meta-llama-Meta-Llama-3.1-8B-Instruct.jinja | Llama 3.x |
+| microsoft-Phi-3-medium-4k-instruct.jinja | Generic |
+| microsoft-Phi-3-mini-4k-instruct.jinja | Generic |
+| microsoft-Phi-3-small-8k-instruct.jinja | Generic |
+| microsoft-Phi-3.5-mini-instruct.jinja | Generic |
+| microsoft-Phi-3.5-vision-instruct.jinja | Generic |
+| microsoft-phi-4.jinja | Generic |
+| migtissera-Tess-3-Mistral-Nemo-12B.jinja | Generic |
+| ministral-Ministral-3b-instruct.jinja | Generic |
+| mistralai-Codestral-22B-v0.1.jinja | Generic |
+| mistralai-Mistral-7B-Instruct-v0.1.jinja | Generic |
+| mistralai-Mistral-7B-Instruct-v0.2.jinja | Generic |
+| mistralai-Mistral-7B-Instruct-v0.3.jinja | Mistral Nemo |
+| mistralai-Mistral-Large-Instruct-2407.jinja | Mistral Nemo |
+| mistralai-Mistral-Large-Instruct-2411.jinja | Generic |
+| mistralai-Mistral-Nemo-Instruct-2407.jinja | Mistral Nemo |
+| mistralai-Mistral-Small-24B-Instruct-2501.jinja | Generic |
+| mistralai-Mixtral-8x7B-Instruct-v0.1.jinja | Generic |
+| mkurman-Qwen2.5-14B-DeepSeek-R1-1M.jinja | Hermes 2 Pro |
+| mlabonne-AlphaMonarch-7B.jinja | Generic |
+| mlx-community-Josiefied-Qwen2.5-0.5B-Instruct-abliterated-v1-float32.jinja | Hermes 2 Pro |
+| mlx-community-Qwen2.5-VL-7B-Instruct-8bit.jinja | Hermes 2 Pro |
+| mobiuslabsgmbh-DeepSeek-R1-ReDistill-Qwen-1.5B-v1.1.jinja | DeepSeek R1 (extract reasoning) |
+| netcat420-MFANNv0.20.jinja | Generic |
+| netcat420-MFANNv0.24.jinja | Generic |
+| netease-youdao-Confucius-o1-14B.jinja | Hermes 2 Pro |
+| nvidia-AceMath-7B-RM.jinja | Hermes 2 Pro |
+| nvidia-Eagle2-1B.jinja | Hermes 2 Pro |
+| nvidia-Eagle2-9B.jinja | Hermes 2 Pro |
+| nvidia-Llama-3.1-Nemotron-70B-Instruct-HF.jinja | Llama 3.x |
+| onnx-community-DeepSeek-R1-Distill-Qwen-1.5B-ONNX.jinja | DeepSeek R1 (extract reasoning) |
+| open-thoughts-OpenThinker-7B.jinja | Hermes 2 Pro |
+| openchat-openchat-3.5-0106.jinja | Generic |
+| pankajmathur-orca_mini_v6_8b.jinja | Generic |
+| princeton-nlp-Mistral-7B-Base-SFT-RDPO.jinja | Generic |
+| princeton-nlp-Mistral-7B-Instruct-DPO.jinja | Generic |
+| princeton-nlp-Mistral-7B-Instruct-RDPO.jinja | Generic |
+| prithivMLmods-Bellatrix-Tiny-1.5B-R1.jinja | Hermes 2 Pro |
+| prithivMLmods-Bellatrix-Tiny-1B-R1.jinja | Llama 3.x |
+| prithivMLmods-Bellatrix-Tiny-1B-v3.jinja | Generic |
+| prithivMLmods-Bellatrix-Tiny-3B-R1.jinja | Llama 3.x |
+| prithivMLmods-Blaze-14B-xElite.jinja | Generic |
+| prithivMLmods-Calcium-Opus-14B-Elite2-R1.jinja | Hermes 2 Pro |
+| prithivMLmods-Calme-Ties-78B.jinja | Generic |
+| prithivMLmods-Calme-Ties2-78B.jinja | Generic |
+| prithivMLmods-Calme-Ties3-78B.jinja | Generic |
+| prithivMLmods-ChemQwen2-vL.jinja | Generic |
+| prithivMLmods-GWQ2b.jinja | Generic |
+| prithivMLmods-LatexMind-2B-Codec.jinja | Generic |
+| prithivMLmods-Llama-3.2-6B-AlgoCode.jinja | Llama 3.x |
+| prithivMLmods-Megatron-Opus-14B-Exp.jinja | Hermes 2 Pro |
+| prithivMLmods-Megatron-Opus-14B-Stock.jinja | Hermes 2 Pro |
+| prithivMLmods-Megatron-Opus-7B-Exp.jinja | Hermes 2 Pro |
+| prithivMLmods-Omni-Reasoner-Merged.jinja | Hermes 2 Pro |
+| prithivMLmods-Omni-Reasoner4-Merged.jinja | Hermes 2 Pro |
+| prithivMLmods-Primal-Opus-14B-Optimus-v1.jinja | Hermes 2 Pro |
+| prithivMLmods-QwQ-Math-IO-500M.jinja | Hermes 2 Pro |
+| prithivMLmods-Qwen-7B-Distill-Reasoner.jinja | DeepSeek R1 (extract reasoning) |
+| prithivMLmods-Qwen2.5-1.5B-DeepSeek-R1-Instruct.jinja | Hermes 2 Pro |
+| prithivMLmods-Qwen2.5-14B-DeepSeek-R1-1M.jinja | Hermes 2 Pro |
+| prithivMLmods-Qwen2.5-32B-DeepSeek-R1-Instruct.jinja | Hermes 2 Pro |
+| prithivMLmods-Qwen2.5-7B-DeepSeek-R1-1M.jinja | Hermes 2 Pro |
+| prithivMLmods-Triangulum-v2-10B.jinja | Hermes 2 Pro |
+| qingy2024-Falcon3-2x10B-MoE-Instruct.jinja | Hermes 2 Pro |
+| rubenroy-Zurich-14B-GCv2-5m.jinja | Hermes 2 Pro |
+| rubenroy-Zurich-7B-GCv2-5m.jinja | Hermes 2 Pro |
+| silma-ai-SILMA-Kashif-2B-Instruct-v1.0.jinja | Generic |
+| simplescaling-s1-32B.jinja | Hermes 2 Pro |
+| sometimesanotion-Lamarck-14B-v0.7.jinja | Hermes 2 Pro |
+| sonthenguyen-zephyr-sft-bnb-4bit-DPO-mtbr-180steps.jinja | Generic |
+| sthenno-tempesthenno-icy-0130.jinja | Generic |
+| sumink-qwft.jinja | Hermes 2 Pro |
+| teknium-OpenHermes-2.5-Mistral-7B.jinja | Generic |
+| thirdeyeai-elevate360m.jinja | Generic |
+| tiiuae-Falcon3-10B-Instruct.jinja | Hermes 2 Pro |
+| unsloth-DeepSeek-R1-Distill-Llama-8B-unsloth-bnb-4bit.jinja | DeepSeek R1 (extract reasoning) |
+| unsloth-DeepSeek-R1-Distill-Llama-8B.jinja | DeepSeek R1 (extract reasoning) |
+| unsloth-DeepSeek-R1.jinja | DeepSeek R1 (extract reasoning) |
+| unsloth-Mistral-Small-24B-Instruct-2501-unsloth-bnb-4bit.jinja | Generic |
+| upstage-solar-pro-preview-instruct.jinja | Generic |
+| whyhow-ai-PatientSeek.jinja | Generic |
+| xwen-team-Xwen-72B-Chat.jinja | Hermes 2 Pro |
+| xwen-team-Xwen-7B-Chat.jinja | Hermes 2 Pro |
+
+This table can be generated with:
+
+<!-- TODO @ngxson : we should update this, since minja dependency has been removed -->
+
+```bash
+./build/bin/test-chat ../minja/build/tests/*.jinja 2>/dev/null
+```
+
+</details>
+
+# Usage - need tool-aware Jinja template
+
+First, start a server with any model, but make sure it has a tools-enabled template: you can verify this by inspecting the `chat_template` or `chat_template_tool_use` properties in `http://localhost:8080/props`).
+
+Here are some models known to work (w/ chat template override when needed):
+
+```shell
+# Native support:
+
+llama-server --jinja -fa -hf bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M
+llama-server --jinja -fa -hf bartowski/Mistral-Nemo-Instruct-2407-GGUF:Q6_K_L
+llama-server --jinja -fa -hf bartowski/Llama-3.3-70B-Instruct-GGUF:Q4_K_M
+llama-server --jinja -fa -hf ibm-granite/granite-4.1-3b-GGUF:Q4_K_M
+
+# Native support for DeepSeek R1 works best w/ our template override (official template is buggy, although we do work around it)
+
+llama-server --jinja -fa -hf bartowski/DeepSeek-R1-Distill-Qwen-7B-GGUF:Q6_K_L \
+    --chat-template-file models/templates/llama-cpp-deepseek-r1.jinja
+
+llama-server --jinja -fa -hf bartowski/DeepSeek-R1-Distill-Qwen-32B-GGUF:Q4_K_M \
+    --chat-template-file models/templates/llama-cpp-deepseek-r1.jinja
+
+# Native support requires the right template for these GGUFs:
+
+llama-server --jinja -fa -hf bartowski/functionary-small-v3.2-GGUF:Q4_K_M
+    --chat-template-file models/templates/meetkai-functionary-medium-v3.2.jinja
+
+llama-server --jinja -fa -hf bartowski/Hermes-2-Pro-Llama-3-8B-GGUF:Q4_K_M \
+    --chat-template-file models/templates/NousResearch-Hermes-2-Pro-Llama-3-8B-tool_use.jinja
+
+llama-server --jinja -fa -hf bartowski/Hermes-3-Llama-3.1-8B-GGUF:Q4_K_M \
+    --chat-template-file models/templates/NousResearch-Hermes-3-Llama-3.1-8B-tool_use.jinja
+
+llama-server --jinja -fa -hf bartowski/firefunction-v2-GGUF -hff firefunction-v2-IQ1_M.gguf \
+    --chat-template-file models/templates/fireworks-ai-llama-3-firefunction-v2.jinja
+
+llama-server --jinja -fa -hf bartowski/c4ai-command-r7b-12-2024-GGUF:Q6_K_L \
+    --chat-template-file models/templates/CohereForAI-c4ai-command-r7b-12-2024-tool_use.jinja
+
+# Generic format support
+llama-server --jinja -fa -hf bartowski/phi-4-GGUF:Q4_0
+llama-server --jinja -fa -hf bartowski/gemma-2-2b-it-GGUF:Q8_0
+llama-server --jinja -fa -hf bartowski/c4ai-command-r-v01-GGUF:Q2_K
+```
+
+To get the official template from original HuggingFace repos, you can use [scripts/get_chat_template.py](../scripts/get_chat_template.py) (see examples invocations in [models/templates/README.md](../models/templates/README.md))
+
+> [!TIP]
+> If there is no official `tool_use` Jinja template, you may want to set `--chat-template chatml` to use a default that works with many models (YMMV!), or write your own (e.g. we provide a custom [llama-cpp-deepseek-r1.jinja](../models/templates/llama-cpp-deepseek-r1.jinja) for DeepSeek R1 distills)
+
+> [!CAUTION]
+> Beware of extreme KV quantizations (e.g. `-ctk q4_0`), they can substantially degrade the model's tool calling performance.
+
+Test in CLI (or with any library / software that can use OpenAI-compatible API backends):
+
+```bash
+curl http://localhost:8080/v1/chat/completions -d '{
+    "model": "gpt-3.5-turbo",
+    "tools": [
+        {
+        "type":"function",
+        "function":{
+            "name":"python",
+            "description":"Runs code in an ipython interpreter and returns the result of the execution after 60 seconds.",
+            "parameters":{
+            "type":"object",
+            "properties":{
+                "code":{
+                "type":"string",
+                "description":"The code to run in the ipython interpreter."
+                }
+            },
+            "required":["code"]
+            }
+        }
+        }
+    ],
+    "messages": [
+        {
+        "role": "user",
+        "content": "Print a hello world message with python."
+        }
+    ]
+}'
+
+
+curl http://localhost:8080/v1/chat/completions -d '{
+    "model": "gpt-3.5-turbo",
+    "messages": [
+        {"role": "system", "content": "You are a chatbot that uses tools/functions. Dont overthink things."},
+        {"role": "user", "content": "What is the weather in Istanbul?"}
+    ],
+    "tools": [{
+        "type":"function",
+        "function":{
+            "name":"get_current_weather",
+            "description":"Get the current weather in a given location",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "location":{
+                        "type":"string",
+                        "description":"The city and country/state, e.g. `San Francisco, CA`, or `Paris, France`"
+                    }
+                },
+                "required":["location"]
+            }
+        }
+    }]
+}'
+```
+
+<details>
+<summary>Show output</summary>
+
+```json
+{
+"choices": [
+    {
+    "finish_reason": "tool",
+    "index": 0,
+    "message": {
+        "content": null,
+        "tool_calls": [
+        {
+            "name": "python",
+            "arguments": "{\"code\":\" \\nprint(\\\"Hello, World!\\\")\"}"
+        }
+        ],
+        "role": "assistant"
+    }
+    }
+],
+"created": 1727287211,
+"model": "gpt-3.5-turbo",
+"object": "chat.completion",
+"usage": {
+    "completion_tokens": 16,
+    "prompt_tokens": 44,
+    "total_tokens": 60
+},
+"id": "chatcmpl-Htbgh9feMmGM0LEH2hmQvwsCxq3c6Ni8"
+}
+```
+
+</details>
+
+# Install pre-built version of llama.cpp
+
+| Install via | Windows | Mac  | Linux |
+|-------------|---------|------|-------|
+| conda-forge | ✅      | ✅   | ✅   |
+| Winget      | ✅      |      |      |
+| Homebrew    |         | ✅   | ✅   |
+| MacPorts    |         | ✅   |      |
+| Nix         |         | ✅   | ✅   |
+
+## conda-forge (Windows, Mac and Linux)
+
+conda-forge provides builds for:
+ - CUDA (Windows and Linux)
+ - Vulkan (Windows and Linux)
+ - Apple Metal (macOS)
+
+```sh
+conda install -c conda-forge llama.cpp
+```
+
+```sh
+mamba install -c conda-forge llama.cpp
+```
+
+```sh
+# Project-local installation
+pixi add llama.cpp
+
+# Global installation
+pixi global install llama.cpp
+```
+
+This distribution is managed on [`conda-forge/llama.cpp-feedstock`](https://github.com/conda-forge/llama.cpp-feedstock/).
+
+Shall you have any problems, please open an issue on [its issue tracker](https://github.com/conda-forge/llama.cpp-feedstock/issues).
+
+## Winget (Windows)
+
+```sh
+winget install llama.cpp
+```
+
+The package is automatically updated with new `llama.cpp` releases. More info: https://github.com/ggml-org/llama.cpp/issues/8188
+
+## Homebrew (Mac and Linux)
+
+```sh
+brew install llama.cpp
+```
+
+The formula is automatically updated with new `llama.cpp` releases. More info: https://github.com/ggml-org/llama.cpp/discussions/7668
+
+## MacPorts (Mac)
+
+```sh
+sudo port install llama.cpp
+```
+
+See also: https://ports.macports.org/port/llama.cpp/details/
+
+## Nix (Mac and Linux)
+
+```sh
+nix profile install nixpkgs#llama-cpp
+```
+
+For flake enabled installs.
+
+Or
+
+```sh
+nix-env --file '<nixpkgs>' --install --attr llama-cpp
+```
+
+For non-flake enabled installs.
+
+This expression is automatically updated within the [nixpkgs repo](https://github.com/NixOS/nixpkgs/blob/nixos-24.05/pkgs/by-name/ll/llama-cpp/package.nix#L164).
+
+# LLGuidance Support in llama.cpp
+
+[LLGuidance](https://github.com/guidance-ai/llguidance) is a library for constrained decoding (also called constrained sampling or structured outputs) for Large Language Models (LLMs). Initially developed as the backend for the [Guidance](https://github.com/guidance-ai/guidance) library, it can also be used independently.
+
+LLGuidance supports JSON Schemas and arbitrary context-free grammars (CFGs) written in a [variant](https://github.com/guidance-ai/llguidance/blob/main/docs/syntax.md) of Lark syntax. It is [very fast](https://github.com/guidance-ai/jsonschemabench/tree/main/maskbench) and has [excellent](https://github.com/guidance-ai/llguidance/blob/main/docs/json_schema.md) JSON Schema coverage but requires the Rust compiler, which complicates the llama.cpp build process.
+
+## Building
+
+To enable LLGuidance support, build llama.cpp with the `LLAMA_LLGUIDANCE` option:
+
+```sh
+cmake -B build -DLLAMA_LLGUIDANCE=ON
+make -C build -j
+```
+
+For Windows use `cmake --build build --config Release` instead of `make`.
+
+This requires the Rust compiler and the `cargo` tool to be [installed](https://www.rust-lang.org/tools/install).
+
+## Interface
+
+There are no new command-line arguments or modifications to `common_params`. When enabled, grammars starting with `%llguidance` are passed to LLGuidance instead of the [current](../grammars/README.md) llama.cpp grammars. Additionally, JSON Schema requests (e.g., using the `-j` argument in `llama-cli`) are also passed to LLGuidance.
+
+For your existing GBNF grammars, you can use [gbnf_to_lark.py script](https://github.com/guidance-ai/llguidance/blob/main/python/llguidance/gbnf_to_lark.py) to convert them to LLGuidance Lark-like format.
+
+## Performance
+
+Computing a "token mask" (i.e., the set of allowed tokens) for a llama3 tokenizer with 128k tokens takes, on average, 50μs of single-core CPU time for the [JSON Schema Bench](https://github.com/guidance-ai/jsonschemabench). The p99 time is 0.5ms, and the p100 time is 20ms. These results are due to the lexer/parser split and several [optimizations](https://github.com/guidance-ai/llguidance/blob/main/docs/optimizations.md).
+
+## JSON Schema
+
+LLGuidance adheres closely to the JSON Schema specification. For example:
+
+- `additionalProperties` defaults to `true`, unlike current grammars, though you can set `"additionalProperties": false` if needed.
+- any whitespace is allowed.
+- The definition order in the `"properties": {}` object is maintained, regardless of whether properties are required (current grammars always puts required properties first).
+
+Unsupported schemas result in an error message—no keywords are silently ignored.
+
+## Why Not Reuse GBNF Format?
+
+GBNF lacks the concept of a lexer.
+
+Most programming languages, including JSON, use a two-step process: a lexer (built with regular expressions) converts a byte stream into lexemes, which are then processed by a CFG parser. This approach is faster because lexers are cheaper to evaluate, and there is ~10x fewer lexemes than bytes.
+LLM tokens often align with lexemes, so the parser is engaged in under 0.5% of tokens, with the lexer handling the rest.
+
+However, the user has to provide the distinction between lexemes and CFG symbols. In [Lark](https://github.com/lark-parser/lark), lexeme names are uppercase, while CFG symbols are lowercase.
+The [gbnf_to_lark.py script](https://github.com/guidance-ai/llguidance/blob/main/scripts/gbnf_to_lark.py) can often take care of this automatically.
+See [LLGuidance syntax docs](https://github.com/guidance-ai/llguidance/blob/main/docs/syntax.md#terminals-vs-rules) for more details.
+
+## Error Handling
+
+Errors are currently printed to `stderr`, and generation continues. Improved error handling may be added in the future.
+
+# Obtaining and quantizing models
+
+The [Hugging Face](https://huggingface.co) platform hosts [thousands of models](https://huggingface.co/models?library=gguf&sort=trending) compatible with `llama.cpp`:
+
+- [Trending](https://huggingface.co/models?library=gguf&sort=trending)
+
+You can use any `llama.cpp`-compatible model from [Hugging Face](https://huggingface.co/) using this CLI argument: `-hf <user>/<model>[:quant]`. For example:
+
+```sh
+llama cli -hf ggml-org/gemma-3-1b-it-GGUF
+```
+
+You can use the same CLI invocation to download from other sites, by pointing the `MODEL_ENDPOINT` environment variable to an endpoint compatible with the Hugging Face API.
+`llama.cpp` can also run models you have downloaded locally to your filesystem.
+
+After downloading a model, use the CLI tools to run it locally - see below.
+
+`llama.cpp` requires the model to be stored in the [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) file format. Models in other data formats can be converted to GGUF using the `convert_*.py` Python scripts in this repo.
+To learn more about model quantization, [read this documentation](../tools/quantize/README.md)
+
+The Hugging Face platform provides a variety of online tools for converting, quantizing and hosting models with `llama.cpp`:
+
+- Use the [GGUF-my-repo space](https://huggingface.co/spaces/ggml-org/gguf-my-repo) to convert to GGUF format and quantize model weights to smaller sizes
+- Use the [GGUF-my-LoRA space](https://huggingface.co/spaces/ggml-org/gguf-my-lora) to convert LoRA adapters to GGUF format (more info: https://github.com/ggml-org/llama.cpp/discussions/10123)
+- Use the [GGUF-editor space](https://huggingface.co/spaces/CISCai/gguf-editor) to edit GGUF meta data in the browser (more info: https://github.com/ggml-org/llama.cpp/discussions/9268)
+- Use the [Inference Endpoints](https://ui.endpoints.huggingface.co/) to directly host `llama.cpp` in the cloud (more info: https://github.com/ggml-org/llama.cpp/discussions/9669)
+
+# Using multiple GPUs with llama.cpp
+
+This guide explains how to run [llama.cpp](https://github.com/ggml-org/llama.cpp) across more than one GPU. It covers the split modes, the command-line flags that control them, the limitations you need to know about, and ready-to-use recipes for `llama-cli` and `llama-server`.
+
+The CLI arguments listed here are the same for both tools - or most llama.cpp binaries for that matter.
+
+---
+
+## When you need multi-GPU
+
+Reach for multi-GPU when one of these is true:
+
+- **The model doesn't fit in a single GPU's VRAM.** By spreading the weights across two or more GPUs the whole model can stay on accelerators. Otherwise part of the model will need to be run off of the comparatively slower system RAM.
+- **You want more throughput.** By distributing the computation across multiple GPUs, each individual GPU has to do less work. This can result in better prefill and/or token generation performance, depending on the split mode and interconnect speed vs. the speed of an individual GPU.
+
+---
+
+## The split modes
+
+Set with `--split-mode` / `-sm`.
+
+| Mode | What it does | When to use |
+|---|---|---|
+| `none` | Use a single GPU only. Pick which one with `--main-gpu`. | You explicitly want to confine the model to one GPU even though more are visible. |
+| `layer` (**default**) | Pipeline parallelism. Each GPU holds a contiguous slice of layers. The KV cache for layer *l* lives on the GPU that owns layer *l*. | Default and most compatible multi-GPU choice. You want more memory than a single GPU provides and your priority is a fast prefill. Can tolerate slow interconnect speeds between GPUs. |
+| `row` | **Deprecated.** Older row-split tensor-parallel path with comparatively poor performance. Splits only dense weights across GPUs. Superseded by `tensor` which should be universally superior if it can be used. | Avoid in new deployments. |
+| `tensor` | **EXPERIMENTAL.** Tensor parallelism that splits both weights *and* KV across the participating GPUs via a "meta device" abstraction. | You want more memory than a single GPU provides and your priority is fast token generation. Prefill speeds approach pipeline parallel speeds for large, dense models and fast GPU interconnect speeds. Treat as experimental as the code is less mature than pipeline parallelism. Performance should be good for multiple NVIDIA GPUs using the CUDA backend, no guarantees otherwise. |
+
+> Pipeline parallel (`layer`) vs. tensor parallel (`tensor`): pipeline-parallel runs different layers on different GPUs and processes tokens sequentially through the pipeline. This minimizes data transfers between GPUs but requires many tokens to scale well. Tensor-parallel splits each layer across GPUs and does multiple cross-GPU reductions per layer. This enables parallelizing any workload but is much more bottlenecked by the GPU interconnect speed. Pipeline-parallel maximizes batch throughput; tensor-parallel minimizes latency.
+
+---
+
+## Command-line arguments reference
+
+| Short | Long | Value | Default | Notes |
+|---|---|---|---|---|
+| `-sm` | `--split-mode` | `none` \| `layer` \| `tensor` | `layer` | See modes above. |
+| `-ts` | `--tensor-split` | comma-separated proportions, e.g. `3,1` | mode-dependent | How much of the model goes to each GPU. If omitted, `layer`/`row` use automatic splitting proportional to memory, while `tensor` splits tensor segments evenly. With `3,1` on two GPUs, GPU 0 gets 75 %, GPU 1 gets 25 %. The values follow the order in `--device`. |
+| `-mg` | `--main-gpu` | integer device index | `0` | The single GPU used in `--split-mode none`. |
+| `-ngl` | `--n-gpu-layers` / `--gpu-layers` | integer \| `auto` \| `all` | `auto` | Maximum number of layers to keep in VRAM. Use `999` or `all` to push everything possible to the GPUs. |
+| `-dev` | `--device` | comma-separated device names, or `none` | auto | Restrict which devices llama.cpp may use. See `--list-devices` for names. |
+| | `--list-devices` | - | - | Print the available devices and their memory. Run this first to learn the names you'd pass to `--device`. |
+| `-fa` | `--flash-attn` | `on` \| `off` \| `auto` | `auto` | Required when using `--split-mode tensor` and/or quantized V cache. Supported (and therefore enabled by default) for most combinations of models and backends. |
+| `-ctk` | `--cache-type-k` | `f32` \| `f16` \| `bf16` \| `q8_0` \| `q4_0` \| ... | `f16` | KV cache type for K. |
+| `-ctv` | `--cache-type-v` | same as `-ctk` | `f16` | KV cache type for V. |
+| `-fit` | `--fit` | `on` \| `off` | `on` | Auto-fit unset args to device memory. **Not supported with `tensor`. You may need to manually set the `--ctx-size` to make the model fit.**  |
+
+As for any CUDA program, the environment variable `CUDA_VISIBLE_DEVICES` can be used to control which GPUs to use for the CUDA backend: if you set it, llama.cpp only sees the specified GPUs. Use `--device` for selecting GPUs from among those visible to llama.cpp, this works for any backend.
+
+---
+
+## Recipes
+
+### 1. Default - pipeline parallel across all visible GPUs
+
+```bash
+llama-cli -m model.gguf
+llama-server -m model.gguf
+```
+
+Easiest configuration. KV cache spreads across the GPUs along with the layers. `--fit` (on by default) sizes things automatically.
+
+### 2. Pipeline parallel with a custom split ratio
+
+```bash
+llama-cli -m model.gguf -ts 3,1
+```
+
+Useful when GPUs have different memory: GPU 0 (3 parts) and GPU 1 (1 part). Proportions are normalized so `-ts 3,1` is the same as e.g. `-ts 75,25`.
+
+### 3. Single-GPU mode, picking a specific GPU
+
+```bash
+llama-cli --list-devices
+llama-cli -m model.gguf -dev CUDA1
+```
+
+Use only the device listed as `CUDA1` when calling with `--list-devices`.
+
+### 4. Tensor parallelism (experimental)
+
+```bash
+llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
+```
+
+- `--flash-attn off` or (`--flash-attn auto` resolving to `off` when it isn't supported) is a hard error.
+- KV cache types must be non-quantized: `f32`, `f16`, or `bf16`. Support for quantized KV cache is not implemented and trying to use it will result in an error.
+- Mark this configuration as experimental in your tooling: validate output quality before deploying.
+- `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
+
+  - **MoE / hybrid:** Grok, MPT, OLMoE, DeepSeek2, GLM-DSA, Nemotron-H, Nemotron-H-MoE, Granite-Hybrid, LFM2-MoE, Minimax-M2, Mistral4, Kimi-Linear, Jamba, Falcon-H1
+  - **State-space / RWKV-style:** Mamba, Mamba2 (and the hybrid Mamba-attention models above)
+  - **Other:** PLAMO2, MiniCPM3, Gemma-3n, OLMo2, BitNet, T5
+
+### 5. With NCCL
+
+There's no runtime flag for NCCL - it's selected at build time (`-DGGML_CUDA_NCCL=ON`, this is the default). Note that NCCL is **not** automatically distributed with CUDA and you may need to install it manually - when in doubt check the CMake log to see whether or not it can find the package. When llama.cpp is compiled with NCCL support it uses it automatically for cross-GPU reductions in `tensor` mode. When NCCL is missing on a multi-GPU build, you'll see this one-time warning and performance will be lower:
+
+```
+NVIDIA Collective Communications Library (NCCL) is unavailable, multi GPU performance will be suboptimal
+```
+
+When using the "ROCm" backend (which is the ggml CUDA code translated for AMD via HIP), the AMD equivalent RCCL can be used by compiling with `-DGGML_HIP_RCCL=ON`. Note that RCCL is by default *disabled* because (unlike NCCL) it was not universally beneficial during testing.
+### 6. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
+
+CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. It is **opt-in** at runtime - set the environment variable `GGML_CUDA_P2P` to any value to enable it:
+
+```bash
+GGML_CUDA_P2P=1 llama-cli -m model.gguf -sm tensor
+```
+
+P2P requires driver support (usually restricted to workstation/datacenter GPUs) and **may cause crashes or corrupted outputs on some motherboards or BIOS configurations** (e.g. when IOMMU is enabled). If you see instability after enabling it, unset the variable.
+
+---
+
+## Troubleshooting
+
+| Symptom | How to fix |
+|---|---|
+| Startup error *"SPLIT_MODE_TENSOR requires flash_attn to be enabled"* | Add `-fa on` or remove `-fa off`. |
+| Startup error *"simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented"* | Use `-ctk f16 -ctv f16` (or `bf16`/`f32`) with `--split-mode tensor`. |
+| Startup error *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'X'"* | Architecture not on the TENSOR allow-list. Use `--split-mode layer`. |
+| Warning *"NCCL is unavailable, multi GPU performance will be suboptimal"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
+| CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
+| Performance is worse with multi-GPU than single-GPU | The performance is bottlenecked by GPU interconnect speed. For `--split-mode tensor`, verify that NCCL is being used. Try `--split-mode layer` (less communication than `tensor`). Increase GPU interconnect speed via more PCIe lanes or e.g. NVLink (if available). |
+| GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |
+| Crashes or corrupted outputs after setting `GGML_CUDA_P2P=1` | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Unset `GGML_CUDA_P2P`. |
+
+# Gemma 3 vision
+
+> [!IMPORTANT]
+>
+> This is very experimental, only used for demo purpose.
+
+## Quick started
+
+You can use pre-quantized model from [ggml-org](https://huggingface.co/ggml-org)'s Hugging Face account
+
+```bash
+# build
+cmake -B build
+cmake --build build --target llama-mtmd-cli
+
+# alternatively, install from brew (MacOS)
+brew install llama.cpp
+
+# run it
+llama-mtmd-cli -hf ggml-org/gemma-3-4b-it-GGUF
+llama-mtmd-cli -hf ggml-org/gemma-3-12b-it-GGUF
+llama-mtmd-cli -hf ggml-org/gemma-3-27b-it-GGUF
+
+# note: 1B model does not support vision
+```
+
+## How to get mmproj.gguf?
+
+Simply to add `--mmproj` in when converting model via `convert_hf_to_gguf.py`:
+
+```bash
+cd gemma-3-4b-it
+python ../llama.cpp/convert_hf_to_gguf.py --outfile model.gguf --outtype f16 --mmproj .
+# output file: mmproj-model.gguf
+```
+
+## How to run it?
+
+What you need:
+- The text model GGUF, can be converted using `convert_hf_to_gguf.py`
+- The mmproj file from step above
+- An image file
+
+```bash
+# build
+cmake -B build
+cmake --build build --target llama-mtmd-cli
+
+# run it
+./build/bin/llama-mtmd-cli -m {text_model}.gguf --mmproj mmproj.gguf --image your_image.jpg
+```
+
+# GLMV-EDGE
+
+Currently this implementation supports [glm-edge-v-2b](https://huggingface.co/THUDM/glm-edge-v-2b) and [glm-edge-v-5b](https://huggingface.co/THUDM/glm-edge-v-5b).
+
+## Usage
+Build the `llama-mtmd-cli` binary.
+
+After building, run: `./llama-mtmd-cli` to see the usage. For example:
+
+```sh
+./llama-mtmd-cli -m model_path/ggml-model-f16.gguf --mmproj model_path/mmproj-model-f16.gguf
+```
+
+**note**: A lower temperature like 0.1 is recommended for better quality. add `--temp 0.1` to the command to do so.
+**note**: For GPU offloading ensure to use the `-ngl` flag just like usual
+
+## GGUF conversion
+
+1. Clone a GLMV-EDGE model ([2B](https://huggingface.co/THUDM/glm-edge-v-2b) or [5B](https://huggingface.co/THUDM/glm-edge-v-5b)). For example:
+
+```sh
+git clone https://huggingface.co/THUDM/glm-edge-v-5b or https://huggingface.co/THUDM/glm-edge-v-2b
+```
+
+2. Use `glmedge-surgery.py` to split the GLMV-EDGE model to LLM and multimodel projector constituents:
+
+```sh
+python ./tools/mtmd/glmedge-surgery.py -m ../model_path
+```
+
+4. Use `glmedge-convert-image-encoder-to-gguf.py` to convert the GLMV-EDGE image encoder to GGUF:
+
+```sh
+python ./tools/mtmd/glmedge-convert-image-encoder-to-gguf.py -m ../model_path --llava-projector ../model_path/glm.projector --output-dir ../model_path
+```
+
+5. Use `examples/convert_hf_to_gguf.py` to convert the LLM part of GLMV-EDGE to GGUF:
+
+```sh
+python convert_hf_to_gguf.py ../model_path
+```
+
+Now both the LLM part and the image encoder are in the `model_path` directory.
+
+# Granite Vision
+
+Download the model and point your `GRANITE_MODEL` environment variable to the path.
+
+```bash
+$ git clone https://huggingface.co/ibm-granite/granite-vision-3.2-2b
+$ export GRANITE_MODEL=./granite-vision-3.2-2b
+```
+
+
+### 1. Running llava surgery v2.
+First, we need to run the llava surgery script as shown below:
+
+`python llava_surgery_v2.py -C -m $GRANITE_MODEL`
+
+You should see two new files (`llava.clip` and `llava.projector`) written into your model's directory, as shown below.
+
+```bash
+$ ls $GRANITE_MODEL | grep -i llava
+llava.clip
+llava.projector
+```
+
+We should see that the projector and visual encoder get split out into the llava files. Quick check to make sure they aren't empty:
+```python
+import os
+import torch
+
+MODEL_PATH = os.getenv("GRANITE_MODEL")
+if not MODEL_PATH:
+    raise ValueError("env var GRANITE_MODEL is unset!")
+
+encoder_tensors = torch.load(os.path.join(MODEL_PATH, "llava.clip"))
+projector_tensors = torch.load(os.path.join(MODEL_PATH, "llava.projector"))
+
+assert len(encoder_tensors) > 0
+assert len(projector_tensors) > 0
+```
+
+If you actually inspect the `.keys()` of the loaded tensors, you should see a lot of `vision_model` tensors in the `encoder_tensors`, and 5 tensors (`'multi_modal_projector.linear_1.bias'`, `'multi_modal_projector.linear_1.weight'`, `'multi_modal_projector.linear_2.bias'`, `'multi_modal_projector.linear_2.weight'`, `'image_newline'`) in the multimodal `projector_tensors`.
+
+
+### 2. Creating the Visual Component GGUF
+Next, create a new directory to hold the visual components, and copy the llava.clip/projector files, as shown below.
+
+```bash
+$ ENCODER_PATH=$PWD/visual_encoder
+$ mkdir $ENCODER_PATH
+
+$ cp $GRANITE_MODEL/llava.clip $ENCODER_PATH/pytorch_model.bin
+$ cp $GRANITE_MODEL/llava.projector $ENCODER_PATH/
+```
+
+Now, we need to write a config for the visual encoder. In order to convert the model, be sure to use the correct `image_grid_pinpoints`, as these may vary based on the model. You can find the `image_grid_pinpoints` in `$GRANITE_MODEL/config.json`.
+
+```json
+{
+    "_name_or_path": "siglip-model",
+    "architectures": [
+      "SiglipVisionModel"
+    ],
+    "image_grid_pinpoints": [
+        [384,384],
+        [384,768],
+        [384,1152],
+        [384,1536],
+        [384,1920],
+        [384,2304],
+        [384,2688],
+        [384,3072],
+        [384,3456],
+        [384,3840],
+        [768,384],
+        [768,768],
+        [768,1152],
+        [768,1536],
+        [768,1920],
+        [1152,384],
+        [1152,768],
+        [1152,1152],
+        [1536,384],
+        [1536,768],
+        [1920,384],
+        [1920,768],
+        [2304,384],
+        [2688,384],
+        [3072,384],
+        [3456,384],
+        [3840,384]
+    ],
+    "mm_patch_merge_type": "spatial_unpad",
+    "hidden_size": 1152,
+    "image_size": 384,
+    "intermediate_size": 4304,
+    "model_type": "siglip_vision_model",
+    "num_attention_heads": 16,
+    "num_hidden_layers": 27,
+    "patch_size": 14,
+    "layer_norm_eps": 1e-6,
+    "hidden_act": "gelu_pytorch_tanh",
+    "projection_dim": 0,
+    "vision_feature_layer": [-24, -20, -12, -1]
+}
+```
+
+At this point you should have something like this:
+```bash
+$ ls $ENCODER_PATH
+config.json             llava.projector         pytorch_model.bin
+```
+
+Now convert the components to GGUF; Note that we also override the image mean/std dev to `[.5,.5,.5]` since we use the SigLIP visual encoder - in the transformers model, you can find these numbers in the `preprocessor_config.json`.
+```bash
+$ python convert_image_encoder_to_gguf.py \
+    -m $ENCODER_PATH \
+    --llava-projector $ENCODER_PATH/llava.projector \
+    --output-dir $ENCODER_PATH \
+    --clip-model-is-vision \
+    --clip-model-is-siglip \
+    --image-mean 0.5 0.5 0.5 \
+    --image-std 0.5 0.5 0.5
+```
+
+This will create the first GGUF file at `$ENCODER_PATH/mmproj-model-f16.gguf`; we will refer to the absolute path of this file as the `$VISUAL_GGUF_PATH.`
+
+
+### 3. Creating the LLM GGUF.
+The granite vision model contains a granite LLM as its language model. For now, the easiest way to get the GGUF for LLM is by loading the composite model in `transformers` and exporting the LLM so that it can be directly converted with the normal conversion path.
+
+First, set the `LLM_EXPORT_PATH` to the path to export the `transformers` LLM to.
+```bash
+$ export LLM_EXPORT_PATH=$PWD/granite_vision_llm
+```
+
+```python
+import os
+import transformers
+
+MODEL_PATH = os.getenv("GRANITE_MODEL")
+if not MODEL_PATH:
+    raise ValueError("env var GRANITE_MODEL is unset!")
+
+LLM_EXPORT_PATH = os.getenv("LLM_EXPORT_PATH")
+if not LLM_EXPORT_PATH:
+    raise ValueError("env var LLM_EXPORT_PATH is unset!")
+
+tokenizer = transformers.AutoTokenizer.from_pretrained(MODEL_PATH)
+
+# NOTE: granite vision support was added to transformers very recently (4.49);
+# if you get size mismatches, your version is too old.
+# If you are running with an older version, set `ignore_mismatched_sizes=True`
+# as shown below; it won't be loaded correctly, but the LLM part of the model that
+# we are exporting will be loaded correctly.
+model = transformers.AutoModelForImageTextToText.from_pretrained(MODEL_PATH, ignore_mismatched_sizes=True)
+
+tokenizer.save_pretrained(LLM_EXPORT_PATH)
+model.language_model.save_pretrained(LLM_EXPORT_PATH)
+```
+
+Now you can convert the exported LLM to GGUF with the normal converter in the root of the llama cpp project.
+```bash
+$ LLM_GGUF_PATH=$LLM_EXPORT_PATH/granite_llm.gguf
+...
+$ python convert_hf_to_gguf.py --outfile $LLM_GGUF_PATH $LLM_EXPORT_PATH
+```
+
+
+### 4. Quantization
+If you want to quantize the LLM, you can do so with `llama-quantize` as you would any other LLM. For example:
+```bash
+$ ./build/bin/llama-quantize $LLM_EXPORT_PATH/granite_llm.gguf $LLM_EXPORT_PATH/granite_llm_q4_k_m.gguf Q4_K_M
+$ LLM_GGUF_PATH=$LLM_EXPORT_PATH/granite_llm_q4_k_m.gguf
+```
+
+Note that currently you cannot quantize the visual encoder because granite vision models use SigLIP as the visual encoder, which has tensor dimensions that are not divisible by 32.
+
+
+### 5. Running the Model in Llama cpp
+Build llama cpp normally; you should have a target binary named `llama-mtmd-cli`, which you can pass two binaries to. As an example, we pass the llama.cpp banner.
+
+```bash
+$ ./build/bin/llama-mtmd-cli -m $LLM_GGUF_PATH \
+    --mmproj $VISUAL_GGUF_PATH \
+    -c 16384 \
+    --temp 0
+```
+
+# LLaVA
+
+Currently this implementation supports [llava-v1.5](https://huggingface.co/liuhaotian/llava-v1.5-7b) variants,
+as well as llava-1.6 [llava-v1.6](https://huggingface.co/collections/liuhaotian/llava-16-65b9e40155f60fd046a5ccf2) variants.
+
+The pre-converted [7b](https://huggingface.co/mys/ggml_llava-v1.5-7b)
+and [13b](https://huggingface.co/mys/ggml_llava-v1.5-13b)
+models are available.
+For llava-1.6 a variety of prepared gguf models are available as well [7b-34b](https://huggingface.co/cmp-nct/llava-1.6-gguf)
+
+After API is confirmed, more models will be supported / uploaded.
+
+## Usage
+Build the `llama-mtmd-cli` binary.
+
+After building, run: `./llama-mtmd-cli` to see the usage. For example:
+
+```sh
+./llama-mtmd-cli -m ../llava-v1.5-7b/ggml-model-f16.gguf \
+    --mmproj ../llava-v1.5-7b/mmproj-model-f16.gguf \
+    --chat-template vicuna
+```
+
+**note**: A lower temperature like 0.1 is recommended for better quality. add `--temp 0.1` to the command to do so.
+**note**: For GPU offloading ensure to use the `-ngl` flag just like usual
+
+## LLaVA 1.5
+
+1. Clone a LLaVA and a CLIP model ([available options](https://github.com/haotian-liu/LLaVA/blob/main/docs/MODEL_ZOO.md)). For example:
+
+```sh
+git clone https://huggingface.co/liuhaotian/llava-v1.5-7b
+
+git clone https://huggingface.co/openai/clip-vit-large-patch14-336
+```
+
+2. Install the required Python packages:
+
+```sh
+pip install -r tools/mtmd/requirements.txt
+```
+
+3. Use `llava_surgery.py` to split the LLaVA model to LLaMA and multimodel projector constituents:
+
+```sh
+python ./tools/mtmd/llava_surgery.py -m ../llava-v1.5-7b
+```
+
+4. Use `convert_image_encoder_to_gguf.py` to convert the LLaVA image encoder to GGUF:
+
+```sh
+python ./tools/mtmd/convert_image_encoder_to_gguf.py -m ../clip-vit-large-patch14-336 --llava-projector ../llava-v1.5-7b/llava.projector --output-dir ../llava-v1.5-7b
+```
+
+5. Use `examples/convert_legacy_llama.py` to convert the LLaMA part of LLaVA to GGUF:
+
+```sh
+python ./examples/convert_legacy_llama.py ../llava-v1.5-7b --skip-unknown
+```
+
+Now both the LLaMA part and the image encoder are in the `llava-v1.5-7b` directory.
+
+## LLaVA 1.6 gguf conversion
+1) First clone a LLaVA 1.6 model:
+```console
+git clone https://huggingface.co/liuhaotian/llava-v1.6-vicuna-7b
+```
+
+2) Install the required Python packages:
+
+```sh
+pip install -r tools/mtmd/requirements.txt
+```
+
+3) Use `llava_surgery_v2.py` which also supports llava-1.5 variants pytorch as well as safetensor models:
+```console
+python tools/mtmd/llava_surgery_v2.py -C -m ../llava-v1.6-vicuna-7b/
+```
+- you will find a llava.projector and a llava.clip file in your model directory
+
+4) Copy the llava.clip file into a subdirectory (like vit), rename it to pytorch_model.bin and add a fitting vit configuration to the directory:
+```console
+mkdir vit
+cp ../llava-v1.6-vicuna-7b/llava.clip vit/pytorch_model.bin
+cp ../llava-v1.6-vicuna-7b/llava.projector vit/
+curl -s -q https://huggingface.co/cmp-nct/llava-1.6-gguf/raw/main/config_vit.json -o vit/config.json
+```
+
+5) Create the visual gguf model:
+```console
+python ./tools/mtmd/convert_image_encoder_to_gguf.py -m vit --llava-projector vit/llava.projector --output-dir vit --clip-model-is-vision
+```
+- This is similar to llava-1.5, the difference is that we tell the encoder that we are working with the pure vision model part of CLIP
+
+6) Then convert the model to gguf format:
+```console
+python ./examples/convert_legacy_llama.py ../llava-v1.6-vicuna-7b/ --skip-unknown
+```
+
+7) And finally we can run the llava cli using the 1.6 model version:
+```console
+./llama-mtmd-cli -m ../llava-v1.6-vicuna-7b/ggml-model-f16.gguf --mmproj vit/mmproj-model-f16.gguf
+```
+
+**note** llava-1.6 needs more context than llava-1.5, at least 3000 is needed (just run it at -c 4096)
+
+**note** llava-1.6 greatly benefits from batched prompt processing (defaults work)
+
+**note** if the language model in step `6)` is incompatible with the legacy conversion script, the easiest way handle the LLM model conversion is to load the model in transformers, and export only the LLM from the llava next model.
+
+```python
+import os
+import transformers
+
+model_path = ...
+llm_export_path = ...
+
+tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
+model = transformers.AutoModelForImageTextToText.from_pretrained(model_path)
+
+tokenizer.save_pretrained(llm_export_path)
+model.language_model.save_pretrained(llm_export_path)
+```
+
+Then, you can convert the LLM using the `convert_hf_to_gguf.py` script, which handles more LLM architectures.
+
+## Chat template
+
+For llava-1.5 and llava-1.6, you need to use `vicuna` chat template. Simply add `--chat-template vicuna` to activate this template.
+
+
+## How to know if you are running in llava-1.5 or llava-1.6 mode
+
+When running llava-cli you will see a visual information right before the prompt is being processed:
+
+**Llava-1.5:**
+`encode_image_with_clip: image embedding created: 576 tokens`
+
+**Llava-1.6 (anything above 576):**
+`encode_image_with_clip: image embedding created: 2880 tokens`
+
+
+Alternatively just pay notice to how many "tokens" have been used for your prompt, it will also show 1000+ tokens for llava-1.6
+
+## MiniCPM-o 2.6
+Currently, this readme only supports minicpm-omni's image capabilities, and we will update the full-mode support as soon as possible.
+
+### Prepare models and code
+
+Download [MiniCPM-o-2_6](https://huggingface.co/openbmb/MiniCPM-o-2_6) PyTorch model from huggingface to "MiniCPM-o-2_6" folder.
+
+
+### Build llama.cpp
+Readme modification time: 20250206
+
+If there are differences in usage, please refer to the official build [documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+
+Clone llama.cpp:
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+```
+
+Build llama.cpp using `CMake`:
+```bash
+cmake -B build
+cmake --build build --config Release
+```
+
+
+### Usage of MiniCPM-o 2.6
+
+Convert PyTorch model to gguf files (You can also download the converted [gguf](https://huggingface.co/openbmb/MiniCPM-o-2_6-gguf) by us)
+
+```bash
+python ./tools/mtmd/legacy-models/minicpmv-surgery.py -m ../MiniCPM-o-2_6
+python ./tools/mtmd/legacy-models/minicpmv-convert-image-encoder-to-gguf.py -m ../MiniCPM-o-2_6 --minicpmv-projector ../MiniCPM-o-2_6/minicpmv.projector --output-dir ../MiniCPM-o-2_6/ --minicpmv_version 4
+python ./convert_hf_to_gguf.py ../MiniCPM-o-2_6/model
+
+# quantize int4 version
+./build/bin/llama-quantize ../MiniCPM-o-2_6/model/ggml-model-f16.gguf ../MiniCPM-o-2_6/model/ggml-model-Q4_K_M.gguf Q4_K_M
+```
+
+
+Inference on Linux or Mac
+```bash
+# run in single-turn mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-o-2_6/model/ggml-model-f16.gguf --mmproj ../MiniCPM-o-2_6/mmproj-model-f16.gguf -c 4096 --temp 0.7 --top-p 0.8 --top-k 100 --repeat-penalty 1.05 --image xx.jpg -p "What is in the image?"
+
+# run in conversation mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-o-2_6/model/ggml-model-Q4_K_M.gguf --mmproj ../MiniCPM-o-2_6/mmproj-model-f16.gguf
+```
+
+## MiniCPM-o 4
+
+### Prepare models and code
+
+Download [MiniCPM-o-4](https://huggingface.co/openbmb/MiniCPM-o-4) PyTorch model from huggingface to "MiniCPM-o-4" folder.
+
+
+### Build llama.cpp
+Readme modification time: 20250206
+
+If there are differences in usage, please refer to the official build [documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+
+Clone llama.cpp:
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+```
+
+Build llama.cpp using `CMake`:
+```bash
+cmake -B build
+cmake --build build --config Release
+```
+
+
+### Usage of MiniCPM-o 4
+
+Convert PyTorch model to gguf files (You can also download the converted [gguf](https://huggingface.co/openbmb/MiniCPM-o-4-gguf) by us)
+
+```bash
+python ./tools/mtmd/legacy-models/minicpmv-surgery.py -m ../MiniCPM-o-4
+python ./tools/mtmd/legacy-models/minicpmv-convert-image-encoder-to-gguf.py -m ../MiniCPM-o-4 --minicpmv-projector ../MiniCPM-o-4/minicpmv.projector --output-dir ../MiniCPM-o-4/ --minicpmv_version 6
+python ./convert_hf_to_gguf.py ../MiniCPM-o-4/model
+
+# quantize int4 version
+./build/bin/llama-quantize ../MiniCPM-o-4/model/ggml-model-f16.gguf ../MiniCPM-o-4/model/ggml-model-Q4_K_M.gguf Q4_K_M
+```
+
+
+Inference on Linux or Mac
+```bash
+# run in single-turn mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-o-4/model/ggml-model-f16.gguf --mmproj ../MiniCPM-o-4/mmproj-model-f16.gguf -c 4096 --temp 0.7 --top-p 0.8 --top-k 100 --repeat-penalty 1.05 --image xx.jpg -p "What is in the image?"
+
+# run in conversation mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-o-4/model/ggml-model-Q4_K_M.gguf --mmproj ../MiniCPM-o-4/mmproj-model-f16.gguf
+```
+
+## MiniCPM-Llama3-V 2.5
+
+### Prepare models and code
+
+Download [MiniCPM-Llama3-V-2_5](https://huggingface.co/openbmb/MiniCPM-Llama3-V-2_5) PyTorch model from huggingface to "MiniCPM-Llama3-V-2_5" folder.
+
+
+### Build llama.cpp
+Readme modification time: 20250206
+
+If there are differences in usage, please refer to the official build [documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+
+Clone llama.cpp:
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+```
+
+Build llama.cpp using `CMake`:
+```bash
+cmake -B build
+cmake --build build --config Release
+```
+
+
+### Usage of MiniCPM-Llama3-V 2.5
+
+Convert PyTorch model to gguf files (You can also download the converted [gguf](https://huggingface.co/openbmb/MiniCPM-Llama3-V-2_5-gguf) by us)
+
+```bash
+python ./tools/mtmd/legacy-models/minicpmv-surgery.py -m ../MiniCPM-Llama3-V-2_5
+python ./tools/mtmd/legacy-models/minicpmv-convert-image-encoder-to-gguf.py -m ../MiniCPM-Llama3-V-2_5 --minicpmv-projector ../MiniCPM-Llama3-V-2_5/minicpmv.projector --output-dir ../MiniCPM-Llama3-V-2_5/ --minicpmv_version 2
+python ./convert_hf_to_gguf.py ../MiniCPM-Llama3-V-2_5/model
+
+# quantize int4 version
+./build/bin/llama-quantize ../MiniCPM-Llama3-V-2_5/model/model-8B-F16.gguf ../MiniCPM-Llama3-V-2_5/model/ggml-model-Q4_K_M.gguf Q4_K_M
+```
+
+
+Inference on Linux or Mac
+```bash
+# run in single-turn mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-Llama3-V-2_5/model/model-8B-F16.gguf --mmproj ../MiniCPM-Llama3-V-2_5/mmproj-model-f16.gguf -c 4096 --temp 0.7 --top-p 0.8 --top-k 100 --repeat-penalty 1.05 --image xx.jpg -p "What is in the image?"
+
+# run in conversation mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-Llama3-V-2_5/model/ggml-model-Q4_K_M.gguf --mmproj ../MiniCPM-Llama3-V-2_5/mmproj-model-f16.gguf
+```
+
+## MiniCPM-V 2.6
+
+### Prepare models and code
+
+Download [MiniCPM-V-2_6](https://huggingface.co/openbmb/MiniCPM-V-2_6) PyTorch model from huggingface to "MiniCPM-V-2_6" folder.
+
+
+### Build llama.cpp
+Readme modification time: 20250206
+
+If there are differences in usage, please refer to the official build [documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+
+Clone llama.cpp:
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+```
+
+Build llama.cpp using `CMake`:
+```bash
+cmake -B build
+cmake --build build --config Release
+```
+
+
+### Usage of MiniCPM-V 2.6
+
+Convert PyTorch model to gguf files (You can also download the converted [gguf](https://huggingface.co/openbmb/MiniCPM-V-2_6-gguf) by us)
+
+```bash
+python ./tools/mtmd/legacy-models/minicpmv-surgery.py -m ../MiniCPM-V-2_6
+python ./tools/mtmd/legacy-models/minicpmv-convert-image-encoder-to-gguf.py -m ../MiniCPM-V-2_6 --minicpmv-projector ../MiniCPM-V-2_6/minicpmv.projector --output-dir ../MiniCPM-V-2_6/ --minicpmv_version 3
+python ./convert_hf_to_gguf.py ../MiniCPM-V-2_6/model
+
+# quantize int4 version
+./build/bin/llama-quantize ../MiniCPM-V-2_6/model/ggml-model-f16.gguf ../MiniCPM-V-2_6/model/ggml-model-Q4_K_M.gguf Q4_K_M
+```
+
+
+Inference on Linux or Mac
+```bash
+# run in single-turn mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-V-2_6/model/ggml-model-f16.gguf --mmproj ../MiniCPM-V-2_6/mmproj-model-f16.gguf -c 4096 --temp 0.7 --top-p 0.8 --top-k 100 --repeat-penalty 1.05 --image xx.jpg -p "What is in the image?"
+
+# run in conversation mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-V-2_6/model/ggml-model-Q4_K_M.gguf --mmproj ../MiniCPM-V-2_6/mmproj-model-f16.gguf
+```
+
+## MiniCPM-V 4
+
+### Prepare models and code
+
+Download [MiniCPM-V-4](https://huggingface.co/openbmb/MiniCPM-V-4) PyTorch model from huggingface to "MiniCPM-V-4" folder.
+
+
+### Build llama.cpp
+Readme modification time: 20250731
+
+If there are differences in usage, please refer to the official build [documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+
+Clone llama.cpp:
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+```
+
+Build llama.cpp using `CMake`:
+```bash
+cmake -B build
+cmake --build build --config Release
+```
+
+
+### Usage of MiniCPM-V 4
+
+Convert PyTorch model to gguf files (You can also download the converted [gguf](https://huggingface.co/openbmb/MiniCPM-V-4-gguf) by us)
+
+```bash
+python ./tools/mtmd/legacy-models/minicpmv-surgery.py -m ../MiniCPM-V-4
+python ./tools/mtmd/legacy-models/minicpmv-convert-image-encoder-to-gguf.py -m ../MiniCPM-V-4 --minicpmv-projector ../MiniCPM-V-4/minicpmv.projector --output-dir ../MiniCPM-V-4/ --minicpmv_version 5
+python ./convert_hf_to_gguf.py ../MiniCPM-V-4/model
+
+# quantize int4 version
+./build/bin/llama-quantize ../MiniCPM-V-4/model/ggml-model-f16.gguf ../MiniCPM-V-4/model/ggml-model-Q4_K_M.gguf Q4_K_M
+```
+
+
+Inference on Linux or Mac
+```bash
+# run in single-turn mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-V-4/model/ggml-model-f16.gguf --mmproj ../MiniCPM-V-4/mmproj-model-f16.gguf -c 4096 --temp 0.7 --top-p 0.8 --top-k 100 --repeat-penalty 1.05 --image xx.jpg -p "What is in the image?"
+
+# run in conversation mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-V-4/model/ggml-model-Q4_K_M.gguf --mmproj ../MiniCPM-V-4/mmproj-model-f16.gguf
+```
+
+## MiniCPM-V 4.5
+
+### Prepare models and code
+
+Download [MiniCPM-V-4_5](https://huggingface.co/openbmb/MiniCPM-V-4_5) PyTorch model from huggingface to "MiniCPM-V-4_5" folder.
+
+
+### Build llama.cpp
+Readme modification time: 20250826
+
+If there are differences in usage, please refer to the official build [documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+
+Clone llama.cpp:
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+```
+
+Build llama.cpp using `CMake`:
+```bash
+cmake -B build
+cmake --build build --config Release
+```
+
+
+### Usage of MiniCPM-V 4
+
+Convert PyTorch model to gguf files (You can also download the converted [gguf](https://huggingface.co/openbmb/MiniCPM-V-4_5-gguf) by us)
+
+```bash
+python ./tools/mtmd/legacy-models/minicpmv-surgery.py -m ../MiniCPM-V-4_5
+python ./tools/mtmd/legacy-models/minicpmv-convert-image-encoder-to-gguf.py -m ../MiniCPM-V-4_5 --minicpmv-projector ../MiniCPM-V-4_5/minicpmv.projector --output-dir ../MiniCPM-V-4_5/ --minicpmv_version 6
+python ./convert_hf_to_gguf.py ../MiniCPM-V-4_5/model
+
+# quantize int4 version
+./build/bin/llama-quantize ../MiniCPM-V-4_5/model/ggml-model-f16.gguf ../MiniCPM-V-4_5/model/ggml-model-Q4_K_M.gguf Q4_K_M
+```
+
+
+Inference on Linux or Mac
+```bash
+# run in single-turn mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-V-4_5/model/ggml-model-f16.gguf --mmproj ../MiniCPM-V-4_5/mmproj-model-f16.gguf -c 4096 --temp 0.7 --top-p 0.8 --top-k 100 --repeat-penalty 1.05 --image xx.jpg -p "What is in the image?"
+
+# run in conversation mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-V-4_5/model/ggml-model-Q4_K_M.gguf --mmproj ../MiniCPM-V-4_5/mmproj-model-f16.gguf
+```
+
+## MiniCPM-V 4.6
+
+### Prepare models and code
+
+Download [MiniCPM-V-4_6](https://huggingface.co/openbmb/MiniCPM-V-4_6) PyTorch model from huggingface to "MiniCPM-V-4_6" folder.
+
+The model must be the standard `transformers` v5.7.0+ checkpoint (no `trust_remote_code`); the architecture in `config.json` is `MiniCPMV4_6ForConditionalGeneration` with a `qwen3_5_text` text model and a SigLIP-based vision tower plus a window-attention `vit_merger`.
+
+### Build llama.cpp
+
+If there are differences in usage, please refer to the official build [documentation](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+
+Clone llama.cpp:
+```bash
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+```
+
+Build llama.cpp using `CMake`:
+```bash
+cmake -B build
+cmake --build build --config Release
+```
+
+
+### Usage of MiniCPM-V 4.6
+
+Unlike older MiniCPM-V variants, MiniCPM-V 4.6 is converted directly through `convert_hf_to_gguf.py`. The same script is invoked twice on the original Hugging Face directory: once to produce the language-model GGUF and once with `--mmproj` to produce the multimodal projector GGUF.
+
+```bash
+# language model
+python ./convert_hf_to_gguf.py ../MiniCPM-V-4_6 --outfile ../MiniCPM-V-4_6/ggml-model-f16.gguf
+
+# multimodal projector (vision tower + window-attention vit_merger + DownsampleMLP merger)
+python ./convert_hf_to_gguf.py ../MiniCPM-V-4_6 --mmproj --outfile ../MiniCPM-V-4_6/mmproj-model-f16.gguf
+
+# optional: quantize to Q4_K_M
+./build/bin/llama-quantize ../MiniCPM-V-4_6/ggml-model-f16.gguf ../MiniCPM-V-4_6/ggml-model-Q4_K_M.gguf Q4_K_M
+```
+
+
+Inference on Linux or Mac
+```bash
+# run in single-turn mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-V-4_6/ggml-model-f16.gguf --mmproj ../MiniCPM-V-4_6/mmproj-model-f16.gguf -c 4096 --temp 0.7 --top-p 0.8 --top-k 100 --repeat-penalty 1.05 --image xx.jpg -p "What is in the image?"
+
+# run in conversation mode
+./build/bin/llama-mtmd-cli -m ../MiniCPM-V-4_6/ggml-model-Q4_K_M.gguf --mmproj ../MiniCPM-V-4_6/mmproj-model-f16.gguf
+```
+
+# MobileVLM
+
+Currently this implementation supports [MobileVLM-1.7B](https://huggingface.co/mtgv/MobileVLM-1.7B) / [MobileVLM_V2-1.7B](https://huggingface.co/mtgv/MobileVLM_V2-1.7B) variants.
+
+for more information, please go to [Meituan-AutoML/MobileVLM](https://github.com/Meituan-AutoML/MobileVLM)
+
+The implementation is based on llava, and is compatible with llava and mobileVLM. The usage is basically same as llava.
+
+Notice: The overall process of model inference for both **MobileVLM** and **MobileVLM_V2** models is the same, but the process of model conversion is a little different. Therefore, using **MobileVLM-1.7B** as an example, the different conversion step will be shown.
+
+## Usage
+
+Build the `llama-mtmd-cli` binary.
+
+After building, run: `./llama-mtmd-cli` to see the usage. For example:
+
+```sh
+./llama-mtmd-cli -m MobileVLM-1.7B/ggml-model-q4_k.gguf \
+    --mmproj MobileVLM-1.7B/mmproj-model-f16.gguf \
+    --chat-template deepseek
+```
+
+## Model conversion
+
+1. Clone `mobileVLM-1.7B` and `clip-vit-large-patch14-336` locally:
+
+```sh
+git clone https://huggingface.co/mtgv/MobileVLM-1.7B
+
+git clone https://huggingface.co/openai/clip-vit-large-patch14-336
+```
+
+2. Use `llava_surgery.py` to split the LLaVA model to LLaMA and multimodel projector constituents:
+
+```sh
+python ./tools/mtmd/llava_surgery.py -m path/to/MobileVLM-1.7B
+```
+
+3. Use `convert_image_encoder_to_gguf.py` with `--projector-type ldp` (for **V2** please use `--projector-type ldpv2`) to convert the LLaVA image encoder to GGUF:
+
+```sh
+python ./tools/mtmd/convert_image_encoder_to_gguf.py \
+    -m path/to/clip-vit-large-patch14-336 \
+    --llava-projector path/to/MobileVLM-1.7B/llava.projector \
+    --output-dir path/to/MobileVLM-1.7B \
+    --projector-type ldp
+```
+
+```sh
+python ./tools/mtmd/convert_image_encoder_to_gguf.py \
+    -m path/to/clip-vit-large-patch14-336 \
+    --llava-projector path/to/MobileVLM-1.7B_V2/llava.projector \
+    --output-dir path/to/MobileVLM-1.7B_V2 \
+    --projector-type ldpv2
+```
+
+4. Use `examples/convert_legacy_llama.py` to convert the LLaMA part of LLaVA to GGUF:
+
+```sh
+python ./examples/convert_legacy_llama.py path/to/MobileVLM-1.7B --skip-unknown
+```
+
+5. Use `quantize` to convert LLaMA part's DataType from `fp32` to `q4_k`
+```sh
+./llama-quantize path/to/MobileVLM-1.7B/ggml-model-F32.gguf path/to/MobileVLM-1.7B/ggml-model-q4_k.gguf q4_k_s
+```
+
+Now both the LLaMA part and the image encoder is in the `MobileVLM-1.7B` directory.
+
+## Android compile and run
+### compile
+refer to `tools/mtmd/android/build_64.sh`
+```sh
+mkdir tools/mtmd/android/build_64
+cd tools/mtmd/android/build_64
+../build_64.sh
+```
+### run on Android
+refer to `android/adb_run.sh`, modify resources' `name` and `path`
+
+## Some result on Android with `Snapdragon 888` chip
+### case 1
+**input**
+```sh
+/data/local/tmp/llama-mtmd-cli \
+    -m /data/local/tmp/ggml-model-q4_k.gguf \
+    --mmproj /data/local/tmp/mmproj-model-f16.gguf \
+    -t 4 \
+    --image /data/local/tmp/demo.jpg \
+    -p "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: <image>\nWho is the author of this book? \nAnswer the question using a single word or phrase. ASSISTANT:"
+```
+**output**
+```sh
+encode_image_with_clip: image encoded in 21148.71 ms by CLIP (  146.87 ms per image patch)
+ Susan Wise Bauer
+llama_print_timings:        load time =   23574.72 ms
+llama_print_timings:      sample time =       1.24 ms /     6 runs   (    0.21 ms per token,  4850.44 tokens per second)
+llama_print_timings: prompt eval time =   12460.15 ms /   246 tokens (   50.65 ms per token,    19.74 tokens per second)
+llama_print_timings:        eval time =     424.86 ms /     6 runs   (   70.81 ms per token,    14.12 tokens per second)
+llama_print_timings:       total time =   34731.93 ms
+```
+### case 2
+**input**
+```sh
+/data/local/tmp/llama-mtmd-cli \
+    -m /data/local/tmp/ggml-model-q4_k.gguf \
+    --mmproj /data/local/tmp/mmproj-model-f16.gguf \
+    -t 4 \
+    --image /data/local/tmp/cat.jpeg \
+    -p "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: <image>\nWhat is in the image? ASSISTANT:"
+```
+**output**
+```sh
+encode_image_with_clip: image encoded in 21149.51 ms by CLIP (  146.87 ms per image patch)
+ The image depicts a cat sitting in the grass near some tall green plants.
+llama_print_timings:        load time =   23257.32 ms
+llama_print_timings:      sample time =       5.25 ms /    18 runs   (    0.29 ms per token,  3430.53 tokens per second)
+llama_print_timings: prompt eval time =   11900.73 ms /   232 tokens (   51.30 ms per token,    19.49 tokens per second)
+llama_print_timings:        eval time =    1279.03 ms /    18 runs   (   71.06 ms per token,    14.07 tokens per second)
+llama_print_timings:       total time =   34570.79 ms
+```
+
+
+## Some result on Android with `Snapdragon 778G` chip
+### MobileVLM-1.7B case
+#### mtmd-cli release-b2005
+**input**
+```sh
+/data/local/tmp/llama-mtmd-cli \
+    -m /data/local/tmp/ggml-model-q4_k.gguf \
+    --mmproj /data/local/tmp/mmproj-model-f16.gguf \
+    -t 4 \
+    --image /data/local/tmp/many_llamas.jpeg \
+    -p "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: <image>\nWhat's that? ASSISTANT:"
+```
+**output**
+```sh
+encode_image_with_clip: image encoded in 18728.52 ms by CLIP (  130.06 ms per image patch)
+system_prompt: A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER:
+user_prompt: \nWhat's that? ASSISTANT:
+
+ A group of llamas are standing in a green pasture.
+
+llama_print_timings:        load time =   20357.33 ms
+llama_print_timings:      sample time =       2.96 ms /    14 runs   (    0.21 ms per token,  4734.53 tokens per second)
+llama_print_timings: prompt eval time =    8119.49 ms /   191 tokens (   42.51 ms per token,    23.52 tokens per second)
+llama_print_timings:        eval time =    1005.75 ms /    14 runs   (   71.84 ms per token,    13.92 tokens per second)
+llama_print_timings:       total time =   28038.34 ms /   205 tokens
+```
+#### mtmd-cli latest-version
+**input**
+
+Just the same as above.
+
+**output**(seems to be much slower)
+```sh
+encode_image_with_clip: image embedding created: 144 tokens
+
+encode_image_with_clip: image encoded in 288268.88 ms by CLIP ( 2001.87 ms per image patch)
+system_prompt: A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER:
+user_prompt: \nWhat's that? ASSISTANT:
+
+ It is a group of sheep standing together in a grass field.
+
+llama_print_timings:        load time =  818120.91 ms
+llama_print_timings:      sample time =       3.44 ms /    14 runs   (    0.25 ms per token,  4067.40 tokens per second)
+llama_print_timings: prompt eval time =  529274.69 ms /   191 tokens ( 2771.07 ms per token,     0.36 tokens per second)
+llama_print_timings:        eval time =   43894.02 ms /    13 runs   ( 3376.46 ms per token,     0.30 tokens per second)
+llama_print_timings:       total time =  865441.76 ms /   204 tokens
+```
+### MobileVLM_V2-1.7B case
+#### mtmd-cli release-2005b
+**input**
+
+Just the same as above.
+
+**output**
+```sh
+encode_image_with_clip: image encoded in 20609.61 ms by CLIP (  143.12 ms per image patch)
+system_prompt: A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER:
+user_prompt: \nWhat's that? ASSISTANT:
+
+ This image captures a lively scene of 20 llamas in motion on an expansive, grassy field. The llama is scattered across the landscape with some standing and others sitting down as if taking rest or observing their surroundings from different vantage points within this verdant setting.
+
+The background offers glimpses into a picturesque town nestled amidst hills under an overcast sky, adding depth to the scene while also emphasizing that distance between these llama and human-made structures like houses or roads in which they roam freely without any barriers around them. The image is framed by text at both right angles on white backgrounds against a contrasting blue backdrop with green foliage, further drawing attention to the llamas amidst their natural habitat while also inviting viewers into this picturesque landscape within town limits of Alta Llama
+
+llama_print_timings:        load time =   22406.77 ms
+llama_print_timings:      sample time =      49.26 ms /   186 runs   (    0.26 ms per token,  3776.27 tokens per second)
+llama_print_timings: prompt eval time =    9044.54 ms /   191 tokens (   47.35 ms per token,    21.12 tokens per second)
+llama_print_timings:        eval time =   14497.49 ms /   186 runs   (   77.94 ms per token,    12.83 tokens per second)
+llama_print_timings:       total time =   44411.01 ms /   377 tokens
+```
+
+## Orin compile and run
+### compile
+```sh
+make GGML_CUDA=1 CUDA_DOCKER_ARCH=sm_87 -j 32
+```
+### run on Orin
+### case 1
+**input**
+```sh
+./llama-mtmd-cli \
+    -m /data/local/tmp/ggml-model-q4_k.gguf \
+    --mmproj /data/local/tmp/mmproj-model-f16.gguf \
+    --image /data/local/tmp/demo.jpeg \
+    -p "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: <image>\nWho is the author of this book? \nAnswer the question using a single word or phrase. ASSISTANT:" \
+    --n-gpu-layers 999
+```
+**output**
+```sh
+
+encode_image_with_clip: image encoded in   296.62 ms by CLIP (    2.06 ms per image patch)
+
+ Susan Wise Bauer
+
+llama_print_timings:        load time =    1067.64 ms
+llama_print_timings:      sample time =       1.53 ms /     6 runs   (    0.25 ms per token,  3934.43 tokens per second)
+llama_print_timings: prompt eval time =     306.84 ms /   246 tokens (    1.25 ms per token,   801.72 tokens per second)
+llama_print_timings:        eval time =      91.50 ms /     6 runs   (   15.25 ms per token,    65.58 tokens per second)
+llama_print_timings:       total time =    1352.63 ms /   252 tokens
+```
+
+### case 2
+**input**
+```sh
+./llama-mtmd-cli \
+    -m /data/local/tmp/ggml-model-q4_k.gguf \
+    --mmproj /data/local/tmp/mmproj-model-f16.gguf \
+    -p "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: <image>\nWhat is in the image? ASSISTANT:" \
+    --n-gpu-layers 999
+
+```
+**output**
+```sh
+encode_image_with_clip: image encoded in   302.15 ms by CLIP (    2.10 ms per image patch)
+
+ The image features a cat lying in the grass.
+
+llama_print_timings:        load time =    1057.07 ms
+llama_print_timings:      sample time =       3.27 ms /    11 runs   (    0.30 ms per token,  3360.83 tokens per second)
+llama_print_timings: prompt eval time =     213.60 ms /   232 tokens (    0.92 ms per token,  1086.14 tokens per second)
+llama_print_timings:        eval time =     166.65 ms /    11 runs   (   15.15 ms per token,    66.01 tokens per second)
+llama_print_timings:       total time =    1365.47 ms /   243 tokens
+```
+
+## Running on Intel(R) Core(TM) i7-10750H
+### Operating system
+Ubuntu22.04
+### compile
+```sh
+make -j32
+```
+### MobileVLM-1.7B case
+**input**
+```sh
+-m /path/to/ggml-model-q4_k.gguf \
+    --mmproj /path/to/mmproj-model-f16.gguf \
+    --image /path/to/many_llamas.jpeg
+    -p "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: <image>\nWhat's that? ASSISTANT:" \
+```
+**output**
+```sh
+encode_image_with_clip: image embedding created: 144 tokens
+
+encode_image_with_clip: image encoded in  2730.94 ms by CLIP (   18.96 ms per image patch)
+system_prompt: A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER:
+user_prompt: \nWhat's that?ASSISTANT:
+
+ A group of llamas are walking together in a field.
+
+llama_print_timings:        load time =    5506.60 ms
+llama_print_timings:      sample time =       0.44 ms /    13 runs   (    0.03 ms per token, 29545.45 tokens per second)
+llama_print_timings: prompt eval time =    2031.58 ms /   190 tokens (   10.69 ms per token,    93.52 tokens per second)
+llama_print_timings:        eval time =     438.92 ms /    12 runs   (   36.58 ms per token,    27.34 tokens per second)
+llama_print_timings:       total time =    5990.25 ms /   202 tokens
+```
+
+### MobileVLM_V2-1.7B case
+**input**
+
+Just the same as above.
+
+**output**
+```sh
+encode_image_with_clip: image embedding created: 144 tokens
+
+encode_image_with_clip: image encoded in  3223.89 ms by CLIP (   22.39 ms per image patch)
+system_prompt: A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER:
+user_prompt: \nWhat's that?ASSISTANT:
+
+ The image captures a tranquil scene in a park, where a group of approximately 20 llamas are gathered. The llamas, a mix of white and black, are standing in a line, their black and white patterns contrasting with the lush green grass of the park. The lamas are arranged in a line, suggesting a social order.
+
+The park itself is lush and green, with trees dotting the landscape in the background. A sign reading "Llamas Tico  Ana" is also visible in the image, possibly indicating the location or the breed of the llamas. The image seems to be taken from a distance, providing a wide view of the scene and the surrounding environment.
+
+The llamas' positions relative to each other, the sign, and the trees create a harmonious composition. The image does not contain any discernible text. The overall scene is one of peace and natural beauty, with the llamas in their natural habitat, surrounded by the vibrant colors and lush greenery of the park.
+
+llama_print_timings:        load time =    6642.61 ms
+llama_print_timings:      sample time =       8.15 ms /   223 runs   (    0.04 ms per token, 27358.61 tokens per second)
+llama_print_timings: prompt eval time =    2475.07 ms /   190 tokens (   13.03 ms per token,    76.77 tokens per second)
+llama_print_timings:        eval time =    8760.60 ms /   222 runs   (   39.46 ms per token,    25.34 tokens per second)
+llama_print_timings:       total time =   15513.95 ms /   412 tokens
+```
+
+## Run on Intel(R) Core(TM) Ultra7 115H
+### operation system
+Windows11
+### compile
+```sh
+make -j32
+```
+### MobileVLM-1.7B case
+**input**
+```sh
+-m /path/to/ggml-model-q4_k.gguf \
+    --mmproj /path/to/tmp/mmproj-model-f16.gguf \
+    -p "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: <image>\nWhat's that? ASSISTANT:" \
+```
+**output**
+```sh
+encode_image_with_clip: image encoded in  4902.81 ms by CLIP (   34.05 ms per image patch)
+system_prompt: A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER:
+user_prompt: \nWhat's that? ASSISTANT:
+
+ The image features a group of brown and white llamas standing in a grassy field.
+
+llama_print_timings:        load time =    7441.06 ms
+llama_print_timings:      sample time =       0.72 ms /    19 runs   (    0.04 ms per token, 26279.39 tokens per second)
+llama_print_timings: prompt eval time =    2090.71 ms /   191 tokens (   10.95 ms per token,    91.36 tokens per second)
+llama_print_timings:        eval time =     512.35 ms /    18 runs   (   28.46 ms per token,    35.13 tokens per second)
+llama_print_timings:       total time =    7987.23 ms /   209 tokens
+```
+
+### MobileVLM_V2-1.7B case
+**input**
+
+Just the same as above.
+
+**output**
+```sh
+encode_image_with_clip: image encoded in  4682.44 ms by CLIP (   32.52 ms per image patch)
+system_prompt: A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER:
+user_prompt: \nWhat's that? ASSISTANT:
+
+ This image captures a lively scene of a group of 14 llamas in a grassy field. The llamas, with their distinctive black and white coats, are standing and walking in a line, seemingly engaged in a social activity. One
+ of them, possibly the first in the line, has its back turned, perhaps observing something in the distance.
+
+The llama in the front of the line stands out due to its black and white coloring, which is quite unusual for llama patterns. The llama in the front also seems to be more aware of its surroundings, as it faces the camera, giving a sense of engagement with the viewer.
+
+The image is taken from the side of the llama, providing a clear view of the llama in the front and its companions. The lameness in the llama in
+ front is not visible, indicating that it might not be the main focus of the photo.
+
+The background of the image features a grassy field, with a fence and a tree visible in the distance. The tree appears to be bare, suggesting that it might be during a time of year when most trees are dormant or have shed their leaves.
+
+
+llama_print_timings:        load time =    7015.35 ms
+llama_print_timings:      sample time =      10.61 ms /   256 runs   (    0.04 ms per token, 24119.09 tokens per second)
+llama_print_timings: prompt eval time =    2052.45 ms /   191 tokens (   10.75 ms per token,    93.06 tokens per second)
+llama_print_timings:        eval time =    7259.43 ms /   255 runs   (   28.47 ms per token,    35.13 tokens per second)
+llama_print_timings:       total time =   14371.19 ms /   446 tokens
+```
+
+## TODO
+
+- [x] Support non-CPU backend for the new operators, such as `depthwise`, `hardswish`, `hardsigmoid`
+- [ ] Optimize LDP projector performance
+
+      - Optimize the structure definition to avoid unnecessary memory rearrangements, to reduce the use of `ggml_permute_cpy`;
+      - Optimize operator implementation (ARM CPU/NVIDIA GPU): such as depthwise conv, hardswish, hardsigmoid, etc.
+- [x] run MobileVLM on `Jetson Orin`
+- [ ] Support more model variants, such as `MobileVLM-3B`.
+
+
+## contributor
+```sh
+zhangjidong05, yangyang260, huyiming03, chenxiaotao03, ZiangWu-77
+```
+
+# Multimodal
+
+llama.cpp supports multimodal input via `libmtmd`. Currently, there are 2 tools support this feature:
+- [llama-cli](../tools/cli/README.md)
+- [llama-server](../tools/server/README.md) via OpenAI-compatible `/chat/completions` API
+- [llama-mtmd-cli](../tools/mtmd/README.md), for testing and development
+
+Currently, we support **image**, **audio** and **video** input.
+
+To enable it, you can use one of the 2 methods below:
+
+- Use `-hf` option with a supported model (see a list of pre-quantized model below)
+    - To load a model using `-hf` while disabling multimodal, use `--no-mmproj`
+    - To load a model using `-hf` while using a custom mmproj file, use `--mmproj local_file.gguf`
+- Use `-m model.gguf` option with `--mmproj file.gguf` to specify text and multimodal projector respectively
+
+By default, multimodal projector will be offloaded to GPU. To disable this, add `--no-mmproj-offload`
+
+For example:
+
+```sh
+# simple usage with CLI
+llama-mtmd-cli -hf ggml-org/gemma-3-4b-it-GGUF
+
+# simple usage with server
+llama-server -hf ggml-org/gemma-3-4b-it-GGUF
+
+# using local file
+llama-server -m gemma-3-4b-it-Q4_K_M.gguf --mmproj mmproj-gemma-3-4b-it-Q4_K_M.gguf
+
+# no GPU offload
+llama-server -hf ggml-org/gemma-3-4b-it-GGUF --no-mmproj-offload
+```
+
+> [!IMPORTANT]
+>
+> OCR models are trained with specific prompt and input structure, please refer to these discussions for more info:
+> - PaddleOCR-VL: https://github.com/ggml-org/llama.cpp/pull/18825
+> - GLM-OCR: https://github.com/ggml-org/llama.cpp/pull/19677
+> - Deepseek-OCR: https://github.com/ggml-org/llama.cpp/pull/17400
+> - Dots.OCR: https://github.com/ggml-org/llama.cpp/pull/17575
+> - HunyuanOCR: https://github.com/ggml-org/llama.cpp/pull/21395
+
+## Pre-quantized models
+
+These are ready-to-use models, most of them come with `Q4_K_M` quantization by default. They can be found at the Hugging Face page of the ggml-org: https://huggingface.co/collections/ggml-org/multimodal-ggufs-68244e01ff1f39e5bebeeedc
+
+Replaces the `(tool_name)` with the name of binary you want to use. For example, `llama-mtmd-cli` or `llama-server`
+
+NOTE: some models may require large context window, for example: `-c 8192`
+
+**Vision models**:
+
+```sh
+# Gemma 3
+(tool_name) -hf ggml-org/gemma-3-4b-it-GGUF
+(tool_name) -hf ggml-org/gemma-3-12b-it-GGUF
+(tool_name) -hf ggml-org/gemma-3-27b-it-GGUF
+
+# SmolVLM
+(tool_name) -hf ggml-org/SmolVLM-Instruct-GGUF
+(tool_name) -hf ggml-org/SmolVLM-256M-Instruct-GGUF
+(tool_name) -hf ggml-org/SmolVLM-500M-Instruct-GGUF
+(tool_name) -hf ggml-org/SmolVLM2-2.2B-Instruct-GGUF
+(tool_name) -hf ggml-org/SmolVLM2-256M-Video-Instruct-GGUF
+(tool_name) -hf ggml-org/SmolVLM2-500M-Video-Instruct-GGUF
+
+# Pixtral 12B
+(tool_name) -hf ggml-org/pixtral-12b-GGUF
+
+# Qwen 2 VL
+(tool_name) -hf ggml-org/Qwen2-VL-2B-Instruct-GGUF
+(tool_name) -hf ggml-org/Qwen2-VL-7B-Instruct-GGUF
+
+# Qwen 2.5 VL
+(tool_name) -hf ggml-org/Qwen2.5-VL-3B-Instruct-GGUF
+(tool_name) -hf ggml-org/Qwen2.5-VL-7B-Instruct-GGUF
+(tool_name) -hf ggml-org/Qwen2.5-VL-32B-Instruct-GGUF
+(tool_name) -hf ggml-org/Qwen2.5-VL-72B-Instruct-GGUF
+
+# Mistral Small 3.1 24B (IQ2_M quantization)
+(tool_name) -hf ggml-org/Mistral-Small-3.1-24B-Instruct-2503-GGUF
+
+# InternVL 2.5 and 3
+(tool_name) -hf ggml-org/InternVL2_5-1B-GGUF
+(tool_name) -hf ggml-org/InternVL2_5-4B-GGUF
+(tool_name) -hf ggml-org/InternVL3-1B-Instruct-GGUF
+(tool_name) -hf ggml-org/InternVL3-2B-Instruct-GGUF
+(tool_name) -hf ggml-org/InternVL3-8B-Instruct-GGUF
+(tool_name) -hf ggml-org/InternVL3-14B-Instruct-GGUF
+
+# Llama 4 Scout
+(tool_name) -hf ggml-org/Llama-4-Scout-17B-16E-Instruct-GGUF
+
+# Moondream2 20250414 version
+(tool_name) -hf ggml-org/moondream2-20250414-GGUF
+
+# Gemma 4
+(tool_name) -hf ggml-org/gemma-4-E2B-it-GGUF
+(tool_name) -hf ggml-org/gemma-4-E4B-it-GGUF
+(tool_name) -hf ggml-org/gemma-4-26B-A4B-it-GGUF
+(tool_name) -hf ggml-org/gemma-4-31B-it-GGUF
+```
+
+**Audio models**:
+
+```sh
+# Ultravox 0.5
+(tool_name) -hf ggml-org/ultravox-v0_5-llama-3_2-1b-GGUF
+(tool_name) -hf ggml-org/ultravox-v0_5-llama-3_1-8b-GGUF
+
+# Qwen2-Audio and SeaLLM-Audio
+# note: no pre-quantized GGUF this model, as they have very poor result
+# ref: https://github.com/ggml-org/llama.cpp/pull/13760
+
+# Mistral's Voxtral
+(tool_name) -hf ggml-org/Voxtral-Mini-3B-2507-GGUF
+
+# Qwen3-ASR
+(tool_name) -hf ggml-org/Qwen3-ASR-0.6B-GGUF
+(tool_name) -hf ggml-org/Qwen3-ASR-1.7B-GGUF
+```
+
+**Mixed modalities**:
+
+```sh
+# Qwen2.5 Omni
+# Capabilities: audio input, vision input
+(tool_name) -hf ggml-org/Qwen2.5-Omni-3B-GGUF
+(tool_name) -hf ggml-org/Qwen2.5-Omni-7B-GGUF
+
+# Qwen3 Omni
+# Capabilities: audio input, vision input
+(tool_name) -hf ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF
+(tool_name) -hf ggml-org/Qwen3-Omni-30B-A3B-Thinking-GGUF
+
+# Gemma 4
+# Capabilities: audio input, vision input
+(tool_name) -hf ggml-org/gemma-4-E2B-it-GGUF
+(tool_name) -hf ggml-org/gemma-4-E4B-it-GGUF
+```
+
+## Finding more models:
+
+GGUF models on Huggingface with vision capabilities can be found here: https://huggingface.co/models?pipeline_tag=image-text-to-text&sort=trending&search=gguf
+
+# GGML Operations
+
+List of GGML operations and backend support status.
+
+## How to add a backend to this table:
+
+1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)
+2. Regenerate `/docs/ops.md` via `./scripts/create_ops_docs.py`
+
+Legend:
+- ✅ Fully supported by this backend
+- 🟡 Partially supported by this backend
+- ❌ Not supported by this backend
+
+| Operation | BLAS | CANN | CPU | CUDA | ET | HTP | MTL | OpenCL | SYCL | Vulkan | WebGPU | ZenDNN | zDNN |
+|-----------|------|------|------|------|------|------|------|------|------|------|------|------|------|
+|                              ABS | ❌ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                              ACC | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                              ADD | ❌ | ✅ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                             ADD1 | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+|                           ADD_ID | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                           ARANGE | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                           ARGMAX | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                          ARGSORT | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                             CEIL | ❌ | ❌ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                            CLAMP | ❌ | ✅ | ✅ | ✅ | 🟡 | ✅ | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                        COL2IM_1D | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                           CONCAT | ❌ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | ✅ | ✅ | 🟡 | ❌ | ❌ |
+|                             CONT | ❌ | 🟡 | ✅ | ✅ | 🟡 | 🟡 | ✅ | 🟡 | ✅ | ✅ | 🟡 | ❌ | ❌ |
+|                          CONV_2D | ❌ | ❌ | 🟡 | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | 🟡 | ✅ | ❌ | ❌ |
+|                       CONV_2D_DW | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                          CONV_3D | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                CONV_TRANSPOSE_1D | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                CONV_TRANSPOSE_2D | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                              COS | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                      COUNT_EQUAL | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                              CPY | ❌ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | ❌ | ❌ |
+|               CROSS_ENTROPY_LOSS | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|          CROSS_ENTROPY_LOSS_BACK | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                           CUMSUM | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                             DIAG | ❌ | ❌ | ✅ | ✅ | 🟡 | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                    DIAG_MASK_INF | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | 🟡 | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                              DIV | ❌ | ✅ | ✅ | ✅ | ❌ | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                     DSV4_HC_COMB | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+|                     DSV4_HC_POST | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+|                      DSV4_HC_PRE | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+|                              DUP | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | 🟡 | 🟡 | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                              ELU | ❌ | ✅ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                              EXP | ❌ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                            EXPM1 | ❌ | ❌ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                             FILL | ❌ | ❌ | ✅ | ✅ | 🟡 | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                   FLASH_ATTN_EXT | ❌ | 🟡 | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | ❌ | ❌ |
+|                            FLOOR | ❌ | ❌ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                  GATED_DELTA_NET | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | 🟡 | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                GATED_LINEAR_ATTN | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                            GEGLU | ❌ | ✅ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                        GEGLU_ERF | ❌ | ✅ | ✅ | ✅ | 🟡 | ❌ | 🟡 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                      GEGLU_QUICK | ❌ | ✅ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                             GELU | ❌ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                         GELU_ERF | ❌ | ✅ | ✅ | 🟡 | 🟡 | ❌ | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                       GELU_QUICK | ❌ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                         GET_ROWS | ❌ | 🟡 | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | ❌ | ❌ |
+|                    GET_ROWS_BACK | ❌ | ❌ | 🟡 | 🟡 | ❌ | ❌ | ❌ | ❌ | 🟡 | 🟡 | ❌ | ❌ | ❌ |
+|                       GROUP_NORM | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                      HARDSIGMOID | ❌ | ✅ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                        HARDSWISH | ❌ | ✅ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                           IM2COL | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                        IM2COL_3D | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                          L2_NORM | ❌ | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ❌ | ✅ | ✅ | 🟡 | ❌ | ❌ |
+|                       LEAKY_RELU | ❌ | ✅ | ✅ | ✅ | ❌ | 🟡 | 🟡 | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                LIGHTNING_INDEXER | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+|                              LOG | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                             MEAN | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | 🟡 | ✅ | ❌ | ❌ | ❌ |
+|                              MUL | ❌ | ✅ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                          MUL_MAT | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 |
+|                 MUL_MAT_HADAMARD | ❌ | ❌ | ✅ | ❌ | ✅ | 🟡 | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                       MUL_MAT_ID | ❌ | 🟡 | ✅ | ✅ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | 🟡 | ❌ |
+|                  MUL_MAT_ID_W4A4 | ❌ | ❌ | ✅ | ❌ | ❌ | 🟡 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+|                  MUL_MAT_ID_W4A8 | ❌ | ❌ | ✅ | ❌ | ❌ | 🟡 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+|                     MUL_MAT_W4A4 | ❌ | ❌ | ✅ | ❌ | ❌ | 🟡 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+|                     MUL_MAT_W4A8 | ❌ | ❌ | ✅ | ❌ | ❌ | 🟡 | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+|                              NEG | ❌ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                             NORM | ❌ | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | 🟡 | ❌ | ❌ |
+|                   OPT_STEP_ADAMW | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                     OPT_STEP_SGD | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                         OUT_PROD | 🟡 | 🟡 | 🟡 | 🟡 | ❌ | ❌ | ❌ | ❌ | 🟡 | 🟡 | ❌ | ❌ | 🟡 |
+|                              PAD | ❌ | 🟡 | ✅ | 🟡 | ❌ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ✅ | ❌ | ❌ |
+|                   PAD_REFLECT_1D | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+|                          POOL_1D | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                          POOL_2D | ❌ | 🟡 | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                            REGLU | ❌ | ✅ | ✅ | ✅ | 🟡 | ❌ | 🟡 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                             RELU | ❌ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                           REPEAT | ❌ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | ✅ | ✅ | 🟡 | ❌ | ❌ |
+|                      REPEAT_BACK | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                         RMS_NORM | ❌ | ✅ | ✅ | ✅ | 🟡 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                    RMS_NORM_BACK | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                             ROLL | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                             ROPE | ❌ | ✅ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                        ROPE_BACK | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                            ROUND | ❌ | ❌ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                        RWKV_WKV6 | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                        RWKV_WKV7 | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                            SCALE | ❌ | 🟡 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                              SET | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | 🟡 | ✅ | ✅ | ❌ | ❌ |
+|                         SET_ROWS | ❌ | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | 🟡 | ❌ | ❌ |
+|                              SGN | ❌ | ✅ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                          SIGMOID | ❌ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                             SILU | ❌ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                        SILU_BACK | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
+|                              SIN | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                         SOFTPLUS | ❌ | ❌ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                         SOFT_MAX | ❌ | 🟡 | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                    SOFT_MAX_BACK | ❌ | ❌ | 🟡 | 🟡 | ❌ | ❌ | ❌ | ❌ | 🟡 | ✅ | ❌ | ❌ | ❌ |
+|                        SOLVE_TRI | ❌ | ❌ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ❌ | 🟡 | ✅ | ✅ | ❌ | ❌ |
+|                              SQR | ❌ | ✅ | ✅ | ✅ | 🟡 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                             SQRT | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                         SSM_CONV | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                         SSM_SCAN | ❌ | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | 🟡 | 🟡 | ✅ | ❌ | ❌ |
+|                             STEP | ❌ | ✅ | ✅ | 🟡 | 🟡 | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                              SUB | ❌ | ✅ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                              SUM | ❌ | 🟡 | ✅ | 🟡 | ❌ | 🟡 | 🟡 | ❌ | 🟡 | 🟡 | 🟡 | ❌ | ❌ |
+|                         SUM_ROWS | ❌ | ✅ | ✅ | 🟡 | ❌ | 🟡 | ✅ | 🟡 | 🟡 | ✅ | ✅ | ❌ | ❌ |
+|                           SWIGLU | ❌ | ✅ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                     SWIGLU_CLAMP | ❌ | ❌ | ✅ | ❌ | ❌ | 🟡 | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+|                       SWIGLU_OAI | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                             TANH | ❌ | ✅ | ✅ | 🟡 | 🟡 | 🟡 | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|               TIMESTEP_EMBEDDING | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+|                            TOP_K | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | 🟡 | ✅ | ❌ | ❌ |
+|                              TRI | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                            TRUNC | ❌ | ❌ | ✅ | 🟡 | 🟡 | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                          UPSCALE | ❌ | 🟡 | ✅ | ✅ | ❌ | ❌ | ✅ | 🟡 | ✅ | ✅ | ✅ | ❌ | ❌ |
+|                            XIELU | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ |
+
+# llama.cpp INI Presets
+
+## Introduction
+
+The INI preset feature, introduced in [PR#17859](https://github.com/ggml-org/llama.cpp/pull/17859), allows users to create reusable and shareable parameter configurations for llama.cpp.
+
+## Using Presets with the Server
+
+When running multiple models on the server (router mode), INI preset files can be used to configure model-specific parameters. Please refer to the [server documentation](../tools/server/README.md) for more details.
+
+### Using a Hugging Face Preset
+
+> [!IMPORTANT]
+>
+> Please only use presets that you can trust! Unknown presets may be unsafe
+
+You can push your preset to Hugging Face Hub and share with other users by:
+1. Creating an empty model repository on Hugging Face
+2. Creating a `preset.ini` file in the root directory of the repository
+
+Example of a `preset.ini`:
+
+```ini
+[*]
+ctx-size             = 0
+mmap                 = 1
+kv-unified           = 1
+parallel             = 4
+spec-default         = 1
+
+[Qwen3.5-4B]
+hf                   = unsloth/Qwen3.5-4B-GGUF:Q4_K_M
+ctx-size             = 262144
+batch-size           = 2048
+ubatch-size          = 2048
+top-p                = 1.0
+top-k                = 0
+min-p                = 0.01
+temp                 = 1.0
+
+[gpt-oss-120b-hf]
+hf                   = ggml-org/gpt-oss-120b-GGUF
+ctx-size             = 262144
+batch-size           = 2048
+ubatch-size          = 2048
+top-p                = 1.0
+top-k                = 0
+min-p                = 0.01
+temp                 = 1.0
+chat-template-kwargs = {"reasoning_effort": "high"}
+```
+
+The preset will be loaded similarly to the `--models-preset` option. Therefore, you can also override certain params via CLI arguments:
+
+```sh
+# Force temp = 0.1, overriding the preset value
+llama-cli -hf username/my-preset --temp 0.1
+```
+
+### Named presets
+
+If you want to define multiple preset configurations for one or more GGUF models, you can create a blank HF repo containing a single `preset.ini` file that references the actual model(s):
+
+```ini
+[*]
+mmap = 1
+
+[gpt-oss-20b-hf]
+hf          = ggml-org/gpt-oss-20b-GGUF
+batch-size  = 2048
+ubatch-size = 2048
+top-p       = 1.0
+top-k       = 0
+min-p       = 0.01
+temp        = 1.0
+chat-template-kwargs = {"reasoning_effort": "high"}
+
+[gpt-oss-120b-hf]
+hf          = ggml-org/gpt-oss-120b-GGUF
+batch-size  = 2048
+ubatch-size = 2048
+top-p       = 1.0
+top-k       = 0
+min-p       = 0.01
+temp        = 1.0
+chat-template-kwargs = {"reasoning_effort": "high"}
+```
+
+You can then use it via `llama-cli` or `llama-server`, example:
+
+```sh
+llama-server -hf user/repo:gpt-oss-120b-hf
+```
+
+Please make sure to provide the correct `hf-repo` for each child preset. Otherwise, you may get error: `The specified tag is not a valid quantization scheme.`
+
+## System-level config
+
+The system-level config, added in PR [#26118](https://github.com/ggml-org/llama.cpp/pull/26118), allows sharing the same set of options among multiple tools and examples. Unlike the sections above, it is not limited to the server.
+
+These files are loaded on startup if present. A later file overrides an earlier one:
+1. System-wide: `/etc/llama.cpp/config.ini` (or `%PROGRAMDATA%\llama.cpp\config.ini` on Windows)
+2. User-level: `$XDG_CONFIG_HOME/llama.cpp/config.ini`, `~/.config/llama.cpp/config.ini` by default (or `%APPDATA%\llama.cpp\config.ini` on Windows)
+
+The config file is applied first, then its options are overridden by ENV variables, CLI arguments and model presets (in router mode).
+
+Note:
+- Only the `[*]` and default sections are used; options written before any section header belong to "default. Named sections are ignored
+- Tool-specific options can be specified, but will be ignored (with a warning) if the example doesn't support it<br/>Example: if you specify `port = 1234`, only `llama-server` will use it, other examples will ignore it
+- `model` or `hf-repo` are not recommended to be configured system-level, because it may introduce conflicts<br/>Example: a `hf-repo` in the config file still takes effect when you pass `-m` on the command line, so you may load a different model than expected
+
+# Release process
+
+llama.cpp uses [semantic versioning](https://semver.org) (`MAJOR.MINOR.PATCH`).
+
+## Version bump guidelines
+
+| Change type | Version component |
+|---|---|
+| Breaking change to the public C API (`include/llama.h`)         | `MAJOR` |
+| Backward-compatible features, model support, or API addition    | `MINOR` |
+| Bug fix with no API change                                      | `PATCH` |
+
+The version is set in the three variables at the top of the root `CMakeLists.txt`:
+
+```cmake
+set(LLAMA_VERSION_MAJOR 0)
+set(LLAMA_VERSION_MINOR 1)
+set(LLAMA_VERSION_PATCH 0)
+```
+
+_A version bump should be included in the PR that introduces the change, or in a
+dedicated bump commit merged before the release is cut._
+
+_TODO: add PR labels (`semver: patch`, `semver: minor`, `semver: major`) to help
+identify which PRs require a version bump before cutting a release._
+
+## Making a release
+
+Releases are created by running the [make-release](.github/workflows/make-release.yml)
+which is a manual workflow.
+
+The workflow runs against the branch selected in the "Run workflow" dialog
+(default `master`) and takes an optional `commit` SHA. When a commit is given,
+the workflow validates that the commit belongs to the branch and is not older
+than 3 days from the branch HEAD, then releases that commit instead of the
+branch HEAD.
+
+The workflow creates an annotated git tag (e.g. `v0.1.0`) and pushes it to the
+remote. No GitHub Release object is created, the tag is the release artifact.
+
+## Building a release
+
+By default, `LLAMA_BUILD_IS_DEV=ON` which appends a `-dev` suffix to `LLAMA_VERSION`,
+marking the build as a nightly/development build. Distributors building from a
+release tag must pass `-DLLAMA_BUILD_IS_DEV=OFF` to produce a clean version string
+(e.g. `0.1.0` instead of `0.1.0-dev`).
+
+## How releases reach users
+Currently releases are not published to github releases, only nightly/development
+builds are available there. The way users can access releases are using the following
+channels:
+
+- **llama-install.sh**  — downloads pre-built binaries built from the release tag.
+- **Package managers**  — consume the git tag directly.
+- **Build from source** — users clone the repo and check out the tag.
+
+# Speculative Decoding
+
+llama.cpp supports speculative decoding, a technique that can significantly accelerate token generation by predicting multiple tokens ahead of the main model.
+
+[Speculative decoding](https://en.wikipedia.org/wiki/Transformer_(deep_learning)#Speculative_decoding) leverages the fact that computing n tokens in a batch (as in prompt processing) is more efficient than computing n sequentially (as in response generation). By generating draft tokens quickly and then verifying them with the target model in a single batch, this approach can achieve substantial speedups when the draft predictions are frequently correct.
+
+## Implementations
+
+The `llama-server` application supports several implementations of speculative decoding. An implementation with draft model can be mixed with an implementation without draft model.
+
+### Draft Model (`draft`)
+
+A much smaller model (called the _draft model_) generates drafts.
+A draft model is the most used approach in speculative decoding.
+
+### EA
