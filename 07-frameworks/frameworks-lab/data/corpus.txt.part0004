@@ -1,0 +1,3897 @@
+       if (x > val) {
+            lower_pivot = pivot;
+            lower = val;
+            pivot += i;
+        } else {
+            upper_pivot = pivot;
+            upper = val;
+            pivot -= i;
+        }
+        val = smem_code[pivot];
+    }
+
+    if (upper_pivot == 255)
+        upper = smem_code[upper_pivot];
+    if (lower_pivot == 0)
+        lower = smem_code[lower_pivot];
+
+    if (!STOCHASTIC) {
+        if (x > val) {
+            float midpoint = (upper + val) * 0.5f;
+            if (x > midpoint) {
+                return upper_pivot;
+            } else
+                return pivot;
+        } else {
+            float midpoint = (lower + val) * 0.5f;
+            if (x < midpoint)
+                return lower_pivot;
+            else
+                return pivot;
+        }
+    } else {
+        if (x > val) {
+            float dist_to_upper = fabsf(upper - x);
+            float dist_full = upper - val;
+            if (rand >= dist_to_upper / dist_full)
+                return upper_pivot;
+            else
+                return pivot;
+        } else {
+            float dist_to_lower = fabsf(lower - x);
+            float dist_full = val - lower;
+            if (rand >= dist_to_lower / dist_full)
+                return lower_pivot;
+            else
+                return pivot;
+        }
+    }
+}
+
+template <int SIGNED>
+__device__ __forceinline__ unsigned char
+    quantize_2D(float* __restrict__ quadrants, float* __restrict__ const smem_code, float x) {
+    int pivot = 127;
+    int upper_pivot = 255;
+    int lower_pivot = 0;
+
+    float lower = SIGNED ? -1.0f : 0.0f;
+    float upper = 1.0f;
+    float midpoint;
+    float val = quadrants[1];
+    int local_pivot = 1;
+    int offset = 1;
+
+    // i>>=1 = {32, 16, 8, 4, 2, 1}
+    for (int i = 64; i > 0; i >>= 1) {
+        if (x > val) {
+            lower_pivot = pivot;
+            lower = val;
+            pivot += i;
+            // val = i == 64 ? quadrants[2] : smem_code[pivot];
+            local_pivot += offset;
+        } else {
+            upper_pivot = pivot;
+            upper = val;
+            pivot -= i;
+            // val = i == 64 ? quadrants[0] : smem_code[pivot];
+            local_pivot -= offset;
+        }
+        val = i >= 64 ? quadrants[local_pivot] : smem_code[pivot];
+        offset -= 1;
+    }
+
+    if (x > val) {
+        midpoint = (upper + val) * 0.5f;
+        if (x > midpoint)
+            return upper_pivot;
+        else
+            return pivot;
+    } else {
+        midpoint = (lower + val) * 0.5f;
+        if (x < midpoint)
+            return lower_pivot;
+        else
+            return pivot;
+    }
+}
+
+template <typename T, int BLOCK_SIZE, int NUM_PER_TH, int STOCHASTIC, int DATA_TYPE>
+//__launch_bounds__(TH, 4)
+__global__ void kQuantizeBlockwise(
+    float* code, T* __restrict__ const A, float* absmax, unsigned char* out, float* __restrict__ const rand,
+    const int rand_offset, const int n
+) {
+    // This can overflow, so we clamp to INT32_MAX. We won't have more elements than this.
+    const int n_full = min(gridDim.x * BLOCK_SIZE, INT32_MAX);
+
+    const int base_idx = blockIdx.x * BLOCK_SIZE;
+    int valid_items = 0;
+
+    T vals[NUM_PER_TH];
+    float rand_vals[NUM_PER_TH];
+    unsigned char qvals[(DATA_TYPE > 0) ? NUM_PER_TH / 2 : NUM_PER_TH];
+
+    float local_abs_max = 0.0f;
+    int local_rand_idx = 0;
+
+    // WARP_TRANSPOSE requires block_dim >= warp_size. On CDNA (warp=64),
+    // block_dim=32 (from BLOCK_SIZE=64/NUM_PER_TH=2) is too small. Fall back
+    // to DIRECT load/store in that case.
+    static constexpr int THREADS = BLOCK_SIZE / NUM_PER_TH;
+    static constexpr auto LOAD_ALGO =
+        (THREADS >= BNB_WARP_SIZE) ? bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE : bnb_cub::BLOCK_LOAD_DIRECT;
+    static constexpr auto STORE_ALGO =
+        (THREADS >= BNB_WARP_SIZE) ? bnb_cub::BLOCK_STORE_WARP_TRANSPOSE : bnb_cub::BLOCK_STORE_DIRECT;
+
+    typedef bnb_cub::BlockLoad<T, THREADS, NUM_PER_TH, LOAD_ALGO> LoadT;
+    typedef bnb_cub::BlockStore<unsigned char, THREADS, (DATA_TYPE > 0) ? NUM_PER_TH / 2 : NUM_PER_TH, STORE_ALGO>
+        StoreChar;
+    typedef bnb_cub::BlockReduce<float, THREADS> BlockReduce;
+    typedef bnb_cub::BlockLoad<float, THREADS, NUM_PER_TH, LOAD_ALGO> LoadFloat;
+
+    __shared__ typename LoadT::TempStorage loadt;
+    __shared__ typename LoadFloat::TempStorage loadf;
+    __shared__ typename StoreChar::TempStorage storec;
+    __shared__ typename BlockReduce::TempStorage reduce;
+    __shared__ float smem_code[256];
+    __shared__ float smem_absmax_value[1];
+
+    if (DATA_TYPE == General8bit)
+        for (int i = threadIdx.x; i < 256; i += blockDim.x)
+            smem_code[i] = code[i];
+
+    for (int64_t i = base_idx; i < n_full; i += gridDim.x * BLOCK_SIZE) {
+        valid_items = min(BLOCK_SIZE, static_cast<int>(n - i));
+        local_abs_max = -FLT_MAX;
+
+        __syncthreads();
+        LoadT(loadt).Load(&(A[i]), vals, valid_items, (T)0.0f);
+
+        // 1. compute local max
+        // 2. broadcast local max
+        // 3. normalize inputs and quantize
+
+#pragma unroll NUM_PER_TH
+        for (int j = 0; j < NUM_PER_TH; j++)
+            local_abs_max = fmaxf(local_abs_max, fabsf((float)vals[j]));
+
+        local_abs_max = BlockReduce(reduce).Reduce(local_abs_max, BNB_MAX_OP, valid_items);
+
+        if (threadIdx.x == 0) {
+            smem_absmax_value[0] = 1.0f / local_abs_max;
+            absmax[i / BLOCK_SIZE] = local_abs_max;
+        }
+        __syncthreads();
+
+        local_abs_max = smem_absmax_value[0];
+
+        if (STOCHASTIC) {
+            local_rand_idx = ((blockIdx.x * NUM_BLOCK) + (threadIdx.x * NUM) + rand_offset) % (1024 - 4);
+            LoadFloat(loadf).Load(&rand[local_rand_idx], rand_vals, BLOCK_SIZE, 0);
+        }
+
+        switch (DATA_TYPE) {
+        case General8bit:
+#pragma unroll NUM_PER_TH
+            for (int j = 0; j < NUM_PER_TH; j++) {
+                if (!STOCHASTIC)
+                    qvals[j] = dQuantize<0>(smem_code, 0.0f, ((float)vals[j]) * local_abs_max);
+                else
+                    qvals[j] = dQuantize<1>(smem_code, rand_vals[j], ((float)vals[j]) * local_abs_max);
+            }
+            break;
+        case FP4:
+#pragma unroll NUM_PER_TH
+            for (int j = 0; j < NUM_PER_TH / 2; j++) {
+                qvals[j] = dQuantizeFP4(((float)vals[2 * j]) * local_abs_max) << 4;
+                qvals[j] |= dQuantizeFP4(((float)vals[2 * j + 1]) * local_abs_max);
+            }
+            break;
+        case NF4:
+#pragma unroll NUM_PER_TH
+            for (int j = 0; j < NUM_PER_TH / 2; j++) {
+                qvals[j] = dQuantizeNF4(((float)vals[2 * j]) * local_abs_max) << 4;
+                qvals[j] |= dQuantizeNF4(((float)vals[2 * j + 1]) * local_abs_max);
+            }
+            break;
+        }
+
+        __syncthreads();
+        StoreChar(storec).Store(
+            &(out[(DATA_TYPE > 0) ? i / 2 : i]), qvals, (DATA_TYPE > 0) ? (valid_items + 1) / 2 : valid_items
+        );
+    }
+}
+
+// Small-blocksize kernel for 4-bit quantization, parameterized on quantization
+// block size (QBLOCK_SIZE).  Always launches exactly BNB_WARP_SIZE threads so
+// every lane in the wavefront is productive.  Multiple quantization blocks are
+// packed into one wavefront when QBLOCK_SIZE < BNB_WARP_SIZE * NUM_PER_TH:
+//
+//   CDNA (64), QBLOCK_SIZE=32 -> 4 quant blocks per wavefront
+//   CDNA (64), QBLOCK_SIZE=64 -> 2 quant blocks per wavefront
+//   CUDA/RDNA (32), QBLOCK_SIZE=32 -> 2 quant blocks per wavefront
+//
+// Uses logical-warp WarpReduce<THREADS_PER_QB> so each quantization block's
+// threads reduce independently via warp shuffles.
+template <typename T, int QBLOCK_SIZE, int DATA_TYPE>
+__global__ void kQuantizeBlockwiseSmall(
+    float* code, T* __restrict__ const A, float* absmax, unsigned char* out, float* __restrict__ const rand,
+    const int rand_offset, const int n
+) {
+    static_assert(QBLOCK_SIZE <= BNB_WARP_SIZE * 2, "QBLOCK_SIZE too large for one warp");
+
+    constexpr int NUM_PER_TH = 2;
+    constexpr int THREADS = BNB_WARP_SIZE;
+    constexpr int THREADS_PER_QB = QBLOCK_SIZE / NUM_PER_TH;
+    constexpr int NUM_QB = THREADS / THREADS_PER_QB;
+    constexpr int TOTAL_VALUES = QBLOCK_SIZE * NUM_QB;
+
+    const int base_idx = blockIdx.x * TOTAL_VALUES;
+
+    T vals[NUM_PER_TH];
+    unsigned char qvals[NUM_PER_TH / 2];
+    float local_abs_max = 0.0f;
+
+    const int qb_id = threadIdx.x / THREADS_PER_QB;
+    const int local_tid = threadIdx.x % THREADS_PER_QB;
+
+    typedef bnb_cub::BlockLoad<T, THREADS, NUM_PER_TH, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadT;
+    typedef bnb_cub::BlockStore<unsigned char, THREADS, NUM_PER_TH / 2, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE> StoreChar;
+    typedef bnb_cub::WarpReduce<float, THREADS_PER_QB> WarpReduce;
+
+    __shared__ typename LoadT::TempStorage loadt;
+    __shared__ typename StoreChar::TempStorage storec;
+    __shared__ typename WarpReduce::TempStorage warp_reduce[NUM_QB];
+    __shared__ float smem_absmax_value[NUM_QB];
+
+    const int qi = base_idx + qb_id * QBLOCK_SIZE;
+    const bool qb_valid = (qi < n);
+
+    __syncthreads();
+    LoadT(loadt).Load(&(A[base_idx]), vals, min(TOTAL_VALUES, n - base_idx), (T)0.0f);
+
+    local_abs_max = -FLT_MAX;
+#pragma unroll NUM_PER_TH
+    for (int j = 0; j < NUM_PER_TH; j++)
+        local_abs_max = fmaxf(local_abs_max, fabsf((float)vals[j]));
+
+    local_abs_max = WarpReduce(warp_reduce[qb_id]).Reduce(local_abs_max, BNB_MAX_OP);
+
+    if (local_tid == 0) {
+        if (qb_valid) {
+            smem_absmax_value[qb_id] = 1.0f / local_abs_max;
+            absmax[blockIdx.x * NUM_QB + qb_id] = local_abs_max;
+        } else {
+            smem_absmax_value[qb_id] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    local_abs_max = smem_absmax_value[qb_id];
+
+    switch (DATA_TYPE) {
+    case FP4:
+#pragma unroll NUM_PER_TH
+        for (int j = 0; j < NUM_PER_TH / 2; j++) {
+            qvals[j] = dQuantizeFP4(((float)vals[2 * j]) * local_abs_max) << 4;
+            qvals[j] |= dQuantizeFP4(((float)vals[2 * j + 1]) * local_abs_max);
+        }
+        break;
+    case NF4:
+#pragma unroll NUM_PER_TH
+        for (int j = 0; j < NUM_PER_TH / 2; j++) {
+            qvals[j] = dQuantizeNF4(((float)vals[2 * j]) * local_abs_max) << 4;
+            qvals[j] |= dQuantizeNF4(((float)vals[2 * j + 1]) * local_abs_max);
+        }
+        break;
+    }
+
+    __syncthreads();
+    StoreChar(storec).Store(&(out[base_idx / 2]), qvals, min((TOTAL_VALUES + 1) / 2, (n - base_idx + 1) / 2));
+}
+
+template <typename T, int TILE_SIZE, int THREADS, int NUM_PER_TH, int DATA_TYPE>
+__global__ void
+    kDequantizeBlockwise(float* code, unsigned char* A, float* absmax, T* out, const int blocksize, const int n) {
+
+    const int n_load = (gridDim.x * TILE_SIZE);
+    int valid_items_load = 0;
+    int valid_items_store = 0;
+    const int base_idx = (blockIdx.x * TILE_SIZE);
+
+    T vals[NUM_PER_TH * ((DATA_TYPE > 0) ? 2 : 1)];
+    unsigned char qvals[NUM_PER_TH];
+    float local_abs_max = -FLT_MAX;
+
+    typedef bnb_cub::BlockLoad<unsigned char, THREADS, NUM_PER_TH, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadChar;
+    typedef bnb_cub::BlockStore<T, THREADS, NUM_PER_TH*((DATA_TYPE > 0) ? 2 : 1), bnb_cub::BLOCK_STORE_WARP_TRANSPOSE>
+        StoreT;
+
+    __shared__ typename LoadChar::TempStorage loadchar;
+    __shared__ typename StoreT::TempStorage storet;
+
+    for (int i = base_idx; i < n_load; i += gridDim.x * TILE_SIZE) {
+        if (DATA_TYPE > 0) {
+            // Cast n to int64_t to avoid overflow for large n
+            valid_items_load = min(TILE_SIZE, static_cast<int>((static_cast<int64_t>(n) + 1) / 2) - i);
+            valid_items_store = min(TILE_SIZE * 2, n - i * 2);
+        } else {
+            valid_items_load = min(TILE_SIZE, n - i);
+            valid_items_store = valid_items_load;
+        }
+
+        // Since blocksize will always be a power-of-2, we avoid more expensive
+        // division by the blocksize and instead use a shift operation.
+        // This is equivalent to (i+threadId.x*NUM_PER_TH)/blocksize.
+        local_abs_max = __ldg(&absmax[(i + threadIdx.x * NUM_PER_TH) >> (31 - __clz(blocksize))]);
+
+        __syncthreads();
+        LoadChar(loadchar).Load(&(A[i]), qvals, valid_items_load, 128);
+
+        switch (DATA_TYPE) {
+        case General8bit:
+// load code through read-only cache via __ldg
+#pragma unroll NUM_PER_TH
+            for (int j = 0; j < NUM_PER_TH; j++)
+                vals[j] = __ldg(&code[qvals[j]]) * local_abs_max;
+            break;
+        case FP4:
+#pragma unroll NUM_PER_TH
+            for (int j = 0; j < NUM_PER_TH; j++) {
+                vals[j * 2] = dDequantizeFP4Tree(qvals[j] >> 4) * local_abs_max;
+                vals[j * 2 + 1] = dDequantizeFP4Tree(qvals[j] & 0x0F) * local_abs_max;
+            }
+            break;
+        case NF4:
+#pragma unroll NUM_PER_TH
+            for (int j = 0; j < NUM_PER_TH; j++) {
+                vals[j * 2] = dDequantizeNF4(qvals[j] >> 4) * local_abs_max;
+                vals[j * 2 + 1] = dDequantizeNF4(qvals[j] & 0x0F) * local_abs_max;
+            }
+            break;
+        }
+
+        __syncthreads();
+        StoreT(storet).Store(&(out[(DATA_TYPE > 0) ? i * 2 : i]), vals, valid_items_store);
+    }
+}
+
+template <typename T, int OPTIMIZER, int BLOCK_SIZE, int NUM_VALS>
+__launch_bounds__(BLOCK_SIZE / NUM_VALS, 1) __global__ void kPreconditionOptimizer32bit2State(
+    T* g, T* p, float* state1, float* state2, float* unorm, const float beta1, const float beta2, const float eps,
+    const float weight_decay, const int step, const float lr, const float gnorm_scale, const int n
+) {
+
+    const int n_full = (BLOCK_SIZE * (n / BLOCK_SIZE)) + (n % BLOCK_SIZE == 0 ? 0 : BLOCK_SIZE);
+    const int base_idx = (blockIdx.x * blockDim.x * NUM_VALS);
+    int valid_items = 0;
+
+    T g_vals[NUM_VALS];
+
+    float s1_vals[NUM_VALS];
+    float s2_vals[NUM_VALS];
+
+    const float correction1 = 1.0f / (1.0f - powf(beta1, step));
+    const float correction2 = 1.0f / (1.0f - powf(beta2, step));
+
+    typedef bnb_cub::BlockLoad<T, BLOCK_SIZE / NUM_VALS, NUM_VALS, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> Load;
+    typedef bnb_cub::BlockLoad<float, BLOCK_SIZE / NUM_VALS, NUM_VALS, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadFloat;
+    typedef bnb_cub::BlockReduce<float, BLOCK_SIZE / NUM_VALS> BlockReduce;
+
+    __shared__ union {
+        typename Load::TempStorage load;
+        typename LoadFloat::TempStorage loadf;
+        typename BlockReduce::TempStorage reduce;
+    } temp_storage;
+
+    for (unsigned int i = base_idx; i < n_full; i += gridDim.x * BLOCK_SIZE) {
+        valid_items = n - i >= (BLOCK_SIZE) ? (BLOCK_SIZE) : n - i;
+
+        __syncthreads();
+        Load(temp_storage.load).Load(&(g[i]), g_vals, valid_items, 0.0f);
+        __syncthreads();
+        LoadFloat(temp_storage.loadf).Load(&(state1[i]), s1_vals, valid_items, 0.0f);
+        __syncthreads();
+        LoadFloat(temp_storage.loadf).Load(&(state2[i]), s2_vals, valid_items, 0.0f);
+
+#pragma unroll NUM_VALS
+        for (unsigned int j = 0; j < NUM_VALS; j++)
+            g_vals[j] = gnorm_scale * ((float)g_vals[j]);
+
+#pragma unroll NUM_VALS
+        for (unsigned int j = 0; j < NUM_VALS; j++) {
+            switch (OPTIMIZER) {
+            case ADAM:
+                s1_vals[j] = s1_vals[j] * beta1 + ((1.0f - beta1) * ((float)g_vals[j]));
+                s2_vals[j] = s2_vals[j] * beta2 + ((1.0f - beta2) * (((float)g_vals[j]) * ((float)g_vals[j])));
+                s1_vals[j] *= correction1;
+                s2_vals[j] *= correction2;
+                s1_vals[j] = s1_vals[j] / (sqrtf(s2_vals[j]) + eps); // update
+                s1_vals[j] *= s1_vals[j];                            // update l2 norm (update*update)
+                break;
+            case ADEMAMIX:
+                break;
+            }
+        }
+
+#pragma unroll NUM_VALS - 1
+        for (unsigned int j = 1; j < NUM_VALS; j++)
+            s1_vals[0] += s1_vals[j];
+
+        __syncthreads();
+        s1_vals[0] = BlockReduce(temp_storage.reduce).Sum(s1_vals[0]);
+
+        if (threadIdx.x == 0)
+            atomicAdd(&unorm[0], s1_vals[0]);
+
+        __syncwarp();
+    }
+}
+
+#define NUM_PER_THREAD 4
+
+template <typename T, int OPTIMIZER>
+__launch_bounds__(TH, 1) __global__ void kOptimizer32bit2State(
+    T* g, T* p, float* state1, float* state2, float* unorm, const float max_unorm, const float param_norm,
+    const float beta1, const float beta2, const float beta3, const float alpha, const float eps,
+    const float weight_decay, const int step, const float lr, const float gnorm_scale, const bool skip_zeros,
+    const int n
+) {
+
+    const int n_full = ((TH * NUM_PER_THREAD) * (n / (TH * NUM_PER_THREAD))) +
+                       (n % (TH * NUM_PER_THREAD) == 0 ? 0 : (TH * NUM_PER_THREAD));
+    const int base_idx = (blockIdx.x * blockDim.x * NUM_PER_THREAD);
+    int valid_items = 0;
+    float update_scale = 0.0f;
+    T g_vals[NUM_PER_THREAD];
+    T p_vals[NUM_PER_THREAD];
+
+    float s1_vals[NUM_PER_THREAD];
+    float s2_vals[NUM_PER_THREAD];
+
+    // AdEMAMix has an additional state buffer, which we packed
+    // into state1. We need thread-local storage here for these.
+    // TODO: Mark with [[maybe_unused]] after upgrade to min compiler.
+    float s3_vals[NUM_PER_THREAD];
+
+    const float correction1 = 1.0f - powf(beta1, step);
+    const float correction2 = sqrtf(1.0f - powf(beta2, step));
+    const float step_size = -lr * correction2 / correction1;
+
+    if (max_unorm > 0.0f) {
+        update_scale = max_unorm > 0.0f ? sqrtf(unorm[0]) : 1.0f;
+        if (update_scale > max_unorm * param_norm) {
+            update_scale = (max_unorm * param_norm) / update_scale;
+        } else {
+            update_scale = 1.0f;
+        }
+    } else {
+        update_scale = 1.0f;
+    }
+
+    typedef bnb_cub::BlockLoad<T, TH, NUM_PER_THREAD, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> Load;
+    typedef bnb_cub::BlockStore<T, TH, NUM_PER_THREAD, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE> Store;
+
+    typedef bnb_cub::BlockLoad<float, TH, NUM_PER_THREAD, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadFloat;
+    typedef bnb_cub::BlockStore<float, TH, NUM_PER_THREAD, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE> StoreFloat;
+
+    __shared__ union {
+        typename Load::TempStorage load;
+        typename Store::TempStorage store;
+        typename LoadFloat::TempStorage loadf;
+        typename StoreFloat::TempStorage storef;
+    } temp_storage;
+
+    for (unsigned int i = base_idx; i < n_full; i += gridDim.x * TH * NUM_PER_THREAD) {
+        valid_items = n - i >= (TH * NUM_PER_THREAD) ? (TH * NUM_PER_THREAD) : n - i;
+
+        __syncthreads();
+        Load(temp_storage.load).Load(&(g[i]), g_vals, valid_items);
+        __syncthreads();
+        LoadFloat(temp_storage.loadf).Load(&(state1[i]), s1_vals, valid_items);
+        __syncthreads();
+        LoadFloat(temp_storage.loadf).Load(&(state2[i]), s2_vals, valid_items);
+        __syncthreads();
+        Load(temp_storage.load).Load(&(p[i]), p_vals, valid_items);
+
+        // Load additional state1 data for AdEMAMix
+        // TODO: Make constexpr after updating min compiler
+        if (OPTIMIZER == ADEMAMIX) {
+            __syncthreads();
+            LoadFloat(temp_storage.loadf).Load(&(state1[n + i]), s3_vals, valid_items);
+        }
+
+#pragma unroll 4
+        for (unsigned int j = 0; j < NUM_PER_THREAD; j++)
+            g_vals[j] = gnorm_scale * ((float)g_vals[j]);
+
+#pragma unroll 4
+        for (unsigned int j = 0; j < NUM_PER_THREAD; j++) {
+            switch (OPTIMIZER) {
+            case ADEMAMIX:
+                // m1 update: m1 = beta1 * m1 + (1-beta1) * g
+                s1_vals[j] = (s1_vals[j] * beta1) + ((1.0f - beta1) * (float)g_vals[j]);
+
+                // m2 update: m2 = m2 * beta3 + (1-beta3) * g
+                s3_vals[j] = (s3_vals[j] * beta3) + ((1.0f - beta3) * (float)g_vals[j]);
+
+                // nu update: nu = beta2 * nu + (1-beta2) * g^2
+                s2_vals[j] = (s2_vals[j] * beta2) + ((1.0f - beta2) * (float)g_vals[j] * (float)g_vals[j]);
+
+                p_vals[j] = (float)p_vals[j] - lr * (((s1_vals[j] / correction1) + (alpha * s3_vals[j])) /
+                                                     ((sqrtf(s2_vals[j]) / correction2) + eps));
+
+                if (weight_decay > 0.0f)
+                    p_vals[j] = ((float)p_vals[j]) * (1.0f - (lr * weight_decay));
+
+                break;
+            case ADAM:
+
+                if (!skip_zeros || (skip_zeros && ((float)g_vals[j] != 0.0f))) {
+                    s1_vals[j] = s1_vals[j] * beta1 + ((1.0f - beta1) * ((float)g_vals[j]));
+                    s2_vals[j] = s2_vals[j] * beta2 + ((1.0f - beta2) * (((float)g_vals[j]) * ((float)g_vals[j])));
+                    p_vals[j] = ((float)p_vals[j]) +
+                                (update_scale * step_size * (s1_vals[j] / (sqrtf(s2_vals[j]) + (eps * correction2))));
+
+                    if (weight_decay > 0.0f)
+                        p_vals[j] = ((float)p_vals[j]) * (1.0f - (lr * weight_decay));
+                }
+                break;
+            }
+        }
+
+        __syncthreads();
+        Store(temp_storage.store).Store(&(p[i]), p_vals, valid_items);
+        __syncthreads();
+        StoreFloat(temp_storage.storef).Store(&(state1[i]), s1_vals, valid_items);
+        __syncthreads();
+        StoreFloat(temp_storage.storef).Store(&(state2[i]), s2_vals, valid_items);
+
+        if (OPTIMIZER == ADEMAMIX) {
+            __syncthreads();
+            StoreFloat(temp_storage.storef).Store(&(state1[n + i]), s3_vals, valid_items);
+        }
+    }
+}
+
+template <typename T, int OPTIMIZER, int BLOCK_SIZE, int NUM_VALS>
+__launch_bounds__(BLOCK_SIZE / NUM_VALS, 1) __global__ void kPreconditionOptimizer32bit1State(
+    T* g, T* p, float* state1, float* unorm, const float beta1, const float beta2, const float eps,
+    const float weight_decay, const int step, const float lr, const float gnorm_scale, const int n
+) {
+
+    const int n_full = (BLOCK_SIZE * (n / BLOCK_SIZE)) + (n % BLOCK_SIZE == 0 ? 0 : BLOCK_SIZE);
+    const int base_idx = (blockIdx.x * blockDim.x * NUM_VALS);
+    int valid_items = 0;
+
+    T g_vals[NUM_VALS];
+
+    float s1_vals[NUM_VALS];
+
+    typedef bnb_cub::BlockLoad<T, BLOCK_SIZE / NUM_VALS, NUM_VALS, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> Load;
+    typedef bnb_cub::BlockLoad<float, BLOCK_SIZE / NUM_VALS, NUM_VALS, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadFloat;
+    typedef bnb_cub::BlockReduce<float, BLOCK_SIZE / NUM_VALS> BlockReduce;
+
+    __shared__ union {
+        typename Load::TempStorage load;
+        typename LoadFloat::TempStorage loadf;
+        typename BlockReduce::TempStorage reduce;
+    } temp_storage;
+
+    for (unsigned int i = base_idx; i < n_full; i += gridDim.x * BLOCK_SIZE) {
+        valid_items = n - i >= (BLOCK_SIZE) ? (BLOCK_SIZE) : n - i;
+
+        __syncthreads();
+        Load(temp_storage.load).Load(&(g[i]), g_vals, valid_items, 0.0f);
+        __syncthreads();
+        LoadFloat(temp_storage.loadf).Load(&(state1[i]), s1_vals, valid_items, 0.0f);
+
+#pragma unroll NUM_VALS
+        for (unsigned int j = 0; j < NUM_VALS; j++)
+            g_vals[j] = gnorm_scale * ((float)g_vals[j]);
+
+#pragma unroll NUM_VALS
+        for (unsigned int j = 0; j < NUM_VALS; j++) {
+            switch (OPTIMIZER) {
+            case MOMENTUM:
+                if (step == 1)
+                    s1_vals[j] = (float)g_vals[j]; // state update
+                else
+                    s1_vals[j] = s1_vals[j] * beta1 + ((float)g_vals[j]); // state update
+                s1_vals[j] = s1_vals[j] * s1_vals[j];                     // update norm
+                break;
+            case LION:
+                s1_vals[j] = s1_vals[j] * beta2 + ((1.0f - beta2) * (float)g_vals[j]); // state update
+                break;
+            case RMSPROP:
+                s1_vals[j] =
+                    s1_vals[j] * beta1 + ((1.0f - beta1) * ((float)g_vals[j]) * ((float)g_vals[j])); // state update
+                s1_vals[j] = __fdividef((float)g_vals[j], sqrtf(s1_vals[j]) + eps);                  // update value
+                s1_vals[j] = s1_vals[j] * s1_vals[j];                                                // update norm
+                break;
+            case ADAGRAD:
+                s1_vals[j] = s1_vals[j] + ((float)g_vals[j]) * ((float)g_vals[j]);  // state update
+                s1_vals[j] = __fdividef((float)g_vals[j], sqrtf(s1_vals[j]) + eps); // update value
+                s1_vals[j] = s1_vals[j] * s1_vals[j];                               // update norm
+                break;
+            }
+        }
+
+#pragma unroll
+        for (unsigned int j = 1; j < NUM_VALS; j++)
+            s1_vals[0] += s1_vals[j];
+
+        __syncthreads();
+        s1_vals[0] = BlockReduce(temp_storage.reduce).Sum(s1_vals[0], valid_items);
+
+        if (threadIdx.x == 0)
+            atomicAdd(&unorm[0], s1_vals[0]);
+
+        __syncwarp();
+    }
+}
+
+template <typename T, int OPTIMIZER>
+__launch_bounds__(TH, 1) __global__ void kOptimizer32bit1State(
+    T* g, T* p, float* state1, float* unorm, const float max_unorm, const float param_norm, const float beta1,
+    const float beta2, const float eps, const float weight_decay, const int step, const float lr,
+    const float gnorm_scale, const bool skip_zeros, const int n
+) {
+
+    const int n_full = ((TH * NUM_PER_THREAD) * (n / (TH * NUM_PER_THREAD))) +
+                       (n % (TH * NUM_PER_THREAD) == 0 ? 0 : (TH * NUM_PER_THREAD));
+    const int base_idx = (blockIdx.x * blockDim.x * NUM_PER_THREAD);
+    int valid_items = 0;
+    float update_scale = 0.0f;
+
+    if (max_unorm > 0.0f) {
+        update_scale = max_unorm > 0.0f ? sqrtf(unorm[0]) : 1.0f;
+        if (update_scale > max_unorm * param_norm + eps) {
+            update_scale = (max_unorm * param_norm + eps) / update_scale;
+        } else {
+            update_scale = 1.0f;
+        }
+    } else {
+        update_scale = 1.0f;
+    }
+
+    T g_vals[NUM_PER_THREAD];
+    T p_vals[NUM_PER_THREAD];
+
+    float s1_vals[NUM_PER_THREAD];
+
+    typedef bnb_cub::BlockLoad<T, TH, NUM_PER_THREAD, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> Load;
+    typedef bnb_cub::BlockStore<T, TH, NUM_PER_THREAD, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE> Store;
+
+    typedef bnb_cub::BlockLoad<float, TH, NUM_PER_THREAD, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadFloat;
+    typedef bnb_cub::BlockStore<float, TH, NUM_PER_THREAD, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE> StoreFloat;
+
+    __shared__ union {
+        typename Load::TempStorage load;
+        typename Store::TempStorage store;
+        typename LoadFloat::TempStorage loadf;
+        typename StoreFloat::TempStorage storef;
+    } temp_storage;
+
+    for (unsigned int i = base_idx; i < n_full; i += gridDim.x * TH * NUM_PER_THREAD) {
+        valid_items = n - i >= (TH * NUM_PER_THREAD) ? (TH * NUM_PER_THREAD) : n - i;
+
+        __syncthreads();
+        Load(temp_storage.load).Load(&(g[i]), g_vals, valid_items);
+        __syncthreads();
+        LoadFloat(temp_storage.loadf).Load(&(state1[i]), s1_vals, valid_items);
+        __syncthreads();
+        Load(temp_storage.load).Load(&(p[i]), p_vals, valid_items);
+
+#pragma unroll 4
+        for (unsigned int j = 0; j < NUM_PER_THREAD; j++) {
+            g_vals[j] = gnorm_scale * ((float)g_vals[j]);
+            // Coupled (L2) weight decay folds decay into the gradient. Correct for
+            // MOMENTUM/RMSPROP/ADAGRAD, but NOT for LION, which uses decoupled
+            // (AdamW-style) decay applied to the param directly (see the LION branch
+            // below and Chen et al. 2023). This matches the CUDA 8-bit blockwise kernel.
+            if (weight_decay > 0.0f && OPTIMIZER != LION)
+                g_vals[j] = (float)g_vals[j] + (((float)p_vals[j]) * weight_decay);
+        }
+
+#pragma unroll 4
+        for (unsigned int j = 0; j < NUM_PER_THREAD; j++) {
+            if (!skip_zeros || (skip_zeros && ((float)g_vals[j] != 0.0f))) {
+                switch (OPTIMIZER) {
+                case MOMENTUM:
+                    if (step == 1)
+                        s1_vals[j] = (float)g_vals[j];
+                    else
+                        s1_vals[j] = s1_vals[j] * beta1 + ((float)g_vals[j]);
+
+                    p_vals[j] = ((float)p_vals[j]) + update_scale * (-lr * (s1_vals[j]));
+                    break;
+                case LION:
+                    // Decoupled weight decay: shrink the param directly, outside the
+                    // sign update (Chen et al. 2023), matching the 8-bit blockwise kernel.
+                    if (weight_decay > 0.0f)
+                        p_vals[j] = ((float)p_vals[j]) * (1.0f - lr * weight_decay);
+                    p_vals[j] =
+                        ((float)p_vals[j]) -
+                        update_scale * (lr * sgn(((float)s1_vals[j]) * beta1 + ((1.0f - beta1) * ((float)g_vals[j]))));
+                    s1_vals[j] = s1_vals[j] * beta2 + ((1.0f - beta2) * ((float)g_vals[j]));
+                    break;
+                case RMSPROP:
+                    s1_vals[j] = s1_vals[j] * beta1 + ((1.0f - beta1) * ((float)g_vals[j]) * ((float)g_vals[j]));
+                    p_vals[j] = ((float)p_vals[j]) -
+                                update_scale * (lr * __fdividef((float)g_vals[j], sqrtf((float)s1_vals[j]) + eps));
+                    break;
+                case ADAGRAD:
+                    s1_vals[j] = s1_vals[j] + ((float)g_vals[j]) * ((float)g_vals[j]);
+                    p_vals[j] = ((float)p_vals[j]) - lr * __fdividef((float)g_vals[j], sqrtf((float)s1_vals[j]) + eps);
+                    break;
+                }
+            }
+        }
+
+        __syncthreads();
+        Store(temp_storage.store).Store(&(p[i]), p_vals, valid_items);
+        __syncthreads();
+        StoreFloat(temp_storage.storef).Store(&(state1[i]), s1_vals, valid_items);
+    }
+}
+
+#define LANES 2
+#define QUAD 3
+
+template <typename T, int OPTIMIZER, int BLOCK_SIZE, int N_PER_TH>
+__launch_bounds__(256, 3) __global__ void kOptimizerStatic8bit2StateBlockwise(
+    T* p, T* __restrict__ const g, unsigned char* state1, unsigned char* state2, const float beta1, const float beta2,
+    const float beta3, const float alpha, const float eps, const int step, const float lr,
+    float* __restrict__ const quantiles1, float* __restrict__ const quantiles2, float* absmax1, float* absmax2,
+    float weight_decay, const float gnorm_scale, const bool skip_zeros, const int n
+) {
+
+    // const int n_full = n + (n%BLOCK_SIZE);
+    const int n_full = gridDim.x * BLOCK_SIZE;
+    const int base_idx = (blockIdx.x * BLOCK_SIZE);
+    int valid_items = 0;
+    float g_val = 0.0f;
+    float s1_vals[N_PER_TH];
+    float s2_vals[N_PER_TH];
+    float s3_vals[N_PER_TH];
+
+    // 2-5%
+    const float correction1 = 1.0f - __powf(beta1, step);
+    const float correction2 = sqrtf(1.0f - __powf(beta2, step));
+    const float step_size = __fdividef(-lr * correction2, correction1);
+    const int lane_id = threadIdx.x % LANES;
+    float new_local_abs_max1 = -FLT_MAX;
+    float new_local_abs_max2 = -FLT_MAX;
+    float new_local_abs_max3 = -FLT_MAX;
+    float quadrants1[QUAD];
+    float quadrants2[QUAD];
+
+    unsigned char c1s[N_PER_TH];
+    unsigned char c2s[N_PER_TH];
+    unsigned char c3s[N_PER_TH];
+
+    T g_vals[N_PER_TH];
+    T p_vals[N_PER_TH];
+    typedef bnb_cub::BlockLoad<T, BLOCK_SIZE / N_PER_TH, N_PER_TH, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadT;
+    typedef bnb_cub::BlockLoad<unsigned char, BLOCK_SIZE / N_PER_TH, N_PER_TH, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE>
+        LoadChar;
+
+    typedef bnb_cub::BlockStore<unsigned char, BLOCK_SIZE / N_PER_TH, N_PER_TH, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE>
+        StoreChar;
+    typedef bnb_cub::BlockStore<T, BLOCK_SIZE / N_PER_TH, N_PER_TH, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE> StoreT;
+
+    __shared__ float smem_quantiles1[LANES][257];
+    __shared__ float smem_quantiles2[LANES][257];
+    typedef bnb_cub::BlockReduce<float, BLOCK_SIZE / N_PER_TH> BlockReduce1;
+    typedef bnb_cub::BlockReduce<float, BLOCK_SIZE / N_PER_TH> BlockReduce2;
+    typedef bnb_cub::BlockReduce<float, BLOCK_SIZE / N_PER_TH> BlockReduce3;
+    __shared__ typename BlockReduce1::TempStorage reduce1;
+    __shared__ typename BlockReduce2::TempStorage reduce2;
+    __shared__ typename BlockReduce2::TempStorage reduce3;
+    __shared__ float smem_exchange1[1];
+    __shared__ float smem_exchange2[1];
+    __shared__ float smem_exchange3[1]; // [[maybe_unused]]
+
+    __shared__ union {
+        typename LoadT::TempStorage loadh;
+        typename LoadChar::TempStorage loadc;
+        typename StoreChar::TempStorage storec;
+        typename StoreT::TempStorage storeh;
+    } temp_storage;
+
+    // init: 0.2 -> 0.23
+
+    // 0.23 -> 0.23
+    smem_quantiles1[0][threadIdx.x] = quantiles1[threadIdx.x];
+    smem_quantiles2[0][threadIdx.x] = quantiles2[threadIdx.x];
+#pragma unroll
+    for (unsigned int j = 1; j < LANES; j++) {
+        smem_quantiles1[j][threadIdx.x] = smem_quantiles1[0][threadIdx.x];
+        smem_quantiles2[j][threadIdx.x] = smem_quantiles2[0][threadIdx.x];
+    }
+
+    __syncthreads();
+
+#pragma unroll
+    for (int k = 0; k < QUAD; k++) {
+        quadrants1[k] = smem_quantiles1[lane_id][(k * 256 / (QUAD + 1)) + (256 / (QUAD + 1) - 1)];
+        quadrants2[k] = smem_quantiles2[lane_id][(k * 256 / (QUAD + 1)) + (256 / (QUAD + 1) - 1)];
+    }
+
+    for (unsigned int i = base_idx; i < n_full; i += gridDim.x * BLOCK_SIZE) {
+        // loads: 0.23 -> 0.85/1.44
+        valid_items = n - i >= BLOCK_SIZE ? BLOCK_SIZE : n - i;
+        __syncthreads();
+        LoadT(temp_storage.loadh).Load(&(g[i]), g_vals, valid_items, (T)0.0f);
+        __syncthreads();
+        LoadChar(temp_storage.loadc).Load(&(state1[i]), c1s, valid_items, 128);
+        __syncthreads();
+        LoadChar(temp_storage.loadc).Load(&(state2[i]), c2s, valid_items, 0);
+
+        // AdEMAMix has an additional state packed into state1.
+        if (OPTIMIZER == ADEMAMIX) {
+            __syncthreads();
+            LoadChar(temp_storage.loadc).Load(&(state1[n + i]), c3s, valid_items, 128);
+        }
+
+        new_local_abs_max1 = -FLT_MAX;
+        new_local_abs_max2 = -FLT_MAX;
+        new_local_abs_max3 = -FLT_MAX;
+
+//  update: 2.48/1.57 -> 2.51/1.60
+#pragma unroll N_PER_TH
+        for (unsigned int j = 0; j < N_PER_TH; j++) {
+            if (!isnan((float)g_vals[j]) && !isinf((float)g_vals[j])) {
+                s2_vals[j] = smem_quantiles2[lane_id][c2s[j]] * absmax2[i / BLOCK_SIZE];
+                g_val = g_vals[j];
+                // float ratio = (g_val*g_val)/fmaxf(s2_vals[j], eps*eps);
+                // g_val = ratio > 2.0f ? 2.0f*g_val/ratio : g_val;
+                g_val *= gnorm_scale;
+
+                s2_vals[j] = (s2_vals[j] * beta2) + (((1.0f - beta2) * g_val * g_val));
+
+                s1_vals[j] = smem_quantiles1[lane_id][c1s[j]] * absmax1[i / BLOCK_SIZE];
+                s1_vals[j] = (s1_vals[j] * beta1) + (((1.0f - beta1) * g_val));
+
+                if (OPTIMIZER == ADEMAMIX) {
+                    // The absmax for the third state is appended to absmax1
+                    s3_vals[j] = smem_quantiles1[lane_id][c3s[j]] * absmax1[(n + i) / BLOCK_SIZE];
+                    s3_vals[j] = (s3_vals[j] * beta3) + (((1.0f - beta3) * g_val));
+                }
+            } else {
+                s1_vals[j] = 0.0f;
+                s2_vals[j] = 0.0f;
+
+                if (OPTIMIZER == ADEMAMIX) {
+                    s3_vals[j] = 0.0f;
+                }
+            }
+
+            new_local_abs_max1 = fmaxf(new_local_abs_max1, fabsf(s1_vals[j]));
+            new_local_abs_max2 = fmaxf(new_local_abs_max2, fabsf(s2_vals[j]));
+
+            if (OPTIMIZER == ADEMAMIX) {
+                new_local_abs_max3 = fmaxf(new_local_abs_max3, fabsf(s3_vals[j]));
+            }
+        }
+
+        //  reduce: 2.51/1.60 -> 2.67/1.69
+        new_local_abs_max1 = BlockReduce1(reduce1).Reduce(new_local_abs_max1, BNB_MAX_OP);
+        new_local_abs_max2 = BlockReduce2(reduce2).Reduce(new_local_abs_max2, BNB_MAX_OP);
+
+        if (OPTIMIZER == ADEMAMIX) {
+            new_local_abs_max3 = BlockReduce3(reduce3).Reduce(new_local_abs_max3, BNB_MAX_OP);
+        }
+
+        if (threadIdx.x == 0) {
+            smem_exchange1[0] = new_local_abs_max1;
+            smem_exchange2[0] = new_local_abs_max2;
+
+            if (OPTIMIZER == ADEMAMIX) {
+                smem_exchange3[0] = new_local_abs_max3;
+            }
+        }
+
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            absmax1[i / BLOCK_SIZE] = new_local_abs_max1;
+            absmax2[i / BLOCK_SIZE] = new_local_abs_max2;
+
+            if (OPTIMIZER == ADEMAMIX) {
+                absmax1[(n + i) / BLOCK_SIZE] = new_local_abs_max3;
+            }
+        } else {
+            new_local_abs_max1 = smem_exchange1[0];
+            new_local_abs_max2 = smem_exchange2[0];
+
+            if (OPTIMIZER == ADEMAMIX) {
+                new_local_abs_max3 = smem_exchange3[0];
+            }
+        }
+
+        __syncthreads();
+        LoadT(temp_storage.loadh).Load(&(p[i]), p_vals, valid_items, (T)0.0f);
+//  reduce: 2.67/1.69 -> 2.67/1.70
+#pragma unroll N_PER_TH
+        for (unsigned int j = 0; j < N_PER_TH; j++) {
+            // if(!skip_zeros || (skip_zeros && ((float)g_vals[j] != 0.0f)))
+            if (!isnan((float)g_vals[j]) && !isinf((float)g_vals[j])) {
+                if (OPTIMIZER == ADEMAMIX) {
+                    p_vals[j] =
+                        T((float)p_vals[j] - lr * (((s1_vals[j] / correction1) + (alpha * s3_vals[j])) /
+                                                   ((sqrtf(s2_vals[j]) / correction2) + eps)));
+                } else {
+                    p_vals[j] =
+                        (T)(((float)p_vals[j]) +
+                            ((step_size * (__fdividef(s1_vals[j], (sqrtf(s2_vals[j]) + (correction2 * eps)))))));
+                }
+
+                if (weight_decay > 0.0f)
+                    p_vals[j] = ((float)p_vals[j]) * (1.0f - (lr * weight_decay));
+            }
+        }
+
+        //  store: 0.85/1.44 -> 2.48/1.57
+        __syncthreads();
+        StoreT(temp_storage.storeh).Store(&(p[i]), p_vals, valid_items);
+
+//  quantizaztion: 2.67/1.70  -> 3.4/3.3
+#pragma unroll N_PER_TH
+        for (unsigned int j = 0; j < N_PER_TH; j++) {
+            c1s[j] = quantize_2D<1>(quadrants1, smem_quantiles1[lane_id], __fdividef(s1_vals[j], new_local_abs_max1));
+            c2s[j] = quantize_2D<0>(quadrants2, smem_quantiles2[lane_id], __fdividef(s2_vals[j], new_local_abs_max2));
+
+            // make sure state1 term has still the same sign after quantization
+            // (not needed for state2 term which has only positive values)
+            if (signbit(smem_quantiles1[lane_id][c1s[j]]) != signbit(s1_vals[j])) {
+                if (s1_vals[j] > 0.0f)
+                    c1s[j] += 1;
+                else
+                    c1s[j] -= 1;
+            }
+
+            if (OPTIMIZER == ADEMAMIX) {
+                c3s[j] =
+                    quantize_2D<1>(quadrants1, smem_quantiles1[lane_id], __fdividef(s3_vals[j], new_local_abs_max3));
+
+                if (signbit(smem_quantiles1[lane_id][c3s[j]]) != signbit(s3_vals[j])) {
+                    c3s[j] += (s3_vals[j] > 0.0f) ? 1 : -1;
+                }
+            }
+        }
+
+        __syncthreads();
+        StoreChar(temp_storage.storec).Store(&(state1[i]), c1s, valid_items);
+        __syncthreads();
+        StoreChar(temp_storage.storec).Store(&(state2[i]), c2s, valid_items);
+
+        if (OPTIMIZER == ADEMAMIX) {
+            __syncthreads();
+            StoreChar(temp_storage.storec).Store(&(state1[n + i]), c3s, valid_items);
+        }
+    }
+}
+
+#define LANES 2
+#define QUAD 3
+
+template <typename T, int OPTIMIZER, int BLOCK_SIZE, int N_PER_TH>
+__launch_bounds__(256, 3) __global__ void kOptimizerStatic8bit1StateBlockwise(
+    T* p, T* __restrict__ const g, unsigned char* state1, const float beta1, const float beta2, const float eps,
+    const int step, const float lr, float* __restrict__ const quantiles1, float* absmax1, float weight_decay,
+    const float gnorm_scale, const bool skip_zeros, const int n
+) {
+
+    // const int n_full = n + (n%BLOCK_SIZE);
+    const int n_full = gridDim.x * BLOCK_SIZE;
+    const int base_idx = (blockIdx.x * BLOCK_SIZE);
+    int valid_items = 0;
+    float g_val = 0.0f;
+    float s1_vals[N_PER_TH];
+    // 2-5%
+    const int lane_id = threadIdx.x % LANES;
+    float new_local_abs_max1 = -FLT_MAX;
+    float quadrants1[QUAD];
+
+    unsigned char c1s[N_PER_TH];
+    T g_vals[N_PER_TH];
+    T p_vals[N_PER_TH];
+
+    typedef bnb_cub::BlockLoad<T, BLOCK_SIZE / N_PER_TH, N_PER_TH, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE> LoadT;
+    typedef bnb_cub::BlockLoad<unsigned char, BLOCK_SIZE / N_PER_TH, N_PER_TH, bnb_cub::BLOCK_LOAD_WARP_TRANSPOSE>
+        LoadChar;
+
+    typedef bnb_cub::BlockStore<unsigned char, BLOCK_SIZE / N_PER_TH, N_PER_TH, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE>
+        StoreChar;
+    typedef bnb_cub::BlockStore<T, BLOCK_SIZE / N_PER_TH, N_PER_TH, bnb_cub::BLOCK_STORE_WARP_TRANSPOSE> StoreT;
+
+    __shared__ float smem_quantiles1[LANES][257];
+    typedef bnb_cub::BlockReduce<float, BLOCK_SIZE / N_PER_TH> BlockReduce1;
+    __shared__ typename BlockReduce1::TempStorage reduce1;
+    __shared__ float smem_exchange1[1];
+
+    __shared__ union {
+        typename LoadT::TempStorage loadh;
+        typename LoadChar::TempStorage loadc;
+        typename StoreChar::TempStorage storec;
+        typename StoreT::TempStorage storeh;
+    } temp_storage;
+
+    // init: 0.2 -> 0.23
+
+    // 0.23 -> 0.23
+    smem_quantiles1[0][threadIdx.x] = quantiles1[threadIdx.x];
+#pragma unroll
+    for (unsigned int j = 1; j < LANES; j++)
+        smem_quantiles1[j][threadIdx.x] = smem_quantiles1[0][threadIdx.x];
+
+    __syncthreads();
+
+#pragma unroll
+    for (int k = 0; k < QUAD; k++)
+        quadrants1[k] = smem_quantiles1[lane_id][(k * 256 / (QUAD + 1)) + (256 / (QUAD + 1) - 1)];
+
+    for (unsigned int i = base_idx; i < n_full; i += gridDim.x * BLOCK_SIZE) {
+        // loads: 0.23 -> 0.85/1.44
+        valid_items = n - i >= BLOCK_SIZE ? BLOCK_SIZE : n - i;
+        __syncthreads();
+        LoadT(temp_storage.loadh).Load(&(g[i]), g_vals, valid_items, (T)0.0f);
+        __syncthreads();
+        LoadChar(temp_storage.loadc).Load(&(state1[i]), c1s, valid_items, 128);
+        __syncthreads();
+        LoadT(temp_storage.loadh).Load(&(p[i]), p_vals, valid_items, (T)0.0f);
+
+        new_local_abs_max1 = -FLT_MAX;
+
+//  update: 2.48/1.57 -> 2.51/1.60
+#pragma unroll N_PER_TH
+        for (unsigned int j = 0; j < N_PER_TH; j++) {
+            g_val = float(g_vals[j]);
+            g_val *= gnorm_scale;
+            if (!skip_zeros || (skip_zeros && ((float)g_vals[j] != 0.0f))) {
+                if (weight_decay > 0.0f) {
+                    switch (OPTIMIZER) {
+                    case MOMENTUM:
+                    case ADAGRAD:
+                    case RMSPROP:
+                        g_val += ((float)p_vals[j]) * weight_decay;
+                        break;
+                    case LION:
+                        p_vals[j] = ((float)p_vals[j]) * (1.0f - lr * weight_decay);
+                        break;
+                    }
+                }
+
+                s1_vals[j] = smem_quantiles1[lane_id][c1s[j]] * absmax1[i / BLOCK_SIZE];
+
+                switch (OPTIMIZER) {
+                case MOMENTUM:
+                    if (step == 1)
+                        s1_vals[j] = g_val;
+                    else
+                        s1_vals[j] = (s1_vals[j] * beta1) + g_val;
+                    break;
+                case LION:
+                    // here, using gvals[j] to store the gradient smoothed by beta1 for the following parameter update,
+                    // before the momentum is updated by beta2
+                    g_vals[j] = lr * sgn(((float)s1_vals[j]) * beta1 + ((1.0f - beta1) * g_val));
+                    s1_vals[j] = s1_vals[j] * beta2 + ((1.0f - beta2) * g_val);
+                    break;
+                case RMSPROP:
+                    s1_vals[j] = s1_vals[j] * beta1 + ((1.0f - beta1) * (g_val * g_val));
+                    break;
+                case ADAGRAD:
+                    s1_vals[j] = s1_vals[j] + (g_val * g_val);
+                    break;
+                }
+            }
+
+            new_local_abs_max1 = fmaxf(new_local_abs_max1, fabsf(s1_vals[j]));
+        }
+
+        //  reduce: 2.51/1.60 -> 2.67/1.69
+        new_local_abs_max1 = BlockReduce1(reduce1).Reduce(new_local_abs_max1, BNB_MAX_OP);
+
+        if (threadIdx.x == 0)
+            smem_exchange1[0] = new_local_abs_max1;
+
+        __syncthreads();
+
+        if (threadIdx.x == 0)
+            absmax1[i / BLOCK_SIZE] = new_local_abs_max1;
+        else
+            new_local_abs_max1 = smem_exchange1[0];
+
+//  reduce: 2.67/1.69 -> 2.67/1.70
+#pragma unroll N_PER_TH
+        for (unsigned int j = 0; j < N_PER_TH; j++) {
+            if (!skip_zeros || (skip_zeros && ((float)g_vals[j] != 0.0f))) {
+                switch (OPTIMIZER) {
+                case MOMENTUM:
+                    p_vals[j] = ((float)p_vals[j]) - lr * (s1_vals[j]);
+                    break;
+                case LION:
+                    p_vals[j] = ((float)p_vals[j]) - ((float)g_vals[j]);
+                    break;
+                case RMSPROP:
+                    g_val = g_vals[j];
+                    p_vals[j] = ((float)p_vals[j]) - lr * (__fdividef(g_val, sqrtf(s1_vals[j]) + eps));
+                    break;
+                case ADAGRAD:
+                    g_val = g_vals[j];
+                    p_vals[j] = ((float)p_vals[j]) - lr * (__fdividef(g_val, sqrtf(s1_vals[j]) + eps));
+                    break;
+                }
+            }
+        }
+
+        //  store: 0.85/1.44 -> 2.48/1.57
+        __syncthreads();
+        StoreT(temp_storage.storeh).Store(&(p[i]), p_vals, valid_items);
+
+//  quantizaztion: 2.67/1.70  -> 3.4/3.3
+#pragma unroll N_PER_TH
+        for (unsigned int j = 0; j < N_PER_TH; j++) {
+            c1s[j] = quantize_2D<1>(quadrants1, smem_quantiles1[lane_id], __fdividef(s1_vals[j], new_local_abs_max1));
+
+            // make sure state1 term has still the same sign after quantization
+            // (not needed for state2 term which has only positive values)
+            if (signbit(smem_quantiles1[lane_id][c1s[j]]) != signbit(s1_vals[j])) {
+                if (s1_vals[j] > 0.0f)
+                    c1s[j] += 1;
+                else
+                    c1s[j] -= 1;
+            }
+        }
+
+        __syncthreads();
+        StoreChar(temp_storage.storec).Store(&(state1[i]), c1s, valid_items);
+    }
+}
+
+// Inputs:
+//  A [rows, cols]
+// Outputs:
+//  rowStats [rows]
+//  out [rows, cols]
+template <typename T, int THREADS, int SPARSE_DECOMP>
+__launch_bounds__(1024, BNB_MAX_THREADS_PER_SM / 1024) __global__
+    void kInt8VectorQuant(T* __restrict__ A, int8_t* out, float* rowStats, float threshold, int rows, int cols) {
+
+    using BlockReduceT = bnb_cub::BlockReduce<T, THREADS>;
+
+    // One block per row.
+    // Threads load column values in a striped arrangement.
+    // e.g. t0 reads row[0], row[0+nthreads], ..
+    // and  t1 reads row[1], row[1+nthreads], ..
+    // Each thread will determine its local absmax.
+    // We then do a blockwise reduction to determine the row's absmax.
+
+    __shared__ typename BlockReduceT::TempStorage temp_storage;
+    __shared__ T smem_row_absmax;
+
+    const int row_id = blockIdx.x;
+    const T* row_data = A + (row_id * cols);
+
+    // Threads will read the row values in a striped access pattern and find a local absmax.
+    T row_local_absmax = -FLT_MIN;
+    for (int i = threadIdx.x; i < cols; i += THREADS) {
+        const T absval = fabsf(__ldcs(&(row_data[i])));
+
+        // For sparse decomposition, values outside of the threshold are not to be
+        // included when calculating the row's absmax.
+        if constexpr (SPARSE_DECOMP) {
+            row_local_absmax = fmaxf(row_local_absmax, absval < T(threshold) ? absval : row_local_absmax);
+        } else {
+            row_local_absmax = fmaxf(row_local_absmax, absval);
+        }
+    }
+
+    // Reduce thread-local absmax across the block.
+    const T row_absmax = BlockReduceT(temp_storage).Reduce(row_local_absmax, BNB_MAX_OP, cols);
+    if (threadIdx.x == 0) {
+        // Save our block's absmax to shared memory for the quantization step.
+        rowStats[row_id] = smem_row_absmax = row_absmax;
+    }
+    __syncthreads();
+
+    // Quantize row-wise.
+    const float scale = __fdividef(127.0f, smem_row_absmax);
+    for (int i = threadIdx.x; i < cols; i += THREADS) {
+        float val = row_data[i];
+
+        if constexpr (SPARSE_DECOMP) {
+            // For sparse decomposition, we do not want to quantize the outliers.
+            // Instead they're zeroed out.
+            out[row_id * cols + i] = fabs(val) < threshold ? __float2int_rn(val * scale) : 0;
+        } else {
+            out[row_id * cols + i] = __float2int_rn(val * scale);
+        }
+    }
+}
+
+template __global__ void kInt8VectorQuant<half, 1024, 0>(
+    half* __restrict__ A, int8_t* out, float* rowStats, float threshold, int rows, int cols
+);
+template __global__ void kInt8VectorQuant<half, 1024, 1>(
+    half* __restrict__ A, int8_t* out, float* rowStats, float threshold, int rows, int cols
+);
+
+#define MM_DEQUANT_CONST 6.200012e-05f // 1.0f/(127.0f*127.0f)
+
+template <int ITEMS_PER_THREAD, int THREADS>
+__global__ void kdequant_mm_int32_fp16(
+    int* __restrict__ const A, float* __restrict__ const rowStats, float* __restrict__ const colStats, half* out,
+    half* __restrict__ const bias, const int numRows, const int numCols, const int n
+) {
+    const int n_out = numRows * numCols;
+
+    int block_offset = blockIdx.x * THREADS * ITEMS_PER_THREAD;
+    int thread_offset = threadIdx.x * ITEMS_PER_THREAD;
+
+    int local_values[ITEMS_PER_THREAD];
+    half local_output[ITEMS_PER_THREAD];
+
+    float local_rowStats[ITEMS_PER_THREAD];
+    float local_colStats[ITEMS_PER_THREAD];
+    float local_biasValue[ITEMS_PER_THREAD];
+
+    typedef bnb_cub::BlockLoad<int, THREADS, ITEMS_PER_THREAD, bnb_cub::BLOCK_LOAD_VECTORIZE> LoadInt32;
+    __shared__ typename LoadInt32::TempStorage loadint32;
+
+    int row_idx, col_idx;
+
+#pragma unroll ITEMS_PER_THREAD
+    for (int j = 0; j < ITEMS_PER_THREAD; ++j) {
+
+        row_idx = (block_offset + thread_offset + j) / numCols;
+        col_idx = (block_offset + thread_offset + j) % numCols;
+
+        local_colStats[j] = col_idx >= numCols ? 0.0f : __ldg(&colStats[col_idx]);
+        local_rowStats[j] = row_idx >= numRows ? 0.0f : __ldg(&rowStats[row_idx]);
+        local_biasValue[j] = ((bias == nullptr) || col_idx >= numCols) ? 0.0f : __half2float(bias[col_idx]);
+    }
+
+    // Each block loads THREADS * ITEMS_PER_THREAD values from A
+    int valid_items =
+        block_offset + THREADS * ITEMS_PER_THREAD < n_out ? THREADS * ITEMS_PER_THREAD : n_out - block_offset;
+    LoadInt32(loadint32).Load(&(A[block_offset]), local_values, valid_items, 0);
+
+#pragma unroll ITEMS_PER_THREAD
+    for (int j = 0; j < ITEMS_PER_THREAD; ++j) {
+        local_output[j] = __float2half(
+            fmaf(local_values[j] * local_rowStats[j] * local_colStats[j], MM_DEQUANT_CONST, local_biasValue[j])
+        );
+    }
+
+#pragma unroll ITEMS_PER_THREAD
+    for (int j = 0; j < ITEMS_PER_THREAD; j++) {
+        int outIdx = block_offset + thread_offset + j;
+        if (outIdx < n_out) {
+            out[outIdx] = local_output[j];
+        }
+    }
+}
+
+#define num_values_4bit 32
+
+template <typename T, int THREADS, int BITS>
+__global__ void kgemm_4bit_inference_naive(
+    int M, int N, int K, T* __restrict__ const A, unsigned char* B, float* absmax, const float* datatype, T* out,
+    int lda, int ldb, int ldc, int blocksize
+) {
+
+    // per threadblock:
+    // load step-by-step in chunks of [warp_size,warps]: 1xwarp_size * [warp_size,warps] -> [1,warps]
+    // THREADS/BNB_WARP_SIZE warps -> that many loads per iter
+    // 1xwarp_size * warp_size x warps -> 1 x warps outputs per thread block
+    typedef bnb_cub::WarpReduce<float> WarpReduce;
+    __shared__ typename WarpReduce::TempStorage temp_storage[THREADS / BNB_WARP_SIZE];
+
+    const int warp_idx = threadIdx.x / BNB_WARP_SIZE;
+    const int warp_lane = threadIdx.x % BNB_WARP_SIZE;
+    const int row_B = (THREADS / BNB_WARP_SIZE) * blockIdx.x + warp_idx;
+    const int offset_B = ldb * row_B;
+    const int num_values_8bit = num_values_4bit / 2;
+    float local_C = 0.0f;
+
+    unsigned char local_B_4bit[num_values_8bit];
+    T local_B[num_values_4bit / 4];
+    T local_A[num_values_4bit / 4];
+    __shared__ T quant_map[16];
+    T local_absmax = T(0.0f);
+
+    if (threadIdx.x < 16)
+        quant_map[threadIdx.x] = T(__ldg(&datatype[threadIdx.x]));
+    // for(int i = threadIdx.x; i < 16; i++)
+    // quant_map[i] = T(__ldg(&datatype[i]));
+    __syncthreads();
+
+    // A: [1, K]
+    // B: [N, K]
+    for (int inner_idx = warp_lane * num_values_4bit; inner_idx < K; inner_idx += BNB_WARP_SIZE * num_values_4bit) {
+        const int inner_idx_halved = inner_idx / 2;
+
+        // Since blocksize will always be a power-of-2, we avoid more expensive
+        // division by the blocksize and instead use a shift operation.
+        // This is equivalent to (i+threadId.x*NUM_PER_TH)/blocksize.
+        const int absidx = ((2 * offset_B) + inner_idx) >> (31 - __clz(blocksize));
+
+        local_absmax = __ldg(&(absmax[absidx]));
+
+        if (row_B < M) {
+            if ((inner_idx_halved + num_values_8bit) < (K / 2)) {
+                // this is the most important for performance considerations
+                reinterpret_cast<int4(&)[num_values_8bit]>(local_B_4bit)[0] =
+                    reinterpret_cast<int4*>(B)[(offset_B + (inner_idx_halved)) / (num_values_8bit)];
+            } else {
+#pragma unroll
+                for (int j = 0; j < (num_values_8bit); j++)
+                    if ((inner_idx_halved) + j < (K / 2))
+                        local_B_4bit[j] = B[offset_B + inner_idx_halved + j];
+                    else
+                        local_B_4bit[j] = 0b01110111;
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < (num_values_8bit); j++)
+                local_B_4bit[j] = 0b01110111;
+        }
+
+        for (int i = 0; i < 4; i++) {
+#pragma unroll
+            for (int k = 0; k < num_values_8bit / 4; k++) {
+#if BNB_BF16_AVAILABLE
+                local_B[k * 2] = quant_map[local_B_4bit[(i * num_values_8bit / 4) + k] >> 4] * local_absmax;
+                local_B[k * 2 + 1] = quant_map[local_B_4bit[(i * num_values_8bit / 4) + k] & 0x0F] * local_absmax;
+#else
+                // bf16 multipliation not supported
+                local_B[k * 2] =
+                    T((float)quant_map[local_B_4bit[(i * num_values_8bit / 4) + k] >> 4] * (float)local_absmax);
+                local_B[k * 2 + 1] =
+                    T((float)quant_map[local_B_4bit[(i * num_values_8bit / 4) + k] & 0x0F] * (float)local_absmax);
+#endif
+            }
+
+            if (inner_idx + (num_values_4bit / 4) + (i * num_values_4bit / 4) < K) {
+                // this is also relatively important for performance
+                if (BITS == 16) {
+                    reinterpret_cast<int4(&)[num_values_4bit]>(local_A)[0] =
+                        reinterpret_cast<int4*>(A)[inner_idx / (num_values_4bit / 4) + i];
+                } else {
+                    reinterpret_cast<int4(&)[num_values_4bit]>(local_A)[0] =
+                        reinterpret_cast<int4*>(A)[inner_idx / (num_values_4bit / 8) + (2 * i) + 0];
+                    reinterpret_cast<int4(&)[num_values_4bit]>(local_A)[1] =
+                        reinterpret_cast<int4*>(A)[inner_idx / (num_values_4bit / 8) + (2 * i) + 1];
+                }
+
+            } else
+#pragma unroll
+                for (int k = 0; k < num_values_4bit / 4; k++)
+                    if (inner_idx + (i * num_values_4bit / 4) + k < K)
+                        local_A[k] = A[inner_idx + k + (i * num_values_4bit / 4)];
+                    else
+                        local_A[k] = T(0.0f);
+
+// accumulate in float; small performance hit for Ampere, but lower error for outputs
+#pragma unroll
+            for (int k = 0; k < num_values_4bit / 4; k++) {
+#if BNB_BF16_AVAILABLE
+                local_C += (float)(local_A[k] * local_B[k]);
+#else
+                // bf16 multipliation not supported
+                local_C += ((float)local_A[k] * (float)local_B[k]);
+#endif
+            }
+        }
+    }
+
+    local_C = WarpReduce(temp_storage[warp_idx]).Sum(local_C);
+
+    if (row_B < M && warp_lane == 0)
+        out[row_B] = T(local_C);
+}
+
+template <typename T, int FUNC> __global__ void kfunc(T* A, T* B, T value, long n) {
+    for (long i = (blockDim.x * blockIdx.x) + threadIdx.x; i < n; i += (blockDim.x * gridDim.x)) {
+        switch (FUNC) {
+        case FILL:
+            A[i] = (T)value;
+            break;
+        case ARANGE:
+            A[i] = (T)i;
+            break;
+        case _MUL:
+            A[i] = A[i] * B[i];
+            break;
+        }
+    }
+}
+
+//==============================================================
+//                   TEMPLATE DEFINITIONS
+//==============================================================
+
+template __global__ void kfunc<float, FILL>(float* A, float* B, float value, long n);
+template __global__ void kfunc<unsigned char, FILL>(unsigned char* A, unsigned char* B, unsigned char value, long n);
+template __global__ void kfunc<float, ARANGE>(float* A, float* B, float value, long n);
+template __global__ void kfunc<float, _MUL>(float* A, float* B, float value, long n);
+
+template __global__ void kgemm_4bit_inference_naive<half, 128, 16>(
+    int M, int N, int K, half* __restrict__ const A, unsigned char* B, float* absmax, const float* datatype, half* out,
+    int lda, int ldb, int ldc, int blocksize
+);
+template __global__ void kgemm_4bit_inference_naive<bnb_bfloat16, 128, 16>(
+    int M, int N, int K, bnb_bfloat16* __restrict__ const A, unsigned char* B, float* absmax, const float* datatype,
+    bnb_bfloat16* out, int lda, int ldb, int ldc, int blocksize
+);
+template __global__ void kgemm_4bit_inference_naive<float, 128, 32>(
+    int M, int N, int K, float* __restrict__ const A, unsigned char* B, float* absmax, const float* datatype,
+    float* out, int lda, int ldb, int ldc, int blocksize
+);
+
+template __global__ void kdequant_mm_int32_fp16<4, 512>(
+    int* __restrict__ const A, float* __restrict__ const rowStats, float* __restrict__ const colStats, half* out,
+    half* __restrict__ const bias, const int numRows, const int numCols, const int n
+);
+
+template __device__ unsigned char dQuantize<0>(float* smem_code, const float rand, float x);
+template __device__ unsigned char dQuantize<1>(float* smem_code, const float rand, float x);
+
+#define MAKE_PreconditionOptimizer32bit1State(oname, gtype)                                                            \
+    template __global__ void kPreconditionOptimizer32bit1State<gtype, oname, 4096, 8>(                                 \
+        gtype * g, gtype * p, float* state1, float* unorm, const float beta1, const float beta2, const float eps,      \
+        const float weight_decay, const int step, const float lr, const float gnorm_scale, const int n                 \
+    );
+
+MAKE_PreconditionOptimizer32bit1State(MOMENTUM, half)
+MAKE_PreconditionOptimizer32bit1State(MOMENTUM, float)
+MAKE_PreconditionOptimizer32bit1State(MOMENTUM, bnb_bfloat16)
+MAKE_PreconditionOptimizer32bit1State(RMSPROP, half)
+MAKE_PreconditionOptimizer32bit1State(RMSPROP, float)
+MAKE_PreconditionOptimizer32bit1State(RMSPROP, bnb_bfloat16)
+MAKE_PreconditionOptimizer32bit1State(LION, half)
+MAKE_PreconditionOptimizer32bit1State(LION, float)
+MAKE_PreconditionOptimizer32bit1State(LION, bnb_bfloat16)
+MAKE_PreconditionOptimizer32bit1State(ADAGRAD, half)
+MAKE_PreconditionOptimizer32bit1State(ADAGRAD, float)
+MAKE_PreconditionOptimizer32bit1State(ADAGRAD, bnb_bfloat16)
+
+#define MAKE_Optimizer32bit1State(oname, gtype)                                                                        \
+    template __global__ void kOptimizer32bit1State<gtype, oname>(                                                      \
+        gtype * g, gtype * p, float* state1, float* unorm, const float max_unorm, const float param_norm,              \
+        const float beta1, const float beta2, const float eps, const float weight_decay, const int step,               \
+        const float lr, const float gnorm_scale, const bool skip_zeros, const int n                                    \
+    );
+
+MAKE_Optimizer32bit1State(MOMENTUM, half)
+MAKE_Optimizer32bit1State(MOMENTUM, float)
+MAKE_Optimizer32bit1State(MOMENTUM, bnb_bfloat16)
+MAKE_Optimizer32bit1State(RMSPROP, half)
+MAKE_Optimizer32bit1State(RMSPROP, float)
+MAKE_Optimizer32bit1State(RMSPROP, bnb_bfloat16)
+MAKE_Optimizer32bit1State(LION, half)
+MAKE_Optimizer32bit1State(LION, float)
+MAKE_Optimizer32bit1State(LION, bnb_bfloat16)
+MAKE_Optimizer32bit1State(ADAGRAD, half)
+MAKE_Optimizer32bit1State(ADAGRAD, float)
+MAKE_Optimizer32bit1State(ADAGRAD, bnb_bfloat16)
+
+#define MAKE_PreconditionOptimizer32bit2State(oname, gtype)                                                            \
+    template __global__ void kPreconditionOptimizer32bit2State<gtype, oname, 4096, 8>(                                 \
+        gtype * g, gtype * p, float* state1, float* state2, float* unorm, const float beta1, const float beta2,        \
+        const float eps, const float weight_decay, const int step, const float lr, const float gnorm_scale,            \
+        const int n                                                                                                    \
+    );
+
+MAKE_PreconditionOptimizer32bit2State(ADAM, float)
+MAKE_PreconditionOptimizer32bit2State(ADAM, half)
+MAKE_PreconditionOptimizer32bit2State(ADAM, bnb_bfloat16)
+MAKE_PreconditionOptimizer32bit2State(ADEMAMIX, float)
+MAKE_PreconditionOptimizer32bit2State(ADEMAMIX, half)
+MAKE_PreconditionOptimizer32bit2State(ADEMAMIX, bnb_bfloat16)
+
+template __global__ void kOptimizer32bit2State<float, ADAM>(
+    float* g, float* p, float* state1, float* state2, float* unorm, const float max_unorm, const float param_norm,
+    const float beta1, const float beta2, const float beta3, const float alpha, const float eps,
+    const float weight_decay, const int step, const float lr, const float gnorm_scale, const bool skip_zeros,
+    const int n
+);
+template __global__ void kOptimizer32bit2State<half, ADAM>(
+    half* g, half* p, float* state1, float* state2, float* unorm, const float max_unorm, const float param_norm,
+    const float beta1, const float beta2, const float beta3, const float alpha, const float eps,
+    const float weight_decay, const int step, const float lr, const float gnorm_scale, const bool skip_zeros,
+    const int n
+);
+template __global__ void kOptimizer32bit2State<bnb_bfloat16, ADAM>(
+    bnb_bfloat16* g, bnb_bfloat16* p, float* state1, float* state2, float* unorm, const float max_unorm,
+    const float param_norm, const float beta1, const float beta2, const float beta3, const float alpha, const float eps,
+    const float weight_decay, const int step, const float lr, const float gnorm_scale, const bool skip_zeros,
+    const int n
+);
+template __global__ void kOptimizer32bit2State<float, ADEMAMIX>(
+    float* g, float* p, float* state1, float* state2, float* unorm, const float max_unorm, const float param_norm,
+    const float beta1, const float beta2, const float beta3, const float alpha, const float eps,
+    const float weight_decay, const int step, const float lr, const float gnorm_scale, const bool skip_zeros,
+    const int n
+);
+template __global__ void kOptimizer32bit2State<half, ADEMAMIX>(
+    half* g, half* p, float* state1, float* state2, float* unorm, const float max_unorm, const float param_norm,
+    const float beta1, const float beta2, const float beta3, const float alpha, const float eps,
+    const float weight_decay, const int step, const float lr, const float gnorm_scale, const bool skip_zeros,
+    const int n
+);
+template __global__ void kOptimizer32bit2State<bnb_bfloat16, ADEMAMIX>(
+    bnb_bfloat16* g, bnb_bfloat16* p, float* state1, float* state2, float* unorm, const float max_unorm,
+    const float param_norm, const float beta1, const float beta2, const float beta3, const float alpha, const float eps,
+    const float weight_decay, const int step, const float lr, const float gnorm_scale, const bool skip_zeros,
+    const int n
+);
+
+#define MAKE_kQuantizeBlockwise(dtype, blocksize, num_per_thread, stochastic, data_type_name)                          \
+    template __global__ void kQuantizeBlockwise<dtype, blocksize, num_per_thread, stochastic, data_type_name>(         \
+        float* code, dtype* __restrict__ const A, float* absmax, unsigned char* out, float* __restrict__ const rand,   \
+        const int rand_offset, const int n                                                                             \
+    );
+
+MAKE_kQuantizeBlockwise(half, 4096, 4, 0, General8bit)
+MAKE_kQuantizeBlockwise(half, 4096, 4, 1, General8bit)
+MAKE_kQuantizeBlockwise(half, 2048, 4, 0, General8bit)
+MAKE_kQuantizeBlockwise(half, 1024, 4, 0, General8bit)
+MAKE_kQuantizeBlockwise(half, 512, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(half, 256, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(half, 128, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(half, 64, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(half, 4096, 4, 0, FP4)
+MAKE_kQuantizeBlockwise(half, 2048, 4, 0, FP4)
+MAKE_kQuantizeBlockwise(half, 1024, 4, 0, FP4)
+MAKE_kQuantizeBlockwise(half, 512, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(half, 256, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(half, 128, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(half, 64, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(half, 4096, 4, 0, NF4)
+MAKE_kQuantizeBlockwise(half, 2048, 4, 0, NF4)
+MAKE_kQuantizeBlockwise(half, 1024, 4, 0, NF4)
+MAKE_kQuantizeBlockwise(half, 512, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(half, 256, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(half, 128, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(half, 64, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(float, 4096, 4, 0, General8bit)
+MAKE_kQuantizeBlockwise(float, 4096, 4, 1, General8bit)
+MAKE_kQuantizeBlockwise(float, 2048, 4, 0, General8bit)
+MAKE_kQuantizeBlockwise(float, 1024, 4, 0, General8bit)
+MAKE_kQuantizeBlockwise(float, 512, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(float, 256, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(float, 128, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(float, 64, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(float, 4096, 4, 0, FP4)
+MAKE_kQuantizeBlockwise(float, 2048, 4, 0, FP4)
+MAKE_kQuantizeBlockwise(float, 1024, 4, 0, FP4)
+MAKE_kQuantizeBlockwise(float, 512, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(float, 256, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(float, 128, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(float, 64, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(float, 4096, 4, 0, NF4)
+MAKE_kQuantizeBlockwise(float, 2048, 4, 0, NF4)
+MAKE_kQuantizeBlockwise(float, 1024, 4, 0, NF4)
+MAKE_kQuantizeBlockwise(float, 512, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(float, 256, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(float, 128, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(float, 64, 2, 0, NF4)
+
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 4096, 4, 0, General8bit)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 4096, 4, 1, General8bit)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 2048, 4, 0, General8bit)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 1024, 4, 0, General8bit)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 512, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 256, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 128, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 64, 2, 0, General8bit)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 4096, 4, 0, FP4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 2048, 4, 0, FP4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 1024, 4, 0, FP4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 512, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 256, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 128, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 64, 2, 0, FP4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 4096, 4, 0, NF4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 2048, 4, 0, NF4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 1024, 4, 0, NF4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 512, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 256, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 128, 2, 0, NF4)
+MAKE_kQuantizeBlockwise(bnb_bfloat16, 64, 2, 0, NF4)
+
+// Template instantiations for kQuantizeBlockwiseSmall (4-bit only)
+#define MAKE_kQuantizeBlockwiseSmall(dtype, qblock_size, data_type_name)                                               \
+    template __global__ void kQuantizeBlockwiseSmall<dtype, qblock_size, data_type_name>(                              \
+        float* code, dtype* __restrict__ const A, float* absmax, unsigned char* out, float* __restrict__ const rand,   \
+        const int rand_offset, const int n                                                                             \
+    );
+
+// QBLOCK_SIZE=32 instantiations
+MAKE_kQuantizeBlockwiseSmall(half, 32, FP4)
+MAKE_kQuantizeBlockwiseSmall(float, 32, FP4)
+MAKE_kQuantizeBlockwiseSmall(bnb_bfloat16, 32, FP4)
+MAKE_kQuantizeBlockwiseSmall(half, 32, NF4)
+MAKE_kQuantizeBlockwiseSmall(float, 32, NF4)
+MAKE_kQuantizeBlockwiseSmall(bnb_bfloat16, 32, NF4)
+
+// QBLOCK_SIZE=64 instantiations (blocksize=64, 4-bit)
+MAKE_kQuantizeBlockwiseSmall(half, 64, FP4)
+MAKE_kQuantizeBlockwiseSmall(float, 64, FP4)
+MAKE_kQuantizeBlockwiseSmall(bnb_bfloat16, 64, FP4)
+MAKE_kQuantizeBlockwiseSmall(half, 64, NF4)
+MAKE_kQuantizeBlockwiseSmall(float, 64, NF4)
+MAKE_kQuantizeBlockwiseSmall(bnb_bfloat16, 64, NF4)
+
+template __global__ void kDequantizeBlockwise<half, 512, 64, 8, FP4>(
+    float* code, unsigned char* A, float* absmax, half* out, const int blocksize, const int n
+);
+template __global__ void kDequantizeBlockwise<half, 512, 64, 8, General8bit>(
+    float* code, unsigned char* A, float* absmax, half* out, const int blocksize, const int n
+);
+template __global__ void kDequantizeBlockwise<half, 512, 64, 8, NF4>(
+    float* code, unsigned char* A, float* absmax, half* out, const int blocksize, const int n
+);
+template __global__ void kDequantizeBlockwise<float, 512, 64, 8, FP4>(
+    float* code, unsigned char* A, float* absmax, float* out, const int blocksize, const int n
+);
+template __global__ void kDequantizeBlockwise<float, 512, 64, 8, General8bit>(
+    float* code, unsigned char* A, float* absmax, float* out, const int blocksize, const int n
+);
+template __global__ void kDequantizeBlockwise<float, 512, 64, 8, NF4>(
+    float* code, unsigned char* A, float* absmax, float* out, const int blocksize, const int n
+);
+template __global__ void kDequantizeBlockwise<bnb_bfloat16, 512, 64, 8, FP4>(
+    float* code, unsigned char* A, float* absmax, bnb_bfloat16* out, const int blocksize, const int n
+);
+template __global__ void kDequantizeBlockwise<bnb_bfloat16, 512, 64, 8, General8bit>(
+    float* code, unsigned char* A, float* absmax, bnb_bfloat16* out, const int blocksize, const int n
+);
+template __global__ void kDequantizeBlockwise<bnb_bfloat16, 512, 64, 8, NF4>(
+    float* code, unsigned char* A, float* absmax, bnb_bfloat16* out, const int blocksize, const int n
+);
+
+#define MAKE_OptimizerStatic8bit2StateBlockwise(oname, gtype, block_size, num_per_thread)                              \
+    template __global__ void kOptimizerStatic8bit2StateBlockwise<gtype, oname, block_size, num_per_thread>(            \
+        gtype * p, gtype* __restrict__ const g, unsigned char* state1, unsigned char* state2, const float beta1,       \
+        const float beta2, const float beta3, const float alpha, const float eps, const int step, const float lr,      \
+        float* __restrict__ const quantiles1, float* __restrict__ const quantiles2, float* absmax1, float* absmax2,    \
+        float weight_decay, const float gnorm_scale, const bool skip_zeros, const int n                                \
+    );
+
+MAKE_OptimizerStatic8bit2StateBlockwise(ADAM, float, 256, 1)
+MAKE_OptimizerStatic8bit2StateBlockwise(ADAM, half, 256, 1)
+MAKE_OptimizerStatic8bit2StateBlockwise(ADAM, bnb_bfloat16, 256, 1)
+MAKE_OptimizerStatic8bit2StateBlockwise(ADEMAMIX, float, 256, 1)
+MAKE_OptimizerStatic8bit2StateBlockwise(ADEMAMIX, half, 256, 1)
+MAKE_OptimizerStatic8bit2StateBlockwise(ADEMAMIX, bnb_bfloat16, 256, 1)
+
+#define MAKE_OptimizerStatic8bit1StateBlockwise(oname, gtype, block_size, num_per_thread)                              \
+    template __global__ void kOptimizerStatic8bit1StateBlockwise<gtype, oname, block_size, num_per_thread>(            \
+        gtype * p, gtype* __restrict__ const g, unsigned char* state1, const float beta1, const float beta2,           \
+        const float eps, const int step, const float lr, float* __restrict__ const quantiles1, float* absmax1,         \
+        float weight_decay, const float gnorm_scale, const bool skip_zeros, const int n                                \
+    );
+
+MAKE_OptimizerStatic8bit1StateBlockwise(MOMENTUM, float, 256, 1)
+MAKE_OptimizerStatic8bit1StateBlockwise(MOMENTUM, half, 256, 1)
+MAKE_OptimizerStatic8bit1StateBlockwise(MOMENTUM, bnb_bfloat16, 256, 1)
+MAKE_OptimizerStatic8bit1StateBlockwise(RMSPROP, float, 256, 1)
+MAKE_OptimizerStatic8bit1StateBlockwise(RMSPROP, half, 256, 1)
+MAKE_OptimizerStatic8bit1StateBlockwise(RMSPROP, bnb_bfloat16, 256, 1)
+MAKE_OptimizerStatic8bit1StateBlockwise(LION, float, 256, 1)
+MAKE_OptimizerStatic8bit1StateBlockwise(LION, half, 256, 1)
+MAKE_OptimizerStatic8bit1StateBlockwise(LION, bnb_bfloat16, 256, 1)
+MAKE_OptimizerStatic8bit1StateBlockwise(ADAGRAD, float, 256, 1)
+MAKE_OptimizerStatic8bit1StateBlockwise(ADAGRAD, half, 256, 1)
+MAKE_OptimizerStatic8bit1StateBlockwise(ADAGRAD, bnb_bfloat16, 256, 1)
+
+// Copyright (c) Facebook, Inc. and its affiliates.
+//
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+
+#include <cassert>
+#include <kernels.cuh>
+#include <limits>
+#include <ops.cuh>
+
+#define ERR_NOT_IMPLEMENTED 100
+
+#if BNB_HIP
+#include <atomic>
+#include <hip/hip_runtime.h>
+
+// NOTE: This queries device 0 once and caches the result. On mixed RDNA+CDNA
+// systems (warp size 32 vs 64) this will return the wrong value for whichever
+// device doesn't match device 0.
+static int bnb_host_warp_size() {
+    static std::atomic<int> warp_size{0};
+    int ws = warp_size.load(std::memory_order_relaxed);
+    if (ws == 0) {
+        (void)hipDeviceGetAttribute(&ws, hipDeviceAttributeWarpSize, 0);
+        warp_size.store(ws, std::memory_order_relaxed);
+    }
+    return ws;
+}
+#else
+static constexpr int bnb_host_warp_size() { return 32; }
+#endif
+
+using std::cout;
+using std::endl;
+
+template <typename T, int STOCHASTIC, int DATA_TYPE>
+void quantizeBlockwise(
+    float* code, T* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+) {
+    int num_blocks = n / blocksize;
+    num_blocks = n % blocksize == 0 ? num_blocks : num_blocks + 1;
+
+    if (blocksize == 4096)
+        kQuantizeBlockwise<T, 4096, 4, STOCHASTIC, DATA_TYPE>
+            <<<num_blocks, 1024>>>(code, A, absmax, out, rand, rand_offset, n);
+    else if (blocksize == 2048)
+        kQuantizeBlockwise<T, 2048, 4, 0, DATA_TYPE><<<num_blocks, 512>>>(code, A, absmax, out, rand, rand_offset, n);
+    else if (blocksize == 1024)
+        kQuantizeBlockwise<T, 1024, 4, 0, DATA_TYPE><<<num_blocks, 256>>>(code, A, absmax, out, rand, rand_offset, n);
+    else if (blocksize == 512)
+        kQuantizeBlockwise<T, 512, 2, 0, DATA_TYPE><<<num_blocks, 256>>>(code, A, absmax, out, rand, rand_offset, n);
+    else if (blocksize == 256)
+        kQuantizeBlockwise<T, 256, 2, 0, DATA_TYPE><<<num_blocks, 128>>>(code, A, absmax, out, rand, rand_offset, n);
+    else if (blocksize == 128)
+        kQuantizeBlockwise<T, 128, 2, 0, DATA_TYPE><<<num_blocks, 64>>>(code, A, absmax, out, rand, rand_offset, n);
+    else if (blocksize == 64) {
+        if constexpr (DATA_TYPE > 0) {
+            const int ws = bnb_host_warp_size();
+            const int num_qb = ws / (64 / 2);
+            int grid = (num_blocks + num_qb - 1) / num_qb;
+            kQuantizeBlockwiseSmall<T, 64, DATA_TYPE><<<grid, ws>>>(code, A, absmax, out, rand, rand_offset, n);
+        } else {
+            kQuantizeBlockwise<T, 64, 2, 0, DATA_TYPE><<<num_blocks, 32>>>(code, A, absmax, out, rand, rand_offset, n);
+        }
+    } else if (blocksize == 32) {
+        if constexpr (DATA_TYPE > 0) {
+            const int ws = bnb_host_warp_size();
+            const int num_qb = ws / (32 / 2);
+            int grid = (num_blocks + num_qb - 1) / num_qb;
+            kQuantizeBlockwiseSmall<T, 32, DATA_TYPE><<<grid, ws>>>(code, A, absmax, out, rand, rand_offset, n);
+        }
+    }
+
+    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+}
+
+template <typename T, int DATA_TYPE>
+void dequantizeBlockwise(
+    float* code, unsigned char* A, float* absmax, T* out, int blocksize, const int n, bnb_stream_t stream
+) {
+    constexpr int tile_size = (DATA_TYPE > 0) ? 1024 : 512;
+
+    // Upcast to int64 to avoid overflow for large n
+    int grid_blocks = ((int64_t)n + tile_size - 1) / tile_size;
+
+    if (DATA_TYPE > 0)
+        kDequantizeBlockwise<T, 512, 64, 8, DATA_TYPE>
+            <<<grid_blocks, 64, 0, stream>>>(code, A, absmax, out, blocksize / 2, n);
+    else
+        kDequantizeBlockwise<T, 512, 64, 8, DATA_TYPE>
+            <<<grid_blocks, 64, 0, stream>>>(code, A, absmax, out, blocksize, n);
+
+    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+}
+
+template <typename T, int OPTIMIZER>
+void optimizer32bit(
+    T* g, T* p, float* state1, float* state2, float* unorm, float max_unorm, float param_norm, const float beta1,
+    const float beta2, const float beta3, const float alpha, const float eps, const float weight_decay, const int step,
+    const float lr, const float gnorm_scale, bool skip_zeros, const int n
+) {
+    int num_blocks = n / 4096;
+    num_blocks = n % 4096 == 0 ? num_blocks : num_blocks + 1;
+    switch (OPTIMIZER) {
+    case ADAM:
+    case ADEMAMIX:
+        if (max_unorm > 0.0f) {
+            BNB_CHECK_RETURN(BNB_DEVICE_MEMSET(unorm, 0, 1 * sizeof(float)));
+            kPreconditionOptimizer32bit2State<T, OPTIMIZER, 4096, 8><<<num_blocks, 512>>>(
+                g, p, state1, state2, unorm, beta1, beta2, eps, weight_decay, step, lr, gnorm_scale, n
+            );
+            BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+        }
+        kOptimizer32bit2State<T, OPTIMIZER><<<num_blocks, 1024>>>(
+            g, p, state1, state2, unorm, max_unorm, param_norm, beta1, beta2, beta3, alpha, eps, weight_decay, step, lr,
+            gnorm_scale, skip_zeros, n
+        );
+        BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+        break;
+    case MOMENTUM:
+    case RMSPROP:
+    case ADAGRAD:
+        if (max_unorm > 0.0f) {
+            BNB_CHECK_RETURN(BNB_DEVICE_MEMSET(unorm, 0, 1 * sizeof(float)));
+            kPreconditionOptimizer32bit1State<T, OPTIMIZER, 4096, 8>
+                <<<num_blocks, 512>>>(g, p, state1, unorm, beta1, beta2, eps, weight_decay, step, lr, gnorm_scale, n);
+            BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+        }
+
+        kOptimizer32bit1State<T, OPTIMIZER><<<num_blocks, 1024>>>(
+            g, p, state1, unorm, max_unorm, param_norm, beta1, beta2, eps, weight_decay, step, lr, gnorm_scale,
+            skip_zeros, n
+        );
+        BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+        break;
+    case LION:
+        // in lion, the momentum update after the parameter update
+        kOptimizer32bit1State<T, OPTIMIZER><<<num_blocks, 1024>>>(
+            g, p, state1, unorm, max_unorm, param_norm, beta1, beta2, eps, weight_decay, step, lr, gnorm_scale,
+            skip_zeros, n
+        );
+        BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+
+        if (max_unorm > 0.0f) {
+            BNB_CHECK_RETURN(BNB_DEVICE_MEMSET(unorm, 0, 1 * sizeof(float)));
+            kPreconditionOptimizer32bit1State<T, OPTIMIZER, 4096, 8>
+                <<<num_blocks, 512>>>(g, p, state1, unorm, beta1, beta2, eps, weight_decay, step, lr, gnorm_scale, n);
+            BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+        }
+        break;
+    }
+}
+
+#define BLOCKSIZE_2STATE 256
+#define NUM_2STATE 1
+#define BLOCKSIZE_1STATE 256
+#define NUM_1STATE 1
+
+template <typename T, int OPTIMIZER>
+void optimizerStatic8bitBlockwise(
+    T* p, T* g, unsigned char* state1, unsigned char* state2, float beta1, float beta2, float beta3, float alpha,
+    float eps, int step, float lr, float* quantiles1, float* quantiles2, float* absmax1, float* absmax2,
+    float weight_decay, const float gnorm_scale, bool skip_zeros, int n
+) {
+
+    int num_blocks = 0;
+    switch (OPTIMIZER) {
+    case ADAM:
+    case ADEMAMIX:
+        num_blocks = n / BLOCKSIZE_2STATE;
+        num_blocks = n % BLOCKSIZE_2STATE == 0 ? num_blocks : num_blocks + 1;
+        kOptimizerStatic8bit2StateBlockwise<T, OPTIMIZER, BLOCKSIZE_2STATE, NUM_2STATE>
+            <<<num_blocks, BLOCKSIZE_2STATE / NUM_2STATE>>>(
+                p, g, state1, state2, beta1, beta2, beta3, alpha, eps, step, lr, quantiles1, quantiles2, absmax1,
+                absmax2, weight_decay, gnorm_scale, skip_zeros, n
+            );
+        BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+        break;
+    case MOMENTUM:
+    case RMSPROP:
+    case ADAGRAD:
+    case LION:
+        num_blocks = n / BLOCKSIZE_1STATE;
+        num_blocks = n % BLOCKSIZE_1STATE == 0 ? num_blocks : num_blocks + 1;
+        kOptimizerStatic8bit1StateBlockwise<T, OPTIMIZER, BLOCKSIZE_1STATE, NUM_1STATE>
+            <<<num_blocks, BLOCKSIZE_1STATE / NUM_1STATE>>>(
+                p, g, state1, beta1, beta2, eps, step, lr, quantiles1, absmax1, weight_decay, gnorm_scale, skip_zeros, n
+            );
+        BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+        break;
+    }
+}
+
+void gemmex(
+    Context* context, bool transposeA, bool transposeB, int m, int n, int k, void* A, void* B, void* C, int lda,
+    int ldb, int ldc
+) {
+    const int falpha = 1;
+    const int fbeta = 0;
+    const void* alpha = &falpha;
+    const void* beta = &fbeta;
+
+#if BNB_HIP
+    hipblasStatus_t status;
+
+#if hipblasVersionMajor >= 3
+    status = hipblasGemmEx(
+        context->m_handle, transposeA ? HIPBLAS_OP_T : HIPBLAS_OP_N, transposeB ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k,
+        alpha, A, HIP_R_8I, lda, B, HIP_R_8I, ldb, beta, C, HIP_R_32I, ldc, HIPBLAS_COMPUTE_32I, HIPBLAS_GEMM_DEFAULT
+    );
+#else
+    status = hipblasGemmEx(
+        context->m_handle, transposeA ? HIPBLAS_OP_T : HIPBLAS_OP_N, transposeB ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k,
+        alpha, A, HIPBLAS_R_8I, lda, B, HIPBLAS_R_8I, ldb, beta, C, HIPBLAS_R_32I, ldc, HIPBLAS_R_32I,
+        HIPBLAS_GEMM_DEFAULT
+    );
+#endif
+
+    if (status != HIPBLAS_STATUS_SUCCESS) {
+        std::cout << "HIPBLAS ERROR: Status " << status << std::endl;
+    }
+#else
+    cublasStatus_t status;
+
+    status = cublasGemmEx(
+        context->m_handle, transposeA ? CUBLAS_OP_T : CUBLAS_OP_N, transposeB ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k,
+        alpha, A, CUDA_R_8I, lda, B, CUDA_R_8I, ldb, beta, C, CUDA_R_32I, ldc, CUDA_R_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    );
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        std::cout << "CUBLAS ERROR: Status " << status << std::endl;
+    }
+#endif
+}
+
+void strided_gemmex(
+    Context* context, bool transposeA, bool transposeB, int m, int n, int k, void* A, void* B, void* C, int lda,
+    int ldb, int ldc, long long int strideA, long long int strideB, long long int strideC, int batchCount
+) {
+    const int falpha = 1;
+    const int fbeta = 0;
+    const void* alpha = &falpha;
+    const void* beta = &fbeta;
+
+#if BNB_HIP
+    hipblasStatus_t status;
+
+#if hipblasVersionMajor >= 3
+    status = hipblasGemmStridedBatchedEx(
+        context->m_handle, transposeA ? HIPBLAS_OP_T : HIPBLAS_OP_N, transposeB ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k,
+        alpha, A, HIP_R_8I, lda, (long long int)strideA, B, HIP_R_8I, ldb, (long long int)strideB, beta, C, HIP_R_32I,
+        ldc, (long long int)strideC, batchCount, HIPBLAS_COMPUTE_32I, HIPBLAS_GEMM_DEFAULT
+    );
+#else
+    status = hipblasGemmStridedBatchedEx(
+        context->m_handle, transposeA ? HIPBLAS_OP_T : HIPBLAS_OP_N, transposeB ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k,
+        alpha, A, HIPBLAS_R_8I, lda, (long long int)strideA, B, HIPBLAS_R_8I, ldb, (long long int)strideB, beta, C,
+        HIPBLAS_R_32I, ldc, (long long int)strideC, batchCount, HIPBLAS_R_32I, HIPBLAS_GEMM_DEFAULT
+    );
+#endif
+
+    if (status != HIPBLAS_STATUS_SUCCESS) {
+        std::cout << "HIPBLAS ERROR: Status " << status << std::endl;
+    }
+#else
+    cublasStatus_t status;
+
+    status = cublasGemmStridedBatchedEx(
+        context->m_handle, transposeA ? CUBLAS_OP_T : CUBLAS_OP_N, transposeB ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k,
+        alpha, A, CUDA_R_8I, lda, (long long int)strideA, B, CUDA_R_8I, ldb, (long long int)strideB, beta, C,
+        CUDA_R_32I, ldc, (long long int)strideC, batchCount, CUDA_R_32I, CUBLAS_GEMM_DEFAULT
+    );
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        std::cout << "CUBLAS ERROR: Status " << status << std::endl;
+    }
+#endif
+}
+
+int roundoff(int v, int d) { return (v + d - 1) / d * d; }
+
+template <int DTYPE_OUT, int SCALE_ROWS>
+int igemmlt(
+    bnb_blasLt_handle_t ltHandle, int m, int n, int k, const int8_t* A, const int8_t* B, void* C, float* row_scale,
+    int lda, int ldb, int ldc, bnb_stream_t stream
+) {
+
+#if BNB_HIP && defined(NO_HIPBLASLT)
+    return ERR_NOT_IMPLEMENTED;
+#else
+
+    // Calculate C = A^T @ B, in col-major layout.
+    //
+    // Use the IMMA kernels requires:
+    // * A must be transposed and B must be non-transposed.
+    // * Dimensions m and k must be multiples of 4.
+    // * All pointers must be 4-byte aligned; 16-byte alignment preferred.
+
+    int has_error = 0;
+
+    bnb_blasLt_matmul_desc_t matmulDesc;
+    bnb_blasLt_layout_t aDesc, bDesc, cDesc;
+    auto opT = BNB_BLASLT_OP_T;
+
+    auto outType = DTYPE_OUT == 32 ? BNB_R_32I : BNB_R_8I;
+    auto scaleType = DTYPE_OUT == 32 ? BNB_R_32I : BNB_R_32F;
+
+    auto pointerMode = BNB_BLASLT_PTR_MODE_ALPHA_VEC;
+
+    has_error |= checkBlasLtStatus(bnb_blasLtLayoutCreate(&aDesc, BNB_R_8I, m, k, lda));
+    has_error |= checkBlasLtStatus(bnb_blasLtLayoutCreate(&bDesc, BNB_R_8I, m, n, ldb));
+    has_error |= checkBlasLtStatus(bnb_blasLtLayoutCreate(&cDesc, outType, k, n, ldc));
+
+    // Default layout order is col major
+
+    has_error |= checkBlasLtStatus(bnb_blasLtMatmulDescCreate(&matmulDesc, BNB_BLASLT_COMPUTE_32I, scaleType));
+    has_error |= checkBlasLtStatus(bnb_blasLtMatmulDescSetAttr(matmulDesc, BNB_BLASLT_DESC_TRANSA, &opT, sizeof(opT)));
+
+    if (DTYPE_OUT == 32) {
+#if BNB_HIP
+        // HIP requires heuristic algo selection
+        const int64_t max_workspace_size = 0; // set to 0 to avoid choosing GSU kernel
+
+        bnb_blasLt_preference_t pref;
+        checkBlasLtStatus(bnb_blasLtPrefCreate(&pref));
+        checkBlasLtStatus(
+            bnb_blasLtPrefSetAttr(pref, BNB_BLASLT_PREF_MAX_WORKSPACE, &max_workspace_size, sizeof(max_workspace_size))
+        );
+
+        // hipBLASLt's first heuristic algo can be unusable for small-n int8 gemms
+        // (e.g. n=4 on MI300X) and fails at matmul time with INVALID_VALUE. Request
+        // several candidates and use the first one that actually runs successfully.
+        const int request_solutions = 8;
+        bnb_blasLt_heuristic_t heuristicResult[request_solutions];
+        int returnedAlgoCount = 0;
+        checkBlasLtStatus(bnb_blasLtAlgoGetHeuristic(
+            ltHandle, matmulDesc, aDesc, bDesc, cDesc, cDesc, pref, request_solutions, heuristicResult,
+            &returnedAlgoCount
+        ));
+
+        if (returnedAlgoCount == 0) {
+            has_error = 1;
+            fprintf(stderr, "Error: Matmul Algo Heuristic didn't return algorithms\n");
+        } else {
+            int alpha = 1, beta = 0;
+            bnb_blas_status_t matmul_status = BNB_BLAS_STATUS_SUCCESS;
+            for (int i = 0; i < returnedAlgoCount; ++i) {
+                matmul_status = bnb_blasLtMatmul(
+                    ltHandle, matmulDesc, &alpha, A, aDesc, B, bDesc, &beta, (int32_t*)C, cDesc, (int32_t*)C, cDesc,
+                    &heuristicResult[i].algo, NULL, 0, stream
+                );
+                if (matmul_status == BNB_BLAS_STATUS_SUCCESS)
+                    break;
+            }
+            if (matmul_status != BNB_BLAS_STATUS_SUCCESS) {
+                // Every workspace-free algo hipBLASLt offered failed at runtime
+                // (seen on MI300X for some small-n int8 gemms). Drain the HIP
+                // last-error flag the failed launches set, otherwise the next
+                // unrelated HIP call will inherit it. Then signal the Python
+                // wrapper to take the fp32 fallback via ERR_NOT_IMPLEMENTED.
+                (void)hipGetLastError();
+                return ERR_NOT_IMPLEMENTED;
+            }
+        }
+#else
+        int alpha = 1, beta = 0;
+        has_error |= checkBlasLtStatus(bnb_blasLtMatmul(
+            ltHandle, matmulDesc, &alpha, A, aDesc, B, bDesc, &beta, (int32_t*)C, cDesc, (int32_t*)C, cDesc, NULL, NULL,
+            0, stream
+        ));
+#endif
+    } else {
+        // This path is unlikely to be used, as 8-bit accumulation can lead to likely overflows.
+
+        if (!SCALE_ROWS) {
+            float alpha = 1.0f, beta = 0.0f;
+            has_error |= checkBlasLtStatus(bnb_blasLtMatmul(
+                ltHandle, matmulDesc, &alpha, A, aDesc, B, bDesc, &beta, (int8_t*)C, cDesc, (int8_t*)C, cDesc, NULL,
+                NULL, 0, stream
+            ));
+        } else {
+            auto alphaVec = BNB_BLASLT_PTR_MODE_ALPHA_VEC;
+            float beta = 0.0f;
+            has_error |= checkBlasLtStatus(
+                bnb_blasLtMatmulDescSetAttr(matmulDesc, BNB_BLASLT_DESC_POINTER_MODE, &pointerMode, sizeof(alphaVec))
+            );
+            has_error |= checkBlasLtStatus(bnb_blasLtMatmul(
+                ltHandle, matmulDesc, row_scale, A, aDesc, B, bDesc, &beta, (int8_t*)C, cDesc, (int8_t*)C, cDesc, NULL,
+                NULL, 0, stream
+            ));
+        }
+    }
+
+    has_error |= checkBlasLtStatus(bnb_blasLtLayoutDestroy(cDesc));
+    has_error |= checkBlasLtStatus(bnb_blasLtLayoutDestroy(bDesc));
+    has_error |= checkBlasLtStatus(bnb_blasLtLayoutDestroy(aDesc));
+    has_error |= checkBlasLtStatus(bnb_blasLtMatmulDescDestroy(matmulDesc));
+
+    if (has_error == 1)
+        printf("error detected");
+
+    return has_error;
+#endif // NO_HIPBLASLT
+}
+
+int fill_up_to_nearest_multiple(int value, int multiple) {
+    return value + (value % multiple == 0 ? 0 : (multiple - (value % multiple)));
+}
+
+void dequant_mm_int32_fp16(
+    int* A, float* rowStats, float* colStats, half* out, half* bias, int numRows, int numCols, bnb_stream_t stream
+) {
+    const int threads = 512;
+    const int num_per_thread = 4;
+    const int num_per_block = threads * num_per_thread;
+    const int n = numRows * numCols;
+    const int num_blocks = (n + num_per_block - 1) / num_per_block;
+
+    kdequant_mm_int32_fp16<num_per_thread, threads>
+        <<<num_blocks, threads, 0, stream>>>(A, rowStats, colStats, out, bias, numRows, numCols, n);
+    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+}
+
+void int8VectorQuant(
+    half* __restrict__ A, int8_t* out, float* rowStats, float threshold, int rows, int cols, bnb_stream_t stream
+) {
+    if (threshold == 0.0) {
+        kInt8VectorQuant<half, 1024, 0><<<rows, 1024, 0, stream>>>(A, out, rowStats, threshold, rows, cols);
+    } else {
+        kInt8VectorQuant<half, 1024, 1><<<rows, 1024, 0, stream>>>(A, out, rowStats, threshold, rows, cols);
+    }
+    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+}
+
+template <typename T, int BITS>
+void gemm_4bit_inference_naive(
+    int m, int n, int k, T* A, unsigned char* B, float* absmax, float* datatype, T* out, int lda, int ldb, int ldc,
+    int blocksize, bnb_stream_t stream
+) {
+
+    int num_blocks = (m + 3) / 4;
+#if BNB_HIP
+    if (bnb_host_warp_size() == 64) {
+        num_blocks = (m + 1) / 2;
+    }
+#endif
+
+    kgemm_4bit_inference_naive<T, 128, BITS>
+        <<<num_blocks, 128, 0, stream>>>(m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize);
+    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+}
+
+template <typename T, int FUNC> void func(T* A, T* B, T value, long n) {
+    int threads = 512;
+    int blocks = n / threads;
+    blocks = n % threads == 0 ? blocks : blocks + 1;
+    blocks = blocks > 65535 ? 65535 : blocks;
+    kfunc<T, FUNC><<<blocks, 512>>>(A, B, value, n);
+    BNB_CHECK_RETURN(BNB_PEEK_LAST_ERROR());
+}
+
+//==============================================================
+//                   TEMPLATE DEFINITIONS
+//==============================================================
+
+template void func<float, FILL>(float* A, float* B, float value, long n);
+template void func<unsigned char, FILL>(unsigned char* A, unsigned char* B, unsigned char value, long n);
+template void func<float, ARANGE>(float* A, float* B, float value, long n);
+template void func<float, _MUL>(float* A, float* B, float value, long n);
+
+template void gemm_4bit_inference_naive<half, 16>(
+    int m, int n, int k, half* A, unsigned char* B, float* absmax, float* datatype, half* out, int lda, int ldb,
+    int ldc, int blocksize, bnb_stream_t stream
+);
+template void gemm_4bit_inference_naive<bnb_bfloat16, 16>(
+    int m, int n, int k, bnb_bfloat16* A, unsigned char* B, float* absmax, float* datatype, bnb_bfloat16* out, int lda,
+    int ldb, int ldc, int blocksize, bnb_stream_t stream
+);
+template void gemm_4bit_inference_naive<float, 32>(
+    int m, int n, int k, float* A, unsigned char* B, float* absmax, float* datatype, float* out, int lda, int ldb,
+    int ldc, int blocksize, bnb_stream_t stream
+);
+
+template int igemmlt<32, 0>(
+    bnb_blasLt_handle_t ltHandle, int m, int n, int k, const int8_t* A, const int8_t* B, void* C, float* row_scale,
+    int lda, int ldb, int ldc, bnb_stream_t stream
+);
+template int igemmlt<8, 0>(
+    bnb_blasLt_handle_t ltHandle, int m, int n, int k, const int8_t* A, const int8_t* B, void* C, float* row_scale,
+    int lda, int ldb, int ldc, bnb_stream_t stream
+);
+template int igemmlt<8, 1>(
+    bnb_blasLt_handle_t ltHandle, int m, int n, int k, const int8_t* A, const int8_t* B, void* C, float* row_scale,
+    int lda, int ldb, int ldc, bnb_stream_t stream
+);
+
+template void quantizeBlockwise<half, 1, General8bit>(
+    float* code, half* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+);
+template void quantizeBlockwise<half, 0, General8bit>(
+    float* code, half* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+);
+template void quantizeBlockwise<half, 0, FP4>(
+    float* code, half* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+);
+template void quantizeBlockwise<half, 0, NF4>(
+    float* code, half* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+);
+template void quantizeBlockwise<float, 1, General8bit>(
+    float* code, float* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+);
+template void quantizeBlockwise<float, 0, General8bit>(
+    float* code, float* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+);
+template void quantizeBlockwise<float, 0, FP4>(
+    float* code, float* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+);
+template void quantizeBlockwise<float, 0, NF4>(
+    float* code, float* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+);
+template void quantizeBlockwise<bnb_bfloat16, 1, General8bit>(
+    float* code, bnb_bfloat16* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize,
+    const int n
+);
+template void quantizeBlockwise<bnb_bfloat16, 0, General8bit>(
+    float* code, bnb_bfloat16* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize,
+    const int n
+);
+template void quantizeBlockwise<bnb_bfloat16, 0, FP4>(
+    float* code, bnb_bfloat16* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize,
+    const int n
+);
+template void quantizeBlockwise<bnb_bfloat16, 0, NF4>(
+    float* code, bnb_bfloat16* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize,
+    const int n
+);
+
+template void dequantizeBlockwise<float, General8bit>(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, bnb_stream_t stream
+);
+template void dequantizeBlockwise<float, FP4>(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, bnb_stream_t stream
+);
+template void dequantizeBlockwise<float, NF4>(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, bnb_stream_t stream
+);
+template void dequantizeBlockwise<half, General8bit>(
+    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int n, bnb_stream_t stream
+);
+template void dequantizeBlockwise<half, FP4>(
+    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int n, bnb_stream_t stream
+);
+template void dequantizeBlockwise<half, NF4>(
+    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int n, bnb_stream_t stream
+);
+template void dequantizeBlockwise<bnb_bfloat16, General8bit>(
+    float* code, unsigned char* A, float* absmax, bnb_bfloat16* out, int blocksize, const int n, bnb_stream_t stream
+);
+template void dequantizeBlockwise<bnb_bfloat16, FP4>(
+    float* code, unsigned char* A, float* absmax, bnb_bfloat16* out, int blocksize, const int n, bnb_stream_t stream
+);
+template void dequantizeBlockwise<bnb_bfloat16, NF4>(
+    float* code, unsigned char* A, float* absmax, bnb_bfloat16* out, int blocksize, const int n, bnb_stream_t stream
+);
+
+#define MAKE_optimizer32bit(name, gtype)                                                                               \
+    template void optimizer32bit<gtype, name>(                                                                         \
+        gtype * g, gtype * p, float* state1, float* state2, float* unorm, float max_unorm, float param_norm,           \
+        const float beta1, const float beta2, const float beta3, const float alpha, const float eps,                   \
+        const float weight_decay, const int step, const float lr, const float gnorm_scale, const bool skip_zeros,      \
+        const int n                                                                                                    \
+    );
+
+MAKE_optimizer32bit(ADAM, half) MAKE_optimizer32bit(ADAM, float) MAKE_optimizer32bit(ADAM, bnb_bfloat16) MAKE_optimizer32bit(MOMENTUM, half) MAKE_optimizer32bit(MOMENTUM, float) MAKE_optimizer32bit(MOMENTUM, bnb_bfloat16) MAKE_optimizer32bit(RMSPROP, half) MAKE_optimizer32bit(RMSPROP, float) MAKE_optimizer32bit(RMSPROP, bnb_bfloat16) MAKE_optimizer32bit(
+    LION, half
+) MAKE_optimizer32bit(LION, float) MAKE_optimizer32bit(LION, bnb_bfloat16) MAKE_optimizer32bit(ADAGRAD, half) MAKE_optimizer32bit(ADAGRAD, float) MAKE_optimizer32bit(ADAGRAD, bnb_bfloat16) MAKE_optimizer32bit(ADEMAMIX, half) MAKE_optimizer32bit(ADEMAMIX, bnb_bfloat16) MAKE_optimizer32bit(ADEMAMIX, float)
+
+#define MAKE_optimizerStatic8bitBlockwise(gtype, optim_name)                                                           \
+    template void optimizerStatic8bitBlockwise<gtype, optim_name>(                                                     \
+        gtype * p, gtype * g, unsigned char* state1, unsigned char* state2, float beta1, float beta2, float beta3,     \
+        float alpha, float eps, int step, float lr, float* quantiles1, float* quantiles2, float* absmax1,              \
+        float* absmax2, float weight_decay, const float gnorm_scale, bool skip_zeros, int n                            \
+    );
+
+    MAKE_optimizerStatic8bitBlockwise(half, ADAM);
+MAKE_optimizerStatic8bitBlockwise(float, ADAM);
+MAKE_optimizerStatic8bitBlockwise(bnb_bfloat16, ADAM);
+MAKE_optimizerStatic8bitBlockwise(half, MOMENTUM);
+MAKE_optimizerStatic8bitBlockwise(float, MOMENTUM);
+MAKE_optimizerStatic8bitBlockwise(bnb_bfloat16, MOMENTUM);
+MAKE_optimizerStatic8bitBlockwise(half, RMSPROP);
+MAKE_optimizerStatic8bitBlockwise(float, RMSPROP);
+MAKE_optimizerStatic8bitBlockwise(bnb_bfloat16, RMSPROP);
+MAKE_optimizerStatic8bitBlockwise(half, LION);
+MAKE_optimizerStatic8bitBlockwise(float, LION);
+MAKE_optimizerStatic8bitBlockwise(bnb_bfloat16, LION);
+MAKE_optimizerStatic8bitBlockwise(half, ADAGRAD);
+MAKE_optimizerStatic8bitBlockwise(float, ADAGRAD);
+MAKE_optimizerStatic8bitBlockwise(bnb_bfloat16, ADAGRAD);
+MAKE_optimizerStatic8bitBlockwise(half, ADEMAMIX);
+MAKE_optimizerStatic8bitBlockwise(bnb_bfloat16, ADEMAMIX);
+MAKE_optimizerStatic8bitBlockwise(float, ADEMAMIX);
+
+// Copyright (c) Facebook, Inc. and its affiliates.
+//
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+
+#if BUILD_CUDA
+#include <cuda_runtime_api.h>
+#include <ops.cuh>
+#endif
+#if BUILD_HIP
+#include <ops.cuh>
+#endif
+#if BUILD_XPU
+#include <xpu_ops.h>
+#endif
+#include <cpu_ops.h>
+
+// Compatibility between HIP/CUDA APIs
+#if BUILD_HIP
+#define cudaStream_t hipStream_t
+#define cublasLtHandle_t hipblasLtHandle_t
+#define cudaMallocManaged hipMallocManaged
+#define cudaMemAttachHost hipMemAttachHost
+#define cudaPeekAtLastError hipPeekAtLastError
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrConcurrentManagedAccess hipDeviceAttributeConcurrentManagedAccess
+#define cudaMemPrefetchAsync hipMemPrefetchAsync
+#endif
+
+// We cannot call templated code from C, so we wrap the template in a C compatible call here if necessary.
+// We use macro functions to expand all the different optimizers. Looks ugly, and is ugly, but its better than to
+// maintain all that boilerplate
+//===================================================================================
+//                               UNMANGLED CALLS
+//===================================================================================
+
+#if BUILD_CUDA || BUILD_HIP
+
+void gemm_4bit_inference_naive_fp16(
+    int m, int n, int k, half* A, unsigned char* B, float* absmax, float* datatype, half* out, int lda, int ldb,
+    int ldc, int blocksize, cudaStream_t stream
+) {
+    gemm_4bit_inference_naive<half, 16>(m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize, stream);
+}
+
+void gemm_4bit_inference_naive_bf16(
+    int m, int n, int k, bnb_bfloat16* A, unsigned char* B, float* absmax, float* datatype, bnb_bfloat16* out, int lda,
+    int ldb, int ldc, int blocksize, cudaStream_t stream
+) {
+    gemm_4bit_inference_naive<bnb_bfloat16, 16>(m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize, stream);
+}
+
+void gemm_4bit_inference_naive_fp32(
+    int m, int n, int k, float* A, unsigned char* B, float* absmax, float* datatype, float* out, int lda, int ldb,
+    int ldc, int blocksize, cudaStream_t stream
+) {
+    gemm_4bit_inference_naive<float, 32>(m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize, stream);
+}
+
+#define MAKE_ELEMENTWISE_FUNC(fname, type_name, ctype, FUNC)                                                           \
+    void fname##_##type_name(ctype* A, ctype* B, ctype value, long n) { func<ctype, FUNC>(A, B, value, n); }
+
+MAKE_ELEMENTWISE_FUNC(fill, fp32, float, FILL)
+MAKE_ELEMENTWISE_FUNC(fill, uint8, unsigned char, FILL)
+MAKE_ELEMENTWISE_FUNC(arange, fp32, float, ARANGE)
+MAKE_ELEMENTWISE_FUNC(_mul, fp32, float, _MUL)
+
+#define MAKE_FUNC32(fname, oname, gtype, gbits)                                                                        \
+    void fname##32bit_grad_##gbits(                                                                                    \
+        gtype* g, gtype* p, float* state1, float* state2, float* unorm, float max_unorm, float param_norm,             \
+        const float beta1, const float beta2, const float beta3, const float alpha, const float eps,                   \
+        const float weight_decay, const int step, const float lr, float gnorm_scale, bool skip_zeros, const int n      \
+    ) {                                                                                                                \
+        optimizer32bit<gtype, oname>(                                                                                  \
+            g, p, state1, state2, unorm, max_unorm, param_norm, beta1, beta2, beta3, alpha, eps, weight_decay, step,   \
+            lr, gnorm_scale, skip_zeros, n                                                                             \
+        );                                                                                                             \
+    }
+
+MAKE_FUNC32(momentum, MOMENTUM, float, 32)
+MAKE_FUNC32(momentum, MOMENTUM, half, 16)
+MAKE_FUNC32(adam, ADAM, float, fp32)
+MAKE_FUNC32(adam, ADAM, half, fp16)
+MAKE_FUNC32(adam, ADAM, bnb_bfloat16, bf16)
+MAKE_FUNC32(rmsprop, RMSPROP, float, 32)
+MAKE_FUNC32(rmsprop, RMSPROP, half, 16)
+MAKE_FUNC32(lion, LION, float, fp32)
+MAKE_FUNC32(lion, LION, half, fp16)
+MAKE_FUNC32(lion, LION, bnb_bfloat16, bf16)
+MAKE_FUNC32(adagrad, ADAGRAD, float, 32)
+MAKE_FUNC32(adagrad, ADAGRAD, half, 16)
+MAKE_FUNC32(ademamix, ADEMAMIX, float, fp32)
+MAKE_FUNC32(ademamix, ADEMAMIX, half, fp16)
+MAKE_FUNC32(ademamix, ADEMAMIX, bnb_bfloat16, bf16)
+
+#define MAKE_BLOCKWISE8(fname, optim_name, gtype, gbits)                                                               \
+    void fname##_8bit_blockwise_grad_##gbits(                                                                          \
+        gtype* p, gtype* g, unsigned char* state1, unsigned char* state2, float beta1, float beta2, float beta3,       \
+        float alpha, float eps, int step, float lr, float* quantiles1, float* quantiles2, float* absmax1,              \
+        float* absmax2, float weight_decay, const float gnorm_scale, bool skip_zeros, int n                            \
+    ) {                                                                                                                \
+        optimizerStatic8bitBlockwise<gtype, optim_name>(                                                               \
+            p, g, state1, state2, beta1, beta2, beta3, alpha, eps, step, lr, quantiles1, quantiles2, absmax1, absmax2, \
+            weight_decay, gnorm_scale, skip_zeros, n                                                                   \
+        );                                                                                                             \
+    }
+
+MAKE_BLOCKWISE8(adam, ADAM, half, fp16)
+MAKE_BLOCKWISE8(adam, ADAM, bnb_bfloat16, bf16)
+MAKE_BLOCKWISE8(adam, ADAM, float, fp32)
+MAKE_BLOCKWISE8(momentum, MOMENTUM, half, fp16)
+MAKE_BLOCKWISE8(momentum, MOMENTUM, bnb_bfloat16, bf16)
+MAKE_BLOCKWISE8(momentum, MOMENTUM, float, fp32)
+MAKE_BLOCKWISE8(rmsprop, RMSPROP, half, fp16)
+MAKE_BLOCKWISE8(rmsprop, RMSPROP, bnb_bfloat16, bf16)
+MAKE_BLOCKWISE8(rmsprop, RMSPROP, float, fp32)
+MAKE_BLOCKWISE8(adagrad, ADAGRAD, half, fp16)
+MAKE_BLOCKWISE8(adagrad, ADAGRAD, bnb_bfloat16, bf16)
+MAKE_BLOCKWISE8(adagrad, ADAGRAD, float, fp32)
+MAKE_BLOCKWISE8(lion, LION, half, fp16)
+MAKE_BLOCKWISE8(lion, LION, bnb_bfloat16, bf16)
+MAKE_BLOCKWISE8(lion, LION, float, fp32)
+MAKE_BLOCKWISE8(ademamix, ADEMAMIX, half, fp16)
+MAKE_BLOCKWISE8(ademamix, ADEMAMIX, bnb_bfloat16, bf16)
+MAKE_BLOCKWISE8(ademamix, ADEMAMIX, float, fp32)
+
+void quantizeBlockwise_fp16(float* code, half* A, float* absmax, unsigned char* out, int blocksize, const int n) {
+    quantizeBlockwise<half, 0, General8bit>(code, A, absmax, out, nullptr, 0, blocksize, n);
+}
+
+void quantizeBlockwise_fp16_fp4(float* code, half* A, float* absmax, unsigned char* out, int blocksize, const int n) {
+    quantizeBlockwise<half, 0, FP4>(nullptr, A, absmax, out, nullptr, 0, blocksize, n);
+}
+
+void quantizeBlockwise_fp16_nf4(float* code, half* A, float* absmax, unsigned char* out, int blocksize, const int n) {
+    quantizeBlockwise<half, 0, NF4>(nullptr, A, absmax, out, nullptr, 0, blocksize, n);
+}
+
+void quantizeBlockwise_bf16(
+    float* code, bnb_bfloat16* A, float* absmax, unsigned char* out, int blocksize, const int n
+) {
+    quantizeBlockwise<bnb_bfloat16, 0, General8bit>(code, A, absmax, out, nullptr, 0, blocksize, n);
+}
+
+void quantizeBlockwise_bf16_fp4(
+    float* code, bnb_bfloat16* A, float* absmax, unsigned char* out, int blocksize, const int n
+) {
+    quantizeBlockwise<bnb_bfloat16, 0, FP4>(nullptr, A, absmax, out, nullptr, 0, blocksize, n);
+}
+
+void quantizeBlockwise_bf16_nf4(
+    float* code, bnb_bfloat16* A, float* absmax, unsigned char* out, int blocksize, const int n
+) {
+    quantizeBlockwise<bnb_bfloat16, 0, NF4>(nullptr, A, absmax, out, nullptr, 0, blocksize, n);
+}
+
+void quantizeBlockwise_fp32(float* code, float* A, float* absmax, unsigned char* out, int blocksize, const int n) {
+    quantizeBlockwise<float, 0, General8bit>(code, A, absmax, out, nullptr, 0, blocksize, n);
+}
+
+void quantizeBlockwise_fp32_fp4(float* code, float* A, float* absmax, unsigned char* out, int blocksize, const int n) {
+    quantizeBlockwise<float, 0, FP4>(nullptr, A, absmax, out, nullptr, 0, blocksize, n);
+}
+
+void quantizeBlockwise_fp32_nf4(float* code, float* A, float* absmax, unsigned char* out, int blocksize, const int n) {
+    quantizeBlockwise<float, 0, NF4>(nullptr, A, absmax, out, nullptr, 0, blocksize, n);
+}
+
+void dequantizeBlockwise_fp16(
+    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise<half, General8bit>(code, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_fp16_fp4(
+    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise<half, FP4>(nullptr, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_fp16_nf4(
+    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise<half, NF4>(nullptr, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_fp32(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise<float, General8bit>(code, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_fp32_fp4(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise<float, FP4>(nullptr, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_fp32_nf4(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise<float, NF4>(nullptr, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_bf16(
+    float* code, unsigned char* A, float* absmax, bnb_bfloat16* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise<bnb_bfloat16, General8bit>(code, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_bf16_fp4(
+    float* code, unsigned char* A, float* absmax, bnb_bfloat16* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise<bnb_bfloat16, FP4>(nullptr, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_bf16_nf4(
+    float* code, unsigned char* A, float* absmax, bnb_bfloat16* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise<bnb_bfloat16, NF4>(nullptr, A, absmax, out, blocksize, n, stream);
+}
+
+int igemmlt_32(
+    cublasLtHandle_t ltHandle, int m, int n, int k, const int8_t* A, const int8_t* B, void* C, float* row_scale,
+    int lda, int ldb, int ldc, cudaStream_t stream
+) {
+    return igemmlt<32, 0>(ltHandle, m, n, k, A, B, C, row_scale, lda, ldb, ldc, stream);
+}
+
+int igemmlt_8(
+    cublasLtHandle_t ltHandle, int m, int n, int k, const int8_t* A, const int8_t* B, void* C, float* row_scale,
+    int lda, int ldb, int ldc, cudaStream_t stream
+) {
+    return igemmlt<8, 0>(ltHandle, m, n, k, A, B, C, row_scale, lda, ldb, ldc, stream);
+}
+
+int igemmlt_8_rowscale(
+    cublasLtHandle_t ltHandle, int m, int n, int k, const int8_t* A, const int8_t* B, void* C, float* row_scale,
+    int lda, int ldb, int ldc, cudaStream_t stream
+) {
+    return igemmlt<8, 1>(ltHandle, m, n, k, A, B, C, row_scale, lda, ldb, ldc, stream);
+}
+
+#endif
+
+#if BUILD_XPU
+
+void dequantizeBlockwise_fp16(
+    float* code, unsigned char* A, float* absmax, sycl::half* out, int blocksize, const int n, sycl::queue* stream
+) {
+    dequantizeBlockwise<sycl::half, General8bit>(code, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_fp16_fp4(
+    float* code, unsigned char* A, float* absmax, sycl::half* out, int blocksize, const int n, sycl::queue* stream
+) {
+    dequantizeBlockwise<sycl::half, FP4>(nullptr, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_fp16_nf4(
+    float* code, unsigned char* A, float* absmax, sycl::half* out, int blocksize, const int n, sycl::queue* stream
+) {
+    dequantizeBlockwise<sycl::half, NF4>(nullptr, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_fp32(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, sycl::queue* stream
+) {
+    dequantizeBlockwise<float, General8bit>(code, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_fp32_fp4(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, sycl::queue* stream
+) {
+    dequantizeBlockwise<float, FP4>(nullptr, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_fp32_nf4(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, sycl::queue* stream
+) {
+    dequantizeBlockwise<float, NF4>(nullptr, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_bf16(
+    float* code, unsigned char* A, float* absmax, sycl::ext::oneapi::bfloat16* out, int blocksize, const int n,
+    sycl::queue* stream
+) {
+    dequantizeBlockwise<sycl::ext::oneapi::bfloat16, General8bit>(code, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_bf16_fp4(
+    float* code, unsigned char* A, float* absmax, sycl::ext::oneapi::bfloat16* out, int blocksize, const int n,
+    sycl::queue* stream
+) {
+    dequantizeBlockwise<sycl::ext::oneapi::bfloat16, FP4>(nullptr, A, absmax, out, blocksize, n, stream);
+}
+
+void dequantizeBlockwise_bf16_nf4(
+    float* code, unsigned char* A, float* absmax, sycl::ext::oneapi::bfloat16* out, int blocksize, const int n,
+    sycl::queue* stream
+) {
+    dequantizeBlockwise<sycl::ext::oneapi::bfloat16, NF4>(nullptr, A, absmax, out, blocksize, n, stream);
+}
+
+void gemv_4bit_inference_fp16(
+    int m, int n, int k, sycl::half* A, unsigned char* B, float* absmax, float* datatype, sycl::half* out, int lda,
+    int ldb, int ldc, int blocksize, sycl::queue* stream
+) {
+    gemv_4bit_inference<sycl::half, 16>(m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize, stream);
+}
+
+void gemv_4bit_inference_bf16(
+    int m, int n, int k, sycl::ext::oneapi::bfloat16* A, unsigned char* B, float* absmax, float* datatype,
+    sycl::ext::oneapi::bfloat16* out, int lda, int ldb, int ldc, int blocksize, sycl::queue* stream
+) {
+    gemv_4bit_inference<sycl::ext::oneapi::bfloat16, 16>(
+        m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize, stream
+    );
+}
+
+void gemv_4bit_inference_fp32(
+    int m, int n, int k, float* A, unsigned char* B, float* absmax, float* datatype, float* out, int lda, int ldb,
+    int ldc, int blocksize, sycl::queue* stream
+) {
+    gemv_4bit_inference<float, 32>(m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize, stream);
+}
+
+#endif
+
+#if BUILD_XPU
+// Helper: get default SYCL queue for XPU paged memory operations.
+// SYCL USM (Unified Shared Memory) provides equivalent functionality to:
+//   - CUDA's cudaMallocManaged / Level Zero's zeMemAllocShared
+//   - CUDA's cudaMemPrefetchAsync / Level Zero's zeCommandListAppendMemoryPrefetch
+// Level Zero has no equivalent to cudaPeekAtLastError; each L0 call returns ze_result_t.
+// SYCL wraps L0 and uses exceptions for error reporting.
+static sycl::queue& xpu_default_queue() {
+    static sycl::queue q{sycl::gpu_selector_v, sycl::property::queue::in_order{}};
+    return q;
+}
+#endif
+
+extern "C" {
+#if BUILD_CUDA || BUILD_HIP
+
+void cdequantize_blockwise_fp16_fp4(
+    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise_fp16_fp4(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_fp16(
+    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise_fp16(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_fp16_nf4(
+    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise_fp16_nf4(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cquantize_blockwise_fp16(float* code, half* A, float* absmax, unsigned char* out, int blocksize, const int n) {
+    quantizeBlockwise_fp16(code, A, absmax, out, blocksize, n);
+}
+
+void cquantize_blockwise_fp16_fp4(float* code, half* A, float* absmax, unsigned char* out, int blocksize, const int n) {
+    quantizeBlockwise_fp16_fp4(code, A, absmax, out, blocksize, n);
+}
+
+void cquantize_blockwise_fp16_nf4(float* code, half* A, float* absmax, unsigned char* out, int blocksize, const int n) {
+    quantizeBlockwise_fp16_nf4(code, A, absmax, out, blocksize, n);
+}
+
+void cquantize_blockwise_fp32(float* code, float* A, float* absmax, unsigned char* out, int blocksize, const int n) {
+    quantizeBlockwise_fp32(code, A, absmax, out, blocksize, n);
+}
+
+void cquantize_blockwise_fp32_fp4(
+    float* code, float* A, float* absmax, unsigned char* out, int blocksize, const int n
+) {
+    quantizeBlockwise_fp32_fp4(code, A, absmax, out, blocksize, n);
+}
+
+void cquantize_blockwise_fp32_nf4(
+    float* code, float* A, float* absmax, unsigned char* out, int blocksize, const int n
+) {
+    quantizeBlockwise_fp32_nf4(code, A, absmax, out, blocksize, n);
+}
+
+void cdequantize_blockwise_fp32(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise_fp32(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_fp32_fp4(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise_fp32_fp4(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_fp32_nf4(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise_fp32_nf4(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cquantize_blockwise_bf16(
+    float* code, bnb_bfloat16* A, float* absmax, unsigned char* out, int blocksize, const int n
+) {
+    quantizeBlockwise_bf16(code, A, absmax, out, blocksize, n);
+}
+
+void cquantize_blockwise_bf16_fp4(
+    float* code, bnb_bfloat16* A, float* absmax, unsigned char* out, int blocksize, const int n
+) {
+    quantizeBlockwise_bf16_fp4(code, A, absmax, out, blocksize, n);
+}
+
+void cquantize_blockwise_bf16_nf4(
+    float* code, bnb_bfloat16* A, float* absmax, unsigned char* out, int blocksize, const int n
+) {
+    quantizeBlockwise_bf16_nf4(code, A, absmax, out, blocksize, n);
+}
+
+void cdequantize_blockwise_bf16(
+    float* code, unsigned char* A, float* absmax, bnb_bfloat16* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise_bf16(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_bf16_fp4(
+    float* code, unsigned char* A, float* absmax, bnb_bfloat16* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise_bf16_fp4(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_bf16_nf4(
+    float* code, unsigned char* A, float* absmax, bnb_bfloat16* out, int blocksize, const int n, cudaStream_t stream
+) {
+    dequantizeBlockwise_bf16_nf4(code, A, absmax, out, blocksize, n, stream);
+}
+
+#define MAKE_CFUNC32(name, gtype, gbits)                                                                               \
+    void c##name##32bit_grad_##gbits(                                                                                  \
+        gtype* g, gtype* p, float* state1, float* state2, float* unorm, float max_unorm, float param_norm,             \
+        const float beta1, const float beta2, const float beta3, const float alpha, const float eps,                   \
+        const float weight_decay, const int step, const float lr, const float gnorm_scale, bool skip_zeros,            \
+        const int n                                                                                                    \
+    ) {                                                                                                                \
+        name##32bit_grad_##gbits(                                                                                      \
+            g, p, state1, state2, unorm, max_unorm, param_norm, beta1, beta2, beta3, alpha, eps, weight_decay, step,   \
+            lr, gnorm_scale, skip_zeros, n                                                                             \
+        );                                                                                                             \
+    }
+
+MAKE_CFUNC32(adam, float, fp32)
+MAKE_CFUNC32(adam, half, fp16)
+MAKE_CFUNC32(adam, bnb_bfloat16, bf16)
+MAKE_CFUNC32(momentum, float, 32)
+MAKE_CFUNC32(momentum, half, 16)
+MAKE_CFUNC32(rmsprop, float, 32)
+MAKE_CFUNC32(rmsprop, half, 16)
+MAKE_CFUNC32(lion, float, fp32)
+MAKE_CFUNC32(lion, half, fp16)
+MAKE_CFUNC32(lion, bnb_bfloat16, bf16)
+MAKE_CFUNC32(adagrad, float, 32)
+MAKE_CFUNC32(adagrad, half, 16)
+MAKE_CFUNC32(ademamix, float, fp32)
+MAKE_CFUNC32(ademamix, half, fp16)
+MAKE_CFUNC32(ademamix, bnb_bfloat16, bf16)
+
+#define MAKE_CBLOCKWISE8(fname, optim_name, gtype, gbits)                                                              \
+    void c##fname##_8bit_blockwise_grad_##gbits(                                                                       \
+        gtype* p, gtype* g, unsigned char* state1, unsigned char* state2, float beta1, float beta2, float beta3,       \
+        float alpha, float eps, int step, float lr, float* quantiles1, float* quantiles2, float* absmax1,              \
+        float* absmax2, float weight_decay, const float gnorm_scale, bool skip_zeros, int n                            \
+    ) {                                                                                                                \
+        fname##_8bit_blockwise_grad_##gbits(                                                                           \
+            p, g, state1, state2, beta1, beta2, beta3, alpha, eps, step, lr, quantiles1, quantiles2, absmax1, absmax2, \
+            weight_decay, gnorm_scale, skip_zeros, n                                                                   \
+        );                                                                                                             \
+    }
+
+MAKE_CBLOCKWISE8(adam, ADAM, half, fp16)
+MAKE_CBLOCKWISE8(adam, ADAM, float, fp32)
+MAKE_CBLOCKWISE8(adam, ADAM, bnb_bfloat16, bf16)
+MAKE_CBLOCKWISE8(momentum, MOMENTUM, half, fp16)
+MAKE_CBLOCKWISE8(momentum, MOMENTUM, float, fp32)
+MAKE_CBLOCKWISE8(momentum, MOMENTUM, bnb_bfloat16, bf16)
+MAKE_CBLOCKWISE8(rmsprop, RMSPROP, half, fp16)
+MAKE_CBLOCKWISE8(rmsprop, RMSPROP, float, fp32)
+MAKE_CBLOCKWISE8(rmsprop, RMSPROP, bnb_bfloat16, bf16)
+MAKE_CBLOCKWISE8(adagrad, ADAGRAD, half, fp16)
+MAKE_CBLOCKWISE8(adagrad, ADAGRAD, float, fp32)
+MAKE_CBLOCKWISE8(adagrad, ADAGRAD, bnb_bfloat16, bf16)
+MAKE_CBLOCKWISE8(lion, LION, half, fp16)
+MAKE_CBLOCKWISE8(lion, LION, float, fp32)
+MAKE_CBLOCKWISE8(lion, LION, bnb_bfloat16, bf16)
+MAKE_CBLOCKWISE8(ademamix, ADEMAMIX, half, fp16)
+MAKE_CBLOCKWISE8(ademamix, ADEMAMIX, float, fp32)
+MAKE_CBLOCKWISE8(ademamix, ADEMAMIX, bnb_bfloat16, bf16)
+
+void cigemm(
+    Context* context, bool transposeA, bool transposeB, int m, int n, int k, void* A, void* B, void* C, int lda,
+    int ldb, int ldc
+) {
+    gemmex(context, transposeA, transposeB, m, n, k, A, B, C, lda, ldb, ldc);
+}
+
+void cbatched_igemm(
+    Context* context, bool transposeA, bool transposeB, int m, int n, int k, void* A, void* B, void* C, int lda,
+    int ldb, int ldc, long strideA, long strideB, long strideC, int batchCount
+) {
+    strided_gemmex(
+        context, transposeA, transposeB, m, n, k, A, B, C, lda, ldb, ldc, strideA, strideB, strideC, batchCount
+    );
+}
+
+Context* get_context() { return new Context(); }
+
+int cigemmlt_32(
+    Context* context, int m, int n, int k, const int8_t* A, const int8_t* B, void* C, float* row_scale, int lda,
+    int ldb, int ldc, cudaStream_t stream
+) {
+    return igemmlt_32((cublasLtHandle_t)context->m_handle, m, n, k, A, B, C, row_scale, lda, ldb, ldc, stream);
+}
+
+int cigemmlt_8(
+    Context* context, int m, int n, int k, const int8_t* A, const int8_t* B, void* C, float* row_scale, int lda,
+    int ldb, int ldc, cudaStream_t stream
+) {
+    return igemmlt_8((cublasLtHandle_t)context->m_handle, m, n, k, A, B, C, row_scale, lda, ldb, ldc, stream);
+}
+
+int cigemmlt_8_rowscale(
+    Context* context, int m, int n, int k, const int8_t* A, const int8_t* B, void* C, float* row_scale, int lda,
+    int ldb, int ldc, cudaStream_t stream
+) {
+    return igemmlt_8_rowscale((cublasLtHandle_t)context->m_handle, m, n, k, A, B, C, row_scale, lda, ldb, ldc, stream);
+}
+
+void cdequant_mm_int32_fp16(
+    int* A, float* rowStats, float* colStats, half* out, half* bias, int numRows, int numCols, cudaStream_t stream
+) {
+    dequant_mm_int32_fp16(A, rowStats, colStats, out, bias, numRows, numCols, stream);
+}
+
+void cint8_vector_quant(
+    half* __restrict__ A, int8_t* out, float* rowStats, float threshold, int rows, int cols, cudaStream_t stream
+) {
+    int8VectorQuant(A, out, rowStats, threshold, rows, cols, stream);
+}
+
+void* cget_managed_ptr(size_t bytes) {
+    void* ptr;
+    CUDA_CHECK_RETURN(cudaMallocManaged(&ptr, bytes, cudaMemAttachHost));
+    CUDA_CHECK_RETURN(cudaPeekAtLastError());
+
+    return ptr;
+}
+
+void cprefetch(void* ptr, size_t bytes, int device) {
+
+    int hasPrefetch = 0;
+    CUDA_CHECK_RETURN(
+        cudaDeviceGetAttribute(&hasPrefetch, cudaDevAttrConcurrentManagedAccess, device)
+    ); // 40ns overhead
+    if (hasPrefetch == 0)
+        return;
+
+#if CUDART_VERSION >= 13000
+    cudaMemLocation loc{};
+    loc.type = cudaMemLocationTypeDevice;
+    loc.id = device;
+    CUDA_CHECK_RETURN(cudaMemPrefetchAsync(ptr, bytes, loc, 0u, 0));
+#else
+    CUDA_CHECK_RETURN(cudaMemPrefetchAsync(ptr, bytes, device, 0));
+#endif
+
+    CUDA_CHECK_RETURN(cudaPeekAtLastError());
+}
+
+#define CMAKE_ELEMENTWISE_FUNC(fname, type_name, ctype, FUNC)                                                          \
+    void c##fname##_##type_name(ctype* A, ctype* B, ctype value, long n) { fname##_##type_name(A, B, value, n); }
+
+CMAKE_ELEMENTWISE_FUNC(fill, fp32, float, FILL)
+CMAKE_ELEMENTWISE_FUNC(fill, uint8, unsigned char, FILL)
+CMAKE_ELEMENTWISE_FUNC(arange, fp32, float, ARANGE)
+CMAKE_ELEMENTWISE_FUNC(_mul, fp32, float, _MUL)
+
+void cgemm_4bit_inference_naive_fp16(
+    int m, int n, int k, half* A, unsigned char* B, float* absmax, float* datatype, half* out, int lda, int ldb,
+    int ldc, int blocksize, cudaStream_t stream
+) {
+    gemm_4bit_inference_naive_fp16(m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize, stream);
+}
+
+void cgemm_4bit_inference_naive_bf16(
+    int m, int n, int k, bnb_bfloat16* A, unsigned char* B, float* absmax, float* datatype, bnb_bfloat16* out, int lda,
+    int ldb, int ldc, int blocksize, cudaStream_t stream
+) {
+    gemm_4bit_inference_naive_bf16(m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize, stream);
+}
+
+void cgemm_4bit_inference_naive_fp32(
+    int m, int n, int k, float* A, unsigned char* B, float* absmax, float* datatype, float* out, int lda, int ldb,
+    int ldc, int blocksize, cudaStream_t stream
+) {
+    gemm_4bit_inference_naive_fp32(m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize, stream);
+}
+
+#endif
+
+#if BUILD_XPU
+
+void cdequantize_blockwise_fp16_fp4(
+    float* code, unsigned char* A, float* absmax, sycl::half* out, int blocksize, const int n, sycl::queue* stream
+) {
+    dequantizeBlockwise_fp16_fp4(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_fp16(
+    float* code, unsigned char* A, float* absmax, sycl::half* out, int blocksize, const int n, sycl::queue* stream
+) {
+    dequantizeBlockwise_fp16(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_fp16_nf4(
+    float* code, unsigned char* A, float* absmax, sycl::half* out, int blocksize, const int n, sycl::queue* stream
+) {
+    dequantizeBlockwise_fp16_nf4(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_fp32(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, sycl::queue* stream
+) {
+    dequantizeBlockwise_fp32(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_fp32_fp4(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, sycl::queue* stream
+) {
+    dequantizeBlockwise_fp32_fp4(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_fp32_nf4(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, sycl::queue* stream
+) {
+    dequantizeBlockwise_fp32_nf4(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_bf16(
+    float* code, unsigned char* A, float* absmax, sycl::ext::oneapi::bfloat16* out, int blocksize, const int n,
+    sycl::queue* stream
+) {
+    dequantizeBlockwise_bf16(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_bf16_fp4(
+    float* code, unsigned char* A, float* absmax, sycl::ext::oneapi::bfloat16* out, int blocksize, const int n,
+    sycl::queue* stream
+) {
+    dequantizeBlockwise_bf16_fp4(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cdequantize_blockwise_bf16_nf4(
+    float* code, unsigned char* A, float* absmax, sycl::ext::oneapi::bfloat16* out, int blocksize, const int n,
+    sycl::queue* stream
+) {
+    dequantizeBlockwise_bf16_nf4(code, A, absmax, out, blocksize, n, stream);
+}
+
+void cgemv_4bit_inference_fp16(
+    int m, int n, int k, sycl::half* A, unsigned char* B, float* absmax, float* datatype, sycl::half* out, int lda,
+    int ldb, int ldc, int blocksize, sycl::queue* stream
+) {
+    gemv_4bit_inference_fp16(m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize, stream);
+}
+
+void cgemv_4bit_inference_bf16(
+    int m, int n, int k, sycl::ext::oneapi::bfloat16* A, unsigned char* B, float* absmax, float* datatype,
+    sycl::ext::oneapi::bfloat16* out, int lda, int ldb, int ldc, int blocksize, sycl::queue* stream
+) {
+    gemv_4bit_inference_bf16(m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize, stream);
+}
+
+void cgemv_4bit_inference_fp32(
+    int m, int n, int k, float* A, unsigned char* B, float* absmax, float* datatype, float* out, int lda, int ldb,
+    int ldc, int blocksize, sycl::queue* stream
+) {
+    gemv_4bit_inference_fp32(m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize, stream);
+}
+
+// XPU Paged Memory Support using SYCL USM (Unified Shared Memory)
+// Equivalent CUDA APIs -> SYCL/Level Zero APIs:
+//   cudaMallocManaged     -> sycl::malloc_shared / zeMemAllocShared
+//   cudaMemPrefetchAsync  -> sycl::queue::prefetch / zeCommandListAppendMemoryPrefetch
+//   cudaPeekAtLastError   -> N/A (SYCL uses exceptions; L0 returns ze_result_t per call)
+
+void* cget_managed_ptr(size_t bytes) {
+    try {
+        auto& q = xpu_default_queue();
+        void* ptr = sycl::malloc_shared(bytes, q);
+        if (ptr == nullptr) {
+            fprintf(stderr, "XPU Error: sycl::malloc_shared returned nullptr for %zu bytes\n", bytes);
+        }
+        return ptr;
+    } catch (const sycl::exception& e) {
+        fprintf(stderr, "XPU SYCL Error in cget_managed_ptr: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+void cprefetch(void* ptr, size_t bytes, int device) {
+    // device == -1 means prefetch to host; for SYCL we skip in that case
+    // since SYCL prefetch targets the device associated with the queue.
+    if (device < 0)
+        return;
+    try {
+        auto& q = xpu_default_queue();
+        q.prefetch(ptr, bytes);
+    } catch (const sycl::exception& e) {
+        fprintf(stderr, "XPU Warning: sycl::queue::prefetch failed: %s\n", e.what());
+    }
+}
+
+void cfill_fp32(float* A, float* B, float value, long n) {
+    try {
+        auto& q = xpu_default_queue();
+        q.fill(A, value, static_cast<size_t>(n)).wait();
+    } catch (const sycl::exception& e) {
+        fprintf(stderr, "XPU Error in cfill_fp32: %s\n", e.what());
+    }
+}
+
+void cfill_uint8(unsigned char* A, unsigned char* B, unsigned char value, long n) {
+    // Use host-side memset instead of sycl::queue::fill<unsigned char>
+    // which segfaults on certain Intel GPU drivers (e.g. Max 1550).
+    // USM shared memory is host-accessible, so memset works directly.
+    memset(A, value, static_cast<size_t>(n));
+}
+
+#endif
+
+void cquantize_blockwise_cpu_fp32(
+    float* code, float* A, float* absmax, unsigned char* out, long long blocksize, long long n
+) {
+    quantize_cpu(code, A, absmax, out, blocksize, n);
+}
+
+void cquantize_blockwise_cpu_bf16(
+    float* code, bf16_t* A, float* absmax, unsigned char* out, long long blocksize, long long n
+) {
+    quantize_cpu_bf16(code, A, absmax, out, blocksize, n);
+}
+
+void cquantize_blockwise_cpu_fp16(
+    float* code, fp16_t* A, float* absmax, unsigned char* out, long long blocksize, long long n
+) {
+    quantize_cpu_fp16(code, A, absmax, out, blocksize, n);
+}
+
+void cdequantize_blockwise_cpu_fp32(
+    float* code, unsigned char* A, const float* absmax, float* out, long long blocksize, long long n
+) {
+    dequantizeBlockwise8bitCpu<float>(code, A, absmax, out, blocksize, n);
+}
+
+void cdequantize_blockwise_cpu_bf16(
+    float* code, unsigned char* A, const float* absmax, bf16_t* out, long long blocksize, long long n
+) {
+    dequantizeBlockwise8bitCpu<bf16_t>(code, A, absmax, out, blocksize, n);
+}
+
+void cdequantize_blockwise_cpu_fp16(
+    float* code, unsigned char* A, const float* absmax, fp16_t* out, long long blocksize, long long n
+) {
+    dequantizeBlockwise8bitCpu<fp16_t>(code, A, absmax, out, blocksize, n);
+}
+
+void cdequantize_blockwise_cpu_fp4_fp32(
+    unsigned char* A, const float* absmax, float* out, long long blocksize, long long m, long long n
+) {
+    dequantizeBlockwise4bitCpu<float, FP4>(A, absmax, out, blocksize, m, n);
+}
+
+void cdequantize_blockwise_cpu_fp4_bf16(
+    unsigned char* A, const float* absmax, bf16_t* out, long long blocksize, long long m, long long n
+) {
+    dequantizeBlockwise4bitCpu<bf16_t, FP4>(A, absmax, out, blocksize, m, n);
+}
+
+void cdequantize_blockwise_cpu_fp4_fp16(
+    unsigned char* A, const float* absmax, fp16_t* out, long long blocksize, long long m, long long n
+) {
+    dequantizeBlockwise4bitCpu<fp16_t, FP4>(A, absmax, out, blocksize, m, n);
+}
+
+void cdequantize_blockwise_cpu_nf4_fp32(
+    unsigned char* A, const float* absmax, float* out, long long blocksize, long long m, long long n
+) {
+    dequantizeBlockwise4bitCpu<float, NF4>(A, absmax, out, blocksize, m, n);
+}
+
+void cdequantize_blockwise_cpu_nf4_bf16(
+    unsigned char* A, const float* absmax, bf16_t* out, long long blocksize, long long m, long long n
+) {
+    dequantizeBlockwise4bitCpu<bf16_t, NF4>(A, absmax, out, blocksize, m, n);
+}
+
+void cdequantize_blockwise_cpu_nf4_fp16(
+    unsigned char* A, const float* absmax, fp16_t* out, long long blocksize, long long m, long long n
+) {
+    dequantizeBlockwise4bitCpu<fp16_t, NF4>(A, absmax, out, blocksize, m, n);
+}
+
+#if defined(__AVX512F__) && defined(__AVX512BF16__)
+void gemv_4bit_inference_cpu_fp4_bf16(
+    int64_t M, int64_t N, int64_t K, const bf16_t* __restrict__ x, const unsigned char* __restrict__ w,
+    const bf16_t* __restrict__ absmax, bf16_t* __restrict__ out, int64_t blocksize, int64_t x_stride, int64_t out_stride
+) {
+    gemv_4bit_inference<bf16_t, FP4>(M, N, K, x, w, absmax, out, blocksize, x_stride, out_stride);
+}
+
+void gemv_4bit_inference_cpu_nf4_bf16(
+    int64_t M, int64_t N, int64_t K, const bf16_t* __restrict__ x, const unsigned char* __restrict__ w,
+    const bf16_t* __restrict__ absmax, bf16_t* __restrict__ out, int64_t blocksize, int64_t x_stride, int64_t out_stride
+) {
+    gemv_4bit_inference<bf16_t, NF4>(M, N, K, x, w, absmax, out, blocksize, x_stride, out_stride);
+}
+#endif
+#if defined(__AVX512F__)
+bool has_avx512f_cpu() { return has_avx512f(); }
+#if defined(__AVX512BF16__)
+bool has_avx512bf16_cpu() { return has_avx512bf16(); }
+#endif
+#endif
+}
+
+#include "xpu_kernels.h"
+#include <bit>
+#include <cmath>
+#include <iostream>
+
+#include <sycl/sycl.hpp>
+
+inline float dDequantizeFP4(unsigned char val) {
+    if ((val & 0b1000) == 8)
+        if ((val & 0b0100) == 4)
+            if ((val & 0b0010) == 2)
+                if ((val & 0b0001) == 1)
+                    return -0.25000000f;
+                else
+                    return -0.16666667f;
+            else if ((val & 0b0001) == 1)
+                return -0.50000000f;
+            else
+                return -0.33333333f;
+        else if ((val & 0b0010) == 2)
+            if ((val & 0b0001) == 1)
+                return -1.00000000f;
+            else
+                return -0.66666667f;
+        else if ((val & 0b0001) == 1)
+            return -5.208333333e-03f;
+        else
+            return 0.00000000f;
+    else if ((val & 0b0100) == 4)
+        if ((val & 0b0010) == 2)
+            if ((val & 0b0001) == 1)
+                return 0.25000000f;
+            else
+                return 0.16666667f;
+        else if ((val & 0b0001) == 1)
+            return 0.50000000f;
+        else
+            return 0.33333333f;
+    else if ((val & 0b0010) == 2)
+        if ((val & 0b0001) == 1)
+            return 1.00000000f;
+        else
+            return 0.66666667f;
+    else if ((val & 0b0001) == 1)
+        return 5.208333333e-03f;
+    else
+        return 0.00000000f;
+}
+
+inline float dDequantizeNF4(unsigned char val) {
+
+    // the values for this tree was generated by test_normal_map_tree
+    // in the file tests/test_functional.py
+    if ((val & 0b1000) == 8)
+        if ((val & 0b0100) == 4)         // 1
+            if ((val & 0b0010) == 2)     // 11
+                if ((val & 0b0001) == 1) // 111
+                    return 1.0f;         //*1111
+                else
+                    return 0.7229568362236023f; //*1110
+            else if ((val & 0b0001) == 1)       // 110
+                return 0.5626170039176941f;     //*1101
+            else
+                return 0.44070982933044434f; //*1100
+        else if ((val & 0b0010) == 2)        // 10
+            if ((val & 0b0001) == 1)         // 101
+                return 0.33791524171829224f; //*1011
+            else
+                return 0.24611230194568634f; //*1010
+        else if ((val & 0b0001) == 1)        // 100
+            return 0.16093020141124725f;     //*1001
+        else
+            return 0.07958029955625534f; //*1000
+
+    else if ((val & 0b0100) == 4)    // 0
+        if ((val & 0b0010) == 2)     // 01
+            if ((val & 0b0001) == 1) // 011
+                return 0.0f;         //*0111
+            else
+                return -0.09105003625154495f; //*0110
+        else if ((val & 0b0001) == 1)         // 010
+            return -0.18477343022823334f;     //*0101
+        else
+            return -0.28444138169288635f; //*0100
+    else if ((val & 0b0010) == 2)         // 00
+        if ((val & 0b0001) == 1)          // 001
+            return -0.39491748809814453f; //*0011
+        else
+            return -0.5250730514526367f; //*0010
+    else if ((val & 0b0001) == 1)        // 000
+        return -0.6961928009986877f;     //*0001
+    else
+        return -1.0f; //*0000
+}
+
+template <typename T, int TILE_SIZE, int NUM_PER_TH, int DATA_TYPE>
+SYCL_EXTERNAL void kDequantizeBlockwise<T, TILE_SIZE, NUM_PER_TH, DATA_TYPE>::operator()(sycl::nd_item<1> item) const {
+    const int64_t base_idx = static_cast<int64_t>(item.get_group(0)) * TILE_SIZE;
+    int64_t local_idx = static_cast<int64_t>(item.get_local_id(0)) * NUM_PER_TH;
+    float local_abs_max = -FLT_MAX;
+    int64_t local_load_idx = 0;
+    int64_t local_store_idx = 0;
+
+    uint8_t qvals[NUM_PER_TH];
+    T vals[NUM_PER_TH * ((DATA_TYPE > 0) ? 2 : 1)];
+
+    if (DATA_TYPE > 0) {
+        // Cast n to int64_t to avoid overflow for large n (same as CUDA)
+        local_load_idx = sycl::min(static_cast<int64_t>(TILE_SIZE), (static_cast<int64_t>(n) + 1) / 2 - base_idx);
+        local_store_idx = sycl::min(static_cast<int64_t>(TILE_SIZE * 2), static_cast<int64_t>(n) - base_idx * 2);
+    } else {
+        local_load_idx = sycl::min(static_cast<int64_t>(TILE_SIZE), static_cast<int64_t>(n) - base_idx);
+        local_store_idx = local_load_idx;
+    }
+
+    // Avoid expensive division by the blocksize (as blocksize will always be a
+    // power-of-2)
+    local_abs_max = absmax[(base_idx + local_idx) >> (31 - std::countl_zero<unsigned int>(blocksize))];
+
+    if (local_idx + NUM_PER_TH < local_load_idx) {
+        reinterpret_cast<sycl::vec<uint8_t, NUM_PER_TH>(&)[NUM_PER_TH]>(qvals)[0] =
+            reinterpret_cast<sycl::vec<uint8_t, NUM_PER_TH>*>(A)[(base_idx + local_idx) / NUM_PER_TH];
+    } else {
+#pragma unroll NUM_PER_TH
+        for (int i = 0; i < NUM_PER_TH; i++) {
+            if (local_idx + i < local_load_idx) {
+                qvals[i] = A[base_idx + local_idx + i];
+            } else {
+                qvals[i] = (uint8_t)0;
+            }
+        }
+    }
+
+    switch (DATA_TYPE) {
+    case General8bit:
+#pragma unroll NUM_PER_TH
+        for (int j = 0; j < NUM_PER_TH; j++)
+            vals[j] = code[qvals[j]] * local_abs_max;
+        break;
+    case FP4:
+#pragma unroll NUM_PER_TH
+        for (int j = 0; j < NUM_PER_TH; j++) {
+            vals[j * 2] = dDequantizeFP4(qvals[j] >> 4) * local_abs_max;
+            vals[j * 2 + 1] = dDequantizeFP4(qvals[j] & 0x0F) * local_abs_max;
+        }
+        break;
+    case NF4:
+#pragma unroll NUM_PER_TH
+        for (int j = 0; j < NUM_PER_TH; j++) {
+            vals[j * 2] = dDequantizeNF4(qvals[j] >> 4) * local_abs_max;
+            vals[j * 2 + 1] = dDequantizeNF4(qvals[j] & 0x0F) * local_abs_max;
+        }
+        break;
+    }
+
+    const int local_dst_size = (DATA_TYPE > 0) ? NUM_PER_TH * 2 : NUM_PER_TH;
+    int local_dst_idx = (DATA_TYPE > 0) ? local_idx * 2 : local_idx;
+
+    if (local_dst_idx + local_dst_size < local_store_idx) {
+        reinterpret_cast<sycl::vec<T, local_dst_size>*>(
+            out
+        )[(((DATA_TYPE > 0) ? base_idx * 2 : base_idx) + local_dst_idx) / local_dst_size] =
+            reinterpret_cast<sycl::vec<T, local_dst_size>(&)[local_dst_size]>(vals)[0];
+    } else {
+#pragma unroll NUM_PER_TH
+        for (int i = 0; i < local_dst_size; i++) {
+            if (local_dst_idx + i < local_store_idx) {
+                out[((DATA_TYPE > 0) ? base_idx * 2 : base_idx) + local_dst_idx + i] = vals[i];
+            }
+        }
+    }
+}
+
+template <typename T, size_t GROUP_SIZE, size_t NUM_PER_THREAD, size_t SUBG_SIZE, int BITS>
+SYCL_EXTERNAL void
+    kgemv_4bit_inference<T, GROUP_SIZE, NUM_PER_THREAD, SUBG_SIZE, BITS>::operator()(sycl::nd_item<1> item) const {
+    size_t idx = item.get_local_id();
+    const int sg_idx = idx / SUBG_SIZE;
+    const int sg_lane = idx % SUBG_SIZE;
+    const int num_values_4bit = SUBG_SIZE;
+    const int row_B = NUM_PER_THREAD * item.get_group().get_group_id() + sg_idx;
+    const int offset_B = ldb * row_B;
+    const int num_values_8bit = num_values_4bit / 2;
+    float local_C = 0.0f;
+
+    unsigned char local_B_4bit[num_values_8bit];
+    T local_B[num_values_4bit / 4];
+    T local_A[num_values_4bit / 4];
+    T local_absmax = T(0.0f);
+
+    if (idx < 16) {
+        quant_map[idx] = T(datatype[idx]);
+    }
+
+    item.barrier(sycl::access::fence_space::local_space);
+
+    for (int inner_idx = sg_lane * num_values_4bit; inner_idx < K; inner_idx += SUBG_SIZE * num_values_4bit) {
+        const int inner_idx_halved = inner_idx / 2;
+
+        // Avoid expensive division by the blocksize (as blocksize will always be a
+        // power-of-2)
+        const int absidx = ((2 * offset_B) + inner_idx) >> (31 - std::countl_zero((unsigned int)blocksize));
+        local_absmax = absmax[absidx];
+
+        if (row_B < N) {
+            if ((inner_idx_halved + num_values_8bit) < (K / 2)) {
+                reinterpret_cast<sycl::vec<int, 4>(&)[num_values_8bit]>(local_B_4bit)[0] =
+                    reinterpret_cast<sycl::vec<int, 4>*>(B)[(offset_B + (inner_idx_halved)) / (num_values_8bit)];
+            } else {
+#pragma unroll
+                for (int j = 0; j < (num_values_8bit); j++)
+                    if ((inner_idx_halved) + j < (K / 2))
+                        local_B_4bit[j] = B[offset_B + inner_idx_halved + j];
+                    else
+                        local_B_4bit[j] = 0b01110111;
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < (num_values_8bit); j++)
+                local_B_4bit[j] = 0b01110111;
+        }
+
+        for (int i = 0; i < 4; i++) {
+#pragma unroll
+            for (int k = 0; k < num_values_8bit / 4; k++) {
+                local_B[k * 2] = quant_map[local_B_4bit[(i * num_values_8bit / 4) + k] >> 4] * local_absmax;
+                local_B[k * 2 + 1] = quant_map[local_B_4bit[(i * num_values_8bit / 4) + k] & 0x0F] * local_absmax;
+            }
+
+            if (inner_idx + (num_values_4bit / 4) + (i * num_values_4bit / 4) < K) {
+                if (BITS == 16) {
+                    reinterpret_cast<sycl::vec<int, 4>(&)[num_values_4bit / 4]>(local_A)[0] =
+                        reinterpret_cast<sycl::vec<int, 4>*>(A)[inner_idx / (num_values_4bit / 4) + i];
+                } else {
+                    reinterpret_cast<sycl::vec<int, 4>(&)[num_values_4bit / 4]>(local_A)[0] =
+                        reinterpret_cast<sycl::vec<int, 4>*>(A)[inner_idx / (num_values_4bit / 8) + (2 * i) + 0];
+                    reinterpret_cast<sycl::vec<int, 4>(&)[num_values_4bit / 4]>(local_A)[1] =
+                        reinterpret_cast<sycl::vec<int, 4>*>(A)[inner_idx / (num_values_4bit / 8) + (2 * i) + 1];
+                }
+
+            } else {
+#pragma unroll
+                for (int k = 0; k < num_values_4bit / 4; k++)
+                    if (inner_idx + (i * num_values_4bit / 4) + k < K)
+                        local_A[k] = A[inner_idx + k + (i * num_values_4bit / 4)];
+                    else
+                        local_A[k] = T(0.0f);
+            }
+
+// accumulate in float for accuracy;
+#pragma unroll
+            for (int k = 0; k < num_values_4bit / 4; k++) {
+                local_C += (float)(local_A[k] * local_B[k]);
+            }
+        }
+    }
+
+    local_C = sycl::reduce_over_group(item.get_sub_group(), local_C, sycl::plus<>());
+
+    if (row_B < N && sg_lane == 0)
+        out[row_B] = T(local_C);
+}
+
+//==============================================================
+//                   TEMPLATE DEFINITIONS
+//==============================================================
+
+template class kDequantizeBlockwise<sycl::half, 512, 4, FP4>;
+template class kDequantizeBlockwise<sycl::half, 512, 4, General8bit>;
+template class kDequantizeBlockwise<sycl::half, 512, 4, NF4>;
+
+template class kDequantizeBlockwise<float, 512, 4, FP4>;
+template class kDequantizeBlockwise<float, 512, 4, General8bit>;
+template class kDequantizeBlockwise<float, 512, 4, NF4>;
+
+template class kDequantizeBlockwise<sycl::ext::oneapi::bfloat16, 512, 4, FP4>;
+template class kDequantizeBlockwise<sycl::ext::oneapi::bfloat16, 512, 4, General8bit>;
+template class kDequantizeBlockwise<sycl::ext::oneapi::bfloat16, 512, 4, NF4>;
+
+template class kgemv_4bit_inference<sycl::half, 128, 4, 32, 16>;
+template class kgemv_4bit_inference<sycl::ext::oneapi::bfloat16, 128, 4, 32, 16>;
+template class kgemv_4bit_inference<float, 128, 4, 32, 32>;
+
+#include <float.h>
+#include <xpu_ops.h>
+
+#ifndef xpu_kernels
+#define xpu_kernels
+
+template <typename T, int TILE_SIZE, int NUM_PER_TH, int DATA_TYPE> class kDequantizeBlockwise {
+  public:
+    SYCL_EXTERNAL void operator()(sycl::nd_item<1> item) const;
+
+    kDequantizeBlockwise(float* code_, uint8_t* A_, float* absmax_, T* out_, const int blocksize_, const int n_)
+        : code(code_), A(A_), absmax(absmax_), out(out_), blocksize(blocksize_), n(n_) {}
+
+  private:
+    float* code;
+    uint8_t* A;
+    float* absmax;
+    T* out;
+    const int blocksize;
+    const int n;
+};
+
+template <typename T, size_t GROUP_SIZE, size_t NUM_PER_THREAD, size_t SUBG_SIZE, int BITS> class kgemv_4bit_inference {
+  public:
+    [[sycl::reqd_sub_group_size(SUBG_SIZE)]]
+    SYCL_EXTERNAL void operator()(sycl::nd_item<1> item) const;
+
+    kgemv_4bit_inference(
+        int M_, int N_, int K_, T* A_, unsigned char* B_, float* absmax_, const float* datatype_, T* out_, int lda_,
+        int ldb_, int ldc_, int blocksize_
+    )
+        : M(M_), N(N_), K(K_), A(A_), B(B_), absmax(absmax_), datatype(datatype_), out(out_), lda(lda_), ldb(ldb_),
+          ldc(ldc_), blocksize(blocksize_), quant_map() {}
+
+    void sycl_ker_local_memory_creation(sycl::handler& cgh) { quant_map = sycl::local_accessor<T>(16, cgh); }
+
+  private:
+    int M;
+    int N;
+    int K;
+    T* A;
+    unsigned char* B;
+    float* absmax;
+    const float* datatype;
+    T* out;
+    int lda;
+    int ldb;
+    int ldc;
+    int blocksize;
+    sycl::local_accessor<T> quant_map;
+};
+
+#endif
+
+#include <xpu_kernels.h>
+#include <xpu_ops.h>
+
+template <typename T, int DATA_TYPE>
+void dequantizeBlockwise(
+    float* code, unsigned char* A, float* absmax, T* out, int blocksize, const int n, sycl::queue* stream
+) {
+    auto& queue = *stream;
+    const int workgroup_size = 128;
+    const int num_per_th = 4;
+    const int tile_size = workgroup_size * num_per_th;
+    if (DATA_TYPE > 0) {
+        // Upcast to int64 to avoid overflow for large n (same as CUDA)
+        const int workgroup_num = (static_cast<int64_t>(n) + tile_size * 2 - 1) / (tile_size * 2);
+        sycl::range<1> local_range{(size_t)workgroup_size};
+        sycl::range<1> global_range{(size_t)workgroup_num * (size_t)workgroup_size};
+        kDequantizeBlockwise<T, tile_size, num_per_th, DATA_TYPE> kfn(code, A, absmax, out, blocksize / 2, n);
+        sycl_kernel_submit<decltype(kfn), 1, 32>(
+            sycl::nd_range<1>(sycl::range<1>(global_range), sycl::range<1>(local_range)), queue, kfn
+        );
+    } else {
+        // Upcast to int64 to avoid overflow for large n (same as CUDA)
+        const int workgroup_num = (static_cast<int64_t>(n) + tile_size - 1) / tile_size;
+        sycl::range<1> local_range{(size_t)workgroup_size};
+        sycl::range<1> global_range{(size_t)workgroup_num * (size_t)workgroup_size};
+        kDequantizeBlockwise<T, tile_size, num_per_th, DATA_TYPE> kfn(code, A, absmax, out, blocksize, n);
+        sycl_kernel_submit<decltype(kfn), 1, 32>(
+            sycl::nd_range<1>(sycl::range<1>(global_range), sycl::range<1>(local_range)), queue, kfn
+        );
+    }
+}
+
+template <typename T, int BITS>
+void gemv_4bit_inference(
+    int m, int n, int k, T* A, unsigned char* B, float* absmax, float* datatype, T* out, int lda, int ldb, int ldc,
+    int blocksize, sycl::queue* stream
+) {
+
+    auto& queue = *stream;
+
+    const size_t GROUP_SIZE = 128; // workgroup_size
+    const size_t SUBG_SIZE = 32;   // subgroup_size
+    const size_t NUM_PER_THREAD = GROUP_SIZE / SUBG_SIZE;
+    size_t workgroup_num = (n + NUM_PER_THREAD - 1) / NUM_PER_THREAD;
+
+    kgemv_4bit_inference<T, GROUP_SIZE, NUM_PER_THREAD, SUBG_SIZE, BITS> kfn(
+        m, n, k, A, B, absmax, datatype, out, lda, ldb, ldc, blocksize
+    );
+
+    sycl_comp_kernel_submit<decltype(kfn), 1, SUBG_SIZE>(
+        sycl::nd_range<1>(sycl::range<1>(GROUP_SIZE * workgroup_num), sycl::range<1>(GROUP_SIZE)), queue, kfn
+    );
+}
+
+//==============================================================
+//                   TEMPLATE DEFINITIONS
+//==============================================================
+
+template void dequantizeBlockwise<float, General8bit>(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, sycl::queue* stream
+);
+template void dequantizeBlockwise<float, FP4>(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, sycl::queue* stream
+);
+template void dequantizeBlockwise<float, NF4>(
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, sycl::queue* stream
+);
+
+template void dequantizeBlockwise<sycl::half, General8bit>(
+    float* code, unsigned char* A, float* absmax, sycl::half* out, int blocksize, const int n, sycl::queue* stream
+);
+template void dequantizeBlockwise<sycl::half, FP4>(
+    float* code, unsigned char* A, float* absmax, sycl::half* out, int blocksize, const int n, sycl::queue* stream
+);
+template void dequantizeBlockwise<sycl::half, NF4>(
+    float* code, unsigned char* A, float* absmax, sycl::half* out, int blocksize, const int n, sycl::queue* stream
+);
+
+template void dequantizeBlockwise<sycl::ext::oneapi::bfloat16, General8bit>(
+    float* code, unsigned char* A, float* absmax, sycl::ext::oneapi::bfloat16* out, int blocksize, const int n,
+    sycl::queue* stream
+);
+template void dequantizeBlockwise<sycl::ext::oneapi::bfloat16, FP4>(
+    float* code, unsigned char* A, float* absmax, sycl::ext::oneapi::bfloat16* out, int blocksize, const int n,
+    sycl::queue* stream
+);
+template void dequantizeBlockwise<sycl::ext::oneapi::bfloat16, NF4>(
+    float* code, unsigned char* A, float* absmax, sycl::ext::oneapi::bfloat16* out, int blocksize, const int n,
+    sycl::queue* stream
+);
+
+template void gemv_4bit_inference<sycl::half, 16>(
+    int m, int n, int k, sycl::half* A, unsigned char* B, float* absmax, float* datatype, sycl::half* out, int lda,
+    int ldb, int ldc, int blocksize, sycl::queue* stream
+);
+template void gemv_4bit_inference<sycl::ext::oneapi::bfloat16, 16>(
+    int m, int n, int k, sycl::ext::oneapi::bfloat16* A, unsigned char* B, float* absmax, float* datatype,
+    sycl::ext::oneapi::bfloat16* out, int lda, int ldb, int ldc, int blocksize, sycl::queue* stream
+);
+template void gemv_4bit_inference<float, 32>(
+    int m, int n, int k, float* A, unsigned char* B, float* absmax, float* datatype, float* out, int lda, int ldb,
+    int ldc, int blocksize, sycl::queue* stream
+);
+
+#ifndef xpu_ops_H
+#define xpu_ops_H
+
+#include <assert.h>
+#include <common.h>
+#include <cstdint>
+#include <iostream>
+#include <stdio.h>
+
+#include <functional>
+#include <vector>
+
+#include <sycl/sycl.hpp>
+
+template <typename ker_t, int dim, int subgroup_size>
+static inline void sycl_kernel_submit(sycl::nd_range<dim> range, sycl::queue q, ker_t ker) {
+    auto cgf = [&](::sycl::handler& cgh)
+                   [[sycl::reqd_sub_group_size(subgroup_size)]] { cgh.parallel_for<ker_t>(range, ker); };
+    q.submit(cgf);
+}
+
+template <typename ker_t, int dim, int subgroup_size>
+static inline void sycl_comp_kernel_submit(sycl::nd_range<dim> range, sycl::queue q, ker_t ker) {
+    auto cgf = [&](::sycl::handler& cgh) [[sycl::reqd_sub_group_size(subgroup_size)]] {
+        ker.sycl_ker_local_memory_creation(cgh);
+        cgh.parallel_for<ker_t>(range, ker);
+    };
+    q.submit(cgf);
+}
+
+template <typename T, int DATA_TYPE>
+void dequantizeBlockwise(
+    float* code, unsigned char* A, float* absmax, T* out, int workgroup_size, const int n, sycl::queue* stream
+);
+template <typename T, int BITS>
+void gemv_4bit_inference(
+    int m, int n, int k, T* A, unsigned char* B, float* absmax, float* datatype, T* out, int lda, int ldb, int ldc,
+    int blocksize, sycl::queue* stream
+);
+
+#endif
+
+import os
+if int(os.getenv("TYPED", "0")):
+  from typeguard import install_import_hook
+  install_import_hook(__name__)
+from tinygrad.tensor import Tensor                                    # noqa: F401
+from tinygrad.engine.jit import TinyJit                               # noqa: F401
+from tinygrad.function import function                                # noqa: F401
+from tinygrad.uop.ops import UOp
+Variable = UOp.variable
+from tinygrad.dtype import dtypes                                     # noqa: F401
+from tinygrad.helpers import GlobalCounters, fetch, Context, getenv   # noqa: F401
+from tinygrad.device import Device                                    # noqa: F401
+
+from dataclasses import replace
+import itertools, functools
+from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, USE_TC
+from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, TC_SELECT, TC_OPT, TC_MIN_GLOBALS, TracingKey, Context, panic
+from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
+from tinygrad.uop.weak import pm_lower_weak, pm_commit_weak, pm_cast_const
+from tinygrad.uop.render import render_ssa
+from tinygrad.uop.spec import type_verify, spec_tensor, spec_program
+from tinygrad.renderer import Renderer, Estimates
+from tinygrad.renderer.isa import ISARenderer, IselContext
+from tinygrad.dtype import dtypes, AddrSpace
+
+# import all pattern matchers here
+from tinygrad.codegen.gpudims import pm_group_gpudims, pm_range_to_special
+from tinygrad.uop.symbolic import sym, symbolic_simple, symbolic, pm_move_where_on_load, pm_clean_up_group_sink, pm_remove_invalid, invalid_gate
+from tinygrad.uop.movement import mop_cleanup
+from tinygrad.codegen.decomp.dtype import pm_dtype_decomps
+from tinygrad.codegen.decomp.op import get_late_rewrite_patterns, get_simplifying_rewrite_patterns
+from tinygrad.codegen.decomp.transcendental import get_transcendental_patterns
+from tinygrad.codegen.late.coalesce import indexing_simplify
+from tinygrad.codegen.opt.postrange import apply_opts
+from tinygrad.codegen.late.gater import pm_move_gates_from_index
+from tinygrad.codegen.simplify import pm_simplify_ranges, pm_flatten_range, pm_split_ranges, pm_load_collapse, pm_reduce_unparented
+from tinygrad.schedule.multi import multi_pm
+from tinygrad.schedule.prepare import pm_mops
+from tinygrad.codegen.late.linearizer import CFGContext, pm_split_ends, pm_add_control_flow, linearize
+from tinygrad.codegen.late.regalloc import LinearScanRegallocContext, pm_regalloc_rewrite
+from tinygrad.codegen.late.coalesce import memory_coalescing, pm_simplify_add_image
+from tinygrad.helpers import all_same, all_int, argsort, partition, to_function_name
+from tinygrad.uop.ops import _broadcast_shape, identity_element
+from tinygrad.schedule.rangeify import BufferizeOpts
+
+def do_number_param(ctx:tuple[int, dict[str, int]], x:UOp): # after the params, one slot per name
+  if x.is_variable: return x.replace(arg=replace(x.arg, slot=ctx[0] + ctx[1].setdefault(x.arg.name, len(ctx[1]))))
+
+pm_number_params = PatternMatcher([
+  (UPat(Ops.PARAM, name="x"), do_number_param),
+])
+
+def build_range_map(sink:UOp) -> dict[tuple, int]:
+  ctx: dict[tuple, int] = {}
+  for x in sink.toposort():
+    if x.op is Ops.RANGE and x.axis_type is AxisType.UPCAST:
+      ctx[x.arg] = len(ctx)
+  return ctx
+
+def expand_reduce(r:UOp):
+  range_srcs = []
+  new_axes = []
+  for u in r.src[1:]:
+    if u.op == Ops.RANGE:
+      range_srcs.append(u)
+    else:
+      for i,s in enumerate(u.shape):
+        if s > 1: new_axes.append(i)
+  if len(new_axes) == 0: return None
+  assert r.arg[1] == 0
+  # permute so new_axes come to front, then reduce
+  perm = tuple(new_axes) + tuple(i for i in range(len(r.src[0].shape)) if i not in new_axes)
+  out_shape = tuple([1 if i in new_axes else s for i,s in enumerate(r.src[0].shape)])
+  return r.src[0].permute(perm).reduce(*range_srcs, arg=(r.arg[0], len(new_axes))).reshape(out_shape)
+
+def contract_axis(u:UOp, dims:list[int]) -> UOp:
+  return u.permute([i for i in range(u.ndim) if i not in dims]+dims).flatten(-len(dims))
+
+def unroll_axis(u:UOp, dims:list[int], sizes:list[int]) -> UOp:
+  out = u.unflatten(-1, tuple(sizes))
+  return out.permute(argsort([i for i in range(out.ndim) if i not in dims]+dims))
+
+def expand_wmma(ctx:dict[tuple, int], u:UOp):
+  if u.arg[3] is None: return None
+  in0, in1, out0 = [[ctx[rn] for rn,_ in upcast_axes] for upcast_axes in u.arg[3]]
+  wmma = u.replace(src=(contract_axis(u.src[0], in0), contract_axis(u.src[1], in1), u.src[2]), arg=(*u.arg[:3], None))
+  return unroll_axis(wmma, out0, [sz for _,sz in u.arg[3][2]])
+
+expander = PatternMatcher([
+  (UPat(Ops.REDUCE, name="r"), expand_reduce),
+  (UPat(Ops.RANGE, name="r"),
+   lambda ctx, r: UOp.const(tuple(range(r.vmax+1)), r.dtype) \
+    .reshape(tuple([r.vmax+1 if i == ctx[r.arg] else 1 for i in range(len(ctx))])) if r.arg in ctx else None),
+  (UPat(Ops.WMMA, name="u"), expand_wmma),
+])+pm_flatten_range+mop_cleanup
+
+def expand_broadcast(x:UOp):
+  shapes = [u._shape for u in x.src]
+  if any(s is None for s in shapes) or all_same(shapes): return None
+  shape = _broadcast_shape(*shapes)
+  return x.replace(src=tuple([u.expand(shape) for u in x.src]))
+
+def broadcast_and_devec_wmma(b:UOp):
+  shapes = [u.shape[:-1] for u in b.src]
+  if not any(shapes): return None
+  shape = _broadcast_shape(*shapes)
+  src_expanded = tuple([u.expand(shape+(u.shape[-1],)) for u in b.src])
+  src = []
+  for idx in itertools.product(*[range(i) for i in b.shape[:-1]]):
+    src.append(b.replace(src=tuple([x.index(*idx) for x in src_expanded])))
+  return UOp.stack(*src).reshape(b.shape)
+
+pm_wmma_add = PatternMatcher([
+  (UPat(Ops.WMMA, name="wmma") + UPat.var("add"),
+   lambda add, wmma: UOp(wmma.op, src=(wmma.src[0], wmma.src[1], wmma.src[2]+add), arg=wmma.arg)),
+  # push permute/reshape to the other side of the add
+  (UPat(Ops.PERMUTE, src=(UPat(Ops.WMMA, name="wmma"),), name="permute") + UPat.var("add"),
+    lambda wmma,permute,add: (wmma + add.permute(argsort(permute.arg))).permute(permute.arg)),
+  (UPat(Ops.PERMUTE, src=(UPat(Ops.RESHAPE, src=(UPat(Ops.WMMA, name="wmma"), UPat()), name="reshape"),), name="permute") + UPat.var("add"),
+    lambda wmma,reshape,permute,add: (wmma + add.permute(argsort(permute.arg)).reshape(wmma.shape)).reshape(reshape.shape).permute(permute.arg)),
+])
+
+pm_expand_broadcast = pm_wmma_add+PatternMatcher([
+  (UPat(GroupOp.Binary|GroupOp.Ternary|{Ops.STORE}, name="x"), expand_broadcast),
+  (UPat(Ops.WMMA, name="b"), broadcast_and_devec_wmma),
+])
+
+def do_devectorize(b:UOp):
+  if b.shape == (): return None
+  # broadcasting needs to be already unpacked, Invalid matches any dtype and shape
+  if not all(x.shape == b.shape or x.base.is_invalid for x in b.src): return None
+  src = []
+  for idx_c in itertools.product(*[[UOp.const(i) for i in range(x)] for x in b.shape]):
+    src.append(b.replace(src=tuple(x.base if x.base.is_invalid else x.index(*idx_c) for x in b.src)))
+  return UOp.stack(*src).reshape(b.shape) if b.op is not Ops.STORE else UOp.group(*src)
+
+def do_stack_wmma(u:UOp):
+  if all(x.op in (Ops.STACK, Ops.WMMA) for x in u.src): return None
+  assert len(u.shape) == 1
+  src = []
+  for b in u.src:
+    if b.op != Ops.STACK:
+      src.append(UOp.stack(*[b.index(i) for i in range(b.max_numel())]))
+    else:
+      src.append(b)
+  return u.replace(src=tuple(src))
+
+devectorizer2 = pm_mops+PatternMatcher([
+  # unpack broadcasting
+  (UPat(GroupOp.Elementwise|{Ops.LOAD,Ops.STORE}, name="b"), do_devectorize),
+  # INDEX without src is nothing (TODO: this should be in mop_cleanup)
+  (UPat(Ops.INDEX, src=(UPat.var('x'),)), lambda x: x),
+  # unpack WMMA
+  (UPat(Ops.WMMA, name="u"), do_stack_wmma),
+  # stacked INDEX is many INDEX
+  (UPat(Ops.INDEX, src=(UPat((Ops.PARAM, Ops.BUFFER, Ops.ALLOC), name="b"), UPat(Ops.STACK, name="s")), name="x"),
+   lambda b,s,x: UOp.stack(*[x.replace(src=(b,u)) for u in s.src])),
+  # INDEX into RESHAPE moves the RESHAPE
+  (UPat(Ops.INDEX, src=(UPat((Ops.PARAM, Ops.BUFFER, Ops.ALLOC), name="b"), UPat(Ops.RESHAPE, name="s"))),
+   lambda b,s: b.index(s.src[0]).reshape(s.shape)),
+  # RESHAPE a void is removed (hack for AFTER)
+  (UPat(Ops.RESHAPE, dtype=dtypes.void, name="x"), lambda x: x.src[0]),
+  # reshape of a single element shaped value to scalar is an index
+  (UPat(Ops.RESHAPE, name="x"), lambda x: x.src[0].index(0) if x.marg == () and x.src[0].shape == (1,) else None),
+  # EXPAND on scalar -> nested STACKs with the same shape
+  (UPat(Ops.EXPAND, src=(UPat.var("x"), UPat()), name="out"),
+   lambda x,out: functools.reduce(lambda x,s: UOp.stack(*([x]*s)), reversed(out.shape), x)
+   if x.shape == () and all_int(out.shape) and 0 not in out.shape else None),
+])
+
+def fix_group_for_reduce(x:UOp):
+  threads = (AxisType.WARP, AxisType.LOCAL)
+  reduce_gfr, reduce_r = partition(x.src[1:], lambda u: u.op is Ops.RANGE and u.axis_type in threads)
+  if len(reduce_gfr) == 0: return None
+
+  # NOTE: if there's other locals here, we need them in the buffer too
+  upstream_locals = [u for u in x.ranges if u.axis_type in threads]
+
+  # do only the non grouped reduces early
+  ret = x.replace(src=(x.src[0],)+tuple(reduce_r))
+  reduce_loop = [x.replace(arg=(AxisType.WEAK, x.axis_id[0]+100, *x.axis_id[1:])) for x in reduce_gfr]
+  buf = ret.bufferize(*upstream_locals, *reduce_gfr, arg=BufferizeOpts(None, AddrSpace.LOCAL)).index(*upstream_locals, *reduce_loop)
+
+  # do the final reduce (if/barrier are added in gpudims step)
+  # NOTE: we remove all horizontal reduces here, they remain in the first reduce
+  return buf.reduce(*reduce_loop, arg=(x.arg[0], 0))
+
+def merge_reduce_ends(sink:UOp):
+  # merge ENDs that share the same range and nesting context (only those created by reduce_to_acc)
+  # ENDs at different nesting depths get cloned RANGEs so each RANGE maps to one END
+  range_to_ends: dict[tuple[UOp, ...], list[UOp]] = {}
+  for u in sink.backward_slice:
+    if u.op is Ops.END and u.tag == "mergeable": range_to_ends.setdefault(u.src[1:], []).append(u)
+  subs: dict[UOp, UOp] = {}
+  next_axis = max((u.axis_id[0] for u in sink.backward_slice if u.op is Ops.RANGE), default=-1) + 1
+  for r, ends in range_to_ends.items():
+    if len(ends) <= 1: continue
+    by_ctx: dict[frozenset[UOp], list[UOp]] = {}
+    for e in ends: by_ctx.setdefault(frozenset(e.ranges), []).append(e)
+    for i, group in enumerate(by_ctx.values()):
+      tr = r if i == 0 else tuple(rr.replace(arg=(rr.axis_type, next_axis + j, *rr.axis_id[1:])) for j, rr in enumerate(r))
+      if i > 0: next_axis += len(r)
+      mapped = [e.substitute(dict(zip(r, tr))) if i > 0 else e for e in group]
+      merged = mapped[0] if len(mapped) == 1 else UOp.group(*(e.src[0] for e in mapped)).end(*tr)
+      for e in group: subs[e] = merged
+  return sink.substitute(subs) if subs else None
+
+def reduce_ranges_to_acc(ctx:itertools.count, r:UOp):
+  acc = UOp.alloc_like(r, next(ctx), AddrSpace.REG)
+  input_ranges = tuple(x for x in r.src[0].ranges if x not in r.src[1:])
+  acc_init = acc.after(*input_ranges).store(UOp.const(identity_element(r.arg[0], r.dtype)))
+  acc_initted = acc.after(acc_init, *r.src[1:])
+  inp = r.src[0].reduce(arg=r.arg) if r.arg[1] else r.src[0]
+  acc_out = acc_initted.store(acc_initted.alu(r.arg[0], inp)).end(*r.src[1:]).rtag("mergeable")
+  return acc.after(acc_out)
+
+def expand_horizontal_reduce(r:UOp):
+  inp = r.src[0]
+  vals = [inp.index(*idx) for idx in itertools.product(*[range(inp.max_shape[a]) for a in range(r.arg[1])])]
+  return functools.reduce(lambda x,y: x.alu(r.arg[0], y), vals)
+
+# an Invalid in a REDUCE source is that reduce's identity
+pm_reduce_identity = PatternMatcher([
+  (invalid_gate.reduce(allow_any_len=True, name="red"), lambda red,cond,x,i:
+   red.replace(src=(cond.where(x, x.const_like(identity_element(red.arg[0], red.dtype))),)+red.src[1:])),
+])
+
+pm_reduce_local = pm_wmma_add+PatternMatcher([
+  # fix group for reduce
+  (UPat(Ops.REDUCE, name="x"), fix_group_for_reduce),
+  # remove reduces
+  (UPat(Ops.REDUCE, src=(UPat(), UPat()), allow_any_len=True, name="r"), reduce_ranges_to_acc),
+  (UPat(Ops.REDUCE, src=(UPat(),), name="r"), expand_horizontal_reduce),
+  (UPat(Ops.SINK, name="sink"), merge_reduce_ends),
+])+pm_clean_up_group_sink
+
+def is_shape_changing_bitcast(u:UOp): return u.op is Ops.BITCAST and u.shape != u.src[0].shape
+def maybe_load(u:UOp): return u.load() if u.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL, AddrSpace.REG) else u
+pm_add_loads = PatternMatcher([
+  (UPat(GroupOp.Elementwise|{Ops.REDUCE,Ops.WMMA,Ops.STACK}, name="x"),
+   lambda x: None if is_shape_changing_bitcast(x) else x.replace(src=tuple(map(maybe_load, x.src)))),
+  (UPat(Ops.STORE, name="x"), lambda x: x.replace(src=(x.src[0], maybe_load(x.src[1]))+x.src[2:])),
+])
+
+def add_local_buffer(ctx, x:UOp):
+  buf = UOp.alloc(x.max_shape, x.dtype, slot=next(ctx), addrspace=x.arg.addrspace)
+  return buf.after(buf.index(*x.src[1:]).store(x.src[0]).end(*x.src[1:]))
+
+pm_add_local_buffers = PatternMatcher([
+  (UPat(Ops.STAGE, name="x"), add_local_buffer),
+])+pm_mops
+
+# float ALUs need a float operand
+# make that cast explicit before the decomps, which expand SIN/LOG2/EXP2 into float polynomials and assert a float operand
+pm_cast_float_alu = PatternMatcher([
+  (UPat((Ops.SIN, Ops.LOG2, Ops.EXP2, Ops.SQRT, Ops.RECIPROCAL), src=(UPat(name="x"),), name="u"),
+   lambda u,x: u.replace(src=(x.cast(u.dtype),)) if x.dtype != u.dtype else None),
+])
+
+def _is_local_store(x:UOp): return x.op is Ops.STORE and x.addrspace is AddrSpace.LOCAL
+
+def add_raw_barrier(after:UOp):
+  # loads from a LOCAL buffer that depend (via AFTER) on stores to LOCAL memory need a workgroup barrier
+  if after.addrspace is not AddrSpace.LOCAL: return None
+  # one toposort over all the deps
+  deps = UOp.sink(*after.src[1:]).toposort(gate=lambda x: x.op is not Ops.BARRIER)
+  if not any(_is_local_store(x) for x in deps): return None
+  return after.src[0].after(UOp(Ops.BARRIER, src=after.src[1:]))
+
+def add_war_barrier(end:UOp):
+  # a LOCAL buffer stored and loaded in the same loop needs a barrier at the end of the loop body
+  rngs = [r for r in end.ended_ranges if r.axis_type in (AxisType.WEAK, AxisType.LOOP) and r.vmax > 0]
+  if not rngs or end.src[0].op is Ops.BARRIER: return None
+  sl = end.src[0].backward_slice_with_self
+  # only stores that are inside this loop body (not in the backward slice through AFTER chains from other l

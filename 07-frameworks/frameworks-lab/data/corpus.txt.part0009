@@ -1,0 +1,3198 @@
+H = (i.detach() for i in inputs)
+    grad = norm_coefficient * X + G
+    H.assign(H + grad.square())
+    up = grad / (H.sqrt() + epsilon)
+    r = R / (1 + T * decay_factor)
+    X.assign(X.detach() - r * up)
+    return [X, H]
+
+  @_onnx_training(4)
+  def Adam(R:Tensor, T:int, *inputs:Tensor, alpha:float=0.9, beta:float=0.999, epsilon:float=0.0, norm_coefficient:float=0.0,
+          norm_coefficient_post:float=0.0):
+    from tinygrad.nn.optim import Adam as TinyAdam
+    X, G, V, H = inputs
+    G, V, H = G.detach(), V.detach(), H.detach()
+    X.grad = norm_coefficient * X.detach() + G
+    opt = TinyAdam([X], b1=alpha, b2=beta, eps=epsilon)
+    # NOTE: FUSE_OPTIM can change shapes of m and v
+    opt.m, opt.v, opt.lr = [V.reshape(opt.m[0].shape)], [H.reshape(opt.v[0].shape)], R
+    # need no-op for m_hat and v_hat if T == 0
+    if T == 0: opt.b1_t, opt.b2_t = opt.b1_t.zeros_like(), opt.b2_t.zeros_like()
+    else:
+      # `T-1` since it's applied again at the start of `_step`
+      opt.b1_t = Tensor([alpha**(T-1)], dtype=dtypes.float32, device=X.device)
+      opt.b2_t = Tensor([beta**(T-1)], dtype=dtypes.float32, device=X.device)
+    opt.step()
+    X = (1 - norm_coefficient_post) * X
+    return [X, V, H]
+
+  @_onnx_training(3)
+  def Momentum(R:Tensor, T:int, *inputs:Tensor, alpha:float, beta:float, mode:str, norm_coefficient:float):
+    X, G, V = (i.detach() for i in inputs)
+    grad = norm_coefficient * X + G
+    # NOTE: this beta_adjusted term makes it so we can't use SGD for nesterov
+    beta_adjusted = beta if T > 0 else 1
+    V.assign(alpha * V + grad * beta_adjusted)
+    X.assign(X - R * (V if mode == "standard" else (grad + alpha * V)))
+    return [X, V]
+
+  def Gradient(*inputs:Tensor, y:str, intermediate_tensors:dict[str, Tensor], **_):
+    return tuple(intermediate_tensors[y].gradient(*inputs))
+
+  return {
+    # Tensor ops
+    **{op: getattr(Tensor, op.lower()) for op in ("Neg", "Reciprocal", "Sqrt", "Sign", "Abs", "Exp", "Log", "Mish", "Sin", "Cos", "Tan",
+    "Asin", "Acos", "Atan", "Relu", "Sigmoid", "MatMul", "Floor", "Ceil", "IsNaN", "Softplus", "HardSwish", "Where", "Mul", "Sinh", "Cosh",
+    "Tanh", "Softsign", "Asinh", "Acosh", "Atanh", "Elu", "Celu", "Selu", "Round", "Erf")},
+    # Implemented ops
+    **{name:obj for name,obj in locals().items() if isinstance(obj, types.FunctionType) and not name.startswith("_") and name[0].isupper()},
+    # Version ops
+    **{name:obj for name,obj in locals().items() if isinstance(obj, dict)},
+  }
+
+onnx_ops = get_onnx_ops()
+
+# sorted in order of increasing complexity
+import itertools
+from tinygrad.helpers import dedup, flatten, getenv, unwrap, FUSE_OPTIM, TRAINING
+from tinygrad.tensor import Tensor
+from tinygrad.dtype import dtypes, least_upper_dtype, to_dtype
+
+class Optimizer:
+  """
+  Base class for all optimizers.
+  """
+  def __init__(self, params: list[Tensor], lr: float, device=None, fused=FUSE_OPTIM):
+    if lr < 0: raise ValueError(f"Invalid learning rate: {lr}")
+    self.params: list[Tensor] = dedup([x for x in params if x.is_param])
+    assert len(self.params) != 0, "optimizer must have at least one param"
+    self.buffers: list[Tensor] = dedup([x for x in params if not x.is_param])   # buffers are still realized
+    self.device = device or self.params[0].device
+    self.param_dtype = to_dtype(getenv("OPTIM_DTYPE", "float32"))
+    self.fused = fused
+    # store lr in at least float32 precision
+    self.lr = Tensor(lr if getenv("CONST_LR") else [lr], device=self.device,
+                     dtype=least_upper_dtype(dtypes.default_float, dtypes.float32))
+    if self.fused: self.pos_params = list(itertools.accumulate(self.params, lambda x,y: x+y.numel(), initial=0))
+
+  def _new_optim_param(self) -> list[Tensor]:
+    if self.fused: return [Tensor.zeros(self.pos_params[-1], dtype=self.param_dtype, device=self.device)]
+    if isinstance(self.device, tuple): return [Tensor.zeros_like(t, dtype=self.param_dtype) for t in self.params]
+    else: return [Tensor.zeros(t.shape, dtype=self.param_dtype, device=self.device) for t in self.params]
+
+  def zero_grad(self):
+    """
+    Zeroes the gradients of all the parameters.
+    """
+    for param in self.params: param.grad = None
+
+  def step(self):
+    """
+    Performs a single optimization step.
+    """
+    Tensor.realize(*self.schedule_step())
+
+  def schedule_step(self) -> list[Tensor]:
+    """
+    Returns the tensors that need to be realized to perform a single optimization step.
+    """
+    if not TRAINING: raise RuntimeError(
+            f"""TRAINING={TRAINING.value}, TRAINING must be enabled to use the optimizer.
+                - help: Consider using Context(TRAINING=1) before calling Optimizer.step().""")
+    if self.fused:
+      # optimizer fusion just concatenates all the buffers, runs the _step, then splits them back up
+      # NOTE: contiguous is for speed
+      out, extra = self._step([Tensor.cat(*[t.flatten() for t in self.params], dim=0)],
+                              [Tensor.cat(*[unwrap(t.grad).contiguous().flatten() for t in self.params], dim=0)])
+      updates = [out[0][self.pos_params[i]:self.pos_params[i+1]].reshape(tt.shape) for i, tt in enumerate(self.params)]
+    else:
+      updates, extra = self._step(self.params, [unwrap(t.grad) for t in self.params])
+    for i, tt in enumerate(self.params): tt.assign(self._apply_update(tt, updates[i]))
+    return extra+self.params+self.buffers
+
+  def _step(self, params:list[Tensor], grads:list[Tensor]) -> tuple[list[Tensor], list[Tensor]]: raise NotImplementedError
+  def _apply_update(self, t:Tensor, up:Tensor) -> Tensor: return t.detach() - up.to(t.device)
+
+class OptimizerGroup(Optimizer):
+  """
+  Combines multiple optimizers into one.
+  """
+  def __init__(self, *optimizers: Optimizer): # pylint: disable=super-init-not-called
+    self.optimizers = optimizers
+    self.params, self.buffers = flatten([o.params for o in self.optimizers]), flatten([o.buffers for o in self.optimizers])
+  def __getitem__(self, i): return self.optimizers[i]
+  def zero_grad(self): [o.zero_grad() for o in self.optimizers]
+  def schedule_step(self) -> list[Tensor]: return [x for o in self.optimizers for x in o.schedule_step()]
+
+# LARS is essentially just trust ratio to SGD so if we just set the trust coeff 0.0 it's just standard SGD.
+def SGD(params: list[Tensor], lr=0.001, momentum=0.0, weight_decay=0.0, nesterov=False, classic=False, device=None, fused=FUSE_OPTIM):
+  """
+  Stochastic Gradient Descent (SGD) optimizer with optional momentum and weight decay.
+
+  `classic` is a boolean flag that determines whether to use the popular momentum update rule or the classic momentum update rule.
+  """
+  return LARS(params, lr, momentum, weight_decay, 0, None, nesterov, classic=classic, pre_wd=True, tcoef=0.0, device=device, fused=fused)
+
+# Muon applies the newton schulz algorithm on gradient. also can include momentum, nesterov, and weight decay
+def Muon(params: list[Tensor], lr=0.001, momentum=0.95, weight_decay=0.1, ns_steps=5, ns_coefficients=(3.4445, -4.775, 2.0315),
+         nesterov=True, device=None, fused=FUSE_OPTIM):
+  """
+  SGD with newton-schulz iteration and post momentum weight decay.
+
+  - Described: https://kellerjordan.github.io/posts/muon/
+  - Paper: https://arxiv.org/pdf/2502.16982
+  """
+  assert not fused, "FUSE_OPTIM not allowed for Muon optimizer"
+  return LARS(params, lr, momentum, weight_decay, ns_steps, ns_coefficients, nesterov,
+              classic=False, pre_wd=False, tcoef=0.0, device=device, fused=fused)
+
+class LARS(Optimizer):
+  """
+  Layer-wise Adaptive Rate Scaling (LARS) optimizer with optional momentum and weight decay.
+
+  - Paper: https://arxiv.org/abs/1708.03888v3
+  """
+  def __init__(self, params:list[Tensor], lr=0.001, momentum=0.9, weight_decay=1e-4, ns_steps=0, ns_coefficients=None,
+               nesterov=False, classic=True, pre_wd=True, tcoef=0.001, device=None, fused=FUSE_OPTIM):
+    if momentum < 0: raise ValueError(f"Invalid momentum value: {momentum}")
+    super().__init__(params, lr, device, fused)
+    self.momentum, self.wd, self.ns_steps, self.ns_coefficients  = momentum, weight_decay, ns_steps, ns_coefficients
+    self.nesterov, self.classic, self.pre_wd, self.tcoef = nesterov, classic, pre_wd, tcoef
+    self.b = self._new_optim_param() if self.momentum else []
+
+  def _step(self, params:list[Tensor], grads:list[Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+    ret = []
+    for i, (t, g) in enumerate(zip(params, grads)):
+      if self.tcoef != 0:
+        r1 = t.detach().square().sum().sqrt()
+        r2 = g.square().sum().sqrt()
+        r:Tensor|float = (r1 > 0).where((r2 > 0).where(self.tcoef * r1 / (r2 + self.wd * r1), 1.0), 1.0)
+      else: r = 1.0
+      if self.pre_wd and self.wd > 0: g = g + self.wd * t.detach()
+      # classic momentum does post learning rate update
+      if self.classic: g = g * r * self.lr
+      if self.momentum:
+        self.b[i].assign(self.momentum * self.b[i] + g)  # NOTE: self.b[i] is zero on the first run, no if required
+        g = (g + self.momentum * self.b[i]) if self.nesterov else self.b[i]
+      if self.ns_coefficients: g = g.reshape(g.shape[0], -1).newton_schulz(self.ns_steps, self.ns_coefficients).reshape(g.shape)
+      # popular momentum does pre learning rate update
+      if not self.classic: g = g * r * self.lr
+      # muon does post momentum weight decay
+      if not self.pre_wd and self.wd > 0: g = g + self.wd * self.lr * t.detach()
+      ret.append(g.cast(t.dtype))
+    return ret, self.b
+
+# LAMB is essentially just the trust ratio part of LARS applied to Adam/W so if we just set the trust ratio to 1.0 it's just Adam/W.
+def AdamW(params: list[Tensor], lr=0.001, b1=0.9, b2=0.999, eps=1e-8, weight_decay=0.01, device=None, fused=FUSE_OPTIM):
+  """
+  AdamW optimizer with optional weight decay.
+
+  - Paper: https://arxiv.org/abs/1711.05101v3
+  """
+  return LAMB(params, lr, b1, b2, eps, weight_decay, adam=True, device=device, fused=fused)
+def Adam(params: list[Tensor], lr=0.001, b1=0.9, b2=0.999, eps=1e-8, device=None, fused=FUSE_OPTIM):
+  """
+  Adam optimizer.
+
+  - Paper: https://arxiv.org/abs/1412.6980
+  """
+  return LAMB(params, lr, b1, b2, eps, 0.0, adam=True, device=device, fused=fused)
+
+class LAMB(Optimizer):
+  """
+  LAMB optimizer with optional weight decay.
+
+  - Paper: https://arxiv.org/abs/1904.00962
+  """
+  def __init__(self, params: list[Tensor], lr=0.001, b1=0.9, b2=0.999, eps=1e-6, weight_decay=0.0, adam=False, device=None, fused=FUSE_OPTIM):
+    if weight_decay < 0: raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+    super().__init__(params, lr, device, fused)
+    self.b1, self.b2, self.eps, self.wd, self.adam = b1, b2, eps, weight_decay, adam
+    self.b1_t, self.b2_t = (Tensor.ones((1,), dtype=dtypes.float32, device=self.device).is_param_(False) for _ in [b1, b2])
+    self.m = self._new_optim_param()
+    self.v = self._new_optim_param()
+
+  def _step(self, params:list[Tensor], grads:list[Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+    ret = []
+    self.b1_t *= self.b1
+    self.b2_t *= self.b2
+    for i, (t, g) in enumerate(zip(params, grads)):
+      if g.device != self.m[i].device: g = g.contiguous().to(self.m[i].device)
+      self.m[i].assign((self.b1 * self.m[i] + (1.0 - self.b1) * g).cast(self.m[i].dtype))
+      self.v[i].assign((self.b2 * self.v[i] + (1.0 - self.b2) * (g * g)).cast(self.v[i].dtype))
+      m_hat = self.m[i] / (1.0 - self.b1_t)
+      v_hat = self.v[i] / (1.0 - self.b2_t)
+      up = (m_hat / (v_hat.sqrt() + self.eps)).shard_like(t) + self.wd * t.detach()
+      if not self.adam:
+        r1 = t.detach().square().sum().sqrt()
+        r2 = up.square().sum().sqrt()
+        r: Tensor|float = Tensor.where(r1 > 0, Tensor.where(r2 > 0, r1 / r2, 1.0), 1.0)
+      else:
+        r = 1.0
+      ret.append((self.lr * r * up).cast(t.dtype))
+    return ret, [self.b1_t, self.b2_t] + self.m + self.v
+
+import json, pathlib, struct, functools, io, zlib
+from collections import OrderedDict
+from typing import Any, Callable, BinaryIO, Iterable, cast
+from tinygrad.tensor import Tensor
+from tinygrad.dtype import dtypes
+from tinygrad.helpers import prod, argsort, DEBUG, Timing, GlobalCounters, tqdm, round_up, T, strides_for_shape
+
+class TensorIO(io.RawIOBase, BinaryIO):
+  def __init__(self, t: Tensor):
+    if t.ndim != 1 or t.dtype != dtypes.uint8: raise ValueError("Tensor must be 1d and of dtype uint8!")
+    self._position, self._tensor = 0, t
+
+  def readable(self) -> bool: return True
+  def read(self, size: int = -1) -> bytes:
+    if (buf:=super().read(size)) is None: raise ValueError("io.RawIOBase.read returned None") # only happens if readinto returns None (never)
+    return buf
+  def readinto(self, buffer: Any) -> int:
+    data = self._tensor[self._position:self._position+len(buffer)].data()
+    buffer[:len(data)] = data
+    self._position += len(data)
+    return len(data)
+
+  def seekable(self) -> bool: return True
+  def seek(self, offset: int, whence: int = 0) -> int:
+    self._position = min(len(self._tensor), max(0, [offset, self._position+offset, len(self._tensor)+offset][whence]))
+    return self._position
+
+  # required to correctly implement BinaryIO
+  def __enter__(self): return self
+  def write(self, s: Any): raise io.UnsupportedOperation("TensorIO.write not supported")
+  def writelines(self, lines: Iterable[Any]): raise io.UnsupportedOperation("TensorIO.writelines not supported")
+
+safe_dtypes = {"BOOL":dtypes.bool, "I8":dtypes.int8, "U8":dtypes.uint8, "I16":dtypes.int16, "U16":dtypes.uint16, "I32":dtypes.int, "U32":dtypes.uint,
+               "I64":dtypes.int64, "U64":dtypes.uint64, "F8_E4M3":dtypes.fp8e4m3, "F8_E5M2":dtypes.fp8e5m2,
+               "F16":dtypes.float16, "BF16":dtypes.bfloat16, "F32":dtypes.float32, "F64":dtypes.float64}
+inverse_safe_dtypes = {v:k for k,v in safe_dtypes.items()}
+
+def accept_filename(func: Callable[[Tensor], T]) -> Callable[[Tensor|str|pathlib.Path], T]:
+  @functools.wraps(func)
+  def wrapper(fn: Tensor|str|pathlib.Path) -> T: return func(Tensor(pathlib.Path(fn)) if not isinstance(fn, Tensor) else fn)
+  return wrapper
+
+@accept_filename
+def safe_load_metadata(t:Tensor) -> tuple[Tensor, int, dict[str, Any]]:
+  """
+  Loads a .safetensor file, returning the source tensor, data start position, and metadata.
+  """
+  data_start = int.from_bytes(t[0:8].data(), "little") + 8
+  return t, data_start, json.loads(t[8:data_start].data().tobytes())
+
+def safe_load(fn:Tensor|str|pathlib.Path) -> dict[str, Tensor]:
+  """
+  Loads a .safetensor file, returning the `state_dict`.
+
+  ```python
+  state_dict = nn.state.safe_load("test.safetensor")
+  ```
+  """
+  t, data_start, metadata = safe_load_metadata(fn)
+  data = t[data_start:]
+  return { k: data[v['data_offsets'][0]:v['data_offsets'][1]].bitcast(safe_dtypes[v['dtype']]).reshape(v['shape'])
+          for k, v in metadata.items() if k != "__metadata__" }
+
+def safe_save(tensors:dict[str, Tensor], fn:str, metadata:dict[str, Any]|None=None):
+  """
+  Saves a `state_dict` to disk in a .safetensor file with optional metadata.
+
+  ```python
+  t = Tensor([1, 2, 3])
+  nn.state.safe_save({'t':t}, "test.safetensor")
+  ```
+  """
+  if any(v.dtype in dtypes.weaks for v in tensors.values()): raise ValueError("safe_save requires concrete dtypes")
+  headers, offset = {}, 0
+  if metadata: headers['__metadata__'] = metadata
+  for k,v in tensors.items():
+    headers[k] = {'dtype': inverse_safe_dtypes[v.dtype], 'shape': list(v.shape), 'data_offsets':[offset, offset+v.nbytes()]}
+    offset += v.nbytes()
+  j = json.dumps(headers, separators=(',', ':'))
+  j += "\x20"*(round_up(len(j),8)-len(j))
+  pathlib.Path(fn).unlink(missing_ok=True)
+  t = Tensor.empty(8+len(j)+offset, dtype=dtypes.uint8, device=f"disk:{fn}")
+  t[0:8].bitcast(dtypes.int64).assign([len(j)])
+  t[8:8+len(j)].assign(list(j.encode('utf-8')))
+  for k,v in safe_load(t).items(): v.assign(tensors[k])
+
+# state dict
+
+def get_state_dict(obj, prefix:str='', tensor_type=Tensor) -> dict[str, Tensor]:
+  """
+  Returns a `state_dict` of the object, with optional prefix.
+
+  ```python exec="true" source="above" session="tensor" result="python"
+  class Net:
+    def __init__(self):
+      self.l1 = nn.Linear(4, 5)
+      self.l2 = nn.Linear(5, 6)
+
+  net = Net()
+  print(nn.state.get_state_dict(net).keys())
+  ```
+  """
+  if isinstance(obj, tensor_type): return {prefix.strip('.'):obj}
+  if hasattr(obj, '_asdict'): return get_state_dict(obj._asdict(), prefix, tensor_type)  # namedtuple
+  if isinstance(obj, OrderedDict): return get_state_dict(dict(obj), prefix, tensor_type)
+  if hasattr(obj, '__dict__'): return get_state_dict(obj.__dict__, prefix, tensor_type)
+  state_dict = {}
+  if isinstance(obj, (list, tuple)):
+    for i,x in enumerate(obj): state_dict.update(get_state_dict(x, f"{prefix}{str(i)}.", tensor_type))
+  elif isinstance(obj, dict):
+    for k,v in obj.items(): state_dict.update(get_state_dict(v, f"{prefix}{str(k)}.", tensor_type))
+  return state_dict
+
+def get_parameters(obj) -> list[Tensor]:
+  """
+  ```python exec="true" source="above" session="tensor" result="python"
+  class Net:
+    def __init__(self):
+      self.l1 = nn.Linear(4, 5)
+      self.l2 = nn.Linear(5, 6)
+
+  net = Net()
+  print(len(nn.state.get_parameters(net)))
+  ```
+  """
+  return list(get_state_dict(obj).values())
+
+def load_state_dict(model, state_dict:dict[str, Tensor], strict=True, verbose=True, consume=False, realize=True) -> list[Tensor]:
+  """
+  Loads a `state_dict` into a model. Return the loaded Tensors.
+
+  ```python
+  class Net:
+    def __init__(self):
+      self.l1 = nn.Linear(4, 5)
+      self.l2 = nn.Linear(5, 6)
+
+  net = Net()
+  state_dict = nn.state.get_state_dict(net)
+  nn.state.load_state_dict(net, state_dict)
+  ```
+  """
+  start_mem_used = GlobalCounters.mem_used
+  ret = []
+  with Timing("loaded weights in ",
+              lambda et_ns: f", {(B:=(GlobalCounters.mem_used-start_mem_used))/1e9:.2f} GB loaded at {B/et_ns:.2f} GB/s", enabled=verbose):
+    model_state_dict = get_state_dict(model)
+    if DEBUG >= 1 and len(state_dict) > len(model_state_dict):
+      print("WARNING: unused weights in state_dict", sorted(list(state_dict.keys() - model_state_dict.keys())))
+    for k,v in (t := tqdm(model_state_dict.items(), disable=None if verbose else True)):
+      t.desc = f"ram used: {GlobalCounters.mem_used/1e9:5.2f} GB, {k:50s}: "
+      if k not in state_dict and not strict:
+        if DEBUG >= 1: print(f"WARNING: not loading {k}")
+        continue
+      if v.shape != state_dict[k].shape:
+        if {(), (1,)} == {state_dict[k].shape, v.shape}: state_dict[k] = state_dict[k].reshape(v.shape)
+        else: raise ValueError(f'Shape mismatch in layer `{k}`: Expected shape {v.shape}, but found {state_dict[k].shape} in state dict.')
+      if isinstance(v.device, tuple):
+        if isinstance(state_dict[k].device, tuple): v.replace(state_dict[k])
+        else: v.replace(state_dict[k].shard(v.device, v.uop.axis))
+      else: v.replace(state_dict[k].to(v.device))
+      if realize: v.realize()
+      if consume: del state_dict[k]
+      ret.append(v)
+  return ret
+
+@accept_filename
+def zip_extract(t: Tensor) -> dict[str, Tensor]:
+  import zipfile
+  files: dict[str, Tensor] = {}
+  with zipfile.ZipFile(TensorIO(t), "r") as myzip:
+    # sadly, the extra length needs to be read from the local header of each file.
+    # this is a limitation of the zip file format
+    header_contents = [t[zi.header_offset+26:zi.header_offset+30].bitcast(dtypes.uint16).to('CPU') for zi in myzip.filelist]
+    Tensor.realize(*header_contents)
+    for zi, header_content in zip(myzip.filelist, header_contents):
+      # header_offset + sizeFileHeader + File name length + Extra field length
+      file_offset = zi.header_offset + 30 + sum(cast(list[int], header_content.tolist()))
+      files[zi.filename] = t[file_offset:file_offset+zi.compress_size]
+      match zi.compress_type:
+        case zipfile.ZIP_STORED: pass
+        # TODO: we need a zlib UOp so this can be lazy
+        case zipfile.ZIP_DEFLATED: files[zi.filename] = Tensor(zlib.decompress(files[zi.filename].data(), -15))
+        case _: raise NotImplementedError(f"compression {zi.compress_type} not supported")
+  return files
+
+@accept_filename
+def tar_extract(t: Tensor) -> dict[str, Tensor]:
+  """
+  ```python
+  tar_extract(fn: Tensor | str | Path) -> dict[str, Tensor]
+  ```
+
+  Extracts files from a tar archive and returns them as a dictionary of names (keys) and tensors (values).
+
+  ```python
+  tensors = nn.state.tar_extract(Tensor(pathlib.Path("archive.tar")))
+  ```
+  """
+  import tarfile
+  with tarfile.open(fileobj=TensorIO(t), mode="r") as tar:
+    return {member.name:t[member.offset_data:member.offset_data+member.size] for member in tar if member.type == tarfile.REGTYPE}
+
+# torch support!
+
+@accept_filename
+def torch_load(t:Tensor) -> dict[str, Tensor]:
+  """
+  ```python
+  torch_load(fn: Tensor | str | Path) -> dict[str, Tensor]
+  ```
+
+  Loads a torch .pth file, returning the `state_dict`.
+
+  ```python
+  state_dict = nn.state.torch_load("test.pth")
+  ```
+  """
+  storage_source: dict[str|int, Tensor] = {}
+  lens: dict[str|int, int] = {}
+
+  def _rebuild_tensor(storage, storage_offset, size, stride):
+    return _rebuild_tensor_v2(storage, storage_offset, size, stride)
+
+  def _rebuild_tensor_v2(storage, storage_offset, size, stride, requires_grad=None, backward_hooks=None, metadata=None):
+    #print(storage, storage_offset, size, stride, requires_grad, backward_hooks, metadata)
+    lens[storage[2]] = storage[4] * storage[1].itemsize
+    if storage[2] not in storage_source: return None
+    byte_start, byte_end = storage_offset*storage[1].itemsize, (storage_offset + prod(size))*storage[1].itemsize
+    ret = storage_source[storage[2]][byte_start:byte_end].bitcast(storage[1])
+
+    # 7 lines to deal with permuted tensors. NOTE: this currently requires reading off the disk
+    shape_strides = [(s, st) for s,st in zip(size, stride) if s != 1]
+    permute_indexes = [len(shape_strides)-1-y for y in argsort([x[1] for x in shape_strides])]
+    if tuple(permute_indexes) != tuple(range(len(permute_indexes))):
+      intermediate_shape = tuple([shape_strides[x][0] for x in argsort(permute_indexes)])
+      assert tuple([shape_strides[i][1] for i in argsort(permute_indexes)]) == strides_for_shape(intermediate_shape), "nonpermutable strides"
+      if DEBUG >= 3: print(f"WARNING: this torch load is slow. to permute {intermediate_shape} with {permute_indexes}")
+      assert storage[1] != dtypes.bfloat16, "can't permute BF16"
+      # TODO: find a nice way to support all movement ops on disktensors
+      ret = ret.to(None).reshape(intermediate_shape).permute(permute_indexes)
+
+    return ret.reshape(size)
+
+  class Parameter:
+    def __setstate__(self, state): self.tensor = state[0]
+
+  deserialized_objects: dict[str, Any] = {}
+  intercept = {"HalfStorage": dtypes.float16, "FloatStorage": dtypes.float32, "BFloat16Storage": dtypes.bfloat16,
+               "IntStorage": dtypes.int32, "BoolStorage": dtypes.bool,
+               "LongStorage": dtypes.int64, "_rebuild_tensor": _rebuild_tensor, "_rebuild_tensor_v2": _rebuild_tensor_v2,
+               "FloatTensor": None, "Parameter": Parameter}
+  whitelist = {"torch", "collections", "numpy", "_codecs"}  # NOTE: this is not for security, only speed
+  class Dummy: pass
+  import pickle, zipfile, tarfile
+  class TorchPickle(pickle.Unpickler):
+    def find_class(self, module, name):
+      module_root = module.split(".")[0]
+      if module_root not in whitelist:
+        if DEBUG >= 2: print(f"WARNING: returning Dummy for {module} {name}")
+        return Dummy
+      return intercept[name] if module_root == "torch" else super().find_class(module, name)
+    def persistent_load(self, pid): return deserialized_objects.get(pid, pid)
+
+  fobj = io.BufferedReader(TensorIO(t))
+  def passthrough_reset(v: bool): return fobj.seek(0, 0) or v
+  if passthrough_reset(zipfile.is_zipfile(fobj)): # NOTE: passthrough_reset required to support python < 3.14
+    files = zip_extract(t)
+    base_name = next(iter(files)).split('/', 1)[0]
+    # keyed by persistent_id in pickle file
+    storage_source = {fn.split("/")[-1]: data for fn, data in files.items() if fn.startswith(f"{base_name}/data/") and not fn.endswith(".pkl")}
+    return TorchPickle(io.BufferedReader(TensorIO(files[f"{base_name}/data.pkl"]), 1_000_000)).load()
+  elif passthrough_reset(tarfile.is_tarfile(fobj)): # NOTE: passthrough_reset required to support python < 3.11
+    files = tar_extract(t)
+    f = io.BufferedReader(TensorIO(files["storages"]), 1_000_000)
+    # slice source tensor t
+    for _ in range(TorchPickle(f).load()):
+      (key, _, storage_type), sz = TorchPickle(f).load(), struct.unpack('<q', f.read(8))[0]
+      byte_offset = f.tell()
+      storage_source[key] = files["storages"][byte_offset:byte_offset + sz * storage_type.itemsize]
+      f.seek(sz * storage_type.itemsize, 1)
+    f = io.BufferedReader(TensorIO(files["tensors"]), 1_000_000)
+    # get tensor metadata
+    for _ in range(TorchPickle(f).load()):
+      (key, storage_id, _), ndim, _ = TorchPickle(f).load(), struct.unpack('<i', f.read(4))[0], f.read(4)
+      size, stride = struct.unpack(f'<{ndim}q', f.read(8 * ndim)), struct.unpack(f'<{ndim}q', f.read(8 * ndim))
+      storage_offset = struct.unpack('<q', f.read(8))[0]
+      deserialized_objects[str(key)] = _rebuild_tensor_v2((None, storage_type, storage_id, None, -1), storage_offset, size, stride)
+    pkl_data = TorchPickle(io.BufferedReader(TensorIO(files["pickle"]), 1_000_000)).load()
+    return {k: v.tensor if isinstance(v, Parameter) else v for k, v in pkl_data.items()}
+  else:
+    pkl = TorchPickle(fobj)
+    _, _, _, rwd, _, ids, base_offset = pkl.load(), pkl.load(), pkl.load(), fobj.tell(), pkl.load(), pkl.load(), fobj.tell()
+    # slice source tensor t
+    for i in ids:
+      storage_source[i] = t[base_offset + 8:base_offset + 8 + lens[i]]
+      base_offset += 8 + lens[i]
+    fobj.seek(rwd)
+    return TorchPickle(fobj).load()
+
+# type: ignore
+import sys, pathlib
+sys.path.append(pathlib.Path(__file__).parent.parent.as_posix())
+try: import extra.torch_backend.backend  # noqa: F401 # pylint: disable=unused-import
+except ImportError as e: raise ImportError("torch frontend not in release\nTo fix, install tinygrad from a git checkout with pip install -e .") from e
+from __future__ import annotations
+from typing import Callable, cast
+from dataclasses import dataclass, replace
+from tinygrad.helpers import prod, Target, EMULATED_DTYPES
+from tinygrad.uop.ops import Ops, UOp, sint, ssimplify, smin, GroupOp, PatternMatcher
+from tinygrad.dtype import AddrSpace, DType, dtypes
+from tinygrad.renderer.tc import TensorCore
+from tinygrad.device import Compiler
+
+# an access takes its dtype from the buffer it indexes, so accessing at another dtype restates the storage on the buffer that owns it
+def with_storage(x:UOp, dt:DType) -> UOp:
+  if x.op in {Ops.PARAM, Ops.BUFFER, Ops.ALLOC}: return x.replace(arg=replace(x.arg, dtype=dt))
+  return x.replace(src=(with_storage(x.src[0], dt),)+x.src[1:])
+
+@dataclass(frozen=True)
+class Estimates:
+  # number of FLOPS used in the Kernel
+  ops:sint = 0
+  # bytes accessed in loads and stores
+  lds:sint = 0
+  # total bytes accessed, counting only once for bytes that are accessed multiple times
+  mem:sint = 0
+  def __add__(self, o:Estimates): return Estimates(self.ops + o.ops, self.lds + o.lds, self.mem + o.mem)
+  def simplify(self): return Estimates(ssimplify(self.ops), ssimplify(self.lds), ssimplify(self.mem))
+  @staticmethod
+  def from_uops(uops:tuple[UOp, ...], ignore_indexing=False) -> Estimates:
+    flops: sint = 0
+    lds: sint = 0
+    mem: dict[tuple[UOp, Ops], sint] = {}
+    mults: sint = 1
+    mult_stack: list[sint] = []
+    excluded: set[UOp] = set()
+    if ignore_indexing:
+      for u in uops:
+        if u.op in {Ops.INDEX, Ops.SHRINK}:
+          excluded = excluded.union(set(UOp.sink(*u.src[1:]).toposort(lambda x: x.op not in {Ops.END, Ops.BACKEDGE})))
+    for u in uops:
+      if u.op in {Ops.LOAD, Ops.STORE}:
+        buf = u
+        while len(buf.src): buf = buf.src[0]
+        if buf.op is Ops.PARAM:
+          # u.src[0] is INDEX, cap at buffer size for re-reads (e.g. matmul)
+          accessed = mem.get((buf, u.op), 0) + u.src[0].max_numel() * u.src[0].dtype.itemsize * mults
+          mem[(buf, u.op)] = smin(accessed, buf.max_numel() * buf.dtype.itemsize)
+      if u.op is Ops.RANGE:
+        mult_stack.append(mults)
+        if u.dtype is not dtypes.void:  # unbounded loop, unknown trip count
+          mults *= cast(sint, u.src[0].ssimplify())
+          # SPECIAL are already counted in mults
+          mults = mults.substitute({x:x.const_like(0) for x in mults.toposort() if x.op is Ops.SPECIAL}) if isinstance(mults, UOp) else mults
+      elif u.op in {Ops.END, Ops.BACKEDGE}: mults = mult_stack.pop(-1)
+      elif u.op is Ops.SPECIAL: mults *= cast(sint, u.src[0].ssimplify()) # NOTE: we don't push to the mult_stack here, you can't end these
+      elif u.op is Ops.LOAD and u.src[0].addrspace != AddrSpace.REG:
+        lds += u.max_numel() * u.dtype.itemsize * mults
+      elif u.op is Ops.STORE and u.src[0].addrspace != AddrSpace.REG:
+        lds += u.max_numel() * u.src[1].dtype.itemsize * mults
+      elif u.op in GroupOp.ALU and u not in excluded:
+        flops += (mults * (2 if u.op is Ops.MULACC else 1)) * u.max_numel()
+      elif u.op is Ops.WMMA and u not in excluded:
+        flops += 2 * prod(u.arg[0]) // u.arg[2] * mults
+    return Estimates(ssimplify(flops), lds, sum(mem.values()))
+
+class Renderer:
+  target: Target
+  suffix: str = ""
+  # TODO: make this generic with a list of supported types
+  supports_float4: bool = True
+  has_local: bool = True
+  has_shared: bool = True
+  # NOTE: these two should be in (x,y,z) order to match the max_sizes argument in get_grouped_dims
+  global_max: tuple[int, ...]|None = (0x8FFFFFFF,) * (3) # TODO: Ops.SPECIAL int32 indexes right now
+  local_max: tuple[int, ...]|None = (0x8FFFFFFF,) * (3) # TODO: Ops.SPECIAL int32 indexes right now
+  global_prod_max: tuple[int, ...]|None = None
+  shared_max: int = 32768
+  tensor_cores: list[TensorCore] = []
+  extra_matcher: PatternMatcher|None = None
+  code_for_op: dict[Ops, Callable] = {}
+
+  compiler: Compiler = Compiler()
+
+  def __init__(self, target:Target): self.target = target
+  def __reduce__(self): return self.__class__, (self.target,)
+  def render(self, uops:list[UOp]) -> str: raise NotImplementedError("needs a renderer")
+  def asm(self, prg:UOp, lin:UOp) -> bytes: raise NotImplementedError("needs an assembler")
+  def supported_dtypes(self) -> set[DType]:
+    # double can't be bitcast to anything without long support
+    return set(dtypes.all) - ({dtypes.double} if dtypes.long in EMULATED_DTYPES.tolist(dtypes) else set())
+
+# Instruction format detection and decoding
+from __future__ import annotations
+from tinygrad.renderer.amd.dsl import Inst, FixedBitField, EnumBitField
+
+# SDWA/DPP variant detection: src0 field (bits 0-8) encodes the variant
+# 0xf9 (249) = SDWA, 0xfa (250) = DPP16 for CDNA (GFX9)
+_VARIANT_SRC0 = {"_SDWA_SDST": 0xf9, "_SDWA": 0xf9, "_DPP16": 0xfa}
+
+def _matches(data: bytes, cls: type[Inst]) -> bool:
+  """Check if data matches all FixedBitFields and op is in allowed."""
+  for _, field in cls._fields:
+    dword_idx = field.lo // 32
+    if len(data) < (dword_idx + 1) * 4: return False
+    word = int.from_bytes(data[dword_idx*4:(dword_idx+1)*4], 'little')
+    field_lo = field.lo % 32
+    if isinstance(field, FixedBitField):
+      if ((word >> field_lo) & field.mask) != field.default: return False
+    if isinstance(field, EnumBitField) and field.allowed is not None:
+      try: opcode = field.decode((word >> field_lo) & field.mask)
+      except ValueError: return False  # opcode not in enum
+      if opcode not in field.allowed: return False
+  # Check SDWA/DPP variant based on src0 field (bits 0-8) - only for variant classes
+  name = cls.__name__
+  word = int.from_bytes(data[:4], 'little')
+  for suffix, expected_src0 in _VARIANT_SRC0.items():
+    if name.endswith(suffix): return (word & 0x1ff) == expected_src0
+  return True
+
+# Lazy-load instruction format tables to avoid circular imports (ins.py imports dsl.py which is in this package)
+_FORMATS: dict[str, list[type[Inst]]] | None = None
+
+def _load_formats() -> dict[str, list[type[Inst]]]:
+  global _FORMATS
+  if _FORMATS is not None: return _FORMATS
+  from tinygrad.runtime.autogen.amd.rdna3.ins import (VOP1, VOP1_SDST, VOP1_DPP16, VOP1_LIT, VOP2, VOP2_DPP16, VOP2_LIT, VOP3, VOP3_SDST,
+    VOP3SD, VOP3P, VOPC, VOPC_DPP16, VOPD, VINTERP, SOP1, SOP1_LIT, SOP2, SOP2_LIT, SOPC, SOPK, SOPK_LIT, SOPP, SMEM, DS, FLAT, GLOBAL,
+    SCRATCH)
+  from tinygrad.runtime.autogen.amd.rdna4.ins import (VOP1 as R4_VOP1, VOP1_SDST as R4_VOP1_SDST, VOP1_DPP16 as R4_VOP1_DPP16,
+    VOP1_LIT as R4_VOP1_LIT, VOP2 as R4_VOP2, VOP2_DPP16 as R4_VOP2_DPP16, VOP2_LIT as R4_VOP2_LIT, VOP3 as R4_VOP3,
+    VOP3_SDST as R4_VOP3_SDST, VOP3SD as R4_VOP3SD, VOP3P as R4_VOP3P, VOPC as R4_VOPC, VOPC_DPP16 as R4_VOPC_DPP16,
+    VOPD as R4_VOPD, VINTERP as R4_VINTERP, SOP1 as R4_SOP1, SOP1_LIT as R4_SOP1_LIT,
+    SOP2 as R4_SOP2, SOP2_LIT as R4_SOP2_LIT, SOPC as R4_SOPC, SOPC_LIT as R4_SOPC_LIT,
+    SOPK as R4_SOPK, SOPK_LIT as R4_SOPK_LIT, SOPP as R4_SOPP,
+    SMEM as R4_SMEM, DS as R4_DS, VFLAT as R4_FLAT, VGLOBAL as R4_GLOBAL, VSCRATCH as R4_SCRATCH)
+  from tinygrad.runtime.autogen.amd.cdna.ins import (VOP1 as C_VOP1, VOP1_SDWA as C_VOP1_SDWA, VOP1_DPP16 as C_VOP1_DPP16,
+    VOP2 as C_VOP2, VOP2_LIT as C_VOP2_LIT, VOP2_SDWA as C_VOP2_SDWA, VOP2_DPP16 as C_VOP2_DPP16,
+    VOPC as C_VOPC, VOPC_SDWA_SDST as C_VOPC_SDWA_SDST,
+    VOP3 as C_VOP3, VOP3_SDST as C_VOP3_SDST, VOP3SD as C_VOP3SD, VOP3P as C_VOP3P, VOP3P_MFMA as C_VOP3P_MFMA, VOP3PX2 as C_VOP3PX2,
+    SOP1 as C_SOP1, SOP2 as C_SOP2, SOPC as C_SOPC, SOPK as C_SOPK, SOPK_LIT as C_SOPK_LIT, SOPP as C_SOPP, SMEM as C_SMEM, DS as C_DS,
+    FLAT as C_FLAT, GLOBAL as C_GLOBAL, SCRATCH as C_SCRATCH, MUBUF as C_MUBUF)
+  # Order matters: more specific encodings first, catch-alls (SOP2, VOP2) last
+  # Order: base before _LIT (base matches regular ops, _LIT catches lit-only ops excluded from base)
+  _FORMATS = {
+    "rdna3": [VOPD, VOP3P, VINTERP, VOP3SD, VOP3_SDST, VOP3, DS, GLOBAL, SCRATCH, FLAT, SMEM,
+              SOP1, SOP1_LIT, SOP2, SOP2_LIT, SOPC, SOPK, SOPK_LIT, SOPP, VOPC_DPP16, VOPC, VOP1_SDST, VOP1_DPP16, VOP1, VOP1_LIT,
+              VOP2_DPP16, VOP2, VOP2_LIT],
+    "rdna4": [R4_VOPD, R4_VOP3P, R4_VINTERP, R4_VOP3SD, R4_VOP3_SDST, R4_VOP3, R4_DS, R4_GLOBAL, R4_SCRATCH, R4_FLAT, R4_SMEM,
+              R4_SOP1, R4_SOP1_LIT, R4_SOPC, R4_SOPC_LIT, R4_SOPP, R4_SOPK, R4_SOPK_LIT, R4_VOPC_DPP16, R4_VOPC, R4_VOP1_SDST,
+              R4_VOP1_DPP16, R4_VOP1, R4_VOP1_LIT, R4_SOP2, R4_SOP2_LIT, R4_VOP2_DPP16, R4_VOP2, R4_VOP2_LIT],
+    "cdna": [C_VOP3PX2, C_VOP3P_MFMA, C_VOP3P, C_VOP3SD, C_VOP3_SDST, C_VOP3, C_DS, C_GLOBAL, C_SCRATCH, C_FLAT, C_MUBUF, C_SMEM,
+              C_SOP1, C_SOPC, C_SOPP, C_SOPK, C_SOPK_LIT, C_VOPC_SDWA_SDST, C_VOPC,
+              C_VOP1_DPP16, C_VOP1_SDWA, C_VOP1, C_VOP2_DPP16, C_VOP2_SDWA, C_SOP2, C_VOP2, C_VOP2_LIT],
+  }
+  return _FORMATS
+
+def detect_format(data: bytes, arch: str = "rdna3") -> type[Inst]:
+  """Detect instruction format from machine code bytes."""
+  assert len(data) >= 4, f"need at least 4 bytes, got {len(data)}"
+  for cls in _load_formats()[arch]:
+    if _matches(data, cls): return cls
+  raise ValueError(f"unknown {arch} format word={int.from_bytes(data[:4], 'little'):#010x}")
+
+def decode_inst(data: bytes, arch: str = "rdna3") -> Inst:
+  """Decode machine code bytes into an instruction."""
+  return detect_format(data, arch).from_bytes(data)
+
+# dsl.py - clean DSL for AMD assembly
+from typing import Any
+
+# ══════════════════════════════════════════════════════════════
+# Registers - unified src encoding space (0-511)
+# ══════════════════════════════════════════════════════════════
+
+class Reg:
+  # Register names vary by arch: RDNA has NULL@124/M0@125, CDNA has M0@124/reserved@125
+  # RDNA4 has DPP8@233, CDNA has SDWA@249/DPP@250/VCCZ@251/EXECZ@252
+  _NAMES = {102: "FLAT_SCRATCH_LO", 103: "FLAT_SCRATCH_HI", 104: "XNACK_MASK_LO", 105: "XNACK_MASK_HI",
+            106: "VCC_LO", 107: "VCC_HI", 124: "NULL", 125: "M0", 126: "EXEC_LO", 127: "EXEC_HI",
+            233: "DPP8", 234: "DPP8FI", 235: "SHARED_BASE", 236: "SHARED_LIMIT", 237: "PRIVATE_BASE", 238: "PRIVATE_LIMIT",
+            240: "0.5", 241: "-0.5", 242: "1.0", 243: "-1.0", 244: "2.0", 245: "-2.0", 246: "4.0", 247: "-4.0",
+            248: "INV_2PI", 249: "SDWA", 250: "DPP", 251: "VCCZ", 252: "EXECZ", 253: "SCC", 254: "SRC_LDS_DIRECT", 255: "LIT"}
+  _PAIRS = {106: "VCC", 126: "EXEC"}
+
+  def __init__(self, offset: int = 0, sz: int = 512, *, neg: bool = False, abs_: bool = False, hi: bool = False):
+    self.offset, self.sz = offset, sz
+    self.neg, self.abs_, self.hi = neg, abs_, hi
+
+  def __hash__(self): return hash((self.offset, self.sz, self.neg, self.abs_, self.hi))
+  def __getitem__(self, key):
+    if isinstance(key, slice):
+      start, stop = key.start or 0, key.stop or (self.sz - 1)
+      if start < 0 or stop >= self.sz: raise RuntimeError(f"slice [{start}:{stop}] out of bounds for size {self.sz}")
+      return Reg(self.offset + start, stop - start + 1)
+    if key < 0 or key >= self.sz: raise RuntimeError(f"index {key} out of bounds for size {self.sz}")
+    return Reg(self.offset + key, 1)
+  def __eq__(self, other):
+    if isinstance(other, Reg):
+      return (self.offset == other.offset and self.sz == other.sz and
+              self.neg == other.neg and self.abs_ == other.abs_ and self.hi == other.hi)
+    return NotImplemented
+  def __add__(self, other):
+    if isinstance(other, int): return Reg(self.offset + other, self.sz)
+    return NotImplemented
+  def __neg__(self) -> 'Reg': return Reg(self.offset, self.sz, neg=not self.neg, abs_=self.abs_, hi=self.hi)
+  def __abs__(self) -> 'Reg': return Reg(self.offset, self.sz, neg=self.neg, abs_=True, hi=self.hi)
+  @property
+  def h(self) -> 'Reg': return Reg(self.offset, self.sz, neg=self.neg, abs_=self.abs_, hi=True)
+  @property
+  def l(self) -> 'Reg': return Reg(self.offset, self.sz, neg=self.neg, abs_=self.abs_, hi=False)
+  def fmt(self, sz=None, parens=False, upper=False) -> str:
+    o, sz = self.offset, sz or self.sz
+    l, r = ("[", "]") if parens or sz > 1 else ("", "")  # brackets for multi-reg or when parens=True
+    if 256 <= o < 512:
+      idx = o - 256
+      base = f"v{l}{idx}{r}" if sz == 1 else f"v[{idx}:{idx + sz - 1}]"
+    elif o < 106: base = f"s{l}{o}{r}" if sz == 1 else f"s[{o}:{o + sz - 1}]"
+    elif sz == 2 and o in self._PAIRS: base = self._PAIRS[o] if upper else self._PAIRS[o].lower()
+    elif o in self._NAMES: base = self._NAMES[o] if upper else self._NAMES[o].lower()  # special regs (any sz)
+    elif 108 <= o < 124:
+      idx = o - 108
+      base = f"ttmp{l}{idx}{r}" if sz == 1 else f"ttmp[{idx}:{idx + sz - 1}]"
+    elif 128 <= o <= 192: base = str(o - 128)  # inline int constants (0-64)
+    elif 193 <= o <= 208: base = str(-(o - 192))  # inline negative int constants (-1 to -16)
+    else: raise RuntimeError(f"unknown register: offset={o}, sz={sz}")
+    if self.hi: base += ".h"
+    if self.abs_: base = f"abs({base})" if upper else f"|{base}|"
+    if self.neg: base = f"-{base}"
+    return base
+  def __repr__(self): return self.fmt(parens=True, upper=True)
+
+# Full src encoding space
+src = Reg(0, 512)
+
+# Slices for each region (inclusive end)
+s = src[0:105]           # SGPR0-105
+VCC_LO = src[106]
+VCC_HI = src[107]
+VCC = src[106:107]
+ttmp = src[108:123]      # TTMP0-15
+NULL = OFF = src[124]
+M0 = src[125]
+EXEC_LO = src[126]
+EXEC_HI = src[127]
+EXEC = src[126:127]
+# 128: 0, 129-192: integers 1-64, 193-208: integers -1 to -16
+# 240-248: float constants (0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2*PI))
+INV_2PI = src[248]
+SDWA = src[249]
+DPP = DPP16 = src[250]
+VCCZ = src[251]
+EXECZ = src[252]
+SCC = src[253]
+SRC_LDS_DIRECT = src[254]
+LIT = src[255]           # literal constant marker
+v = src[256:511]         # VGPR0-255
+
+# ══════════════════════════════════════════════════════════════
+# BitField
+# ══════════════════════════════════════════════════════════════
+
+class _Bits:
+  """Helper for defining bit fields with slice syntax: bits[hi:lo] or bits[n]."""
+  def __getitem__(self, key) -> 'BitField': return BitField(key.start, key.stop) if isinstance(key, slice) else BitField(key, key)
+bits = _Bits()
+
+class BitField:
+  name: str | None
+  def __init__(self, hi: int, lo: int, default = 0):
+    self.hi, self.lo, self.default, self.name, self.mask = hi, lo, default, None, (1 << (hi - lo + 1)) - 1
+  def __set_name__(self, owner, name: str): self.name = name
+  def __eq__(self, other) -> 'FixedBitField':  # type: ignore[override]
+    if isinstance(other, int): return FixedBitField(self.hi, self.lo, other)
+    raise TypeError(f"BitField.__eq__ expects int, got {type(other).__name__}")
+  def enum(self, enum_cls) -> 'EnumBitField': return EnumBitField(self.hi, self.lo, enum_cls)
+  def encode(self, val) -> int:
+    assert isinstance(val, int), f"BitField.encode expects int, got {type(val).__name__}"
+    return val
+  def decode(self, val): return val
+  def set(self, raw: int, val) -> int:
+    if val is None: val = self.default
+    encoded = self.encode(val)
+    # Handle signed values: convert negative to 2's complement
+    if encoded < 0: encoded = encoded & self.mask
+    if encoded < 0 or encoded > self.mask: raise RuntimeError(f"field '{self.name}': value {encoded} doesn't fit in {self.hi - self.lo + 1} bits")
+    return (raw & ~(self.mask << self.lo)) | (encoded << self.lo)
+  def __get__(self, obj, objtype=None):
+    if obj is None: return self
+    return self.decode((obj._raw >> self.lo) & self.mask)
+  def __set__(self, obj, val): obj._raw = self.set(obj._raw, val)
+
+class FixedBitField(BitField):
+  def set(self, raw: int, val=None) -> int:
+    assert val is None, f"FixedBitField does not accept values, got {val}"
+    return super().set(raw, self.default)
+
+class EnumBitField(BitField):
+  def __init__(self, hi: int, lo: int, enum_cls, allowed: set | None = None):
+    super().__init__(hi, lo)
+    self._enum = enum_cls
+    self.allowed = allowed  # if set, only these enum values are valid for this encoding
+  def encode(self, val) -> int:
+    if not isinstance(val, self._enum): raise RuntimeError(f"expected {self._enum.__name__}, got {type(val).__name__}")
+    if self.allowed is not None and val not in self.allowed:
+      raise RuntimeError(f"opcode {val.name} not allowed in this encoding")
+    return val.value
+  def decode(self, raw): return self._enum(raw)
+
+# ══════════════════════════════════════════════════════════════
+# Typed fields
+# ══════════════════════════════════════════════════════════════
+
+import struct
+def _f32(f: float) -> int: return struct.unpack('I', struct.pack('f', f))[0]
+
+class SrcField(BitField):
+  _valid_range = (0, 511)  # inclusive
+  _FLOAT_ENC = {0.5: 240, -0.5: 241, 1.0: 242, -1.0: 243, 2.0: 244, -2.0: 245, 4.0: 246, -4.0: 247}
+
+  def __init__(self, hi: int, lo: int, default=s[0]):
+    super().__init__(hi, lo, default)
+    expected_size = self._valid_range[1] - self._valid_range[0] + 1
+    actual_size = 1 << (hi - lo + 1)
+    if actual_size != expected_size:
+      raise RuntimeError(f"{self.__class__.__name__}: field size {hi - lo + 1} bits ({actual_size}) "
+                         f"doesn't match range {self._valid_range} ({expected_size})")
+
+  def encode(self, val) -> int:
+    """Encode value. Returns 255 (literal marker) for out-of-range values."""
+    if isinstance(val, Reg): offset = val.offset
+    elif isinstance(val, float): offset = self._FLOAT_ENC.get(val, 255)
+    elif isinstance(val, int) and 0 <= val <= 64: offset = 128 + val
+    elif isinstance(val, int) and -16 <= val < 0: offset = 192 - val
+    elif isinstance(val, int): offset = 255  # literal
+    else: raise TypeError(f"invalid src value {val}")
+    if not (self._valid_range[0] <= offset <= self._valid_range[1]):
+      raise TypeError(f"{self.__class__.__name__}: {val} (offset {offset}) out of range {self._valid_range}")
+    return offset - self._valid_range[0]
+
+  def decode(self, raw): return src[raw + self._valid_range[0]]
+
+  def __get__(self, obj, objtype=None):
+    if obj is None: return self
+    reg = self.decode((obj._raw >> self.lo) & self.mask)
+    # Resize register based on operand info (skip non-resizable special registers)
+    # VCC/EXEC pairs (106, 126), NULL (124), M0 (125), float constants (240-255)
+    if reg.offset not in (124, 125) and not 240 <= reg.offset <= 255:
+      # Map variant field names (vsrc0->src0, vsrc1->src1, etc.) for DPP/SDWA classes
+      assert self.name is not None
+      name = self.name[1:] if self.name.startswith('v') and self.name[1:] in obj.op_regs else self.name
+      if sz := obj.op_regs.get(name, 1): reg = Reg(reg.offset, sz, neg=reg.neg, abs_=reg.abs_, hi=reg.hi)
+    return reg
+
+class VGPRField(SrcField):
+  _valid_range = (256, 511)
+  def __init__(self, hi: int, lo: int, default=v[0]): super().__init__(hi, lo, default)
+  def encode(self, val) -> int:
+    if not isinstance(val, Reg): raise TypeError(f"VGPRField requires Reg, got {type(val).__name__}")
+    # For 8-bit vdst fields in VOP1/VOP2 16-bit ops, bit 7 is opsel for dest half
+    encoded = super().encode(val)
+    if val.hi and (self.hi - self.lo + 1) == 8:
+      if encoded >= 128:
+        raise ValueError(f"VGPRField: v[{encoded}].h not encodable in 8-bit field (v[0:127] only for .h)")
+      encoded |= 0x80
+    return encoded
+class SGPRField(SrcField): _valid_range = (0, 127)
+class SSrcField(SrcField): _valid_range = (0, 255)
+
+class AlignedSGPRField(BitField):
+  """SGPR field with alignment requirement. Encoded as sgpr_index // alignment."""
+  _align: int = 2
+  def encode(self, val):
+    if isinstance(val, int) and val == 0: return 0  # default: encode as s[0]
+    if not isinstance(val, Reg): raise TypeError(f"{self.__class__.__name__} requires Reg, got {type(val).__name__}")
+    if not (0 <= val.offset < 128): raise ValueError(f"{self.__class__.__name__} requires SGPR, got offset {val.offset}")
+    if val.offset & (self._align - 1): raise ValueError(f"{self.__class__.__name__} requires {self._align}-aligned SGPR, got s[{val.offset}]")
+    return val.offset >> (self._align.bit_length() - 1)
+  def decode(self, raw): return src[raw << (self._align.bit_length() - 1)]
+  def __get__(self, obj, objtype=None):
+    if obj is None: return self
+    reg = self.decode((obj._raw >> self.lo) & self.mask)
+    if sz := obj.op_regs.get(self.name, 1): reg = Reg(reg.offset, sz, neg=reg.neg, abs_=reg.abs_, hi=reg.hi)
+    return reg
+
+class SBaseField(AlignedSGPRField): _align = 2
+class SRsrcField(AlignedSGPRField): _align = 4
+
+class VDSTYField(BitField):
+  """VOPD vdsty: encoded = vgpr_idx >> 1. Actual vgpr = (encoded << 1) | ((vdstx & 1) ^ 1)."""
+  def encode(self, val):
+    if not isinstance(val, Reg): raise TypeError(f"VDSTYField requires Reg, got {type(val).__name__}")
+    if not (256 <= val.offset < 512): raise ValueError(f"VDSTYField requires VGPR, got offset {val.offset}")
+    return (val.offset - 256) >> 1
+  def __get__(self, obj, objtype=None):
+    if obj is None: return self
+    raw = (obj._raw >> self.lo) & self.mask
+    vdstx_bit0 = (obj.vdstx.offset - 256) & 1
+    vgpr_idx = (raw << 1) | (vdstx_bit0 ^ 1)
+    return Reg(256 + vgpr_idx, 1)
+
+# ══════════════════════════════════════════════════════════════
+# Operand info from XML
+# ══════════════════════════════════════════════════════════════
+
+import functools
+from tinygrad.runtime.autogen.amd.rdna3.operands import OPERANDS as OPERANDS_RDNA3
+from tinygrad.runtime.autogen.amd.rdna4.operands import OPERANDS as OPERANDS_RDNA4
+from tinygrad.runtime.autogen.amd.cdna.operands import OPERANDS as OPERANDS_CDNA
+OPERANDS = {**OPERANDS_CDNA, **OPERANDS_RDNA3, **OPERANDS_RDNA4}
+
+# ══════════════════════════════════════════════════════════════
+# Inst base class
+# ══════════════════════════════════════════════════════════════
+
+def _needs_literal(val) -> bool:
+  """Check if a value needs a literal constant (can't be encoded inline)."""
+  if val is None or isinstance(val, Reg): return False
+  if isinstance(val, float): return val not in SrcField._FLOAT_ENC
+  if isinstance(val, int): return not (0 <= val <= 64 or -16 <= val < 0)
+  return False
+
+def _get_variant(cls, suffix: str):
+  """Get a variant class by suffix (e.g., '_LIT') via module lookup."""
+  import sys
+  module = sys.modules.get(cls.__module__)
+  return getattr(module, f"{cls.__name__}{suffix}", None) if module else None
+
+def _canonical_name(name: str) -> str | None:
+  """Map operand name to canonical name."""
+  if name in ('src0', 'vsrc0', 'ssrc0'): return 's0'
+  if name in ('src1', 'vsrc1', 'ssrc1'): return 's1'
+  if name == 'src2': return 's2'
+  if name in ('vdst', 'sdst', 'sdata'): return 'd'
+  if name in ('data', 'vdata', 'data0', 'vsrc'): return 'data'
+  return None
+
+class Inst:
+  _fields: list[tuple[str, BitField]]
+  _base_size: int
+
+  def __init_subclass__(cls):
+    # Collect fields from all parent classes, then override with this class's fields
+    inherited = {}
+    for base in reversed(cls.__mro__[1:]):
+      if hasattr(base, '_fields'):
+        inherited.update(dict(base._fields))
+    inherited.update({name: val for name, val in cls.__dict__.items() if isinstance(val, BitField)})
+    cls._fields = list(inherited.items())
+    cls._base_size = (max(f.hi for _, f in cls._fields) + 8) // 8
+
+  def __new__(cls, *args, **kwargs):
+    # Auto-upgrade to variant if needed (only for base classes, not variants)
+    if not any(cls.__name__.endswith(sfx) for sfx in ('_LIT', '_DPP16', '_DPP8', '_SDWA', '_SDWA_SDST', '_MFMA')):
+      args_iter = iter(args)
+      for name, field in cls._fields:
+        if isinstance(field, FixedBitField): continue
+        val = kwargs.get(name) if name in kwargs else next(args_iter, None)
+        if not isinstance(field, SrcField): continue
+        if isinstance(val, Reg) and val.offset == 255 and (lit_cls := _get_variant(cls, '_LIT')): return lit_cls(*args, **kwargs)
+        if isinstance(val, Reg) and val.offset == 249:
+          if (sdwa_cls := _get_variant(cls, '_SDWA') or _get_variant(cls, '_SDWA_SDST')): return sdwa_cls(*args, **kwargs)
+        if isinstance(val, Reg) and val.offset == 250 and (dpp_cls := _get_variant(cls, '_DPP16')): return dpp_cls(*args, **kwargs)
+        if _needs_literal(val) and (lit_cls := _get_variant(cls, '_LIT')): return lit_cls(*args, **kwargs)
+    return object.__new__(cls)
+
+  def __init__(self, *args, **kwargs):
+    self._raw = 0
+    # Map positional args to field names (skip FixedBitFields)
+    args_iter = iter(args)
+    vals: dict[str, Any] = {}
+    for name, field in self._fields:
+      if isinstance(field, FixedBitField): vals[name] = None
+      elif name in kwargs: vals[name] = kwargs[name]
+      else: vals[name] = next(args_iter, None)
+    assert not (remaining := list(args_iter)), f"too many positional args: {remaining}"
+    known_field_names = [name for name,field in self._fields if not isinstance(field, FixedBitField)]
+    for name in kwargs:
+      if name not in known_field_names: raise TypeError(f"{self.__class__.__name__}() got an unexpected keyword argument {name!r}")
+    # Extract modifiers from Reg objects and merge into neg/abs/opsel
+    neg_bits, abs_bits, opsel_bits = 0, 0, 0
+    for name, bit in [('src0', 0), ('src1', 1), ('src2', 2)]:
+      if name in vals and isinstance(vals[name], Reg):
+        reg = vals[name]
+        if reg.neg: neg_bits |= (1 << bit)
+        if reg.abs_: abs_bits |= (1 << bit)
+        if reg.hi: opsel_bits |= (1 << bit)
+    if 'vdst' in vals and isinstance(vals['vdst'], Reg) and vals['vdst'].hi:
+      opsel_bits |= (1 << 3)
+    if neg_bits: vals['neg'] = (vals.get('neg') or 0) | neg_bits
+    if abs_bits: vals['abs'] = (vals.get('abs') or 0) | abs_bits
+    if opsel_bits: vals['opsel'] = (vals.get('opsel') or 0) | opsel_bits
+    # For _LIT classes, capture literal value from SrcFields that encode to 255
+    literal_val = None
+    for name, field in self._fields:
+      val = vals[name]
+      if isinstance(field, SrcField) and val is not None and _needs_literal(val):
+        literal_val = _f32(val) if isinstance(val, float) else val & 0xFFFFFFFF
+    if literal_val is not None and 'literal' in vals:
+      vals['literal'] = literal_val
+    # Set all field values
+    for name, field in self._fields:
+      self._raw = field.set(self._raw, vals[name])
+    # Validate register sizes against operand info (skip special registers like NULL, VCC, EXEC, SDWA/DPP markers)
+    for name, expected in self.op_regs.items():
+      if (val := vals.get(name)) is None: continue
+      if isinstance(val, Reg) and val.sz != expected and not (106 <= val.offset <= 127 or 249 <= val.offset <= 255):
+        raise TypeError(f"{name} expects {expected} register(s), got {val.sz}")
+
+  @property
+  def op_name(self) -> str: return getattr(self, 'op').name
+  @property
+  def operands(self) -> dict: return OPERANDS.get(getattr(self, 'op'), {}) if hasattr(self, 'op') else {}
+  def _is_cdna(self) -> bool: return 'cdna' in type(self).__module__
+
+  @functools.cached_property
+  def op_bits(self) -> dict[str, int]:
+    """Get bit widths for each operand field, with WAVE32 and addr/saddr adjustments."""
+    if not hasattr(self, 'op'): return {k: v[1] for k, v in self.operands.items()}
+    bits = {k: v[1] for k, v in self.operands.items()}
+    # RDNA (WAVE32): condition masks, carry flags, and compare results are 32-bit
+    if not self._is_cdna():
+      name = self.op_name.lower()
+      if 'cndmask' in name and 'src2' in bits: bits['src2'] = 32
+      if '_co_ci_' in name and 'src2' in bits: bits['src2'] = 32  # carry-in source
+      # VOP3SD: sdst is always wavefront-size dependent (carry-out or condition mask)
+      if 'VOP3SD' in type(self).__name__ and 'sdst' in bits: bits['sdst'] = 32
+      if 'cmp' in name and 'vdst' in bits: bits['vdst'] = 32
+    # GLOBAL/FLAT: addr is 32-bit if saddr is valid SGPR, 64-bit if saddr is NULL
+    # SCRATCH: addr is always 32-bit (offset from scratch base, not absolute address)
+    if 'addr' in bits and (saddr_field := getattr(type(self), 'saddr', None)) and type(self).__name__ not in ('SCRATCH', 'VSCRATCH'):
+      saddr_val = (self._raw >> saddr_field.lo) & saddr_field.mask  # access _raw directly to avoid recursion
+      bits['addr'] = 64 if saddr_val in (124, 125) else 32  # 124=NULL, 125=M0
+    # MUBUF/MTBUF: vaddr size depends on offen/idxen (1 or 2 regs)
+    if 'vaddr' in bits and hasattr(self, 'offen') and hasattr(self, 'idxen'):
+      bits['vaddr'] = max(1, self.offen + self.idxen) * 32
+    # F8F6F4 MFMA: CBSZ selects matrix A format, BLGP selects matrix B format
+    # VGPRs: FP8/BF8(0,1)=8, FP6/BF6(2,3)=6, FP4(4)=4
+    if 'f8f6f4' in getattr(self, 'op_name', '').lower():
+      # Use explicit fields if available (VOP3PX2), else extract from VOP3P-MAI bit positions
+      cbsz = getattr(self, 'cbsz') if hasattr(type(self), 'cbsz') else (self._raw >> 8) & 0x7
+      blgp = getattr(self, 'blgp') if hasattr(type(self), 'blgp') else (self._raw >> 61) & 0x7
+      vgprs = {0: 8, 1: 8, 2: 6, 3: 6, 4: 4}
+      bits['src0'], bits['src1'] = vgprs.get(cbsz, 8) * 32, vgprs.get(blgp, 8) * 32
+    return bits
+  @property
+  def op_regs(self) -> dict[str, int]:
+    """Get register counts for each operand field."""
+    return {k: max(1, v // 32) for k, v in self.op_bits.items()}
+
+  @functools.cached_property
+  def canonical_op_bits(self) -> dict[str, int]:
+    """Get bit widths with canonical names: {'s0', 's1', 's2', 'd', 'data'}."""
+    bits = {'d': 32, 's0': 32, 's1': 32, 's2': 32, 'data': 32}
+    for name, val in self.op_bits.items():
+      if (cn := _canonical_name(name)): bits[cn] = val
+    return bits
+
+  @functools.cached_property
+  def canonical_operands(self) -> dict:
+    """Get operands with canonical names: {'s0', 's1', 's2', 'd', 'data'}."""
+    result = {}
+    for name, val in self.operands.items():
+      if (cn := _canonical_name(name)): result[cn] = val
+    return result
+
+  @property
+  def canonical_op_regs(self) -> dict[str, int]:
+    """Get register counts with canonical names: {'s0', 's1', 's2', 'd', 'data'}."""
+    return {k: max(1, v // 32) for k, v in self.canonical_op_bits.items()}
+
+  def num_srcs(self) -> int:
+    """Get number of source operands from operand info."""
+    ops = self.operands
+    if 'src2' in ops: return 3
+    if 'src1' in ops or 'vsrc1' in ops or 'ssrc1' in ops: return 2
+    if 'src0' in ops or 'vsrc0' in ops or 'ssrc0' in ops: return 1
+    return 0
+  @classmethod
+  def _size(cls) -> int: return cls._base_size
+  def size(self) -> int: return self._base_size
+  def disasm(self) -> str: raise NotImplementedError("disasm is no longer supported")
+
+  def to_bytes(self) -> bytes: return self._raw.to_bytes(self._base_size, 'little')
+
+  @property
+  def _literal(self) -> int | None:
+    """Get the literal value if this instruction has one."""
+    return getattr(self, 'literal', None)
+
+  def _variant_suffix(self) -> str | None:
+    """Check if instruction needs a variant class (_LIT, _DPP8, _DPP16, _SDWA). Returns suffix or None."""
+    cls_name = type(self).__name__
+    # Don't check for variants if we're already a variant class
+    if any(s in cls_name for s in ('_LIT', '_DPP8', '_DPP16', '_SDWA')): return None
+    # VOPD: FMAMK/FMAAK opcodes always require literal (check by name since enum may differ across archs)
+    for name in ('opx', 'opy'):
+      if hasattr(self, name) and any(x in getattr(self, name).name for x in ('FMAMK', 'FMAAK')): return '_LIT'
+    for name, field in self._fields:
+      if isinstance(field, SrcField):
+        off = getattr(self, name).offset
+        if off == 255: return '_LIT'
+        if off == 249: return '_SDWA' if self._is_cdna() else '_DPP8'
+        if off == 250: return '_DPP16'
+    return None
+
+  @classmethod
+  def from_bytes(cls, data: bytes):
+    inst = object.__new__(cls)
+    inst._raw = int.from_bytes(data[:cls._base_size], 'little')
+    # Upgrade to variant class if needed (_LIT, _DPP8, _DPP16, _SDWA)
+    if (suffix := inst._variant_suffix()) and (var_cls := _get_variant(cls, suffix)) is not None:
+      return var_cls.from_bytes(data)
+    return inst
+
+  def __eq__(self, other): return type(self) is type(other) and self._raw == other._raw
+  def __hash__(self): return hash((type(self), self._raw))
+
+  def __repr__(self):
+    # collect (repr, is_default) pairs, strip trailing defaults so repr roundtrips with eval
+    name = self.op.name.lower() if hasattr(self, 'op') else type(self).__name__
+    parts = [(repr(v := getattr(self, n)), v == f.default) for n, f in self._fields if n != 'op' and not isinstance(f, FixedBitField)]
+    while parts and parts[-1][1]: parts.pop()
+    return f"{name}({', '.join(p[0] for p in parts)})"
+
+# minimal amdgpu elf packer
+import ctypes
+from tinygrad.dtype import AddrSpace
+from tinygrad.helpers import ceildiv, round_up
+from tinygrad.uop.ops import UOp, Ops
+from tinygrad.runtime.autogen import amdgpu_kd, hsa, libc
+from tinygrad.renderer.amd.dsl import Reg, FixedBitField
+from tinygrad.runtime.autogen.amd.common import OpType
+
+# instructions used for padding
+from tinygrad.runtime.autogen.amd.rdna3.ins import s_code_end # same encoding as RDNA4
+from tinygrad.runtime.autogen.amd.cdna.ins import s_nop as s_nop_cdna
+
+_arch_map = {"gfx9": "cdna", "gfx10": "rdna3", "gfx11": "rdna3", "gfx12": "rdna4"}
+def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
+  insts = [u.arg[0] for u in lin.src]
+
+  # ** scan for max vgpr/sgpr/accvgpr
+  max_vgpr, max_sgpr, max_accvgpr = 0, 0, 0
+  _ACCVGPR_TYPES = {OpType.OPR_ACCVGPR, OpType.OPR_SRC_ACCVGPR}
+  for inst in insts:
+    # build set of field names that are AccVGPR for this instruction
+    accvgpr_fields: set[str] = set()
+    for opr_name, (_, _, opr_type) in inst.operands.items():
+      if opr_type in _ACCVGPR_TYPES: accvgpr_fields.add(opr_name)
+      elif opr_type in {OpType.OPR_VGPR_OR_ACCVGPR, OpType.OPR_SRC_VGPR_OR_ACCVGPR, OpType.OPR_SRC_VGPR_OR_ACCVGPR_OR_CONST}:
+        if getattr(inst, 'acc_cd', 0) == 1: accvgpr_fields.add(opr_name)
+    for name, field in inst._fields:
+      if isinstance(field, FixedBitField): continue
+      val = getattr(inst, name)
+      if not isinstance(val, Reg): continue
+      if 256 <= val.offset < 512:
+        if name in accvgpr_fields: max_accvgpr = max(max_accvgpr, (val.offset - 256) + val.sz)
+        else: max_vgpr = max(max_vgpr, (val.offset - 256) + val.sz)
+      elif val.offset < 106: max_sgpr = max(max_sgpr, val.offset + val.sz)
+
+  # ** scan sink for metadata
+  sink, param_sizes, lds_size, gids = prg.src[0], {}, 0, set()
+  for u in sink.toposort():
+    if u.op is Ops.PARAM: param_sizes[u.arg.slot] = u.dtype.itemsize if u.addrspace is AddrSpace.ALU else 8
+    elif u.op is Ops.BUFFER and u.addrspace is AddrSpace.LOCAL: lds_size += u.max_numel() * u.dtype.itemsize
+    elif u.op is Ops.SPECIAL and u.arg.startswith("gidx"): gids.add(int(u.arg[-1]))
+  code_bytes = b"".join(inst.to_bytes() for inst in insts)
+  arch = next(v for k, v in _arch_map.items() if arch.startswith(k))
+  is_cdna, is_rdna4 = arch == "cdna", arch == "rdna4"
+
+  # ** pad text to ISA alignment
+  padding_inst = (s_nop_cdna(0) if is_cdna else s_code_end()).to_bytes()
+  text = code_bytes + padding_inst * ((hsa.AMD_ISA_ALIGN_BYTES - len(code_bytes) % hsa.AMD_ISA_ALIGN_BYTES) % hsa.AMD_ISA_ALIGN_BYTES)
+  text_offset = round_up(ctypes.sizeof(libc.Elf64_Ehdr), hsa.AMD_ISA_ALIGN_BYTES)
+
+  # ** pack kernel descriptor (rodata)
+  # CDNA: total VGPRs = regular VGPRs + AccVGPRs, each rounded to granularity of 4
+  accum_offset = round_up(max_vgpr, 4) if max_accvgpr > 0 else 0
+  next_free_vgpr = round_up(accum_offset + max_accvgpr, 8) if max_accvgpr > 0 else round_up(max_vgpr, 8)
+  next_free_sgpr = round_up(max_sgpr, 8)
+  vgpr_granule = max(0, (next_free_vgpr + 7) // 8 - 1)
+  # CDNA: add 6 for VCC(2) + FLAT_SCRATCH(2) + XNACK_MASK(2), next_free_sgpr is unused in RDNA.
+  sgpr_granule = max(0, ceildiv(next_free_sgpr + 6, 8) - 1) if is_cdna else 0
+  desc = amdgpu_kd.llvm_amdhsa_kernel_descriptor_t()
+  desc.group_segment_fixed_size = lds_size
+  for sz in (param_sizes[i] for i in sorted(param_sizes)): desc.kernarg_size = round_up(desc.kernarg_size, sz) + sz
+  desc.kernel_code_entry_byte_offset = -len(text)
+
+  # https://llvm.org/docs/AMDGPUUsage.html#amdgpu-amdhsa-compute-pgm-rsrc1-gfx6-gfx12-table
+  # NOTE: CU mode is the default
+  desc.compute_pgm_rsrc1 = (vgpr_granule << amdgpu_kd.COMPUTE_PGM_RSRC1_GRANULATED_WORKITEM_VGPR_COUNT_SHIFT |
+                            sgpr_granule << amdgpu_kd.COMPUTE_PGM_RSRC1_GRANULATED_WAVEFRONT_SGPR_COUNT_SHIFT |
+                            3 << amdgpu_kd.COMPUTE_PGM_RSRC1_FLOAT_DENORM_MODE_16_64_SHIFT |
+                            (0 if is_rdna4 else 1) << amdgpu_kd.COMPUTE_PGM_RSRC1_GFX6_GFX11_ENABLE_DX10_CLAMP_SHIFT |
+                            (0 if is_rdna4 else 1) << amdgpu_kd.COMPUTE_PGM_RSRC1_GFX6_GFX11_ENABLE_IEEE_MODE_SHIFT |
+                            (0 if is_cdna else 1) << amdgpu_kd.COMPUTE_PGM_RSRC1_GFX10_PLUS_MEM_ORDERED_SHIFT)
+  desc.compute_pgm_rsrc2 = (2 << amdgpu_kd.COMPUTE_PGM_RSRC2_USER_SGPR_COUNT_SHIFT |
+                            int(0 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_X_SHIFT |
+                            int(1 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Y_SHIFT |
+                            int(2 in gids) << amdgpu_kd.COMPUTE_PGM_RSRC2_ENABLE_SGPR_WORKGROUP_ID_Z_SHIFT)
+  desc.kernel_code_properties = (1 << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_SGPR_KERNARG_SEGMENT_PTR_SHIFT |
+                                 (0 if is_cdna else 1) << amdgpu_kd.KERNEL_CODE_PROPERTY_ENABLE_WAVEFRONT_SIZE32_SHIFT)
+  if is_cdna and max_accvgpr > 0:
+    desc.compute_pgm_rsrc3 = max(0, accum_offset // 4 - 1) << amdgpu_kd.COMPUTE_PGM_RSRC3_GFX90A_ACCUM_OFFSET_SHIFT
+  rodata = bytes(desc)
+
+  # ** pack ELF
+  sh_names:list[int] = []
+  strtab = bytearray(b"\x00")
+  for name in [".text", ".rodata", ".strtab"]:
+    sh_names.append(len(strtab))
+    strtab += name.encode("ascii") + b"\x00"
+
+  rodata_offset = round_up(text_offset + (text_size := len(text)), hsa.AMD_KERNEL_CODE_ALIGN_BYTES)
+  strtab_offset = rodata_offset + (rodata_size := len(rodata))
+  shdr_offset   = strtab_offset + (strtab_size := len(strtab))
+
+  sections = [(libc.SHT_PROGBITS, libc.SHF_ALLOC | libc.SHF_EXECINSTR, text_offset, text_offset, text_size),
+              (libc.SHT_PROGBITS, libc.SHF_ALLOC, rodata_offset, rodata_offset, rodata_size),
+              (libc.SHT_STRTAB, 0, 0, strtab_offset, strtab_size)]
+  shdrs = (libc.Elf64_Shdr * len(sections))()
+  for i, s in enumerate(sections): shdrs[i] = libc.Elf64_Shdr(sh_names[i], *s)
+
+  ehdr = libc.Elf64_Ehdr()
+  ehdr.e_ident[:5], ehdr.e_shoff, ehdr.e_shnum, ehdr.e_shstrndx = b"\x7FELF\x02", shdr_offset, len(sections), 2
+
+  elf = bytearray(shdr_offset + ctypes.sizeof(shdrs))
+  elf[0:ctypes.sizeof(ehdr)] = bytes(ehdr)
+  elf[text_offset:text_offset+text_size] = text
+  elf[rodata_offset:rodata_offset+rodata_size] = rodata
+  elf[strtab_offset:strtab_offset+strtab_size] = strtab
+  elf[shdr_offset:shdr_offset+ctypes.sizeof(shdrs)] = bytes(shdrs)
+  binary = bytes(elf)
+
+  return binary
+
+# AMD ISA code generator - generates enum.py, ins.py, operands.py, str_pcode.py
+# Sources: XML from https://gpuopen.com/download/machine-readable-isa/latest/
+#          PDF manuals from AMD documentation
+import re, zlib, xml.etree.ElementTree as ET, zipfile, pathlib
+from tinygrad.helpers import fetch
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ARCHS = {
+  "rdna3": {"xml": "amdgpu_isa_rdna3_5.xml", "pdf": "https://gpuopen.com/download/rdna35_instruction_set_architecture.pdf"},
+  "rdna4": {"xml": "amdgpu_isa_rdna4.xml", "pdf": "https://gpuopen.com/download/rdna4-instruction-set-architecture.pdf"},
+  "cdna": {"xml": "amdgpu_isa_cdna4.xml", "pdf": "https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna4-instruction-set-architecture.pdf"},
+}
+# Pin the September 2025 XML bundle because newer `latest` changed WMMA format bit sizes across archs and breaks generation.
+XML_URL = "https://gpuopen.com/download/AMD_GPU_MR_ISA_XML_2025_09_05.zip"
+# Map XML encoding names to codebase names
+NAME_MAP = {"VOP3_SDST_ENC": "VOP3SD", "VOP3_SDST_ENC_LIT": "VOP3SD_LIT", "VOP3_SDST_ENC_DPP16": "VOP3SD_DPP16",
+            "VOP3_SDST_ENC_DPP8": "VOP3SD_DPP8", "VOPDXY": "VOPD", "VOPDXY_LIT": "VOPD_LIT", "VDS": "DS"}
+# Instructions missing from XML but present in PDF
+FIXES = {"rdna3": {"SOPK": {22: "S_SUBVECTOR_LOOP_BEGIN", 23: "S_SUBVECTOR_LOOP_END"}, "FLAT": {55: "FLAT_ATOMIC_CSUB_U32"}},
+         "rdna4": {"SOP1": {80: "S_GET_BARRIER_STATE", 81: "S_BARRIER_INIT", 82: "S_BARRIER_JOIN"}, "SOPP": {9: "S_WAITCNT", 21: "S_BARRIER_LEAVE"}},
+         "cdna": {"DS": {152: "DS_GWS_SEMA_RELEASE_ALL", 154: "DS_GWS_SEMA_V", 156: "DS_GWS_SEMA_P"},
+                  "VOP3P": {44: "V_MFMA_LD_SCALE_B32", 62: "V_MFMA_F32_16X16X8_XF32", 63: "V_MFMA_F32_32X32X4_XF32"}}}
+# Fields missing from XML but present in hardware (format: {arch: {encoding: [(name, hi, lo), ...]}})
+FIELD_FIXES = {"cdna": {"VOP3P": [("opsel_hi2", 14, 14)]}}
+# Fields variable in XML but fixed in hardware (format: {arch: {encoding: {name: value or (encoding, opcode) of the embedded instruction}}})
+FIXED_FIELDS: dict[str, dict[str, dict[str, int|tuple[str, str]]]] = {
+  "cdna": {"VOP3PX2": {"x2encoding": ("VOP3P", "V_MFMA_LD_SCALE_B32"), "abid": 1}}}
+# Encoding suffixes to strip (variants we don't generate separate classes for)
+_ENC_SUFFIXES = ("_NSA1",)
+# Encoding suffix to class suffix mapping (for variants we DO generate)
+_ENC_SUFFIX_MAP = {"_INST_LITERAL": "_LIT", "_VOP_DPP16": "_DPP16", "_VOP_DPP": "_DPP16", "_VOP_DPP8": "_DPP8",
+                   "_VOP_SDWA": "_SDWA", "_VOP_SDWA_SDST_ENC": "_SDWA_SDST", "_MFMA": "_MFMA"}
+# Field name normalization
+_FIELD_RENAMES = {"opsel_hi_2": "opsel_hi2", "op_sel_hi_2": "opsel_hi2", "op_sel": "opsel", "bound_ctrl": "bc",
+                  "tgt": "target", "row_en": "row", "unorm": "unrm", "clamp": "clmp", "wait_exp": "waitexp",
+                  "simm32": "literal", "dpp_ctrl": "dpp", "acc_cd": "acc_cd", "acc": "acc",
+                  "dst_sel": "dst_sel", "dst_unused": "dst_unused", "src0_sel": "src0_sel", "src1_sel": "src1_sel"}
+# Encoding variants to skip entirely (NSA is for MIMG graphics instructions)
+_SKIP_ENCODINGS = ("NSA",)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# XML parsing helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _strip_enc(name: str) -> str:
+  """Strip ENC_ prefix and normalize encoding suffixes."""
+  name = name.removeprefix("ENC_")
+  for sfx in _ENC_SUFFIXES: name = name.replace(sfx, "")
+  # Process longer suffixes first to avoid partial matches (e.g., _VOP_DPP8 before _VOP_DPP)
+  for old, new in sorted(_ENC_SUFFIX_MAP.items(), key=lambda x: -len(x[0])): name = name.replace(old, new)
+  return name
+
+def _norm_field(name: str) -> str:
+  """Normalize field name to match expected names."""
+  for old, new in _FIELD_RENAMES.items(): name = name.replace(old, new)
+  return name
+
+def _map_flat(enc_name: str, instr_name: str) -> str:
+  """Map FLAT/GLOBAL/SCRATCH encoding to correct enum based on instruction prefix."""
+  if enc_name in ("FLAT_GLBL", "FLAT_GLOBAL"): return "GLOBAL"
+  if enc_name == "FLAT_SCRATCH": return "SCRATCH"
+  if enc_name in ("FLAT", "VFLAT", "VGLOBAL", "VSCRATCH"):
+    v = "V" if enc_name.startswith("V") else ""
+    if instr_name.startswith("GLOBAL_"): return f"{v}GLOBAL"
+    if instr_name.startswith("SCRATCH_"): return f"{v}SCRATCH"
+    return f"{v}FLAT"
+  return enc_name
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# XML parsing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def parse_xml(filename: str):
+  root = ET.fromstring(zipfile.ZipFile(fetch(XML_URL)).read(filename))
+  encodings, enums, types, fmts, op_types_set = {}, {}, {}, {}, set()
+  # Extract HWREG and MSG enums from OperandTypes
+  op_enum_map = {("OPR_HWREG", "ID"): "HWREG", ("OPR_SENDMSG_RTN", "MSG"): "MSG"}
+  for ot in root.findall(".//OperandTypes/OperandType"):
+    ot_name = ot.findtext("OperandTypeName")
+    for field in ot.findall(".//Field"):
+      key = (ot_name, field.findtext("FieldName"))
+      if (enum_name := op_enum_map.get(key)):  # type: ignore[arg-type]
+        def _pv_val(pv: ET.Element) -> tuple[int, str]:
+          v, n = pv.findtext("Value"), pv.findtext("Name")
+          assert v is not None and n is not None
+          return int(v), n.upper()
+        enums[enum_name] = dict(_pv_val(pv) for pv in field.findall(".//PredefinedValue"))
+  # Extract DataFormats with BitCount
+  for df in root.findall("ISA/DataFormats/DataFormat"):
+    name, bits = df.findtext("DataFormatName"), df.findtext("BitCount")
+    if name and bits: fmts[name] = int(bits)
+  # Extract encoding definitions
+  for enc in root.findall("ISA/Encodings/Encoding"):
+    name = enc.findtext("EncodingName")
+    assert name is not None
+    is_base = name.startswith("ENC_") or name in ("VOP3_SDST_ENC", "VOPDXY")
+    is_variant = any(sfx in name for sfx in _ENC_SUFFIX_MAP)
+    if not is_base and not is_variant: continue
+    if any(s in name for s in _SKIP_ENCODINGS): continue
+    fields: list[tuple[str, int, int]] = []
+    for f in enc.findall(".//MicrocodeFormat/BitMap/Field"):
+      br = f.find("BitLayout/Range")
+      if br is None: continue
+      fn = f.findtext("FieldName")
+      assert fn is not None
+      fields.append((_norm_field(fn.lower()),
+        int(br.findtext("BitOffset") or 0) + int(br.findtext("BitCount") or 0) - 1, int(br.findtext("BitOffset") or 0)))
+    ident_list = enc.findall("EncodingIdentifiers/EncodingIdentifier")
+    ident = ident_list[0] if ident_list else None
+    enc_field = next((f for f in fields if f[0] == "encoding"), None)
+    # For multi-dword formats, encoding field may be in higher dword but identifier is always in dword0; use % 32
+    enc_bits: str | None = None
+    if ident is not None and ident.text is not None and enc_field:
+      enc_bits = "".join(ident.text[len(ident.text)-1-b] for b in range(enc_field[1] % 32, (enc_field[2] % 32)-1, -1))
+    base_name = _strip_enc(name)
+    encodings[NAME_MAP.get(base_name, base_name)] = (fields, enc_bits)
+  # Extract instruction opcodes and operand info
+  # Track which encodings each opcode appears in (for detecting LIT-only ops)
+  opcode_encs: dict[str, dict[int, set[str]]] = {}  # {base_fmt: {opcode: {enc_names}}}
+  for instr in root.findall("ISA/Instructions/Instruction"):
+    name = instr.findtext("InstructionName")
+    assert name is not None
+    for enc in instr.findall("InstructionEncodings/InstructionEncoding"):
+      if enc.findtext("EncodingCondition") != "default": continue
+      enc_enc_name = enc.findtext("EncodingName")
+      assert enc_enc_name is not None
+      base, opcode = _map_flat(_strip_enc(enc_enc_name), name), int(enc.findtext("Opcode") or 0)
+      enc_name = NAME_MAP.get(base, base)
+      # Encoding variants use the same Op enum as the base format
+      base_enum = enc_name
+      for sfx in ("_SDWA_SDST", "_DPP16", "_DPP8", "_SDWA", "_LIT", "_MFMA"):
+        base_enum = base_enum.replace(sfx, "")
+      # Track which encodings this opcode appears in
+      opcode_encs.setdefault(base_enum, {}).setdefault(opcode, set()).add(enc_name)
+      # ADDTID instructions go in both FLAT and GLOBAL enums (pcode uses FLATOp for these)
+      if "ADDTID" in name:
+        if base == "GLOBAL": enums.setdefault("FLAT", {})[opcode] = name
+        elif base == "VGLOBAL": enums.setdefault("VFLAT", {})[opcode] = name
+      enums.setdefault(base_enum, {})[opcode] = name
+      # Extract operand info
+      op_info: dict[str, tuple[str | None, int, str | None]] = {}
+      for op in enc.findall("Operands/Operand"):
+        fn = op.findtext("FieldName")
+        if fn: op_info[fn.lower()] = (op.findtext("DataFormatName"), int(op.findtext("OperandSize") or 0), op.findtext("OperandType"))
+      for fmt, _, otype in op_info.values():
+        if fmt and fmt not in fmts: fmts[fmt] = 0
+        if otype: op_types_set.add(otype)
+      if op_info: types[(name, base_enum)] = op_info
+  # Find opcodes that only exist in a specific variant encoding (no base format version)
+  suffix_only_ops: dict[str, dict[str, set[int]]] = {}  # {suffix: {base_fmt: {opcodes}}}
+  for base_fmt, opcodes in opcode_encs.items():
+    for opcode, encs in opcodes.items():
+      suffix = next((s for s in _ENC_SUFFIX_MAP.values() if all(s in e for e in encs)), None)
+      if suffix is not None: suffix_only_ops.setdefault(suffix, {}).setdefault(base_fmt, set()).add(opcode)
+  return encodings, enums, types, fmts, op_types_set, suffix_only_ops
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PDF parsing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_pdf_text(url: str) -> list[list[tuple[float, float, str, str]]]:
+  """Extract positioned text from PDF. Returns list of text elements (x, y, text, font) per page."""
+  data = fetch(url).read_bytes()
+  # Parse xref table to locate objects
+  xref: dict[int, int] = {}
+  xref_match = re.search(rb'startxref\s+(\d+)', data)
+  assert xref_match is not None
+  pos = int(xref_match.group(1)) + 4
+  while data[pos:pos+7] != b'trailer':
+    while data[pos:pos+1] in b' \r\n': pos += 1
+    line_end = data.find(b'\n', pos)
+    start_obj, count = map(int, data[pos:line_end].split()[:2])
+    pos = line_end + 1
+    for i in range(count):
+      if data[pos+17:pos+18] == b'n' and (off := int(data[pos:pos+10])) > 0: xref[start_obj + i] = off
+      pos += 20
+
+  def get_stream(n: int) -> bytes:
+    obj = data[xref[n]:data.find(b'endobj', xref[n])]
+    raw = obj[obj.find(b'stream\n') + 7:obj.find(b'\nendstream')]
+    return zlib.decompress(raw) if b'/FlateDecode' in obj else raw
+
+  pages = []
+  for n in sorted(xref):
+    if b'/Type /Page' not in data[xref[n]:xref[n]+500]: continue
+    if not (m := re.search(rb'/Contents (\d+) 0 R', data[xref[n]:xref[n]+500])): continue
+    stream = get_stream(int(m.group(1))).decode('latin-1')
+    elements, font = [], ''
+    _RE_BT = (r'(/F[\d.]+) [\d.]+ Tf|([\d.+-]+) ([\d.+-]+) Td|[\d.+-]+ [\d.+-]+ [\d.+-]+ [\d.+-]+ ([\d.+-]+) ([\d.+-]+) Tm'
+              r'|<([0-9A-Fa-f]+)>.*?Tj|\[([^\]]+)\] TJ')
+    for bt in re.finditer(r'BT(.*?)ET', stream, re.S):
+      x, y = 0.0, 0.0
+      for sm in re.finditer(_RE_BT, bt.group(1)):
+        if sm.group(1): font = sm.group(1)
+        elif sm.group(2): x, y = x + float(sm.group(2)), y + float(sm.group(3))
+        elif sm.group(4): x, y = float(sm.group(4)), float(sm.group(5))
+        elif sm.group(6) and (t := bytes.fromhex(sm.group(6)).decode('latin-1')).strip():
+          elements.append((x, y, t, font))
+        elif sm.group(7):
+          t = ''.join(bytes.fromhex(h).decode('latin-1') for h in re.findall(r'<([0-9A-Fa-f]+)>', sm.group(7)))
+          if t.strip(): elements.append((x, y, t, font))
+    pages.append(sorted(elements, key=lambda e: (-e[1], e[0])))
+  return pages
+
+def extract_pcode(pages: list[list[tuple[float, float, str, str]]], name_to_op: dict[str, int]) -> dict[tuple[str, int], str]:
+  """Extract pseudocode for instructions. Returns {(name, opcode): pseudocode}."""
+  # First pass: find all instruction headers across all pages
+  all_instructions: list[tuple[int, float, str, int]] = []  # (page_idx, y, name, opcode)
+  for page_idx, page in enumerate(pages):
+    by_y: dict[int, list[tuple[float, str]]] = {}
+    for x, y, t, _ in page:
+      by_y.setdefault(round(y), []).append((x, t))
+    for y, items in sorted(by_y.items(), reverse=True):
+      left = [(x, t) for x, t in items if 55 < x < 65]
+      right = [(x, t) for x, t in items if 535 < x < 550]
+      if left and right and left[0][1] in name_to_op and right[0][1].isdigit():
+        all_instructions.append((page_idx, y, left[0][1], int(right[0][1])))
+
+  # Second pass: extract pseudocode between consecutive instructions
+  pcode: dict[tuple[str, int], str] = {}
+  for i, (page_idx, y, name, opcode) in enumerate(all_instructions):
+    if i + 1 < len(all_instructions):
+      next_page, next_y = all_instructions[i + 1][0], all_instructions[i + 1][1]
+    else:
+      next_page, next_y = page_idx, 0
+    # Collect F6 text from current position to next instruction (pseudocode is at x ≈ 69)
+    lines: list[tuple[int, float, str]] = []
+    for p in range(page_idx, next_page + 1):
+      start_y = y if p == page_idx else 800
+      end_y = next_y if p == next_page else 0
+      lines.extend((p, y2, t) for x, y2, t, f in pages[p] if f in ('/F6.0', '/F7.0') and end_y < y2 < start_y and 60 < x < 80)
+    if lines:
+      sorted_lines = sorted(lines, key=lambda x: (x[0], -x[1]))
+      # Stop at large Y gaps (>30) - indicates section break
+      filtered = [sorted_lines[0]]
+      depth = sorted_lines[0][2].count("{") - sorted_lines[0][2].count("}")
+      for j in range(1, len(sorted_lines)):
+        prev_page, prev_y, _ = sorted_lines[j-1]
+        curr_page, curr_y, _ = sorted_lines[j]
+        if depth == 0 and curr_page == prev_page and prev_y - curr_y > 30: break
+        if depth == 0 and curr_page != prev_page and prev_y > 60 and curr_y < 730: break
+        filtered.append(sorted_lines[j])
+        code = sorted_lines[j][2].split("//")[0]
+        depth += code.count("{") - code.count("}")
+      pcode_lines = [t.replace('Ê', '').strip() for _, _, t in filtered]
+      if pcode_lines: pcode[(name, opcode)] = '\n'.join(pcode_lines)
+  return pcode
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Code generation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def write_common(all_fmts: dict[str, int], all_op_types: set[str], path: pathlib.Path) -> None:
+  lines: list[str] = ["# autogenerated from AMD ISA XML - do not edit", "from enum import Enum, auto", ""]
+  lines.append("class ReprEnum(Enum):")
+  lines.append('  """Enum with clean repr that roundtrips with eval()."""')
+  lines.append('  def __repr__(self): return f"{type(self).__name__}.{self.name}"')
+  lines.append("")
+  lines.append("class Fmt(Enum):")
+  for fmt in sorted(all_fmts.keys()): lines.append(f"  {fmt} = auto()")
+  lines.append("")
+  lines.append("FMT_BITS = {")
+  for fmt, bits in sorted(all_fmts.items()): lines.append(f"  Fmt.{fmt}: {bits},")
+  lines.append("}")
+  lines.append("")
+  lines.append("class OpType(Enum):")
+  for ot in sorted(all_op_types): lines.append(f"  {ot} = auto()")
+  with open(path, "w") as f: f.write("\n".join(lines))
+
+def write_enum(enums, path):
+  lines: list[str] = ["# autogenerated from AMD ISA XML - do not edit",
+    "from tinygrad.runtime.autogen.amd.common import ReprEnum, Fmt, FMT_BITS, OpType  # noqa: F401", ""]
+  for name, ops in sorted(enums.items()):
+    if not ops: continue
+    suffix = "_E32" if name in ("VOP1", "VOP2", "VOPC") else "_E64" if name == "VOP3" else ""
+    lines.append(f"class {name}(ReprEnum):" if name in ("HWREG", "MSG") else f"class {name}Op(ReprEnum):")
+    aliases = []
+    for op, mem in sorted(ops.items()):
+      msuf = suffix if name != "VOP3" or op < 512 else ""
+      lines.append(f"  {mem}{msuf} = {op}")
+      if msuf: aliases.append((mem, msuf))
+    for mem, msuf in aliases: lines.append(f"  {mem} = {mem}{msuf}")
+    lines.append("")
+  with open(path, "w") as f: f.write("\n".join(lines))
+
+def write_ins(encodings, enums, suffix_only_ops, types, arch, path):
+  _VGPR_FIELDS = {"vdst", "vdstx", "vsrc0", "vsrc1", "vsrc2", "vsrc3", "vsrcx1", "vsrcy1", "vaddr", "vdata", "data", "data0", "data1", "addr", "vsrc"}
+  _VARIANT_SUFFIXES = ("_LIT", "_DPP16", "_DPP8", "_SDWA_SDST", "_SDWA", "_MFMA")
+  def get_base_fmt(fmt):
+    for sfx in _VARIANT_SUFFIXES: fmt = fmt.replace(sfx, "")
+    return fmt
+  def field_def(name, hi, lo, fmt, enc_bits=None):
+    bits = hi - lo + 1
+    base_fmt = get_base_fmt(fmt)
+    if name == "encoding" and enc_bits: return f"FixedBitField({hi}, {lo}, 0b{enc_bits})"
+    if (fixed := FIXED_FIELDS.get(arch, {}).get(fmt, {}).get(name)) is not None:
+      if isinstance(fixed, int): return f"FixedBitField({hi}, {lo}, {fixed})"
+      fixed_bits, opcode = encodings[fixed[0]][1], next(op for op, n in enums[fixed[0]].items() if n == fixed[1])
+      return f"FixedBitField({hi}, {lo}, 0b{fixed_bits}{opcode:0{bits-len(fixed_bits)}b})"
+    if name == "op" and fmt not in ("DPP", "SDWA"): return f"EnumBitField({hi}, {lo}, {base_fmt}Op)"
+    if name in ("opx", "opy"): return f"EnumBitField({hi}, {lo}, VOPDOp)"
+    if name == "vdsty": return f"VDSTYField({hi}, {lo})"
+    if name in _VGPR_FIELDS and bits == 8: return f"VGPRField({hi}, {lo})"
+    if name == "sbase" and bits == 6: return f"SBaseField({hi}, {lo})"
+    if name in ("srsrc", "ssamp") and bits == 5: return f"SRsrcField({hi}, {lo})"
+    if name in ("sdst", "sdata") and bits == 7: return f"SGPRField({hi}, {lo})"
+    if name in ("soffset", "saddr") and bits == 7: return f"SGPRField({hi}, {lo}, default=NULL)"
+    if name.startswith("ssrc") and bits == 8: return f"SSrcField({hi}, {lo})"
+    if name in ("saddr", "soffset") and bits == 8: return f"SSrcField({hi}, {lo}, default=NULL)"
+    if name.startswith("src") and bits == 9: return f"SrcField({hi}, {lo})"
+    # GLOBAL/SCRATCH: offset is 13-bit signed [12:0], FLAT: 12-bit unsigned (XML has 12-bit for all)
+    if name == "offset" and base_fmt in ("GLOBAL", "SCRATCH"): return f"BitField(12, {lo})"
+    if base_fmt == "VOP3P" and name == "opsel_hi": return f"BitField({hi}, {lo}, default=3)"
+    if base_fmt == "VOP3P" and name == "opsel_hi2": return f"BitField({hi}, {lo}, default=1)"
+    return f"BitField({hi}, {lo})"
+  ORDER = ['encoding', 'op', 'opx', 'opy', 'vdst', 'vdstx', 'vdsty', 'sdst', 'vdata', 'sdata', 'addr', 'vaddr', 'data', 'data0', 'data1',
+           'src0', 'srcx0', 'srcy0', 'vsrc0', 'ssrc0', 'src1', 'vsrc1', 'vsrcx1', 'vsrcy1', 'ssrc1', 'src2', 'vsrc2', 'src3', 'vsrc3',
+           'saddr', 'sbase', 'srsrc', 'ssamp', 'soffset', 'offset', 'simm16', 'literal', 'en', 'target', 'attr', 'attr_chan',
+           'omod', 'neg', 'neg_hi', 'abs', 'clmp', 'opsel', 'opsel_hi', 'waitexp', 'wait_va',
+           'dmask', 'dim', 'seg', 'format', 'offen', 'idxen', 'glc', 'dlc', 'slc', 'tfe', 'unrm', 'done', 'row',
+           'dpp', 'fi', 'bc', 'row_mask', 'bank_mask', 'src0_neg', 'src0_abs', 'src1_neg', 'src1_abs',
+           'cbsz', 'abid', 'acc_cd', 'acc', 'blgp', 'lane_sel_0', 'lane_sel_1', 'lane_sel_2', 'lane_sel_3',
+           'lane_sel_4', 'lane_sel_5', 'lane_sel_6', 'lane_sel_7', 'dst_sel', 'dst_unused', 'src0_sel', 'src1_sel']
+  def sort_fields(fields): return sorted(fields, key=lambda f: (ORDER.index(f[0]) if f[0] in ORDER else 999, f[2]))
+
+  # Separate base encodings from variants
+  base_encodings, variant_encodings = {}, {}
+  for enc_name, data in encodings.items():
+    base = get_base_fmt(enc_name)
+    if base == enc_name: base_encodings[enc_name] = data
+    else: variant_encodings[enc_name] = data
+
+  # Build sets of ops by their vdst type from operand metadata
+  sdst_opcodes: dict[str, set[int]] = {}  # ops where vdst is OPR_SREG (writes to SGPR)
+  for fmt, ops in enums.items():
+    for op, name in ops.items():
+      op_types = types.get((name, fmt), {})
+      vdst_type = op_types.get("vdst", (None, None, None))[2]
+      if vdst_type == "OPR_SREG": sdst_opcodes.setdefault(fmt, set()).add(op)
+
+  # collect only the XxxOp enums that are actually referenced in this arch's instruction definitions
+  enum_names = sorted(f"{k}Op" for k in enums if enums[k] and k not in ("HWREG", "MSG"))
+  # also re-export HWREG/MSG enums (plain enums, not instruction format ops)
+  enum_names += sorted(k for k in enums if k in ("HWREG", "MSG") and enums[k])
+  # collect DSL field types actually used by scanning generated field definitions
+  all_field_defs = " ".join(field_def(fn, hi, lo, enc, eb) for enc, (flds, eb) in encodings.items() for fn, hi, lo in flds)
+  _ALL_DSL = ["BitField", "EnumBitField", "FixedBitField", "NULL", "SBaseField", "SGPRField", "SRsrcField",
+              "SSrcField", "SrcField", "VDSTYField", "VGPRField"]
+  dsl_names = ["Inst"] + [n for n in _ALL_DSL if n in all_field_defs]
+  # also re-export register names so `from ins import *` still provides them to downstream users
+  _DSL_REGS = ["s", "v", "src", "VCC_LO", "VCC_HI", "VCC", "EXEC_LO", "EXEC_HI", "EXEC", "NULL", "OFF", "M0",
+               "SCC", "VCCZ", "EXECZ", "ttmp", "INV_2PI", "SDWA", "DPP", "DPP16", "LIT", "SRC_LDS_DIRECT"]
+  dsl_reexport = sorted(set(dsl_names + _DSL_REGS))
+  lines: list[str] = ["# autogenerated from AMD ISA XML - do not edit", "# ruff: noqa: E501,F401",
+    f"from tinygrad.renderer.amd.dsl import {', '.join(dsl_reexport)}",
+    f"from tinygrad.runtime.autogen.amd.{arch}.enum import {', '.join(enum_names)}", "import functools", ""]
+
+  def fmt_allowed(op_enum: str, ops: set[int]) -> str:
+    """Format allowed ops as {EnumName.MEMBER, ...}."""
+    names = [f"{op_enum}.{enums[op_enum.removesuffix('Op')][op]}" for op in sorted(ops)]
+    return "{" + ", ".join(names) + "}"
+
+  # Generate base classes first
+  for enc_name, (fields, enc_bits) in sorted(base_encodings.items()):
+    all_ops = set(enums.get(enc_name, {}).keys())
+    # Get suffix-only ops for this format (these can't be used in base class)
+    base_suffix_ops = set().union(*(d.get(enc_name, set()) for d in suffix_only_ops.values()))
+    # Exclude SDST ops from base class (they need VOP1_SDST/VOP3_SDST/VOP3B)
+    base_allowed = all_ops - base_suffix_ops - sdst_opcodes.get(enc_name, set())
+    # RDNA3 FLAT/GLOBAL/SCRATCH share encoding bits, differentiated by seg field
+    # RDNA4 VFLAT/VGLOBAL/VSCRATCH have distinct encoding bits, no seg field needed
+    has_seg_field = any(fn == "seg" for fn, _, _ in fields)
+    if enc_name in ("FLAT", "VFLAT") and has_seg_field:
+      prefix = "V" if enc_name == "VFLAT" else ""
+      flat_variants = [(f"{prefix}FLAT", 0, f"{prefix}FLATOp"), (f"{prefix}GLOBAL", 2, f"{prefix}GLOBALOp"),
+                       (f"{prefix}SCRATCH", 1, f"{prefix}SCRATCHOp")]
+      for cls, seg, op_enum in flat_variants:
+        cls_ops = set(enums.get(cls, {}).keys())
+        lines.append(f"class {cls}(Inst):")
+        for fn, hi, lo in sort_fields(fields):
+          if fn == "seg": lines.append(f"  seg = FixedBitField({hi}, {lo}, {seg})")
+          elif fn == "op": lines.append(f"  op = EnumBitField({hi}, {lo}, {op_enum}, {fmt_allowed(op_enum, cls_ops)})")
+          else: lines.append(f"  {fn} = {field_def(fn, hi, lo, cls, enc_bits)}")
+        lines.append("")
+    elif enc_name not in ("FLAT_GLOBAL", "FLAT_SCRATCH", "FLAT_GLBL", "DPP", "SDWA"):
+      lines.append(f"class {enc_name}(Inst):")
+      for fn, hi, lo in sort_fields(fields):
+        if fn == "op":
+          base_fmt = get_base_fmt(enc_name)
+          lines.append(f"  op = EnumBitField({hi}, {lo}, {base_fmt}Op, {fmt_allowed(f'{base_fmt}Op', base_allowed)})")
+        else:
+          lines.append(f"  {fn} = {field_def(fn, hi, lo, enc_name, enc_bits if fn == 'encoding' else None)}")
+      lines.append("")
+
+  # Generate variant classes that inherit from base (only add extra fields)
+  for enc_name, (fields, enc_bits) in sorted(variant_encodings.items()):
+    base = get_base_fmt(enc_name)
+    if base not in base_encodings: continue  # skip if no base class
+    base_fields = {f[0] for f in base_encodings[base][0]}
+    extra_fields = [(fn, hi, lo) for fn, hi, lo in fields if fn not in base_fields]
+    # Check if this is a suffix-only variant
+    variant_suffix = next((sfx for sfx in _VARIANT_SUFFIXES if enc_name.endswith(sfx)), None)
+    is_suffix_variant = variant_suffix in suffix_only_ops
+    all_ops = set(enums.get(base, {}).keys())
+    if extra_fields or is_suffix_variant:
+      lines.append(f"class {enc_name}({base}):")
+      op_field = next((f for f in base_encodings[base][0] if f[0] == "op"), None)
+      # _LIT classes: override op to allow all opcodes (base excludes lit-only ops)
+      # other classes override op to only suffix-only opcodes
+      if op_field and is_suffix_variant:
+        _, hi, lo = op_field
+        allowed_ops = all_ops if variant_suffix == "_LIT" else suffix_only_ops[variant_suffix][base]
+        lines.append(f"  op = EnumBitField({hi}, {lo}, {base}Op, {fmt_allowed(f'{base}Op', allowed_ops)})")
+      for fn, hi, lo in sort_fields(extra_fields):
+        lines.append(f"  {fn} = {field_def(fn, hi, lo, enc_name)}")
+      lines.append("")
+
+  # SDST variants (special case - redefine vdst field type, restrict to SDST ops)
+  for base, field_hi, field_lo in [("VOP1", 24, 17), ("VOP3", 7, 0)]:
+    if base not in base_encodings: continue
+    sdst_ops = sdst_opcodes.get(base, set())
+    if not sdst_ops: continue
+    # For VOP3, all ops < 256 (compare/cmpx ops) use SDST encoding
+    all_base_ops = set(enums.get(base, {}).keys())
+    if base == "VOP3": sdst_ops = sdst_ops | {op for op in all_base_ops if op < 256}
+    op_field = next((f for f in base_encodings[base][0] if f[0] == "op"), None)
+    lines.append(f"class {base}_SDST({base}):")
+    if op_field:
+      _, hi, lo = op_field
+      lines.append(f"  op = EnumBitField({hi}, {lo}, {base}Op, {fmt_allowed(f'{base}Op', sdst_ops)})")
+    lines.append(f"  vdst = SSrcField({field_hi}, {field_lo})")
+    lines.append("")
+    # SDST_LIT class (for literals with SDST destination) - same ops, just adds literal field
+    lit_enc = variant_encodings.get(f"{base}_LIT")
+    if lit_enc:
+      lit_field = next((f for f in lit_enc[0] if f[0] == "literal"), None)
+      if lit_field:
+        lines.append(f"class {base}_SDST_LIT({base}_SDST):")
+        lines.append(f"  literal = BitField({lit_field[1]}, {lit_field[2]})")
+        lines.append("")
+
+  # Instruction helpers
+  lines.append("# instruction helpers")
+  for fmt, ops in sorted(enums.items()):
+    if fmt not in base_encodings and fmt not in ("GLOBAL", "SCRATCH", "VGLOBAL", "VSCRATCH"): continue
+    suffix = "_E32" if fmt in ("VOP1", "VOP2", "VOPC") else "_E64" if fmt == "VOP3" else ""
+    op_to_suffix = {op:suffix for suffix,ops in suffix_only_ops.items() for op in ops.get(fmt, set())}
+    fmt_sdst_ops = sdst_opcodes.get(fmt, set())
+    for op, name in sorted(ops.items()):
+      # ADDTID ops are in both FLAT and GLOBAL enums (for pcode); only generate helper for GLOBAL/VGLOBAL
+      if "ADDTID" in name and fmt in ("FLAT", "VFLAT"): continue
+      msuf = suffix if fmt != "VOP3" or op < 512 else ""
+      # Determine class: SDST variants, suffix-specific variants (e.g., _MFMA, _LIT), or base
+      if fmt == "VOP1" and op in fmt_sdst_ops: cls = "VOP1_SDST"
+      elif fmt == "VOP3" and (op in fmt_sdst_ops or op < 256): cls = "VOP3_SDST"
+      elif op_to_suffix.get(op): cls = f"{fmt}{op_to_suffix[op]}"
+      else: cls = fmt
+      lines.append(f"{name.lower()}{msuf.lower()} = functools.partial({cls}, {fmt}Op.{name}{msuf})")
+  with open(path, "w") as f: f.write("\n".join(lines))
+
+def write_operands(types: dict, enums: dict, arch: str, path: pathlib.Path) -> None:
+  valid = {(name, fmt) for fmt, ops in enums.items() for name in ops.values()}
+  # only import enums that are actually used as keys in OPERANDS
+  used_bases = {eb for (nm, eb) in types if (nm, eb) in valid}
+  enum_names = sorted(f"{k}Op" for k in used_bases)
+  lines: list[str] = ["# autogenerated from AMD ISA XML - do not edit",
+    "from tinygrad.runtime.autogen.amd.common import Fmt, OpType",
+    f"from tinygrad.runtime.autogen.amd.{arch}.enum import {', '.join(enum_names)}", ""]
+  lines.append("# instruction operand info: {Op: {field: (Fmt, size_bits, OpType)}}")
+  lines.append("OPERANDS = {")
+  def fmt_val(v):
+    fmt, size, otype = v
+    return f"({f'Fmt.{fmt}' if fmt else 'None'}, {size}, {f'OpType.{otype}' if otype else 'None'})"
+  for (name, enc_base), fields in sorted(types.items()):
+    if (name, enc_base) not in valid: continue
+    fstr = ", ".join(f'"{k}": {fmt_val(v)}' for k, v in sorted(fields.items()))
+    lines.append(f'  {enc_base}Op.{name}: {{{fstr}}},')
+  lines.append("}")
+  with open(path, "w") as f: f.write("\n".join(lines))
+
+def write_pcode(pcode: dict[tuple[str, int], str], enums: dict[str, dict[int, str]], arch: str, path: pathlib.Path) -> None:
+  """Write str_pcode.py file from extracted pseudocode."""
+  entries: list[tuple[str, str, int, str]] = []
+  for fmt_name, ops in enums.items():
+    member_suffix = "_E32" if fmt_name in ("VOP1", "VOP2", "VOPC") else "_E64" if fmt_name == "VOP3" else ""
+    for opcode, name in ops.items():
+      if (name, opcode) in pcode:
+        msuf = member_suffix if fmt_name != "VOP3" or opcode < 512 else ""
+        entries.append((f"{fmt_name}Op", f"{name}{msuf}", opcode, pcode[(name, opcode)]))
+  enum_names = sorted(set(e[0] for e in entries))
+  lines = ["# autogenerated from AMD ISA PDF - do not edit", "# ruff: noqa: E501",
+           f"from tinygrad.runtime.autogen.amd.{arch}.enum import {', '.join(enum_names)}", "", "PCODE = {"]
+  for enum_name, name, opcode, code in sorted(entries, key=lambda x: (x[0], x[2])):
+    lines.append(f"  {enum_name}.{name}: {code!r},")
+  lines.append("}")
+  with open(path, "w") as f: f.write("\n".join(lines))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+  all_fmts: dict[str, int] = {}
+  all_op_types: set[str] = set()
+  arch_data: dict[str, dict] = {}
+  # First pass: parse XML for all architectures
+  for arch, cfg in ARCHS.items():
+    print(f"Parsing XML: {cfg['xml']} -> {arch}")
+    encodings, enums, types, fmts, op_types_set, suffix_only_ops = parse_xml(cfg["xml"])
+    for fmt, ops in FIXES.get(arch, {}).items(): enums.setdefault(fmt, {}).update(ops)
+    for fmt, fields in FIELD_FIXES.get(arch, {}).items():
+      if fmt in encodings: encodings[fmt] = (encodings[fmt][0] + fields, encodings[fmt][1])
+    arch_data[arch] = {"encodings": encodings, "enums": enums, "types": types, "suffix_only_ops": suffix_only_ops}
+    for fmt, bits in fmts.items():
+      assert fmt not in all_fmts or all_fmts[fmt] == bits, f"FMT_BITS mismatch for {fmt}: {all_fmts[fmt]} vs {bits}"
+      all_fmts[fmt] = bits
+    all_op_types.update(op_types_set)
+  # Write common.py
+  autogen_base = pathlib.Path(__file__).parents[2] / "runtime" / "autogen" / "amd"
+  common_path = autogen_base / "common.py"
+  write_common(all_fmts, all_op_types, common_path)
+  print(f"Wrote common.py: {len(all_fmts)} formats, {len(all_op_types)} op types")
+  # Write per-arch files from XML
+  for arch, data in arch_data.items():
+    base = autogen_base / arch
+    write_enum(data["enums"], base / "enum.py")
+    write_ins(data["encodings"], data["enums"], data["suffix_only_ops"], data["types"], arch, base / "ins.py")
+    write_operands(data["types"], data["enums"], arch, base / "operands.py")
+    print(f"  {arch}: {len(data['encodings'])} encodings, {sum(len(v) for v in data['enums'].values())} instructions")
+  # Second pass: parse PDFs and write pcode
+  for arch, cfg in ARCHS.items():
+    print(f"Parsing PDF: {arch}...")
+    pages = extract_pdf_text(cfg["pdf"])
+    name_to_op = {name: op for ops in arch_data[arch]["enums"].values() for op, name in ops.items()}
+    pcode = extract_pcode(pages, name_to_op)
+    base = autogen_base / arch
+    write_pcode(pcode, arch_data[arch]["enums"], arch, base / "str_pcode.py")
+    print(f"  {arch}: {len(pcode)} pcode entries")
+
+"""SQTT (SQ Thread Trace) packet encoder and decoder for AMD GPUs.
+
+This module provides encoding and decoding of raw SQTT byte streams.
+The format is nibble-based with variable-width packets determined by a state machine.
+Uses BitField infrastructure from dsl.py, similar to GPU instruction encoding.
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Iterator
+from enum import Enum
+from tinygrad.helpers import getenv, colored
+from tinygrad.renderer.amd.dsl import BitField, FixedBitField, Inst, bits
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIELD ENUMS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MemSrc(Enum):
+  LDS = 0
+  LDS_ALT = 1
+  VMEM = 2
+  VMEM_ALT = 3
+
+class AluSrc(Enum):
+  NONE = 0
+  SALU = 1
+  VALU = 2
+  VALU_SALU = 3
+
+# construct other SIMD instruction operation types, name becomes OTHER_{category}_{cycles}
+def add_other_simd(cls:type[Enum], ranges:list[tuple[str, int, int, int]]) -> None:
+  for category, start, end, base_cycle in ranges:
+    for value in range(start, end + 1):
+      cls._value2member_map_[value] = obj = object.__new__(cls)
+      obj._value_ = value
+      obj._name_ = f"OTHER_{category}_{value - start + base_cycle}"
+
+class InstOp(Enum):
+  """SQTT instruction operation types for RDNA3 (gfx1100).
+
+  Memory ops appear in two ranges depending on which SIMD executes them:
+  - 0x1x-0x2x range: ops on traced SIMD
+  - 0x5x range: ops on other SIMD (OTHER_ prefix)
+
+  GLOBAL memory ops encoding depends on addressing mode AND size:
+  - Loads: 0x21 (saddr=SGPR) or 0x22 (saddr=NULL), all sizes same
+  - Stores: base + size_offset, where VADDR is shifted +1 from SADDR
+    SADDR: 0x24(32) 0x25(64) 0x26(96) 0x27(128)
+    VADDR: 0x25(32) 0x26(64) 0x27(96) 0x28(128)
+
+  OTHER_ range follows same pattern but values overlap differently.
+  """
+  SALU = 0x0
+  SMEM_RD = 0x1
+  JUMP = 0x3              # branch taken
+  JUMP_NO = 0x4           # branch not taken
+  CALL = 0x5              # s_call_b64
+  MESSAGE = 0x9
+  VALUT_4 = 0xb           # transcendental: exp, log, rcp, sqrt, sin, cos
+  VALUB_2 = 0xd           # 64-bit shifts: lshl, lshr, ashr
+  VALUB_4 = 0xe           # 64-bit multiply-add
+  VALUB_16 = 0xf          # 64-bit: add, mul, fma, rcp, sqrt, rounding, frexp, div helpers
+  VINTERP = 0x12          # interpolation: v_interp_p10_f32, v_interp_p2_f32
+  BARRIER = 0x13
+
+  # FLAT memory ops on traced SIMD (0x1x range)
+  FLAT_RD_2 = 0x1c
+  FLAT_WR_3 = 0x1d
+  FLAT_WR_4 = 0x1e
+  FLAT_WR_5 = 0x1f
+  FLAT_WR_6 = 0x20
+
+  # GLOBAL memory ops on traced SIMD (0x2x range)
+  SGMEM_RD_1 = 0x21             # saddr=SGPR, all sizes
+  SGMEM_RD_2 = 0x22             # saddr=NULL, all sizes
+  SGMEM_WR_2 = 0x24             # saddr=SGPR, 32-bit
+  SGMEM_WR_3 = 0x25             # saddr=SGPR 64 or saddr=NULL 32
+  SGMEM_WR_4 = 0x26             # saddr=SGPR 96 or saddr=NULL 64
+  SGMEM_WR_5 = 0x27             # saddr=SGPR 128 or saddr=NULL 96
+  SGMEM_WR_6 = 0x28             # saddr=NULL, 128-bit
+
+  # LDS ops on traced SIMD
+  LDS_RD = 0x29
+  LDS_WR_1 = 0x2a               # ds_append, ds_consume, ds_store_addtid_b32
+  LDS_WR_2 = 0x2b
+  LDS_WR_3 = 0x2c
+  LDS_WR_4 = 0x2d
+  LDS_WR_5 = 0x2e
+
+  # EXEC-modifying ops (0x7x range)
+  SALU_WR_EXEC = 0x72     # s_*_saveexec_b32/b64
+  VALU1_WR_EXEC = 0x73    # v_cmpx_*
+# Memory ops on other SIMD (0x5x range)
+add_other_simd(InstOp, [("LDS", 0x50, 0x54, 1), ("FLAT", 0x55, 0x59, 2), ("VMEM", 0x5a, 0x66, 1)])
+
+class InstOpRDNA4(Enum):
+  """SQTT instruction operation types for RDNA4 (gfx1200). Different encoding from RDNA3."""
+  SALU = 0x0
+  SMEM = 0x1
+  SMEM_WR = 0x2
+  JUMP = 0x3
+  JUMP_NO = 0x4
+  CALL = 0x5
+  SALU_NO_EXEC = 0x7
+  MESSAGE = 0x9
+  VALU_1 = 0xa
+  VALUT_4 = 0xb
+  VALUB_1 = 0xc
+  VALUB_2 = 0xd
+  VALUB_4 = 0xe
+  VALUB_16 = 0xf
+  VINTERP = 0x12
+  BARRIER_WAIT = 0x13
+  FLAT_RD_2 = 0x1c
+  FLAT_WR_3 = 0x1d
+  FLAT_WR_4 = 0x1e
+  FLAT_WR_5 = 0x1f
+  FLAT_WR_6 = 0x20
+  VMEM_RD_1 = 0x21
+  VMEM_RD_2 = 0x22
+  VMEM_WR_1 = 0x23
+  VMEM_WR_2 = 0x24
+  VMEM_WR_3 = 0x25
+  VMEM_WR_4 = 0x26
+  VMEM_WR_5 = 0x27
+  VMEM_WR_6 = 0x28
+  LDS_RD = 0x29
+  LDS_WR_1 = 0x2a
+  LDS_WR_2 = 0x2b
+  LDS_WR_3 = 0x2c
+  LDS_WR_4 = 0x2d
+  LDS_WR_5 = 0x2e
+  BUF_RD_1 = 0x2f
+  BUF_RD_2 = 0x30
+  BUF_WR_1 = 0x31
+  BUF_WR_2 = 0x32
+  BUF_WR_3 = 0x33
+  BUF_WR_4 = 0x34
+  BUF_WR_5 = 0x35
+  BUF_WR_6 = 0x36
+  LDS_DIR_LOAD = 0x6e
+  LDS_PARAM_LOAD = 0x6f
+  SALU_WR_EXEC = 0x72
+  VALU1_WR_EXEC = 0x73
+  VALU_WR_EXEC_2 = 0x74
+  OTHER_LDS_6 = 0x77
+  OTHER_LDS_10 = 0x78
+  BARRIER_SIGNAL = 0x7a
+  DYN_VGPR = 0x87
+  BARRIER_JOIN = 0x8a
+  WMMA_8 = 0x8c
+  WMMA_16 = 0x8d
+  WMMA_32 = 0x8e
+  WMMA_64 = 0x8f
+  VALU_DPFP = 0x92
+  SALU_FLOAT_3 = 0x98
+  VALU_SCL_TRANS = 0x99
+  SALU_2 = 0x9b
+  SALU_5 = 0x9c
+add_other_simd(InstOpRDNA4, [("LDS", 0x50, 0x54, 1), ("FLAT", 0x55, 0x59, 2), ("VMEM", 0xbc, 0xdd, 1)])
+
+class InstOpCDNA(Enum):
+  SMEM_RD = 0
+  SALU_32 = 1
+  VMEM_RD = 2
+  VMEM_WR = 3
+  FLAT_WR = 4
+  VALU_32 = 5
+  LDS = 6
+  PC = 7
+  JUMP = 12
+  NEXT = 13
+  FLAT_RD = 14
+  OTHER_MSG = 15
+  SMEM_WR = 16
+  SALU_64 = 17
+  VALU_64 = 18
+  VALU_MAI = 28
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PACKET TYPE BASE CLASS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PacketType:
+  """Base class for SQTT packet types."""
+  encoding: FixedBitField
+  _raw: int
+  _time: int
+
+  def __init_subclass__(cls, **kwargs):
+    super().__init_subclass__(**kwargs)
+    cls._fields = {k: v for k, v in cls.__dict__.items() if isinstance(v, BitField)}  # type: ignore[attr-defined]
+    cls._size_nibbles = ((max((f.hi for f in cls._fields.values()), default=0) + 4) // 4)  # type: ignore[attr-defined]
+
+  @classmethod
+  def from_raw(cls, raw: int, time: int = 0):
+    inst = object.__new__(cls)
+    inst._raw, inst._time = raw, time
+    return inst
+
+  def __repr__(self) -> str:
+    fields_str = ", ".join(f"{k}={getattr(self, k)}" for k in self._fields if not k.startswith('_') and k != 'encoding')  # type: ignore[attr-defined]
+    return f"{self.__class__.__name__}({fields_str})"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TS PACKET TYPE DEFINITIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TS_DELTA_S8_W3(PacketType):
+  encoding = bits[6:0] == 0b0100001
+  delta = bits[10:8]
+  _padding = bits[71:11]
+
+class TS_DELTA_S5_W3(PacketType):
+  encoding = bits[4:0] == 0b00110
+  delta = bits[7:5]
+  _padding = bits[51:8]
+
+class TS_DELTA_S5_W3_RDNA4(PacketType):  # Layout 4: 52->56 bits
+  encoding = bits[4:0] == 0b00110
+  delta = bits[9:7]
+  _padding = bits[55:10]
+
+class TS_DELTA_SHORT(PacketType):
+  encoding = bits[3:0] == 0b1000
+  delta = bits[7:4]
+
+class TS_DELTA_OR_MARK(PacketType):
+  encoding = bits[6:0] == 0b0000001
+  delta = bits[47:12]
+  pl = bits[8:8]
+  rt = bits[9:9]
+  @property
+  def is_marker(self) -> bool: return bool(self.rt and not self.pl)
+
+class TS_DELTA_OR_MARK_RDNA4(TS_DELTA_OR_MARK):
+  delta = bits[63:12]
+  rt = bits[7:7]
+  pl = bits[8:8]
+  tl = bits[9:9]
+
+class TS_DELTA_S5_W2(PacketType):
+  encoding = bits[4:0] == 0b11100
+  delta = bits[6:5]
+  _padding = bits[47:7]
+
+class TS_DELTA_S5_W2_RDNA4(PacketType):  # Layout 4: 48->40 bits
+  encoding = bits[4:0] == 0b11100
+  delta = bits[6:5]
+  _padding = bits[39:7]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PACKET TYPE DEFINITIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class VALUINST(PacketType):  # exclude: 1 << 2
+  encoding = bits[2:0] == 0b011
+  delta = bits[5:3]
+  flag = bits[6:6]
+  wave = bits[11:7]
+
+class VMEMEXEC(PacketType):  # exclude: 1 << 0
+  encoding = bits[3:0] == 0b1111
+  delta = bits[5:4]
+  src = bits[7:6].enum(MemSrc)
+
+class ALUEXEC(PacketType):  # exclude: 1 << 1
+  encoding = bits[3:0] == 0b1110
+  delta = bits[5:4]
+  src = bits[7:6].enum(AluSrc)
+
+class IMMEDIATE(PacketType):  # exclude: 1 << 5
+  encoding = bits[3:0] == 0b1101
+  delta = bits[6:4]
+  wave = bits[11:7]
+
+class IMMEDIATE_MASK(PacketType):  # exclude: 1 << 5
+  encoding = bits[4:0] == 0b00100
+  delta = bits[7:5]
+  mask = bits[23:8]
+
+class WAVERDY(PacketType):  # exclude: 1 << 3
+  encoding = bits[4:0] == 0b10100
+  delta = bits[7:5]
+  mask = bits[23:8]
+
+class WAVEEND(PacketType):  # exclude: 1 << 4
+  encoding = bits[4:0] == 0b10101
+  delta = bits[7:5]
+  sa = bits[8:8]
+  simd = bits[10:9]
+  wgp = bits[13:11]
+  wave = bits[19:15]
+  @property
+  def cu(self) -> int: return self.wgp | (self.sa << 3)
+
+class WAVEEND_RDNA4(PacketType):
+  encoding = bits[4:0] == 0b10101
+  delta = bits[7:5]
+  sa = bits[8:8]
+  simd = bits[10:9]
+  wgp = bits[14:11]
+  wave = bits[19:15]
+  @property
+  def cu(self) -> int: return self.wgp | (self.sa << 4)
+
+class WAVESTART(PacketType):  # exclude: 1 << 4
+  encoding = bits[4:0] == 0b01100
+  delta = bits[6:5]
+  sa = bits[7:7]
+  simd = bits[9:8]
+  wgp = bits[12:10]
+  wave = bits[17:13]
+  id7 = bits[31:18]
+  @property
+  def cu(self) -> int: return self.wgp | (self.sa << 3)
+
+class WAVESTART_RDNA4(PacketType):  # Layout 4: wgp is 4 bits, wave shifted to bits 15-19
+  encoding = bits[4:0] == 0b01100
+  delta = bits[6:5]
+  sa = bits[7:7]
+  simd = bits[9:8]
+  wgp = bits[13:10]
+  wave = bits[19:15]
+  id7 = bits[31:20]
+  @property
+  def cu(self) -> int: return self.wgp | (self.sa << 4)
+
+class WAVEALLOC(PacketType):  # exclude: 1 << 10
+  encoding = bits[4:0] == 0b00101
+  delta = bits[7:5]
+  _padding = bits[19:8]
+
+class WAVEALLOC_RDNA4(PacketType):  # Layout 4: 20->24 bits
+  encoding = bits[4:0] == 0b00101
+  delta = bits[7:5]
+  _padding = bits[23:8]
+
+class PERF(PacketType):  # exclude: 1 << 11
+  encoding = bits[4:0] == 0b10110
+  delta = bits[7:5]
+  arg = bits[27:8]
+
+class PERF_RDNA4(PacketType):  # Layout 4: 28->32 bits
+  encoding = bits[4:0] == 0b10110
+  delta = bits[9:7]
+  arg = bits[31:10]
+
+class NOP(PacketType):
+  encoding = bits[3:0] == 0b0000
+  delta = None
+  _padding = bits[3:0]
+
+class TS_WAVE_STATE(PacketType):
+  encoding = bits[6:0] == 0b1010001
+  delta = bits[15:7]
+  coarse = bits[23:16]
+  @property
+  def wave_interest(self) -> bool: return bool(self.coarse & 1)
+  @property
+  def terminate_all(self) -> bool: return bool(self.coarse & 8)
+
+class EVENT(PacketType):  # exclude: 1 << 7
+  encoding = bits[7:0] == 0b01100001
+  delta = bits[10:8]
+  event = bits[23:11]
+
+class EVENT_BIG(PacketType):
+  encoding = bits[7:0] == 0b11100001
+  delta = bits[10:8]
+  event = bits[31:11]
+
+class REG(PacketType):
+  encoding = bits[3:0] == 0b1001
+  delta = bits[6:4]
+  slot = bits[9:7]
+  hi_byte = bits[15:8]
+  subop = bits[31:16]
+  val32 = bits[63:32]
+  @property
+  def is_config(self) -> bool: return bool(self.hi_byte & 0x80)
+
+class SNAPSHOT(PacketType):
+  encoding = bits[6:0] == 0b1110001
+  delta = bits[9:7]
+  snap = bits[63:10]
+
+class LAYOUT_HEADER(PacketType):
+  encoding = bits[6:0] == 0b0010001
+  delta = None
+  layout = bits[12:7]
+  simd = bits[14:13]
+  group = bits[17:15]
+  sel_a = bits[31:28]
+  sel_b = bits[36:33]
+  flag4 = bits[59:59]
+  _padding = bits[63:60]
+
+class INST(PacketType):
+  encoding = bits[2:0] == 0b010
+  delta = bits[6:4]
+  flag1 = bits[3:3]
+  flag2 = bits[7:7]
+  wave = bits[12:8]
+  op = bits[19:13].enum(InstOp)
+
+class INST_RDNA4(PacketType):  # Layout 4: different delta position and InstOp encoding
+  encoding = bits[2:0] == 0b010
+  delta = bits[5:3]
+  w64h = bits[6:6]
+  wave = bits[11:7]
+  op = bits[19:12].enum(InstOpRDNA4)
+
+class UTILCTR(PacketType):
+  encoding = bits[6:0] == 0b0110001
+  delta = bits[8:7]
+  ctr = bits[47:9]
+
+# Packet types with rocprof type IDs as keys
+PACKET_TYPES_RDNA3: dict[int, type[PacketType]] = {
+  1: VALUINST, 2: VMEMEXEC, 3: ALUEXEC, 4: IMMEDIATE, 5: IMMEDIATE_MASK, 6: WAVERDY, 7: TS_DELTA_S8_W3, 8: WAVEEND,
+  9: WAVESTART, 10: TS_DELTA_S5_W2, 11: WAVEALLOC, 12: TS_DELTA_S5_W3, 13: PERF, 14: UTILCTR, 15: TS_DELTA_SHORT,
+  16: NOP, 17: TS_WAVE_STATE, 18: EVENT, 19: EVENT_BIG, 20: REG, 21: SNAPSHOT, 22: TS_DELTA_OR_MARK, 23: LAYOUT_HEADER, 24: INST,
+}
+PACKET_TYPES_RDNA4: dict[int, type[PacketType]] = {
+  **PACKET_TYPES_RDNA3,
+  8: WAVEEND_RDNA4, 9: WAVESTART_RDNA4, 10: TS_DELTA_S5_W2_RDNA4, 11: WAVEALLOC_RDNA4,
+  12: TS_DELTA_S5_W3_RDNA4, 13: PERF_RDNA4, 22: TS_DELTA_OR_MARK_RDNA4, 24: INST_RDNA4,
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CDNA PACKET TYPE DEFINITIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CDNA_MISC(PacketType):
+  """pkt_fmt=0: 16-bit (Misc)"""
+  encoding = bits[3:0] == 0
+  delta = bits[11:4]
+  sh = bits[12:12]
+  misc_type = bits[15:13]
+
+class CDNA_TIMESTAMP(PacketType):
+  """pkt_fmt=1: 64-bit timestamp packet (case 0x0)"""
+  encoding = bits[3:0] == 1
+  _reserved = bits[15:4]
+  timestamp = bits[63:16]   # stored as (data_word >> 0x10) in low 46 bits of local_58
+
+class CDNA_REG(PacketType):
+  """pkt_fmt=2: 64-bit (Reg)"""
+  encoding = bits[3:0] == 2
+  pipe = bits[6:5]
+  _me_raw = bits[8:7]
+  _reserved = bits[15:9]
+  regaddr = bits[31:16]
+  regdata = bits[63:32]
+
+class CDNA_WAVESTART(PacketType):
+  """type 3: 32-bit wave start (Wave/group_id)"""
+  encoding = bits[3:0] == 3
+  sh = bits[5:5]
+  cu = bits[9:6]
+  wave = bits[13:10]
+  simd = bits[15:14]
+  pipe = bits[17:16]
+  me = bits[19:18]
+  _reserved = bits[21:20]
+  count = bits[28:22]
+  _padding = bits[31:29]
+
+class CDNA_WAVEALLOC(PacketType):
+  """pkt_fmt=4: 16-bit (Wave)"""
+  encoding = bits[3:0] == 4
+  sh = bits[5:5]
+  cu = bits[9:6]
+  wave = bits[13:10]
+  simd = bits[15:14]
+
+class CDNA_REG_CS(PacketType):
+  """type 5: 48-bit register CS write (RegCs)"""
+  encoding = bits[3:0] == 5
+  pipe = bits[6:5]
+  _me_raw = bits[8:7]
+  regaddr = bits[15:9]
+  regdata = bits[47:16]
+
+class CDNA_WAVEEND(PacketType):
+  """type 6: 16-bit wave end (group_id)"""
+  encoding = bits[3:0] == 6
+  sh = bits[5:5]
+  cu = bits[9:6]
+  wave = bits[13:10]
+  simd = bits[15:14]
+
+class CDNA_INST(PacketType):
+  """pkt_fmt=10: 16-bit (MsgInst)"""
+  encoding = bits[3:0] == 10
+  wave = bits[8:5]
+  simd = bits[10:9]
+  op = bits[15:11].enum(InstOpCDNA)
+
+class CDNA_INST_PC(PacketType):
+  """pkt_fmt=11: 64-bit (MsgInstPc)"""
+  encoding = bits[3:0] == 11
+  wave = bits[8:5]
+  simd = bits[10:9]
+  _reserved = bits[14:11]
+  err = bits[15:15]
+  pc = bits[63:16]
+
+class CDNA_ISSUE(PacketType):
+  """pkt_fmt=13: 32-bit (Issue)"""
+  encoding = bits[3:0] == 13
+  simd = bits[6:5]
+  inst = bits[27:8]
+  _padding = bits[31:28]
+
+class CDNA_PERF(PacketType):
+  """pkt_fmt=14: 64-bit (MsgPerf)"""
+  encoding = bits[3:0] == 14
+  sh = bits[5:5]
+  cu = bits[9:6]
+  cntr_bank = bits[11:10]
+  cntr0 = bits[24:12]
+  cntr1 = bits[37:25]
+  cntr2 = bits[50:38]
+  cntr3 = bits[63:51]
+
+class CDNA_EVENT(PacketType):
+  """pkt_fmt=7: 16-bit"""
+  encoding = bits[3:0] == 7
+  _reserved = bits[15:4]
+
+class CDNA_EVENT_CS(PacketType):
+  """pkt_fmt=8: 16-bit"""
+  encoding = bits[3:0] == 8
+  _reserved = bits[15:4]
+
+class CDNA_EVENT_GFX1(PacketType):
+  """pkt_fmt=9: 16-bit"""
+  encoding = bits[3:0] == 9
+  _reserved = bits[15:4]
+
+class CDNA_USERDATA(PacketType):
+  """pkt_fmt=12: 48-bit (UserData)"""
+  encoding = bits[3:0] == 12
+  sh = bits[5:5]
+  cu = bits[9:6]
+  wave = bits[13:10]
+  simd = bits[15:14]
+  data = bits[47:16]
+
+class CDNA_REG_CS_PRIV(PacketType):
+  """pkt_fmt=15: 48-bit (RegCs)"""
+  encoding = bits[3:0] == 15
+  pipe = bits[6:5]
+  _me_raw = bits[8:7]
+  regaddr = bits[15:9]
+  regdata = bits[47:16]
+
+PACKET_TYPES_CDNA: dict[int, type[PacketType]] = {
+  0: CDNA_MISC, 1: CDNA_TIMESTAMP, 2: CDNA_REG, 3: CDNA_WAVESTART, 4: CDNA_WAVEALLOC, 5: CDNA_REG_CS, 6: CDNA_WAVEEND,
+  7: CDNA_EVENT, 8: CDNA_EVENT_CS, 9: CDNA_EVENT_GFX1, 10: CDNA_INST, 11: CDNA_INST_PC, 12: CDNA_USERDATA,
+  13: CDNA_ISSUE, 14: CDNA_PERF, 15: CDNA_REG_CS_PRIV, 16: LAYOUT_HEADER,
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DECODER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_decode_tables(packet_types: dict[int, type[PacketType]]) -> tuple[dict[int, tuple], bytes]:
+  # Build state table: byte -> opcode. Sort by mask specificity (more bits first), NOP last
+  sorted_types = sorted(packet_types.items(), key=lambda x: (-bin(x[1].encoding.mask).count('1'), x[0] == 16))
+  state_table = bytes(next((op for op, cls in sorted_types if (b & cls.encoding.mask) == cls.encoding.default), 16) for b in range(256))
+  # Build decode info: opcode -> (pkt_cls, nib_count, delta_lo, delta_mask, delta_mul, special_case)
+  # special_case: 0=none, 1=TS_DELTA_OR_MARK (check is_marker), 2=TS_DELTA_SHORT (add 4), 4=CDNA_TIMESTAMP (absolute)
+  _special = {TS_DELTA_OR_MARK: 1, TS_DELTA_OR_MARK_RDNA4: 1, TS_DELTA_SHORT: 2, CDNA_TIMESTAMP: 4}
+  delta_base, delta_mul = (bits[4:4], 4) if packet_types is PACKET_TYPES_CDNA else (None, 1)
+  decode_info = {}
+  for opcode, pkt_cls in packet_types.items():
+    delta_field = getattr(pkt_cls, 'delta', delta_base)
+    special = _special.get(pkt_cls, 0)
+    decode_info[opcode] = (pkt_cls, pkt_cls._size_nibbles, delta_field.lo if delta_field else 0, delta_field.mask if delta_field else 0, delta_mul,  # type: ignore[attr-defined]
+                           special)
+  return decode_info, state_table
+
+_DECODE_INFO_RDNA3, _STATE_TABLE_RDNA3 = _build_decode_tables(PACKET_TYPES_RDNA3)
+_DECODE_INFO_RDNA4, _STATE_TABLE_RDNA4 = _build_decode_tables(PACKET_TYPES_RDNA4)
+_DECODE_INFO_CDNA, _STATE_TABLE_CDNA = _build_decode_tables(PACKET_TYPES_CDNA)
+
+def decode(data: bytes) -> Iterator[PacketType]:
+  """Decode raw SQTT blob, yielding packet instances. Auto-detects RDNA (layout 3/4) vs CDNA."""
+  n, reg, pos, nib_off, nib_count, time, ts_offset = len(data), 0, 0, 0, 16, 0, None
+  decode_info, state_table = _DECODE_INFO_RDNA3, _STATE_TABLE_RDNA3  # start RDNA3, auto-detect switches if needed
+  # in CDNA, packets can arrive before timestamp does, queue them here
+  packets_since_reset:list[PacketType] = []
+
+  while pos + ((nib_count + nib_off + 1) >> 1) <= n:
+    need = nib_count - nib_off
+    # 1. if unaligned, read high nibble to align
+    if nib_off: reg, pos = (reg >> 4) | ((data[pos] >> 4) << 60), pos + 1
+    # 2. read all full bytes at once
+    if (byte_count := need >> 1):
+      read_bytes = min(byte_count, 8)
+      chunk = int.from_bytes(data[pos:pos + read_bytes], 'little')
+      reg, pos = (reg >> (read_bytes * 8)) | (chunk << (64 - read_bytes * 8)), pos + byte_count
+    # 3. if odd, read low nibble
+    if (nib_off := need & 1): reg = (reg >> 4) | ((data[pos] & 0xF) << 60)
+
+    opcode = state_table[reg & 0xFF]
+    pkt_cls, nib_count, delta_lo, delta_mask, delta_mul, special = decode_info[opcode]
+    delta = ((reg >> delta_lo) & delta_mask) * delta_mul
+    if special == 1:  # TS_DELTA_OR_MARK
+      pkt = pkt_cls.from_raw(reg, 0)  # create packet to check is_marker
+      if pkt.is_marker: delta = 0
+    elif special == 2: delta += 4  # TS_DELTA_SHORT
+    elif special == 4:  # CDNA_TIMESTAMP (absolute timestamp anchoring)
+      if (reg >> 4) & 0xfff == 0:  # unk_0 == 0 means absolute timestamp
+        abs_ts = reg >> 16
+        if packets_since_reset: time = packets_since_reset[0]._time
+        if ts_offset is None: ts_offset = abs_ts - time
+        else: time = ((abs_ts - ts_offset) & ~3) - 4
+        if packets_since_reset:
+          shift = time - packets_since_reset[0]._time
+          for buffered in packets_since_reset: buffered._time += shift
+          time = packets_since_reset[-1]._time
+          yield from packets_since_reset
+          packets_since_reset.clear()
+      delta = 0
+    time += delta
+    pkt = pkt_cls.from_raw(reg, time)
+    # auto-detect: first packet is always LAYOUT_HEADER (RDNA layout 3/4) or misdetected (CDNA)
+    if pkt_cls is LAYOUT_HEADER:
+      if pkt.layout == 4: decode_info, state_table = _DECODE_INFO_RDNA4, _STATE_TABLE_RDNA4
+      elif pkt.layout != 3:  # not a real LAYOUT_HEADER — switch to CDNA and re-decode first packet
+        decode_info, state_table = _DECODE_INFO_CDNA, _STATE_TABLE_CDNA
+        opcode = state_table[reg & 0xFF]
+        pkt_cls, nib_count, delta_lo, delta_mask, delta_mul, special = decode_info[opcode]
+        if special == 4 and (reg >> 4) & 0xfff == 0:  # CDNA_TIMESTAMP absolute
+          ts_offset = (reg >> 16) - time
+        pkt = pkt_cls.from_raw(reg, time)
+    if isinstance(pkt, CDNA_MISC) and pkt.misc_type == 1: # TIME_RESET
+      yield from packets_since_reset
+      packets_since_reset = [pkt]
+    elif packets_since_reset: packets_since_reset.append(pkt)
+    else: yield pkt
+  yield from packets_since_reset
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAPPER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class InstructionInfo:
+  pc: int
+  wave: int
+  inst: Inst
+
+def map_insts(data:bytes, lib:bytes, target:str) -> Iterator[tuple[PacketType, InstructionInfo|None]]:
+  """maps SQTT packets to instructions, yields (packet, instruction_info or None)"""
+  # map pcs to insts
+  from tinygrad.viz.serve import amd_decode, get_arch, get_elf_section
+  pc_map = amd_decode((text:=get_elf_section(lib, ".text")).content, get_arch(target), text.header.sh_addr)
+  wave_pc:dict[tuple[int, int], int] = {}
+  cdna_imm_queue:dict[tuple[int, int], list[CDNA_ISSUE]] = {}
+  def cdna_imm_dequeue(key:tuple[int, int]) -> Iterator[tuple[PacketType, InstructionInfo]]:
+    pending = cdna_imm_queue[key]
+    while pending and ((p:=pending[0]).inst >> (key[1]*2)) & 3 == 3:
+      pending.pop(0)
+      if (inst:=pc_map[pc:=wave_pc[key]]).op_name not in {'S_NOP', 'S_WAITCNT', 'S_SETPRIO'}: continue
+      wave_pc[key] += inst.size()
+      yield (p, InstructionInfo(pc, key[1], inst))
+  # RDNA selects one SIMD for instruction tracing, CDNA traces multiple SIMDs
+  simd:int = 0
+  for p in decode(data):
+    if not getattr(p, "cu", 0) == 0: continue
+    if isinstance(p, LAYOUT_HEADER): simd = p.simd
+    if isinstance(p, (WAVESTART, WAVESTART_RDNA4, CDNA_WAVESTART)):
+      if (key:=(p.simd, p.wave)) in wave_pc: raise AssertionError("only one inflight wave per unit")
+      wave_pc[key] = next(iter(pc_map))
+    elif isinstance(p, (WAVEEND, WAVEEND_RDNA4, CDNA_WAVEEND)):
+      wave_pc.pop((p.simd, p.wave))
+      yield (p, None)
+    elif isinstance(p, IMMEDIATE_MASK):
+      # immediate mask may yield multiple times per packet
+      for wave in range(16):
+        if p.mask & (1 << wave):
+          inst = pc_map[pc:=wave_pc[(simd, wave)]]
+          wave_pc[(simd, wave)] += inst.size()
+          yield (p, InstructionInfo(pc, wave, inst))
+    elif isinstance(p, CDNA_ISSUE):
+      for wave in range(10):
+        if ((p.inst >> (wave * 2)) & 3) in {2, 3}:
+          cdna_imm_queue.setdefault(key:=(p.simd, wave), []).append(p)
+          yield from cdna_imm_dequeue(key)
+    elif isinstance(p, CDNA_INST):
+      p._time = cdna_imm_queue[(p.simd, p.wave)].pop(0)._time
+      inst = pc_map[pc:=wave_pc[(p.simd, p.wave)]]
+      if p.op == InstOpCDNA.JUMP:
+        x = getattr(inst, 'simm16') & 0xffff
+        wave_pc[(p.simd, p.wave)] += inst.size() + (x - 0x10000 if x & 0x8000 else x)*4
+      else:
+        wave_pc[(p.simd, p.wave)] += inst.size()
+      yield (p, InstructionInfo(pc, p.wave, inst))
+      yield from cdna_imm_dequeue((p.simd, p.wave))
+    # map INST events on this SIMD to the program counter, we know the waves
+    elif isinstance(p, (VALUINST, INST, INST_RDNA4, IMMEDIATE)) and not (isinstance(p, (INST, INST_RDNA4)) and p.op.name.startswith("OTHER_")):
+      inst = pc_map[pc:=wave_pc[(simd, p.wave)]]
+      # s_delay_alu, s_wait_alu and s_barrier_wait instructions are skipped
+      while (inst_op:=getattr(inst, 'op_name', '')) in {"S_DELAY_ALU", "S_WAIT_ALU", "S_BARRIER_WAIT"}:
+        wave_pc[(simd, p.wave)] += inst.size()
+        inst = pc_map[pc:=wave_pc[(simd, p.wave)]]
+      # assert branch always has a JUMP packet
+      if "BRANCH" in inst_op and not (isinstance(p, (INST, INST_RDNA4)) and p.op.name.startswith("JUMP")):
+        raise AssertionError(f"{inst_op} can only be followed by JUMP, got {p}")
+      # JUMP handling
+      if isinstance(p, (INST, INST_RDNA4)) and p.op in {InstOp.JUMP, InstOpRDNA4.JUMP}:
+        x = getattr(inst, 'simm16') & 0xffff
+        wave_pc[(simd, p.wave)] += inst.size() + (x - 0x10000 if x & 0x8000 else x)*4
+      else:
+        wave_pc[(simd, p.wave)] += inst.size()
+      yield (p, InstructionInfo(pc, p.wave, inst))
+    # for all other packets (VMEMEXEC, ALUEXEC, OTHER_ INST, etc.), yield with None
+    else: yield (p, None)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRINTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+PACKET_COLORS = {
+  "INST": "WHITE", "VALUINST": "BLACK", "VMEMEXEC": "yellow", "ALUEXEC": "yellow",
+  "IMMEDIATE": "YELLOW", "IMMEDIATE_MASK": "YELLOW", "WAVERDY": "cyan", "WAVEALLOC": "cyan",
+  "WAVEEND": "blue", "WAVESTART": "blue", "PERF": "magenta", "EVENT": "red", "EVENT_BIG": "red",
+  "REG": "green", "LAYOUT_HEADER": "white", "SNAPSHOT": "white", "UTILCTR": "green",
+}
+
+def format_packet(p) -> str:
+  name = type(p).__name__
+  if isinstance(p, (INST, INST_RDNA4)):
+    op_name = p.op.name if isinstance(p.op, (InstOp, InstOpRDNA4)) else f"0x{p.op:02x}"
+    fields = f"wave={p.wave} op={op_name}" + ((" flag1" if p.flag1 else "") + (" flag2" if p.flag2 else "") if isinstance(p, INST) else "")
+  elif isinstance(p, VALUINST): fields = f"wave={p.wave}" + (" flag" if p.flag else "")
+  elif isinstance(p, ALUEXEC): fields = f"src={p.src.name if isinstance(p.src, AluSrc) else p.src}"
+  elif isinstance(p, VMEMEXEC): fields = f"src={p.src.name if isinstance(p.src, MemSrc) else p.src}"
+  elif isinstance(p, (WAVESTART, WAVESTART_RDNA4, WAVEEND, WAVEEND_RDNA4)): fields = f"wave={p.wave} simd={p.simd} cu={p.cu}"
+  elif hasattr(p, '_fields'):
+    filt = {'delta', 'encoding'} if not isinstance(p, (TS_DELTA_OR_MARK, TS_DELTA_OR_MARK_RDNA4)) else {'encoding'}
+    fields = " ".join(f"{k}=0x{getattr(p, k):x}" if k in {'snap', 'val32'} else f"{k}={getattr(p, k)}"
+                      for k in p._fields if not k.startswith('_') and k not in filt)
+  else: fields = ""
+  return f"{p._time:8}: {colored(f'{name:18}', PACKET_COLORS.get(name.replace('_RDNA4', ''), 'white'))} {fields}"
+
+def print_packets(packets) -> None:
+  skip = {"NOP", "TS_DELTA_SHORT", "TS_WAVE_STATE", "TS_DELTA_OR_MARK",
+          "TS_DELTA_S5_W2", "TS_DELTA_S5_W3", "TS_DELTA_S8_W3", "REG", "EVENT",
+          "CDNA_MISC", "CDNA_REG_CS", "CDNA_REG_CS_PRIV", "CDNA_REG"} if not getenv("NOSKIP") else {"NOP"}
+  for p in packets:
+    if type(p).__name__.replace("_RDNA4", "") not in skip: print(format_packet(p))
+
+if __name__ == "__main__":
+  import sys, pickle
+  from tinygrad.helpers import temp
+  with open(temp("profile.pkl", append_user=True) if len(sys.argv) < 2 else sys.argv[1], "rb") as f:
+    data = pickle.load(f)
+  prg_names = {e.tag: e.name for e in data if type(e).__name__ == "ProfileProgramEvent" and e.tag is not None}
+  sqtt_events = [e for e in data if type(e).__name__ == "ProfileSQTTEvent"]
+  evt_num = getenv("SQTT_EVENT", -1)
+  for i, event in enumerate(sqtt_events):
+    if evt_num == -1 or i == evt_num:
+      print(f"\n=== event {i} {prg_names.get(event.kern, '')} ===")
+      print_packets(decode(event.blob))
+
+from typing import Literal, Callable
+import math, sys
+from collections import defaultdict, Counter
+from tinygrad.renderer import tc
+from tinygrad.uop.ops import GroupOp, Ops, UOp, PatternMatcher, UPat, range_str, axis_letters
+from tinygrad.uop.weak import commit_weak_consts
+from tinygrad.helpers import strip_parens, getenv, prod, dedup, Target, IMAGE, FLOAT16, is_image_shape
+from tinygrad.dtype import dtypes, DType, AddrSpace, truncate, to_storage_scalar
+from tinygrad.renderer import Renderer
+
+base_rewrite = PatternMatcher([
+  # local/reg buffers
+  (UPat(Ops.BUFFER, name="x"), lambda ctx,x: ctx.render_buffer(x)),
+  (UPat(Ops.BINARY, name="x"), lambda ctx,x: f'const unsigned char {ctx[x]}[] = "' + ''.join(f'\\x{b:02x}' for b in x.arg) + '";'),
+
+  # range/loop/if/endif
+  (UPat(Ops.RANGE, dtypes.void), lambda ctx: "for (;;) {"),
+  (UPat(Ops.RANGE, name="x"),
+   lambda ctx,x: f"for ({ctx.render_dtype(x.dtype)} {ctx[x]} = 0; {ctx[x]} < {ctx[x.src[0]]}; {ctx[x]}++) {{"),
+  (UPat(Ops.BACKEDGE, src=(UPat(), UPat(Ops.RANGE), UPat(name="c", dtype=dtypes.bool))), lambda ctx,c: f"  if (!({ctx[c]})) {{ break; }}\n}}"),
+  (UPat(Ops.IF, name="x"), lambda ctx,x: f"if ({ctx[x.src[0]]}) {{"),
+  (UPat((Ops.ENDIF, Ops.END)), lambda ctx: "}"),
+
+  # const
+  (UPat.cvar("c").cast(dtypes.floats, name="x"), lambda ctx,x,c: None if math.isfinite(v:=c.val) else \
+    f"({ctx.render_cast(x, ctx.nan if math.isnan(v) else ctx.infinity if v > 0 else f'-{ctx.infinity}')})"),
+  (UPat.cvar("c").cast(dtypes.float), lambda ctx,c: f"{c.val}f"),
+  (UPat.cvar("c").cast(dtypes.int64), lambda ctx,c: f"{c.val}l"),
+  (UPat.cvar("c").cast(dtypes.uint64, name="x"), lambda ctx,x,c: f"{truncate[x.dtype](c.val)}ul"),
+  (UPat.cvar("c").cast(dtypes.uint32, name="x"), lambda ctx,x,c: f"{truncate[x.dtype](c.val)}u"),
+  (UPat.cvar("c").cast(dtypes.bool), lambda ctx,c: "1" if c.val else "0"),
+  # consts are rendered to larger type and casted
+  (UPat.cvar("c").cast((*dtypes.fp8s, dtypes.bfloat16, dtypes.half), name="x"), lambda ctx,x,c: f"({ctx.render_cast(x, f'{c.val}f')})"),
+  (UPat.cvar("c").cast((dtypes.uint8, dtypes.uint16), name="x"), lambda ctx,x,c: f"({ctx.render_cast(x, f'{c.val}u')})"),
+  (UPat.cvar("c").cast((dtypes.int8, dtypes.int16), name="x"), lambda ctx,x,c: f"({ctx.render_cast(x, str(c.val))})"),
+  # default const render
+  (UPat.cvar("c").cast(), lambda ctx,c: str(c.val)),
+
+  # casting
+  (UPat(Ops.CAST, name="x"), lambda ctx,x: f"({ctx.render_cast(x, ctx[x.src[0]])})"),
+  (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"(({ctx._render_dtype(x.dtype, addrspace=x.addrspace)})({ctx[x.src[0]]}))"
+   if x.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL) else None),
+  (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"__builtin_bit_cast({ctx.render_type(x)}, ({ctx.render_type(x.src[0])})({ctx[x.src[0]]}))"),
+
+  # GPU stuff
+  (UPat(Ops.BARRIER), lambda ctx: ctx.barrier),
+  (UPat(Ops.SPECIAL, name="x"), lambda ctx,x: f"{ctx.code_for_workitem[x.arg[0]](x.arg[-1])}; /* {(x.src[0]).render()} */"),
+
+  # SHRINK/INDEX
+  (UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var('idx')), name="x"), lambda ctx,**kwargs: ctx.render_index(**kwargs)),
+  (UPat(Ops.SHRINK, src=(UPat.var("buf"), UPat.var('idx'), UPat.cvar().cast()), name="x"), lambda ctx,**kwargs: ctx.render_index(**kwargs)),
+  (UPat(Ops.STACK, name="x"),
+   lambda ctx,x: f"{ctx.float4.replace('float4', ctx.render_type(x))}" + \
+                 f"{ctx.float4_style[0]}{','.join([ctx[y] for y in x.src])}{ctx.float4_style[1]}"),
+
+  # load/store
+  (UPat(Ops.LOAD, src=(UPat.var('bidx'),)), lambda ctx,bidx: f"({ctx.render_access(bidx)})"),
+  (UPat(Ops.LOAD, src=(UPat.var("bidx"), UPat.var("var"), UPat.var("gate"))),
+   lambda ctx,bidx,var,gate: f"({ctx[gate]}?{ctx.render_access(bidx)}:{ctx[var]})"),
+  (UPat(Ops.STORE, src=(UPat.var('bidx'), UPat.var("var"))), lambda ctx,bidx,var: f"{ctx.render_access(bidx)} = {ctx[var]};"),
+
+  # alu/gep
+  (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{_wmma_name(x)}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]})"),
+  (UPat(GroupOp.ALU, name="x"), lambda ctx,x: ctx.code_for_op[x.op](
+    *([strip_parens(ctx[v]) if v.op == x.op and x.op in {Ops.ADD, Ops.MUL, Ops.XOR, Ops.OR, Ops.AND} else ctx[v] for v in x.src]), x.dtype)),
+
+  # call an external function by symbol: the CUSTOM_FUNCTION body names the callee, the srcs are the args and set the types
+  (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, name="f"),), allow_any_len=True, name="x"), lambda ctx,x,f:
+   f"(({ctx.abi}{ctx.render_dtype(x.dtype)}(*)({', '.join(map(ctx.render_type, x.src[1:]))}))({f.arg.name}))"
+   f"({', '.join(f'({ctx.render_type(y)})({ctx[y]})' for y in x.src[1:])})" + (";" if x.dtype is dtypes.void else "")),
+
+  (UPat(Ops.CALL, src=(UPat(Ops.LINEAR, name="body"),), allow_any_len=True, name="x"), lambda ctx,x,body: f"{ctx.fn_names[body]}("
+   f"{', '.join(f'({ctx.param_type(p)}){ctx[x.src[s+1]]}' for s,p in sorted((u.arg.slot,u) for u in body.src if u.op is Ops.PARAM))});"),
+
+  # custom passes through with format
+  (UPat((Ops.CUSTOM, Ops.CUSTOMI), name="x"), lambda ctx,x: x.arg[0].format(*[ctx[y] for y in x.src])),
+])
+
+def create_non_native_float_pats(dts:tuple[DType, ...], casting:bool=True):
+  patterns = PatternMatcher([
+    # a weak CONST states no width and cannot be restated: commit it at the emulated dtype a sibling src states
+    (UPat(GroupOp.ALU, name="x"), lambda x, dts=dts: commit_weak_consts(x, next((s.dtype for s in x.src if s.dtype in dts), None))),
+    (UPat(GroupOp.ALU-{Ops.WHERE}, dtype=dts, name="x"),
+     lambda x: UOp(x.op, src=tuple(vv.cast(dtypes.float) for vv in x.src), arg=x.arg).cast(x.dtype)),
+    (UPat(GroupOp.ALU, dtypes.bool, name="alu", src=(UPat.var("x", dtype=dts), UPat.var("y", dtype=dts))),
+     lambda alu,x,y: UOp(alu.op, src=(x.cast(dtypes.float), y.cast(dtypes.float)), arg=alu.arg))])
+  if casting:
+    # add float intermediate casting
+    patterns += PatternMatcher([
+      (UPat(Ops.CAST, dts, (UPat.var("x"),), name="y"),
+       lambda x,y: x.cast(dtypes.float).cast(y.dtype) if x.dtype!=dtypes.float and x.op is not Ops.CONST else None),
+      (UPat(Ops.CAST, name="x", src=(UPat.var("y", dts),)), lambda x,y: y.cast(dtypes.float).cast(x.dtype) if x.dtype!=dtypes.float else None)])
+  return patterns
+
+def cast_float_to_bf16(x: UOp) -> UOp:
+  assert x.dtype == dtypes.float, "cast float -> bf16 must start with float"
+  x = x.bitcast(dtypes.uint)
+  x = (-x & 0x7f800000).ne(0).where(x + ((x >> 16) & 1) + 0x7fff, (x & 0xffff).ne(0).where((x | 0x10000), x))
+  return (x >> 16).cast(dtypes.ushort).bitcast(dtypes.bfloat16)
+
+# manual bfloat16 casting patterns (shared between LLVM, Clang, and AMD renderers to avoid compiler intrinsics)
+pm_manual_bf16_cast = PatternMatcher([
+  (UPat(Ops.CAST, dtypes.float, (UPat.var("x", dtypes.bfloat16),)),
+   lambda x: (x.bitcast(dtypes.ushort).cast(dtypes.uint)<<16).bitcast(dtypes.float)),
+  (UPat(Ops.CAST, dtype=dtypes.bfloat16, src=(UPat.var("x", dtype=dtypes.float),)), cast_float_to_bf16),
+])
+# a bfloat16 stored as ushort renders its const as the bit pattern
+pm_bf16_ushort_const = PatternMatcher([(UPat.cvar("c").cast(dtypes.bfloat16), lambda ctx,c: f"{to_storage_scalar(c.val, dtypes.bfloat16)}u")])
+
+def uops_to_dtypes(uops:list[UOp]) -> list[tuple[DType, int]]:
+  return dedup((u.dtype, u.max_numel()) for u in uops if u.addrspace in (AddrSpace.ALU, None) and u.dtype != dtypes.void and u._shape is not None)
+
+def _wmma_name(u:UOp) -> str:
+  return f"WMMA_{'_'.join(map(str, u.arg[0]))}_{u.arg[1].name}_{u.dtype.name}"
+
+# (name, dims, dtype_in, dtype_out, upcast_sizes)
+def wmma_args(uops:list[UOp]):
+  return dedup((_wmma_name(uop), uop.arg[0], uop.arg[1], uop.dtype, tuple(x.shape[-1] for x in uop.src)) for uop in uops if uop.op is Ops.WMMA)
+
+class CStyleLanguage(Renderer):
+  abi: str = ""
+  kernel_typedef: str = "void"
+  buffer_prefix: str = ""
+  buffer_suffix: str = ""
+  smem_align: str = ""
+  smem_prefix: str = ""
+  smem_prefix_for_cast: bool = True
+  var_prefix: str = "const "
+  var_suffix: str = ""
+  barrier: str = ""
+  code_for_workitem: dict[Literal["g", "l"], Callable] = {}
+  extra_args: list[str] = []
+  float4: str|None = None
+  float4_style: tuple[str, str] = ('(', ')')
+  gep_arr_threshold: int = 4
+  type_map: dict[DType, str] = {
+    dtypes.void: "void", dtypes.bool: "bool", dtypes.i8: "signed char", dtypes.u8: "unsigned char",
+    dtypes.i16: "short", dtypes.u16: "unsigned short", dtypes.i32: "int", dtypes.u32: "unsigned int",
+    dtypes.i64: "long", dtypes.u64: "unsigned long", dtypes.f16: "half", dtypes.bf16: "__bf16",
+    dtypes.f32: "float", dtypes.f64: "double"}
+  infinity: str = "INFINITY"
+  nan: str = "NAN"
+  code_for_op: dict = {
+    Ops.SQRT: lambda x,dtype: f"sqrt({x})", Ops.RECIPROCAL: lambda x,dtype: f"(1/{x})", Ops.NEG: lambda x,dtype: f"-{x}",
+    Ops.EXP2: lambda x,dtype: f"exp2({x})", Ops.LOG2: lambda x,dtype: f"log2({x})", Ops.SIN: lambda x,dtype: f"sin({x})",
+    Ops.TRUNC: lambda x,dtype: f"trunc({x})",
+    Ops.AND: lambda a,b,dtype: f"({a}&{b})", Ops.XOR: lambda a,b,dtype: f"({a}^{b})", Ops.OR: lambda a,b,dtype: f"({a}|{b})",
+    Ops.ADD: lambda a,b,dtype: f"({a}+{b})", Ops.SUB: lambda a,b,dtype: f"({a}-{b})", Ops.MUL: lambda a,b,dtype: f"({a}*{b})",
+    Ops.CMOD: lambda a,b,dtype: f"({a}%{b})", Ops.CDIV: lambda a,b,dtype: f"({a}/{b})", Ops.CMPNE: lambda a,b,dtype: f"({a}!={b})",
+    Ops.SHR: lambda a,b,dtype: f"({a}>>{b})", Ops.SHL: lambda a,b,dtype: f"({a}<<{b})", Ops.CMPLT: lambda a,b,dtype: f"({a}<{b})",
+    Ops.WHERE: lambda a,b,c,dtype: f"({a}?{b}:{c})", Ops.CMPEQ: lambda a,b,dtype: f"({a}=={b})"}
+
+  string_rewrite = base_rewrite
+
+  def render_kernel(self, function_name:str, kernel:list[str], bufs:list[tuple[str,tuple[UOp,bool]]], uops:list[UOp], prefix=None) -> str:
+    tmp = ""
+    if any(is_image_shape(u._shape) for _,(u,_) in bufs):
+      tmp = "const sampler_t smp = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;\n"
+    buftypes = [(name, ("volatile " if u.arg.volatile else "")+(self.var_prefix if u.addrspace == AddrSpace.ALU else "")+
+                       self._render_dtype(u.dtype, sz=1, addrspace=u.addrspace, mutable=mutable, shape=u._shape)+
+                       (self.var_suffix if u.addrspace == AddrSpace.ALU else self.buffer_suffix)) for name,(u,mutable) in bufs]
+    local_dims = [u.src[0] for u in uops if u.op is Ops.SPECIAL and u.arg[0] == "l"]
+    launch_bounds = prod([d.vmax for d in local_dims])
+    prg = ''.join([f"{self.kernel_typedef.format(launch_bounds=launch_bounds)} {function_name}(",] +
+    [', '.join([f'{t} {name}' for name,t in buftypes] + self.extra_args)] +
+    [") {\n" + tmp] + ['\n'.join(kernel), "\n}"])
+    return prg if prefix is None else "\n".join(prefix)+f"\n{prg}"
+
+  def render_index(self, x:UOp, buf:UOp, idx:UOp):
+    if buf.addrspace == AddrSpace.ALU:
+      # this is lane access in C
+      if not (idx.op is Ops.CAST and idx.src[0].op is Ops.CONST): return f"({self[buf]})[{self[idx]}]"
+      return self[buf]+(f"[{idx.src[0].val}]" if buf.max_numel() > self.gep_arr_threshold else f".{'xyzwabcd'[idx.src[0].val]}")
+    return f"({self[buf]}+{strip_parens(self[idx]) if idx.arg == Ops.ADD else self[idx]})"
+
+  def render_buffer(self, x:UOp):
+    prefix = f"{self.smem_align}{self.smem_prefix}" if x.addrspace == AddrSpace.LOCAL else ""
+    suffix = f"[{x.max_numel()}]"
+    return f"{prefix}{self._render_dtype(x.dtype)} {self[x]}{suffix};"
+
+  def _render_dtype(self, dtype:DType, sz:int=1, addrspace=AddrSpace.ALU, mutable=True, override_ptr=False, shape=None):
+    if is_image_shape(shape): return f"{'write_only' if mutable else 'read_only'} image2d_t"
+    prefix, suffix = "", ""
+    if addrspace in (AddrSpace.LOCAL, AddrSpace.GLOBAL):
+      if addrspace == AddrSpace.LOCAL and self.smem_prefix_for_cast: prefix = self.smem_prefix
+      if addrspace == AddrSpace.GLOBAL: prefix = self.buffer_prefix
+    if addrspace in (AddrSpace.LOCAL, AddrSpace.GLOBAL) or override_ptr:
+      suffix = "*"
+    if sz > 1:
+      return prefix + self.type_map[dtype].replace(" ", "_") + str(sz) + suffix
+    return prefix + self.type_map[dtype] + suffix
+
+  def render_type(self, u:UOp):
+    return self._render_dtype(u.dtype, u.max_numel(), u.addrspace, shape=u._shape, override_ptr=u.op is Ops.INDEX and u.addrspace is AddrSpace.REG)
+  def render_ptr(self, u:UOp):
+    # the address of an access, vector-cast if the access reads/writes more lanes than the pointer's scalar type
+    if u.max_numel() > 1 or u.dtype != u.src[0].dtype:
+      return f"(({self._render_dtype(u.dtype, u.max_numel(), u.addrspace, override_ptr=True, shape=u._shape)})({self[u]}))"
+    else: return f"{self[u]}"
+  def render_access(self, u:UOp): return f"*{self.render_ptr(u)}"
+  def render_cast(self, u:UOp, val:str) -> str: return f"({self.render_type(u)})({val})"
+
+  # LEGACY
+  def render_dtype(self, dt:DType, mutable=True) -> str:
+    return self._render_dtype(dt, 1, AddrSpace.REG)
+
+  def __getitem__(self, key): return self.r[key]  # hacky helper
+  def _render(self, uops:list[UOp]) -> tuple[str, list[str], list[tuple[str,tuple[UOp,bool]]]]:
+    r: dict[UOp, str] = {}
+    self.r = r
+
+    child_count = Counter(v for ru in uops for v in ru.src)
+    # find which PARAMs are stored to with a single toposort
+    writable_params = {u for u in UOp.sink(*[u.src[0] for u in uops if u.op is Ops.STORE]).toposort(lambda u: u.op not in {Ops.END, Ops.BACKEDGE})
+                       if u.op is Ops.PARAM}
+    bufs: dict[UOp, tuple[str, tuple[UOp, bool]]] = {}
+    kernel = []
+    depth = 1
+    c: defaultdict[str, int] = defaultdict(int)
+    name = "test"
+    for u in uops:
+      if u.op in {Ops.NOOP, Ops.GROUP, Ops.CONST, Ops.CUSTOM_FUNCTION}: continue
+      if u.op == Ops.STACK and len(u.src) == 0: continue
+      if u.op is Ops.AFTER:
+        r[u] = r[u.src[0]]
+        continue
+      if u.op is Ops.SINK:
+        if u.arg is not None: name = u.arg.function_name
+        continue
+      if u.op is Ops.PARAM:
+        r[u] = (u.arg.name.replace(":", "_") if u.arg.name is not None else f"data{u.arg.slot}") + \
+          "_" + '_'.join([str(x) for x in u.shape])
+        bufs[u] = (r[u], (u, u in writable_params))
+        continue
+
+      # naming
+      prefix = None
+      if u.op is Ops.SPECIAL: r[u] = u.arg
+      elif u.op is Ops.RANGE: r[u] = f"{axis_letters[u.axis_type]}idx"+range_str(u)
+      else:
+        prefix = {Ops.WMMA: "wmma", Ops.BUFFER: "buf", Ops.CAST: "cast", Ops.BITCAST: "cast", Ops.STACK: "cast",
+                  Ops.INDEX: "bidx", Ops.LOAD: "val"}.get(u.op, "alu")
+        r[u] = f"{prefix}{c[prefix]}"
+
+      l: str|None = self.string_rewrite.rewrite(u, ctx=self)
+      assert l is not None, f"failed to render {u.op} {u.dtype} {[(x.op,x.dtype) for x in u.src]} {u.arg}"
+
+      if u.op in {Ops.ENDIF, Ops.END, Ops.BACKEDGE}: depth -= 1
+      if (u.op is not Ops.CAST or u.max_numel() == 1) and ((u.op is Ops.CAST and u.src[0].op is Ops.CONST) or \
+        u.op in {Ops.INDEX, Ops.SHRINK, Ops.CUSTOMI} or \
+        (u.op is Ops.LOAD and u.src[0].addrspace == AddrSpace.REG and child_count[u] == 1) or \
+        (u.op in {Ops.CAST, Ops.BITCAST} and u.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL)) or \
+        (u.op in {Ops.STACK, *(GroupOp.ALU-{Ops.WHERE}), Ops.CAST, Ops.BITCAST} and child_count[u] == 1 and not getenv("EXPAND_SSA"))):
+        r[u] = l
+      else:
+        if u.op not in {Ops.RANGE, Ops.BUFFER, Ops.BINARY} and u.dtype != dtypes.void:
+          l = f"{self.render_type(u)} {r[u]} = {l}" + (";" if u.op is not Ops.SPECIAL else "")
+        elif u.op is Ops.CAST: l += ";"  # a discarded value renders as a bare statement
+        kernel.append("\n".join("  "*depth + line for line in l.split("\n")))
+        if prefix: c[prefix] += 1  # if it was used, increment
+      if u.op in {Ops.IF, Ops.RANGE}: depth += 1
+    del self.r
+
+    # NOTE: this relies on bufs dict preserving order
+    return (name, kernel, list(bufs.values()))
+  def param_type(self, p:UOp): return "volatile "*p.arg.volatile + self._render_dtype(p.dtype, 1, p.addrspace, True, p.addrspace != AddrSpace.ALU)
+  def render(self, uops:list[UOp]) -> str:
+    prefix, call_bodies, self.fn_names = [], [], dict[UOp, str]()
+    prefix += [f"extern void {f}();" for f in dedup(u.arg.name for u in UOp.sink(*uops).toposort() if u.op is Ops.CUSTOM_FUNCTION)] # symbols to link
+    for body in (u for u in UOp.sink(*uops).toposort() if u.op is Ops.LINEAR):
+      self.fn_names[body] = body.arg + (f"_{n}" if (n:=sum(b.arg == body.arg for b in self.fn_names)) else "") # a name traced with other args
+      _, call, bufs = self._render(body.src)
+      params = ', '.join(f"{self.param_type(p)} {n}" for n,(p,_) in bufs)
+      prefix.append(f"static inline void {self.fn_names[body]}({params}) {{\n" + '\n'.join(call) + "\n}")
+      call_bodies.extend(body.src)
+    return self.render_kernel(*self._render(uops), call_bodies+list(uops), prefix or None)
+
+class ClangRenderer(CStyleLanguage):
+  float4 = "(float4)"
+  float4_style = ('{', '}')
+  gep_arr_threshold = 0
+  has_local = False
+  global_max = (1, 0, 0)
+  infinity = "__builtin_inff()"
+  nan = '__builtin_nanf("")'
+
+  # language options
+  barrier = "__atomic_thread_fence(__ATOMIC_SEQ_CST);"
+  buffer_suffix = " restrict"
+  type_map = {**CStyleLanguage.type_map, dtypes.bool:"_Bool", dtypes.f16:"__fp16"}
+  code_for_op = {**({k:v for k,v in CStyleLanguage.code_for_op.items() if k not in [Ops.EXP2, Ops.SIN, Ops.LOG2, Ops.RECIPROCAL]}),
+                 Ops.SQRT: lambda x,dtype: f"__builtin_sqrt({x})" if dtype == dtypes.float64 else f"__builtin_sqrtf({x})",
+                 Ops.TRUNC: lambda x,dtype: f"__builtin_trunc({x})" if dtype == dtypes.float64 else f"__builtin_truncf({x})",
+                 Ops.FDIV: lambda a,b,dtype: f"({a}/{b})"}
+
+  # LLVM legalizes double => half cast on systems that don't support it natively (like x86 cpus without AVX512-FP16) into a compiler-rt libcall.
+  extra_matcher = PatternMatcher([(UPat.var("x", dtypes.float64).cast(dtypes.float16), lambda x: x.cast(dtypes.float32).cast(dtypes.float16))]) \
+    + create_non_native_float_pats((dtypes.bfloat16,)) + pm_manual_bf16_cast
+
+  if sys.platform == 'win32':
+    abi = "__attribute__((ms_abi)) "
+    kernel_typedef = abi + "void"
+  def render_vector_prefix(self, dt:DType, count:int) -> str:
+    # round (down) to power of two (this is actually the default clang behavior)
+    alignment = 2**int(math.log2(dt.itemsize * count)) if getenv("ALIGNED", 1) and not dtypes.is_bool(dt) else 1
+    vec = self._render_dtype(dt, count, AddrSpace.REG)
+    return f"typedef {self.render_dtype(dt)} {vec} __attribute__((aligned({alignment}),ext_vector_type({count})));"
+
+  def _render_defines(self, uops) -> list[str]: return [self.render_vector_prefix(dt, count) for dt, count in uops_to_dtypes(uops) if count > 1]
+  def _render_body(self, function_name, kernel, bufs, uops, pref=None) -> str: return super().render_kernel(function_name, kernel, bufs, uops, pref)
+  def _render_entry(self, function_name:str, bufs:list[tuple[str,tuple[UOp,bool]]]) -> str: return ""
+
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
+    defines = '\n'.join(self._render_defines(uops))
+    return defines + "\n" + self._render_body(function_name, kernel, bufs, uops, prefix) + "\n" + self._render_entry(function_name, bufs)
+
+  def supported_dtypes(self):
+    return {d for d in super().supported_dtypes() if (d != dtypes.bfloat16 or self.target.arch.startswith(("x86", "arm"))) and d not in dtypes.fp8s}
+
+  def __init__(self, target:Target):
+    super().__init__(target)
+    from tinygrad.runtime.support.compiler_cpu import ClangCompiler
+    self.compiler = ClangCompiler(target.arch.split(","))
+
+class OpenCLRenderer(CStyleLanguage):
+  # language options
+  kernel_typedef = "__kernel void"
+  buffer_prefix = "__global "
+  smem_align = "__attribute__ ((aligned (16))) "
+  smem_prefix = "__local "
+  barrier = "barrier(CLK_LOCAL_MEM_FENCE);"
+  float4 = "(float4)"
+  code_for_workitem = {"g": lambda x: f"get_group_id({x})", "l": lambda x: f"get_local_id({x})"}
+  type_map = {**CStyleLanguage.type_map, dtypes.i8: "char", dtypes.u8: "uchar", dtypes.u32: "uint", dtypes.u16: "ushort",
+              dtypes.u64: "ulong", dtypes.bf16: "ushort"}
+  extra_matcher = create_non_native_float_pats((dtypes.bfloat16,)) + pm_manual_bf16_cast
+
+  string_rewrite = pm_bf16_ushort_const + PatternMatcher([
+    (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"as_{ctx.render_dtype(x.dtype)}(({ctx.render_dtype(x.src[0].dtype)})({ctx[x.src[0]]}))"
+     if x.addrspace not in (AddrSpace.GLOBAL, AddrSpace.LOCAL) else None),
+    # load/store image (OpenCL)
+    (UPat.var('buf').index(UPat.var('idx_y'), UPat.var('idx_x')), lambda ctx,buf,idx_y,idx_x: f"IMAGE<{ctx[buf]}, {ctx[idx_y]}, {ctx[idx_x]}>"),
+    (UPat(Ops.LOAD, dtype=dtypes.float, src=(UPat.var('buf').index(UPat.var('idx_y'), UPat.var('idx_x')), UPat.var("var"), UPat.var("gate"))),
+      lambda ctx,buf,idx_y,idx_x,var,gate: f"({ctx[gate]}?read_imagef({ctx[buf]}, smp, (int2)({ctx[idx_x]},{ctx[idx_y]})):{ctx[var]})"),
+    (UPat(Ops.LOAD, dtype=dtypes.float, src=(UPat.var('buf').index(UPat.var('idx_y'), UPat.var('idx_x')),)),
+      lambda ctx,buf,idx_y,idx_x: f"read_imagef({ctx[buf]}, smp, (int2)({ctx[idx_x]},{ctx[idx_y]}))"),
+    (UPat(Ops.STORE, src=(UPat.var('buf').index(UPat.var('idx_y'), UPat.var('idx_x')), UPat.var("var", dtypes.float))),
+      lambda ctx,buf,idx_y,idx_x,var: f"write_imagef({ctx[buf]}, (int2)({ctx[idx_x]},{ctx[idx_y]}), {ctx[var]});"),
+  ]) + base_rewrite
+
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
+    if any(uop.dtype == dtypes.half for uop in uops): prefix = (["#pragma OPENCL EXTENSION cl_khr_fp16 : enable"] + (prefix or []))
+    return super().render_kernel(function_name, kernel, bufs, uops, prefix)
+
+  def supported_dtypes(self): return {d for d in super().supported_dtypes()
+                                      if (d != dtypes.half or "cl_khr_fp16" in self.target.arch) and
+                                      (d != dtypes.double or "cl_khr_fp64" in self.target.arch) and d not in dtypes.fp8s}
+
+class MetalRenderer(CStyleLanguage):
+  def __init__(self, target:Target):
+    super().__init__(target)
+    from tinygrad.runtime.ops_metal import MetalCompiler
+    self.compiler, self.tensor_cores = MetalCompiler(), tc.metal if target.arch.startswith("Apple") and int(target.arch[5:]) >= 7 else []
+
+  # language options
+  kernel_typedef = "kernel void"
+  buffer_prefix = "device "
+  smem_prefix = "threadgroup __attribute__((aligned(16))) "
+  barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);"
+  float4 = "float4"
+  code_for_workitem = {"g": lambda x: f"gid.{chr(120+int(x))}", "l": lambda x: f"lid.{chr(120+int(x))}"}
+  # uint3 used for gid/lid - TODO: this should probably be `ushort3 lid [[thread_position_in_threadgroup]]`
+  extra_args = ['constant args_t& args [[buffer(0)]]', 'uint3 gid [[threadgroup_position_in_grid]]', 'uint3 lid [[thread_position_in_threadgroup]]']
+  type_map = {**CStyleLanguage.type_map, dtypes.u32: "uint", dtypes.bf16: "bfloat"}
+
+  # precise::sin
+  code_for_op = {**CStyleLanguage.code_for_op, Ops.SIN: lambda x,dtype: f"precise::sin({x})"}
+
+  # upcast to float32 all the ops that don't support bfloat16
+  extra_matcher = PatternMatcher([
+    # NOTE: this is copied from PTX
+    (UPat((Ops.SQRT, Ops.EXP2, Ops.LOG2, Ops.SIN), dtype=dtypes.bfloat16, name="x"),
+      lambda x: (UOp(x.op, src=tuple(vv.cast(dtypes.float) for vv in x.src), arg=x.arg).cast(dtypes.bfloat16))),
+  ]) + pm_manual_bf16_cast
+
+  string_rewrite = PatternMatcher([
+    (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"as_type<{ctx.render_dtype(x.dtype)}>(({ctx.render_dtype(x.src[0].dtype)})({ctx[x.src[0]]}))"
+     if x.addrspace not in (AddrSpace.GLOBAL, AddrSpace.LOCAL) else None),
+  ]) + base_rewrite
+
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
+    prefix = ["#include <metal_stdlib>","using namespace metal;"]
+    for name, _, dtype_in, dtype_out, _ in wmma_args(uops):
+      dstr_out, dstr_in = self._render_dtype(dtype_out, 2, AddrSpace.REG), self._render_dtype(dtype_in, 2, AddrSpace.REG)
+      prefix.append(
+f"""{dstr_out} __{name}({dstr_in} a, {dstr_in} b, {dstr_out} c){{
+  simdgroup_{self.render_dtype(dtype_in)}8x8 mat_a, mat_b; simdgroup_{self.render_dtype(dtype_out)}8x8 mat_c;
+  mat_a.thread_elements()[0] = a[0]; mat_b.thread_elements()[0] = b[0]; mat_c.thread_elements()[0] = c[0];
+  mat_a.thread_elements()[1] = a[1]; mat_b.thread_elements()[1] = b[1]; mat_c.thread_elements()[1] = c[1];
+  simdgroup_multiply_accumulate(mat_c, mat_a, mat_b, mat_c);\n  return {dstr_out}(mat_c.thread_elements()[0], mat_c.thread_elements()[1]);\n}}""")
+    # one argument buffer: a struct of the buffer pointers and the scalars, so a binding is a gpu address (an icb offset keeps 32 bits, an address 64)
+    args = [(name, self._render_dtype(u.dtype, addrspace=u.addrspace)) for name, (u, _) in bufs]
+    prefix.append("struct args_t { " + " ".join(f"{t} {n};" for n, t in args) + " };")
+    return super().render_kernel(function_name, ["  " + " ".join(f"{t} {n} = args.{n};" for n, t in args)] + kernel, [], uops, prefix)
+
+  def supported_dtypes(self):
+    return {d for d in super().supported_dtypes() if (d != dtypes.bfloat16 or ((arch:=self.target.arch).startswith("Apple") and int(arch[5:]) >= 6))
+            and d not in dtypes.fp8s+(dtypes.double,)}
+
+_nms = list("xyzwabcdefghijkl") + [f'v{i}' for i in range(16, 32)]
+
+class CUDARenderer(CStyleLanguage):
+  global_max = (2147483647, 65535, 65535)
+  local_max = (1024, 1024, 64)
+  shared_max = 49152
+
+  def __init__(self, target:Target, use_nvcc=False):
+    super().__init__(target)
+    from tinygrad.runtime.support.compiler_cuda import NVRTCCompiler, NVCCCompiler
+    iface, dev, arch = target.interface, target.device, target.arch
+    self.compiler = (NVCCCompiler if use_nvcc else NVRTCCompiler)(arch, ptx=iface.startswith("MOCK") or dev == "CUDA", cache_key=dev.lower())
+    self.tensor_cores = tc.get_cuda(arch)
+
+  # language options
+  # https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html
+  kernel_typedef = "extern \"C\" __global__ void __launch_bounds__({launch_bounds})"
+  smem_prefix = "__shared__ __align__(16) "
+  smem_prefix_for_cast = False
+  barrier = "__syncthreads();"
+  float4 = "make_float4"
+  gep_arr_threshold = 8
+  code_for_workitem = {"g": lambda x: f"blockIdx.{chr(120+int(x))}", "l": lambda x: f"threadIdx.{chr(120+int(x))}"}
+  code_for_op = { **CStyleLanguage.code_for_op,
+    Ops.TRUNC: lambda x,dtype: f"htrunc({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"trunc({x})",
+    Ops.SIN: lambda x,dtype: f"hsin({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"sin({x})",
+    Ops.LOG2: lambda x,dtype: f"hlog2({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"log2({x})",
+    Ops.EXP2: lambda x,dtype: f"hexp2({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"exp2({x})",
+    Ops.SQRT: lambda x,dtype: f"hsqrt({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"sqrt({x})",
+    Ops.RECIPROCAL: lambda x,dtype: f"hrcp({x})" if dtype in (dtypes.half, dtypes.bfloat16) else f"(1/{x})" }
+  type_map = {**CStyleLanguage.type_map, dtypes.u32: "uint", dtypes.bf16: "nv_bfloat16",
+              dtypes.fp8e4m3: "__nv_fp8_e4m3", dtypes.fp8e5m2: "__nv_fp8_e5m2"}
+  extra_matcher = create_non_native_float_pats(dtypes.fp8s, casting=False) + PatternMatcher([
+    (UPat(Ops.CAST, dtypes.fp8s, UPat.var("x", dtypes.fp8s), name='y'), lambda x,y: x.cast(dtypes.float).cast(y.dtype) if x.dtype!=y.dtype else None),
+  ])
+  string_rewrite = PatternMatcher([
+    (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"tg_bitcast<{ctx.render_dtype(x.dtype)}>(({ctx.render_dtype(x.src[0].dtype)})({ctx[x.src[0]]}))"
+     if x.addrspace not in (AddrSpace.GLOBAL, AddrSpace.LOCAL) else None),
+  ]) + base_rewrite
+
+  def render_vector_prefix(self, dt:DType, count:int) -> str:
+    vec, scal = self._render_dtype(dt, count, AddrSpace.REG), self.render_dtype(dt)
+    elems, header = ', '.join(_nms[:count]), ', '.join([f"{scal} {x}" for x in _nms[:count]])
+    return f"struct __align__({dt.itemsize * count}) {vec} {{ {scal} {elems}; }}; " \
+           f"__device__ {vec} make_{vec}({header}) {{ {vec} r={{{elems}}}; return r; }}"
+
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None):
+    prefix = ["typedef unsigned int uint;", "#define INFINITY (__int_as_float(0x7f800000))", "#define NAN (__int_as_float(0x7fffffff))",
+              "template <class T, class F> __device__ __forceinline__ T tg_bitcast(F v) { union U { F f; T t; }; U u; u.f = v; return u.t; }"]
+    used_dtypes = uops_to_dtypes(uops)
+    if any(dt in dtypes.fp8s for dt, _ in used_dtypes): prefix.append("#include <cuda_fp8.h>")
+    if any(dt == dtypes.half for dt, _ in used_dtypes): prefix.append("#include <cuda_fp16.h>")
+    if any(dt == dtypes.bfloat16 for dt, _ in used_dtypes): prefix.append("#include <cuda_bf16.h>")
+    prefix += [self.render_vector_prefix(dt, count) for dt, count in used_dtypes if (count in (4,8) and dt in {dtypes.half, dtypes.bfloat16})
+      or (count in (2,4,8,16) and dt in dtypes.fp8s)]
+    dt_map_in = { dtypes.f32: "tf32", dtypes.f16: "f16", dtypes.bf16: "bf16", dtypes.fp8e4m3: "e4m3", dtypes.fp8e5m2: "e5m2" }
+    dt_map_out = { dtypes.f32: "f32", dtypes.f16: "f16" }
+    for name, (N, M, K), dtype_in, dtype_out, upcast_sizes in wmma_args(uops):
+      wmma_dtypes = [self._render_dtype(dtype, size, AddrSpace.REG) for dtype, size in zip([dtype_in, dtype_in, dtype_out], upcast_sizes)]
+      n_operands = [size*dtype.itemsize//4 for dtype, size in zip([dtype_in, dtype_in, dtype_out], upcast_sizes)] # 4 => CUDA reg size in bytes
+      operands = [f"%{i}" for i in range(sum(n_operands))]
+
+      # mma operands => {c}, {a}, {b}, {c}
+      prefix.append(f"""__device__ {wmma_dtypes[2]} __{name}({wmma_dtypes[0]} a, {wmma_dtypes[1]} b, {wmma_dtypes[2]} c){{
+  int *a_pk = (int *)(&a), *b_pk = (int *)(&b), *c_pk = (int *)(&c);
+  asm("mma.sync.aligned.m{M}n{N}k{K}.row.col.{dt_map_out[dtype_out]}.{dt_map_in[dtype_in]}.{dt_map_in[dtype_in]}.{dt_map_out[dtype_out]}"
+      "{{{", ".join(operands[:n_operands[2]])}}}, {{{", ".join(operands[n_operands[2]:n_operands[2]+n_operands[0]])}}},"
+      "{{{", ".join(operands[-n_operands[1]:])}}}, {{{", ".join(operands[:n_operands[2]])}}};"
+    : {", ".join([f'"+r"(c_pk[{i}])' for i in range(n_operands[2])])}
+    : {", ".join([f'"r"(a_pk[{i}])' for i in range(n_operands[0])])}, {", ".join([f'"r"(b_pk[{i}])' for i in range(n_operands[1])])});
+  return c;\n}}""")
+
+    return super().render_kernel(function_name, kernel, bufs, uops, prefix=prefix)
+
+  def supported_dtypes(self):
+    ver = int(self.target.arch[3:])
+    return {d for d in super().supported_dtypes() if (d != dtypes.half or ver >= 53) and (d != dtypes.bfloat16 or ver >= 80)
+            and (d not in dtypes.fp8_ocp or ver >= 89) and d not in dtypes.fp8_fnuz}
+
+class NVCCRenderer(CUDARenderer):
+  def __init__(self, target:Target): super().__init__(target, use_nvcc=True)
+
+def fp8_index(dtype: DType): return dtypes.fp8s.index(dtype) % 2
+def amd_fp8s(arch:str): return {"gfx942": dtypes.fp8_fnuz, "gfx950": dtypes.fp8_ocp}.get(arch, ())
+def _ocml(op): return lambda x,dtype: f"__ocml_{op}_f{ {dtypes.half:16, dtypes.double:64}.get(dtype, 32)}({x})"
+
+class HIPRenderer(CStyleLanguage):
+  shared_max = 65536
+  # NOTE: this is only really needed on gfx12, even though gfx11 reports the same limitation
+  global_max = (2147483647, 65535, 65535)
+  global_prod_max = (0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+
+  @staticmethod
+  def is_cdna(arch): return arch.split(":")[0] in {"gfx942", "gfx950"}
+  @staticmethod
+  def is_cdna4(arch): return arch.split(":")[0] == "gfx950"
+  def __init__(self, target:Target, use_hipcc=False): # gfx942 => MI300, gfx1100 => RX 7900, gfx1201 => RX 9700
+    super().__init__(target)
+    from tinygrad.runtime.support.compiler_amd import HIPCompiler, HIPCCCompiler
+    self.compiler, self.tensor_cores = (HIPCCCompiler if use_hipcc else HIPCompiler)(target.arch), tc.get_amd(target.arch)
+    if not self.is_cdna4(target.arch): self.extra_matcher += pm_manual_bf16_cast
+    if self.is_cdna(target.arch):
+      self.string_rewrite = PatternMatcher([
+        (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{_wmma_name(x)}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]},"
+          f" {fp8_index(x.src[0].dtype)}, {fp8_index(x.src[0].dtype)}, 0, 0, 0, 0)" if x.arg[0][2] == 128 else None),
+        (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{_wmma_name(x)}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]}, 0, 0, 0)"),
+        (UPat.cvar("c").cast(dtypes.fp8s, name="x"), lambda ctx,x,c:
+          f"f32_to_fp8({ctx.nan if math.isnan(v:=c.val) else ctx.infinity if v == math.inf else f'-{ctx.infinity}' if v == -math.inf else f'{v}f'},"
+          f" {fp8_index(x.dtype)})"),
+        (UPat(Ops.CAST, dtypes.fp8s, (UPat(dtype=dtypes.float),), name="x",),
+          lambda ctx,x: f"f32_to_fp8({ctx[x.src[0]]}, {fp8_index(x.dtype)})"),
+        (UPat(Ops.CAST, dtypes.float, (UPat.var("y", dtypes.fp8s),), name="x",),
+          lambda ctx,x,y: f"__builtin_amdgcn_cvt_f32_{('fp8', 'bf8')[fp8_index(y.dtype)]}((unsigned int){ctx[x.src[0]]}, 0)"),
+      ]) + base_rewrite
+    # a LOAD flagged nontemporal renders as the cache-bypassing builtin (only used on global loads)
+    self.string_rewrite = PatternMatcher([(UPat(Ops.LOAD, arg="nontemporal", src=(UPat.var("bidx"),)),
+      lambda ctx,bidx: f"__builtin_nontemporal_load({ctx.render_ptr(bidx)})")]) + self.string_rewrite
+    if not self.is_cdna4(target.arch): self.string_rewrite = pm_bf16_ushort_const + self.string_rewrite
+
+  # https://clang.llvm.org/docs/AttributeReference.html#amdgpu-flat-work-group-size
+  # NOTE: this makes hlb_cifar10 twice as fast, there may be more gains in tweaking these parameters
+  kernel_typedef = 'extern "C" __attribute__((global)) void __attribute__((amdgpu_flat_work_group_size(1, {launch_bounds})))'
+  code_for_workitem = {"g": lambda x: f"__ockl_get_group_id({x})", "l": lambda x: f"__ockl_get_local_id({x})"}
+  code_for_op = {**CStyleLanguage.code_for_op, Ops.TRUNC: _ocml("trunc"), Ops.SIN: _ocml("sin"),
+                 Ops.LOG2: _ocml("log2"), Ops.EXP2: _ocml("exp2"), Ops.SQRT: _ocml("sqrt")}
+  smem_prefix = "__attribute__((shared, aligned(16)))"
+  smem_prefix_for_cast: bool = False
+  barrier = '__builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");' + '__builtin_amdgcn_s_barrier();' + \
+            '__builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");'
+  float4 = "make_float4"
+  type_map = {**CStyleLanguage.type_map, dtypes.bf16: "hip_bfloat16", **{d: ("hip_fp8", "hip_bf8")[fp8_index(d)] for d in dtypes.fp8s}}
+  extra_matcher = create_non_native_float_pats((dtypes.bfloat16, *dtypes.fp8s)) + PatternMatcher([
+    (UPat(Ops.WMMA, name="x", dtype=dtypes.float),
+      lambda x: x.replace(src=(x.src[0].bitcast(dtypes.uint64), x.src[1].bitcast(dtypes.uint64), x.src[2]))
+      if x.src[0].max_numel() == 8 and x.src[0].dtype in dtypes.fp8s else None),
+  ])
+
+  def asm(self, prg:UOp, lin:UOp) -> bytes:
+    from tinygrad.renderer.amd.elf import assemble_linear
+    return assemble_linear(prg, lin, self.target.arch)
+
+  def render_vector_prefix(self, dtype:DType, count:int) -> str:
+    vec, scal = self._render_dtype(dtype, count, AddrSpace.REG), self.render_dtype(dtype)
+    return f"typedef {scal} {vec} __attribute__((ext_vector_type({count})));\nstatic inline __attribute__((device)) "+ \
+           f"{vec} make_{vec}({', '.join([f'{scal} {x}' for x in _nms[:count]])}) {{ return {{ {', '.join(_nms[:count])} }}; }}"
+
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
+    prefix, ockl = [], []
+    type_map = {dtypes.bf16: "bf16", dtypes.f32: "f32", dtypes.f16: "f16", **{d: ("_fp8_fp8", "_bf8_bf8")[fp8_index(d)] for d in dtypes.fp8s}}
+    used_dtypes = uops_to_dtypes(uops)
+    if any(u.op is Ops.CAST and u.src[0].op is Ops.CONST and not math.isfinite(u.src[0].val) for u in uops):
+      prefix += ["#define INFINITY (__builtin_inff())", "#define NAN (__builtin_nanf(\"\"))"]
+    if any(u.op is Ops.SPECIAL for u in uops):
+      prefix.append("typedef long unsigned int size_t;")
+      ockl = [(f"__ockl_get_{name}", "unsigned int", "size_t", "const") for name in ["local_id", "group_id", "local_size"]]
+    ocml_ops = {Ops.EXP2: ("exp2", "pure"), Ops.LOG2: ("log2", "pure"), Ops.SQRT: ("sqrt", "const"), Ops.SIN: ("sin", ""), Ops.TRUNC: ("trunc", "")}
+    ocml = [(f"__ocml_{ocml_ops[op][0]}_f{dt.bitsize}", self.render_dtype(dt), self.render_dtype(dt), ocml_ops[op][1])
+      for op, dt in dedup((u.op, u.dtype) for u in uops) if op in ocml_ops and dt in (dtypes.half, dtypes.float, dtypes.double)]
+    if any(dt == dtypes.bfloat16 for dt, _ in used_dtypes):
+      prefix.append(f"typedef {'__bf16' if self.is_cdna4(self.target.arch) else 'unsigned short'} hip_bfloat16;")
+    if any(dt == dtypes.half for dt, _ in used_dtypes): prefix.append("#define half _Float16")
+    if any(dt in dtypes.fp8s for dt, _ in used_dtypes):
+      prefix += ["typedef unsigned char hip_bf8;", "typedef unsigned char hip_fp8;"]
+    if any((u.op is Ops.CAST and u.dtype in dtypes.fp8s and u.src[0].dtype == dtypes.float) or
+           (u.op is Ops.CAST and u.src[0].op is Ops.CONST and u.dtype in dtypes.fp8s) for u in uops):
+      fp8_max = amd_fp8s(self.target.arch)[0].max
+      prefix.append(f"""static inline __attribute__((device)) unsigned char f32_to_fp8(float v, int is_bf8) {{
+  v = (((*(unsigned*)&v)&0x7F800000)!=0x7F800000)?__builtin_amdgcn_fmed3f(v,is_bf8?57344.0f:{fp8_max}f,is_bf8?-57344.0f:-{fp8_max}f) : v;
+  return (unsigned char)(is_bf8?__builtin_amdgcn_cvt_pk_bf8_f32(v,v,0,false):__builtin_amdgcn_cvt_pk_fp8_f32(v,v,0,false));\n}}""")
+    prefix += [f'extern "C" __attribute__((device{f", {atr}" if atr else ""})) {dto} {meth}({dti});' for meth,dti,dto,atr in ockl+ocml]
+    prefix += [self.render_vector_prefix(dt, count) for dt, count in used_dtypes if count > 1]
+
+    for name, (N, M, K), dtype_in, dtype_out, _ in wmma_args(uops): # TODO: handle TCs f32_bf16 and bf16_bf16 w/ wrapper
+      if self.is_cdna(self.target.arch):
+        if (N, M, K) == (16, 16, 16): type_map[dtypes.bf16] = 'bf16_1k'
+        elif (N, M, K) == (16, 16, 32): type_map = {**type_map, dtypes.bf16: "_bf16", dtypes.f16: "_f16"}
+        elif (N, M, K) == (16, 16, 128): type_map = {**type_map, dtypes.fp8e4m3: "_f8f6f4", dtypes.fp8e5m2: "_f8f6f4"}
+        prefix.append(f"#define __{name} __builtin_amdgcn_mfma_{'scale_' if K == 128 else ''}f32_{N}x{M}x{K}{type_map[dtype_in]}")
+      # #define __WMMA_16_16_16_f16_f16 __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12
+      elif self.tensor_cores == tc.amd_rdna4:
+        prefix.append(f"#define __{name} __builtin_amdgcn_wmma_{type_map[dtype_out]}_16x16x16_{type_map[dtype_in]}_w32_gfx12")
+      elif dtype_out == dtypes.int32:
+        prefix.append("typedef int wmma_int4 __attribute__((ext_vector_type(4)));\n"+
+          f"static inline __attribute__((device)) int8 __{name}"+"""(signed_char16 a, signed_char16 b, int8 c) {
+  return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, __builtin_bit_cast(wmma_int4, a),
+    true, __builtin_bit_cast(wmma_int4, b), c, false);\n}""")
+      elif dtype_out == dtypes.float:
+        prefix.append(f"#define __{name} __builtin_amdgcn_wmma_f32_16x16x16_{'f16' if dtype_in == dtypes.half else 'bf16'}_w32")
+      else: prefix.append(f"static inline __attribute__((device)) half8 __{name}"+"""(half16 a, half16 b, half8 c) {
+  half16 c_frag = {}; half8 d; for (int n = 0; n < 8; n++) { c_frag[n*2] = c[n]; }
+  c_frag = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32(a, b, c_frag, false);
+  for (int n = 0; n < 8; n++) { d[n] = c_frag[n*2]; } return d;\n}""")
+    return super().render_kernel(function_name, kernel, bufs, uops, prefix)
+
+  def supported_dtypes(self): return {d for d in super().supported_dtypes() if d not in dtypes.fp8s or d in amd_fp8s(self.target.arch)}
+
+class HIPCCRenderer(HIPRenderer):
+  def __init__(self, target:Target): super().__init__(target, use_hipcc=True)
+
+class QCOMCLRenderer(OpenCLRenderer):
+  def __init__(self, target:Target):
+    super().__init__(target)
+    from tinygrad.runtime.support.compiler_qcom import QCOMCompiler
+    self.comp

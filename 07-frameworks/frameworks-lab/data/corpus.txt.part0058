@@ -1,0 +1,2997 @@
+ddr = [self.pci_dev.bar_info(1)[0] + paddr + i * 0x1000 for i in range(sz // 0x1000)]
+    if data is not None: view[:size] = data
+    return view, paddr, sysaddr
+
+  def include(self, name:str, arch:str):
+    for k,v in getattr(getattr(tinygrad.runtime.autogen.nv_regs, name), arch or 'regs').items():
+      self.__dict__[k] = NVReg(self, *v) if isinstance(v, tuple) else v
+
+import ctypes, ctypes.util, functools, sys
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING: id_ = ctypes.c_void_p
+else:
+  class id_(ctypes.c_void_p):
+    _is_finalizing = sys.is_finalizing # FIXME: why is this needed
+
+    retain: bool = False
+    # This prevents ctypes from converting response to plain int, and dict.fromkeys() can use it to dedup
+    def __hash__(self): return hash(self.value)
+    def __eq__(self, other): return self.value == other.value
+    def __del__(self):
+      if self.retain and not self._is_finalizing(): self.release()
+    def release(self): msg("release")(self)
+    def retained(self):
+      setattr(self, 'retain', True)
+      return self
+    def own(self):
+      msg("retain")(self)
+      return self.retained()
+
+def returns_retained(f): return functools.wraps(f)(lambda *args, **kwargs: f(*args, **kwargs).retained())
+
+lib = ctypes.CDLL(ctypes.util.find_library('objc'))
+lib.sel_registerName.restype = id_
+getsel = functools.cache(lib.sel_registerName)
+lib.objc_getClass.restype = id_
+lib.objc_autoreleasePoolPush.restype, lib.objc_autoreleasePoolPop.argtypes = ctypes.c_void_p, [ctypes.c_void_p]
+dispatch_data_create = ctypes.CDLL("/usr/lib/libSystem.dylib").dispatch_data_create
+dispatch_data_create.restype = id_
+dispatch_data_create = returns_retained(dispatch_data_create)
+
+def msg(sel:str, restype=id_, argtypes=[], retain=False, clsmeth=False):
+  # Using attribute access returns a new reference so setting restype is safe
+  (sender:=lib["objc_msgSend"]).restype, sender.argtypes = restype, [id_, id_]+list(argtypes) if argtypes else []
+  def f(ptr, *args): return sender(ptr._objc_class_ if clsmeth else ptr, getsel(sel.encode()), *args)
+  return returns_retained(f) if retain else f
+
+if TYPE_CHECKING:
+  import _ctypes
+  class MetaSpec(_ctypes._PyCSimpleType):
+    _objc_class_: id_
+    def __getattr__(cls, nm:str) -> Any: ...
+    def __setattr__(cls, nm:str, v:Any): ...
+else:
+  class MetaSpec(type(id_)):
+    def __new__(mcs, name, bases, dct):
+      cls = super().__new__(mcs, name, bases, {'_objc_class_': lib.objc_getClass(name.encode()), '_children_': set(), **dct})
+      cls._methods_, cls._classmethods_ = dct.get('_methods_', []), dct.get('_classmethods_', [])
+      return cls
+
+    def __setattr__(cls, k, v):
+      super().__setattr__(k, v)
+      if k in ("_methods_", "_classmethods_"):
+        for m in v: cls._addmeth(m, clsmeth=(k=="_classmethods_"))
+        for c in cls._children_: c._inherit(cls)
+      if k == "_bases_":
+        for b in v:
+          b._children_.add(cls)
+          cls._inherit(b)
+
+    def _inherit(cls, b):
+      for _b in getattr(b, "_bases_", []): cls._inherit(_b)
+      for m in getattr(b, "_methods_", []): cls._addmeth(m)
+      for m in getattr(b, "_classmethods_", []): cls._addmeth(m, True)
+      for c in cls._children_: c._inherit(cls)
+
+    def _addmeth(cls, m, clsmeth=False):
+      nm = m[0].strip(':').replace(':', '_')
+      if clsmeth: setattr(cls, nm, classmethod(msg(m[0], cls if m[1] == 'instancetype' else m[1],
+                                                   [cls if a == 'instancetype' else a for a in m[2]], *m[3:], clsmeth=True))) # type: ignore[misc]
+      else: setattr(cls, nm, msg(m[0], cls if m[1] == 'instancetype' else m[1], [cls if a == 'instancetype' else a for a in m[2]], *m[3:]))
+
+class Spec(id_, metaclass=MetaSpec):
+  if TYPE_CHECKING:
+    def __getattr__(self, nm:str) -> Any: ...
+
+
+import ctypes, struct
+from dataclasses import dataclass
+from tinygrad.helpers import ceildiv, getenv, wait_cond, DEBUG
+from tinygrad.runtime.autogen import bnxt, pci
+from tinygrad.runtime.support.memory import MMIOInterface
+from tinygrad.runtime.support.system import PCIDevice, System
+
+BNXT_DEBUG = getenv("BNXT_DEBUG", 0)
+BNXT_ACCESS, BNXT_INIT_MASK, BNXT_RTR_MASK, BNXT_RTS_MASK = 3, 0xd, 0x41515ad, 0xae005
+BNXT_CHIMP_COMM, BNXT_CHIMP_COMM_TRIGGER = 0x0, 0x100
+BNXT_BACKING_STORE = ((0, 64), (1, 0), (2, 128), (3, 0), (4, 2), (5, 0), (6, 0), (14, 1024), (15, 0))
+WQE_SIZE, RING_ENTRIES, CQ_ENTRIES, MTU = 128, 4096, 4096, 4096
+def db_value(xid, typ, index, epoch):
+  return (xid & bnxt.DBC_DBC_XID_MASK | bnxt.DBC_DBC_PATH_ROCE | typ | bnxt.BNXT_QPLIB_DBR_VALID) << 32 | \
+         index & bnxt.DBC_DBC_INDEX_MASK | epoch << bnxt.BNXT_QPLIB_DBR_EPOCH_SHIFT
+
+# a wqe: type, flags, size in 16 byte units, then the send header (length at dword 1) or the receive header, then the sge (va, key, size)
+def send_wqe(va:int, key:int, size:int) -> bytes: return struct.pack("<BBB5xI20xQII", 0, bnxt.SQ_SEND_FLAGS_SIGNAL_COMP, 3, size, va, key, size)
+def recv_wqe(va:int, key:int, size:int) -> bytes: return struct.pack("<BBB29xQII", 0x80, 0, 3, va, key, size)
+def msn_entry(wqe_idx:int, psn:int, size:int) -> tuple[int, int]: # the entry and the psn after this send
+  psn &= 0xffffff
+  nxt = (psn + max(1, ceildiv(size, MTU))) & 0xffffff
+  # Thor2 static-mode retransmission indexes WQEs, not 16B slots.
+  return (wqe_idx % RING_ENTRIES) << bnxt.SQ_MSN_SEARCH_START_IDX_SFT | nxt << bnxt.SQ_MSN_SEARCH_NEXT_PSN_SFT | psn, nxt
+def cqe_ready(cqe:bytes, cons:int) -> bool: return (cqe[24] & bnxt.CQ_BASE_TOGGLE) != (cons // CQ_ENTRIES & 1)
+
+def build_pbl(dev, paddrs, queue=False) -> tuple[int, int]:
+  if len(paddrs) == 1: return 0, paddrs[0]
+  values = [p | bnxt.PTU_PTE_VALID for p in paddrs]
+  if queue: values[-1], values[-2] = values[-1] | bnxt.PTU_PTE_LAST, values[-2] | bnxt.PTU_PTE_NEXT_TO_LAST
+  table, table_paddrs = dev.pci_dev.alloc_sysmem(ceildiv(len(values), 512) * 0x1000)
+  table[:len(values) * 8] = struct.pack(f"<{len(values)}Q", *values)
+  if len(table_paddrs) == 1: return 1, table_paddrs[0]
+  assert len(table_paddrs) <= 512, f"a pbl has two levels: {len(values)} pages need bigger pages"
+  top, top_paddrs = dev.pci_dev.alloc_sysmem(0x1000)
+  top[:len(table_paddrs) * 8] = struct.pack(f"<{len(table_paddrs)}Q", *(p | bnxt.PTU_PTE_VALID for p in table_paddrs))
+  return 2, top_paddrs[0]
+
+@dataclass
+class BNXTQueue:
+  ring:MMIOInterface; paddrs:list[int]; stride:int; pbl_level:int; pbl_addr:int; size:int=0x1000; write_idx:int=0; read_idx:int=0 # noqa: E702
+  def read(self, i:int) -> bytes: return bytes(self.ring[(off:=i % (self.size // self.stride) * self.stride):off + self.stride])
+  def write(self, i:int, data:bytes, aux=False): # aux: the msn table after the ring
+    off = self.size + i % (self.size // self.stride) * 8 if aux else i % (self.size // self.stride) * self.stride
+    self.ring[off:off + len(data)] = data
+
+def alloc_queue(dev, stride:int=16, aux=False, entries:int=0) -> BNXTQueue: # a page of entries by default
+  entries = entries or 0x1000 // stride
+  mem, paddrs = dev.pci_dev.alloc_sysmem((size:=entries * stride) + aux * entries * 8)
+  return BNXTQueue(mem, paddrs, stride, *build_pbl(dev, paddrs, queue=True), size=size)
+
+class BNXTDev:
+  def __init__(self, pci_dev:PCIDevice):
+    self.pci_dev, self.devfmt, self.seq = pci_dev, pci_dev.pcibus, 0
+    pci_dev.reset()
+    pci_dev.write_config(pci.PCI_COMMAND, pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
+    self.bar0, self.db = pci_dev.map_bar(0, fmt='I'), pci_dev.map_bar(2, fmt='Q')
+    self.resp, self.resp_pa = pci_dev.alloc_sysmem(0x1000)
+
+    ver = self.hwrm("ver_get")
+    if DEBUG >= 2: print(f"bnxt {self.devfmt}: firmware {ver.hwrm_fw_maj_8b}.{ver.hwrm_fw_min_8b}.{ver.hwrm_fw_bld_8b}")
+    self.hwrm("func_reset", timeout_ms=40000)
+    caps = self.hwrm("func_qcaps", fid=0xffff)
+    self.mac, self.port_id = int.from_bytes(bytes(caps.mac_address), 'big'), caps.port_id
+    self.hwrm("func_drv_rgtr")
+    self.db_off = self.hwrm("func_qcfg", fid=0xffff).legacy_l2_db_size_kb * 1024
+
+    self.setup_backing_store()
+    self._open_rcfw()
+    self._open_l2()
+    self.local_gid = bytes(10) + b'\xff\xff\x0a' + self.mac.to_bytes(6, 'big')[3:]
+    self.gid_id = self.rcfw("add_gid", gid=struct.unpack(">4I", self.local_gid)[::-1], src_mac=struct.unpack(">3H", self.mac.to_bytes(6, 'big'))).xid
+
+    if DEBUG >= 2: print(f"bnxt {self.devfmt}: booted mac={self.mac.to_bytes(6, 'big').hex(':')} gid={self.local_gid.hex()}")
+
+  def hwrm(self, name, timeout_ms=10000, **fields):
+    inp, out = getattr(bnxt, f"struct_hwrm_{name}_input"), getattr(bnxt, f"struct_hwrm_{name}_output")
+    self.seq = (self.seq + 1) & 0xffff
+    data = bytes(inp(req_type=getattr(bnxt, f"HWRM_{name.upper()}"), cmpl_ring=bnxt.BNXT_HWRM_NO_CMPL_RING,
+                     seq_id=self.seq, target_id=bnxt.BNXT_HWRM_TARGET, resp_addr=self.resp_pa[0], **fields))
+    self.resp[:] = bytes(len(self.resp))
+    System.memory_barrier()
+    for i, w in enumerate(memoryview(data.ljust(bnxt.HWRM_MAX_REQ_LEN, b'\0')).cast('I')): self.bar0[BNXT_CHIMP_COMM // 4 + i] = w
+    self.bar0[BNXT_CHIMP_COMM_TRIGGER // 4] = 1
+    def hdr(): return bnxt.struct_hwrm_resp_hdr.from_buffer_copy(bytes(self.resp[:8]))
+    wait_cond(lambda: (n := hdr().resp_len) and hdr().seq_id == self.seq and self.resp[n - 1], timeout_ms=timeout_ms, msg=f"HWRM {name}")
+    ret = out.from_buffer_copy(bytes(self.resp[:ctypes.sizeof(out)]))
+    assert ret.error_code == 0, f"HWRM {name}: {ret.error_code}"
+    return ret
+
+  def setup_backing_store(self):
+    counts: dict[int, int] = {}
+    for typ, extra in BNXT_BACKING_STORE:
+      caps = self.hwrm("func_backing_store_qcaps_v2", type=typ)
+      size, splits = caps.entry_size, tuple(getattr(caps, f"split_entry_{j}") for j in range(caps.subtype_valid_cnt))
+      counts[typ] = n = counts[0] if typ == 15 else max(caps.min_num_entries, sum(splits) + extra)
+      # a zero bitmap means the type has a single instance 0
+      for instance in [i for i in range(8) if caps.instance_bit_map >> i & 1] or [0]:
+        mem, paddrs = self.pci_dev.alloc_sysmem(ceildiv(n * size, 0x1000) * 0x1000)
+        if caps.ctx_init_value:
+          init = bytearray(len(mem))
+          init[caps.ctx_init_offset::size] = bytes([caps.ctx_init_value]) * len(range(caps.ctx_init_offset, len(mem), size))
+          mem[:] = init
+        lvl, base = build_pbl(self, paddrs)
+        self.hwrm("func_backing_store_cfg_v2", type=typ, instance=instance, entry_size=size, num_entries=n, page_dir=base,
+          page_size_pbl_level=lvl, subtype_valid_cnt=len(splits),
+          flags=bnxt.FUNC_BACKING_STORE_CFG_V2_REQ_FLAGS_BS_CFG_ALL_DONE if typ == 15 else 0,
+          **{f"split_entry_{j}": v for j, v in enumerate(splits)})
+
+  def _open_rcfw(self):
+    self.rcfw_first, self.creq, self.cmdq = True, alloc_queue(self), alloc_queue(self)
+    self.creq_id = self.hwrm("ring_alloc", ring_type=bnxt.RING_ALLOC_REQ_RING_TYPE_NQ, page_tbl_addr=self.creq.pbl_addr,
+      page_size=12, page_tbl_depth=self.creq.pbl_level, length=256, int_mode=bnxt.RING_ALLOC_REQ_INT_MODE_MSIX).ring_id
+
+    self.doorbell(self.creq_id, bnxt.DBC_DBC_TYPE_NQ_ARM, 0, 0)
+    init = bnxt.struct_cmdq_init(cmdq_pbl=self.cmdq.pbl_addr, creq_ring_id=self.creq_id, cmdq_size_cmdq_lvl=256 << bnxt.CMDQ_INIT_CMDQ_SIZE_SFT)
+
+    System.memory_barrier()
+    for i, w in enumerate(memoryview(bytes(init)).cast('I')): self.bar0[bnxt.RCFW_COMM_BASE_OFFSET // 4 + i] = w
+
+    _, p = self.pci_dev.alloc_sysmem(0x1000)
+    self.rcfw("initialize_fw", stat_ctx_id=self.hwrm("stat_ctx_alloc", stats_dma_addr=p[0], stats_dma_length=176).stat_ctx_id,
+      flags=bnxt.CMDQ_INITIALIZE_FW_FLAGS_HW_REQUESTER_RETX_SUPPORTED)
+
+    # RoCE notification ring: never armed or serviced, but CQ and L2 ring allocation require one
+    nq = alloc_queue(self)
+    self.nq_id = self.hwrm("ring_alloc", ring_type=bnxt.RING_ALLOC_REQ_RING_TYPE_NQ, page_tbl_addr=nq.pbl_addr,
+      page_size=12, page_tbl_depth=nq.pbl_level, length=16, logical_id=1, int_mode=bnxt.RING_ALLOC_REQ_INT_MODE_MSIX).ring_id
+
+  def rcfw(self, name, timeout_ms=20000, **fields):
+    req_t, resp_t = getattr(bnxt, f"struct_cmdq_{name}"), getattr(bnxt, f"struct_creq_{name}_resp")
+    data = bytes(req_t(opcode=getattr(bnxt, f"CMDQ_BASE_OPCODE_{name.upper()}"),
+                       cmd_size=(slots := ceildiv(ctypes.sizeof(req_t), 16)), **fields)).ljust(slots * 16, b'\0')
+    for i in range(slots): self.cmdq.write(self.cmdq.write_idx + i, data[i * 16:(i + 1) * 16])
+
+    self.cmdq.write_idx += slots
+    prod = self.cmdq.write_idx & 0xffff
+    if self.rcfw_first: prod, self.rcfw_first = prod | 1 << bnxt.FIRMWARE_FIRST_FLAG, False
+
+    System.memory_barrier()
+
+    self.bar0[(bnxt.RCFW_COMM_BASE_OFFSET + bnxt.RCFW_PF_VF_COMM_PROD_OFFSET) // 4] = prod
+    self.bar0[(bnxt.RCFW_COMM_BASE_OFFSET + bnxt.RCFW_COMM_TRIG_OFFSET) // 4] = bnxt.RCFW_CMDQ_TRIG_VAL
+
+    while True: # skip async events (qp/cq error notifications)
+      wait_cond(lambda: (self.creq.read(self.creq.read_idx)[8] & bnxt.CREQ_BASE_V) != (self.creq.read_idx // 256 & 1),
+                timeout_ms=timeout_ms, msg=f"RCFW {name}")
+
+      ret = resp_t.from_buffer_copy(self.creq.read(self.creq.read_idx))
+      self.creq.read_idx += 1
+
+      # NQ_ARM also publishes the CREQ consumer index, which is what frees ring space for the next command
+      self.doorbell(self.creq_id, bnxt.DBC_DBC_TYPE_NQ_ARM, self.creq.read_idx & 255, (self.creq.read_idx // 256) & 1)
+      if ret.type == bnxt.CREQ_BASE_TYPE_QP_EVENT and ret.event < bnxt.CREQ_QP_EVENT_EVENT_QP_ERROR_NOTIFICATION: break
+    assert ret.status == 0, f"RCFW {name}: {ret.status}"
+
+    if BNXT_DEBUG >= 1: print(f"bnxt {self.devfmt}: rcfw {name} xid={getattr(ret, 'xid', 0):#x}")
+    return ret
+
+  def fini(self): self.hwrm("func_drv_unrgtr")
+
+  def doorbell(self, xid, typ, index, epoch):
+    System.memory_barrier()
+    self.db[self.db_off // 8] = db_value(xid, typ, index, epoch)
+
+  # L2 receive path, required for RoCE ingress even though no ethernet receive buffers are posted
+  def _open_l2(self):
+    cq = alloc_queue(self)
+    ci = self.hwrm("ring_alloc", enables=bnxt.RING_ALLOC_REQ_ENABLES_NQ_RING_ID_VALID, ring_type=bnxt.RING_ALLOC_REQ_RING_TYPE_L2_CMPL,
+      page_tbl_addr=cq.pbl_addr, page_size=12, page_tbl_depth=cq.pbl_level, length=16, nq_ring_id=self.nq_id).ring_id
+    rx = alloc_queue(self)
+    ri = self.hwrm("ring_alloc", enables=bnxt.RING_ALLOC_REQ_ENABLES_NQ_RING_ID_VALID |
+      bnxt.RING_ALLOC_REQ_ENABLES_RX_BUF_SIZE_VALID, ring_type=bnxt.RING_ALLOC_REQ_RING_TYPE_RX, page_tbl_addr=rx.pbl_addr,
+      page_size=12, page_tbl_depth=rx.pbl_level, length=16, rx_buf_size=640, nq_ring_id=self.nq_id).ring_id
+    vi = self.hwrm("vnic_alloc").vnic_id
+    self.hwrm("vnic_cfg", enables=bnxt.VNIC_CFG_REQ_ENABLES_MRU | bnxt.VNIC_CFG_REQ_ENABLES_DEFAULT_RX_RING_ID |
+      bnxt.VNIC_CFG_REQ_ENABLES_DEFAULT_CMPL_RING_ID, vnic_id=vi, mru=9018, default_rx_ring_id=ri, default_cmpl_ring_id=ci)
+    self.hwrm("cfa_l2_filter_alloc", flags=bnxt.CFA_L2_FILTER_ALLOC_REQ_FLAGS_PATH_RX,
+      enables=bnxt.CFA_L2_FILTER_ALLOC_REQ_ENABLES_L2_ADDR | bnxt.CFA_L2_FILTER_ALLOC_REQ_ENABLES_L2_ADDR_MASK |
+      bnxt.CFA_L2_FILTER_ALLOC_REQ_ENABLES_DST_ID, l2_addr=tuple(self.mac.to_bytes(6, 'big')), l2_addr_mask=(0xff,) * 6, dst_id=vi)
+
+  # a memory region over pages: the key addresses [va, va + size) as those pages
+  def register_mem(self, paddrs:list[int], size:int, log_page_size:int=12, va:int|None=None) -> int:
+    level, base = build_pbl(self, paddrs[:ceildiv(size, 1 << log_page_size)])
+    return self.rcfw("register_mr", flags=bnxt.CMDQ_REGISTER_MR_FLAGS_ALLOC_MR,
+      log2_pg_size_lvl=level << bnxt.CMDQ_REGISTER_MR_LVL_SFT | log_page_size << bnxt.CMDQ_REGISTER_MR_LOG2_PG_SIZE_SFT,
+      access=bnxt.CMDQ_REGISTER_MR_ACCESS_LOCAL_WRITE | bnxt.CMDQ_REGISTER_MR_ACCESS_REMOTE_WRITE,
+      log2_pbl_pg_size=12, pbl=base, va=paddrs[0] if va is None else va, mr_size=size).xid
+  def unregister_mem(self, key:int): self.rcfw("deregister_mr", lkey=key)
+
+class BNXTQP:
+  def __init__(self, dev:BNXTDev):
+    self.dev, self.sq_psn = dev, 0
+    self.scq, self.rcq = (alloc_queue(dev, ctypes.sizeof(bnxt.struct_cq_base), entries=CQ_ENTRIES) for _ in range(2))
+    self.scq_id, self.rcq_id = (dev.rcfw("create_cq", cq_size=CQ_ENTRIES, pbl=q.pbl_addr, pg_size_lvl=q.pbl_level, cq_fco_cnq_id=dev.nq_id).xid
+                                for q in (self.scq, self.rcq))
+    self.sq, self.rq = alloc_queue(dev, WQE_SIZE, aux=True, entries=RING_ENTRIES), alloc_queue(dev, WQE_SIZE, entries=RING_ENTRIES)
+    self.qpn = dev.rcfw("create_qp", type=bnxt.CMDQ_CREATE_QP_TYPE_RC, scq_cid=self.scq_id, rcq_cid=self.rcq_id,
+      sq_size=RING_ENTRIES, sq_fwo_sq_sge=6, sq_pbl=self.sq.pbl_addr, sq_pg_size_sq_lvl=self.sq.pbl_level,
+      rq_size=RING_ENTRIES, rq_fwo_rq_sge=6, rq_pbl=self.rq.pbl_addr, rq_pg_size_rq_lvl=self.rq.pbl_level).xid
+    self.modify_qp(1, BNXT_INIT_MASK, access=BNXT_ACCESS, pkey=0xffff)
+
+  def modify_qp(self, state, mask, network_type=0, **fields):
+    self.dev.rcfw("modify_qp", qp_cid=self.qpn, modify_mask=mask, network_type_en_sqd_async_notify_new_state=state | network_type, **fields)
+
+  def connect(self, qpn:int, gid:bytes, mac:int):
+    network_type = bnxt.CMDQ_MODIFY_QP_NETWORK_TYPE_ROCEV2_IPV4
+    dgid, dmac = struct.unpack("<4I", gid), struct.unpack("<3H", mac.to_bytes(6, 'big'))
+
+    self.modify_qp(2, BNXT_RTR_MASK, network_type=network_type, qp_type=bnxt.CMDQ_MODIFY_QP_QP_TYPE_RC, access=BNXT_ACCESS,
+      pkey=0xffff, dgid=dgid, sgid_index=self.dev.gid_id, hop_limit=64, dest_mac=dmac, min_rnr_timer=1,
+      path_mtu_pingpong_push_enable=bnxt.CMDQ_MODIFY_QP_PATH_MTU_MTU_4096, max_dest_rd_atomic=4, dest_qp_id=qpn)
+    # a send to a not yet posted receive is retried forever
+    self.modify_qp(3, BNXT_RTS_MASK, network_type=network_type, qp_type=bnxt.CMDQ_MODIFY_QP_QP_TYPE_RC, access=BNXT_ACCESS,
+      max_rd_atomic=1, rnr_retry=7, retry_cnt=7, timeout=14)
+
+    if BNXT_DEBUG >= 1: print(f"bnxt: QP {self.qpn:#x} connected (remote={qpn:#x})")
+
+  def poll(self, cq:BNXTQueue, cq_id, timeout_ms=20000) -> bytes:
+    wait_cond(lambda: cqe_ready(cq.read(cq.read_idx), cq.read_idx), timeout_ms=timeout_ms, msg="BNXT CQ")
+    raw = cq.read(cq.read_idx)
+    cq.read_idx += 1
+    self.dev.doorbell(cq_id, bnxt.DBC_DBC_TYPE_CQ, cq.read_idx % CQ_ENTRIES, (cq.read_idx // CQ_ENTRIES) & 1)
+    assert raw[25] == 0, f"BNXT CQE status {raw[25]}"
+    return raw
+
+  def post_send(self, va:int, key:int, size:int):
+    self.sq.write(self.sq.write_idx, send_wqe(va, key, size))
+    entry, self.sq_psn = msn_entry(self.sq.write_idx, self.sq_psn, size)
+    self.sq.write(self.sq.write_idx, struct.pack("<Q", entry), aux=True)
+    self.sq.write_idx += 1
+    self.dev.doorbell(self.qpn, bnxt.DBC_DBC_TYPE_SQ, self.sq.write_idx % RING_ENTRIES, (self.sq.write_idx // RING_ENTRIES) & 1)
+
+  def post_recv(self, va:int, key:int, size:int):
+    self.rq.write(self.rq.write_idx, recv_wqe(va, key, size))
+    self.rq.write_idx += 1
+    self.dev.doorbell(self.qpn, bnxt.DBC_DBC_TYPE_RQ, self.rq.write_idx % RING_ENTRIES, (self.rq.write_idx // RING_ENTRIES) & 1)
+
+from __future__ import annotations
+import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket, enum, itertools
+try: import fcntl # windows misses that
+except ImportError: fcntl = None #type:ignore[assignment]
+from tinygrad.device import BufferStorage, Buffer, Device
+from tinygrad.helpers import round_up, getenv, OSX, temp, DEBUG, pluralize, DEV
+from tinygrad.runtime.autogen import libc, pci, vfio
+from tinygrad.runtime.support.memory import VirtMapping, AddrSpace, BumpAllocator, MMIOInterface
+from tinygrad.runtime.support.usb import USB3, CustomASM24Controller, USBMMIOInterface
+
+def filter_visible_devices(devs, device):
+  assert (v:=getenv("HCQ_VISIBLE_DEVICES", "")) == "", f"HCQ_VISIBLE_DEVICES={v} is deprecated, use DEV={DEV.target(device, indices=v)} instead"
+  if '-' in (idstr:=DEV.target(device).indices)[1:]: ids = list(range(int(idstr.split('-')[0]), int(idstr.split('-')[1])+1))
+  else: ids = [int(x) for x in idstr.split(',') if x.strip()]
+  assert all(x < len(devs) for x in ids), f"invalid visibility filter: {ids} ({pluralize('device', len(devs))} available)"
+  return [devs[x] for x in ids] if ids else devs
+
+class FileIOInterface:
+  def __init__(self, path:str="", flags:int=os.O_RDONLY, fd:int|None=None):
+    self.path:str = path
+    self.fd:int = fd or os.open(path, flags)
+  def __del__(self):
+    if hasattr(self, 'fd'): os.close(self.fd)
+  def ioctl(self, request, arg): return fcntl.ioctl(self.fd, request, arg)
+  def mmap(self, start, sz, prot, flags, offset): return FileIOInterface._mmap(start, sz, prot, flags, self.fd, offset)
+  def read(self, size=None, binary=False, offset=None):
+    if offset is not None: self.seek(offset)
+    with open(self.fd, "rb" if binary else "r", closefd=False) as file: return file.read(size)
+  def write(self, content, binary=False, offset=None):
+    if offset is not None: self.seek(offset)
+    with open(self.fd, "wb" if binary else "w", closefd=False) as file: file.write(content)
+  def listdir(self): return os.listdir(self.path)
+  def seek(self, offset): os.lseek(self.fd, offset, os.SEEK_SET)
+  @staticmethod
+  def _mmap(start, sz, prot, flags, fd, offset):
+    x = libc.mmap(start, sz, prot, flags, fd, offset)
+    if x == 0xffffffffffffffff: raise OSError(f"Failed to mmap {sz} bytes at {hex(start)}: {os.strerror(ctypes.get_errno())}")
+    return x
+  @staticmethod
+  def anon_mmap(start, sz, prot, flags, offset): return FileIOInterface._mmap(start, sz, prot, flags, -1, offset)
+  @staticmethod
+  def munmap(buf, sz): return libc.munmap(buf, sz)
+  @staticmethod
+  def exists(path): return os.path.exists(path)
+  @staticmethod
+  def readlink(path): return os.readlink(path)
+  @staticmethod
+  def eventfd(initval, flags=None): return FileIOInterface(fd=os.eventfd(initval, flags))  # type: ignore[attr-defined]
+
+MAP_FIXED, MAP_FIXED_NOREPLACE = 0x10, 0x100000
+MAP_LOCKED, MAP_POPULATE, MAP_NORESERVE = 0 if OSX else 0x2000, getattr(mmap, "MAP_POPULATE", 0 if OSX else 0x008000), 0x400
+
+def ipv4_to_gid(ip:str) -> bytes: return bytes(10) + b'\xff\xff' + socket.inet_aton(ip)
+
+class _System:
+  def write_sysfs(self, path:str, value:str, msg:str, expected:str|None=None):
+    if FileIOInterface(path, os.O_RDONLY).read().splitlines()[0] != (expected or value):
+      os.system(cmd:=f"sudo sh -c 'echo {value} > {path}'")
+      if FileIOInterface(path, os.O_RDONLY).read().splitlines()[0] != (expected or value): raise RuntimeError(f"{msg}. Please run {cmd} manually.")
+
+  @functools.cached_property
+  def atomic_lib(self): return ctypes.CDLL(ctypes.util.find_library('atomic')) if sys.platform == "linux" else None
+
+  @functools.cached_property
+  def libsys(self): return ctypes.CDLL(ctypes.util.find_library("System"))
+
+  @functools.cached_property
+  def pagemap(self) -> FileIOInterface:
+    self.write_sysfs("/proc/sys/vm/compact_unevictable_allowed", "0", "Failed to disable migration of locked pages")
+    return FileIOInterface("/proc/self/pagemap", os.O_RDONLY)
+
+  @functools.cached_property
+  def vfio(self) -> FileIOInterface|None:
+    try:
+      if not FileIOInterface.exists("/sys/module/vfio"): os.system("sudo modprobe vfio-pci disable_idle_d3=1")
+
+      FileIOInterface("/sys/module/vfio/parameters/enable_unsafe_noiommu_mode", os.O_RDWR).write("1")
+      vfio_fd = FileIOInterface("/dev/vfio/vfio", os.O_RDWR)
+      vfio.VFIO_CHECK_EXTENSION(vfio_fd, vfio.VFIO_NOIOMMU_IOMMU)
+
+      return vfio_fd
+    except OSError: return None
+
+  @functools.cache
+  def reserve_va(self, va_start, va_size):
+    # cached, runs only once per range. used to not collide with other mappings.
+    FileIOInterface.anon_mmap(va_start, va_size, 0, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, 0)
+
+  def memory_barrier(self): lib.atomic_thread_fence(__ATOMIC_SEQ_CST:=5) if (lib:=self.libsys if OSX else self.atomic_lib) is not None else None
+
+  def lock_memory(self, addr:int, size:int):
+    if libc.mlock(ctypes.c_void_p(addr), size): raise RuntimeError(f"Failed to lock memory at {addr:#x} with size {size:#x}")
+
+  def system_paddrs(self, vaddr:int, size:int) -> list[int]:
+    self.pagemap.seek(vaddr // mmap.PAGESIZE * 8)
+    return [(x & ((1<<55) - 1)) * mmap.PAGESIZE for x in array.array('Q', self.pagemap.read(size//mmap.PAGESIZE*8, binary=True))]
+
+  def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
+    assert not contiguous or size <= (2 << 20), "Contiguous allocation is only supported for sizes up to 2MB"
+    flags = (libc.MAP_HUGETLB if contiguous and (size:=round_up(size, mmap.PAGESIZE)) > mmap.PAGESIZE else 0) | (MAP_FIXED if vaddr else 0)
+    va = FileIOInterface.anon_mmap(vaddr, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED|mmap.MAP_ANONYMOUS|MAP_POPULATE|MAP_LOCKED|flags, 0)
+    return MMIOInterface(va, size), self.system_paddrs(va, round_up(size, mmap.PAGESIZE))
+
+  def pci_scan_bus(self, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None) -> list[str]:
+    all_devs = []
+    if OSX:
+      from tinygrad.runtime.autogen import iokit, corefoundation
+      def read_prop(svc, key) -> int:
+        cfkey = corefoundation.CFStringCreateWithCString(None, key.encode(), corefoundation.kCFStringEncodingUTF8)
+        cfdata = ctypes.cast(iokit.IORegistryEntryCreateCFProperty(svc, ctypes.cast(cfkey, iokit.CFStringRef), None, 0), corefoundation.CFDataRef)
+        corefoundation.CFDataGetBytes(cfdata, corefoundation.CFRange(0, corefoundation.CFDataGetLength(cfdata)), buf:=(ctypes.c_uint8*8)())
+        return int.from_bytes(bytes(buf), "little")
+
+      iokit.IOServiceGetMatchingServices(0, iokit.IOServiceMatching(b"IOPCIDevice"), ctypes.byref(iterator:=ctypes.c_uint()))
+      while svc:=iokit.IOIteratorNext(iterator):
+        if base_class is not None and read_prop(svc, "class-code") >> 16 != base_class: continue
+        all_devs.append((v:=read_prop(svc, "vendor-id"), d:=read_prop(svc, "device-id"), f"{v:x}:{d:x}"))
+    else:
+      try: devs = FileIOInterface("/sys/bus/pci/devices")
+      except FileNotFoundError: raise RuntimeError("no pcie")
+      for pcibus in devs.listdir():
+        if base_class is not None and int(FileIOInterface(f"/sys/bus/pci/devices/{pcibus}/class").read(), 16) >> 16 != base_class: continue
+        all_devs.append((int(FileIOInterface(f"/sys/bus/pci/devices/{pcibus}/vendor").read(), 16),
+                         int(FileIOInterface(f"/sys/bus/pci/devices/{pcibus}/device").read(), 16), pcibus))
+
+    return sorted([val for vndr, device, val in all_devs if vndr == vendor and any((device & mask) in devlist for mask, devlist in devices)])
+
+  @functools.cache
+  def list_devices(self, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None):
+    if getenv("REMOTE", ""): return RemotePCIDevice.scan(vendor, devices, base_class)
+    return [(PCIDevice, x) for x in System.pci_scan_bus(vendor, devices, base_class)]
+
+  def pci_probe_device(self, device:str, dev_id:int, vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None=None):
+    try: cl, pcibus = (ds:=filter_visible_devices(self.list_devices(vendor, devices, base_class), device))[dev_id]
+    except IndexError: raise RuntimeError(f"{device}:{dev_id} does not exist ({pluralize('device', len(ds))} available)")
+    return cl(device[:2], pcibus)
+
+  def pci_setup_usb_bars(self, usb:CustomASM24Controller, gpu_bus:int, mem_base:int, pref_mem_base:int) -> dict[int, tuple[int, int]]:
+    for bus in range(gpu_bus):
+      # All 3 values must be written at the same time.
+      buses = (0 << 0) | ((bus+1) << 8) | ((gpu_bus) << 16)
+      usb.pcie_cfg_req(pci.PCI_PRIMARY_BUS, bus=bus, dev=0, fn=0, value=buses, size=4)
+
+      usb.pcie_cfg_req(pci.PCI_MEMORY_BASE, bus=bus, dev=0, fn=0, value=(mem_base>>16) & 0xffff, size=2)
+      usb.pcie_cfg_req(pci.PCI_MEMORY_LIMIT, bus=bus, dev=0, fn=0, value=0xffff, size=2)
+      usb.pcie_cfg_req(pci.PCI_PREF_MEMORY_BASE, bus=bus, dev=0, fn=0, value=(pref_mem_base>>16) & 0xffff, size=2)
+      usb.pcie_cfg_req(pci.PCI_PREF_MEMORY_LIMIT, bus=bus, dev=0, fn=0, value=0xffff, size=2)
+      usb.pcie_cfg_req(pci.PCI_PREF_BASE_UPPER32,  bus=bus, dev=0, fn=0, value=pref_mem_base >> 32, size=4)
+      usb.pcie_cfg_req(pci.PCI_PREF_LIMIT_UPPER32, bus=bus, dev=0, fn=0, value=0xffffffff, size=4)
+
+      usb.pcie_cfg_req(pci.PCI_COMMAND, bus=bus, dev=0, fn=0, value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
+
+    # resize bar 0
+    cap_ptr = 0x100
+    while cap_ptr:
+      if pci.PCI_EXT_CAP_ID(hdr:=usb.pcie_cfg_req(cap_ptr, bus=gpu_bus, dev=0, fn=0, size=4)) == pci.PCI_EXT_CAP_ID_REBAR:
+        cap = usb.pcie_cfg_req(cap_ptr + 0x04, bus=gpu_bus, dev=0, fn=0, size=4)
+        new_ctrl = (usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, size=4) & ~0x1F00) | ((int(cap >> 4).bit_length() - 1) << 8)
+        usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, value=new_ctrl, size=4)
+
+      cap_ptr = pci.PCI_EXT_CAP_NEXT(hdr)
+
+    mem_space_addr, bar_off, bars = [mem_base, pref_mem_base], 0, {}
+    while bar_off < 24:
+      cfg = usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=gpu_bus, dev=0, fn=0, size=4)
+      bar_mem, bar_64 = bool(cfg & pci.PCI_BASE_ADDRESS_MEM_PREFETCH), cfg & pci.PCI_BASE_ADDRESS_MEM_TYPE_64
+
+      if (cfg & pci.PCI_BASE_ADDRESS_SPACE) == pci.PCI_BASE_ADDRESS_SPACE_MEMORY:
+        usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=gpu_bus, dev=0, fn=0, value=0xffffffff, size=4)
+        lo = (usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=gpu_bus, dev=0, fn=0, size=4) & 0xfffffff0)
+
+        if bar_64: usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off + 4, bus=gpu_bus, dev=0, fn=0, value=0xffffffff, size=4)
+        hi = (usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off + 4, bus=gpu_bus, dev=0, fn=0, size=4) if bar_64 else 0)
+
+        bar_size = ((~(((hi << 32) | lo) & ~0xf)) + 1) & (0xffffffffffffffff if bar_64 else 0xffffffff)
+
+        usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off, bus=gpu_bus, dev=0, fn=0, value=mem_space_addr[bar_mem] & 0xffffffff, size=4)
+        if bar_64: usb.pcie_cfg_req(pci.PCI_BASE_ADDRESS_0 + bar_off + 4, bus=gpu_bus, dev=0, fn=0, value=mem_space_addr[bar_mem] >> 32, size=4)
+
+        bars[bar_off // 4] = (mem_space_addr[bar_mem], bar_size)
+        mem_space_addr[bar_mem] += round_up(bar_size, 2 << 20)
+
+      bar_off += 8 if bar_64 else 4
+
+    usb.pcie_cfg_req(pci.PCI_COMMAND, bus=gpu_bus, dev=0, fn=0, value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
+    return bars
+
+  def flock_acquire(self, name:str) -> int:
+    import fcntl # to support windows
+
+    os.umask(0) # Set umask to 0 to allow creating files with 0666 permissions
+
+    # Avoid O_CREAT because we don’t want to re-create/replace an existing file (triggers extra perms checks) when opening as non-owner.
+    if os.path.exists(lock_name:=temp(name)): self.lock_fd = os.open(lock_name, os.O_RDWR)
+    else: self.lock_fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666)
+
+    try: fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError: raise RuntimeError(f"Failed to acquire lock file {name}. `sudo lsof {lock_name}` may help identify the process holding the lock.")
+
+    return self.lock_fd
+
+System = _System()
+
+# *** PCI Devices
+
+class PCIDevice:
+  def __init__(self, devpref:str, pcibus:str):
+    self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
+    self.pcibus, self.irq_poller = pcibus, None
+
+    try: FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/enable", os.O_RDWR)
+    except PermissionError: raise PermissionError(f"Cannot access PCI device {pcibus}: run `extra/amdpci/setup_python_cap.sh` or use sudo")
+
+    if FileIOInterface.exists(f"/sys/bus/pci/devices/{self.pcibus}/driver"):
+      FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/driver/unbind", os.O_WRONLY).write(self.pcibus)
+    if FileIOInterface.exists(f"/sys/bus/pci/devices/{self.pcibus}/driver"): raise RuntimeError(f"Driver is bound to {pcibus}")
+
+    # remove sibling functions of the gpu, if any
+    for fn in range(1, 8):
+      if FileIOInterface.exists(sib:=f"/sys/bus/pci/devices/{self.pcibus[:-1]}{fn}"): FileIOInterface(f"{sib}/remove", os.O_WRONLY).write("1")
+
+    if getenv("VFIO", 0) and (vfio_fd:=System.vfio) is not None:
+      FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/driver_override", os.O_WRONLY).write("vfio-pci")
+      FileIOInterface("/sys/bus/pci/drivers_probe", os.O_WRONLY).write(self.pcibus)
+      iommu_group = FileIOInterface.readlink(f"/sys/bus/pci/devices/{self.pcibus}/iommu_group").split('/')[-1]
+
+      self.vfio_group = FileIOInterface(f"/dev/vfio/noiommu-{iommu_group}", os.O_RDWR)
+      vfio.VFIO_GROUP_SET_CONTAINER(self.vfio_group, ctypes.c_int(vfio_fd.fd))
+
+      with contextlib.suppress(OSError): vfio.VFIO_SET_IOMMU(vfio_fd, vfio.VFIO_NOIOMMU_IOMMU) # set iommu works only once for the fd.
+      self.vfio_dev = FileIOInterface(fd=vfio.VFIO_GROUP_GET_DEVICE_FD(self.vfio_group, ctypes.create_string_buffer(self.pcibus.encode())))
+
+      self.irq_fd = FileIOInterface.eventfd(0, 0)
+      self.irq_poller = select.poll()
+      self.irq_poller.register(self.irq_fd.fd, select.POLLIN)
+
+      irqs = vfio.struct_vfio_irq_set(index=vfio.VFIO_PCI_MSI_IRQ_INDEX, flags=vfio.VFIO_IRQ_SET_DATA_EVENTFD|vfio.VFIO_IRQ_SET_ACTION_TRIGGER,
+        argsz=ctypes.sizeof(vfio.struct_vfio_irq_set) + ctypes.sizeof(ctypes.c_int), count=1)
+      vfio.VFIO_DEVICE_SET_IRQS(self.vfio_dev, (ctypes.c_byte * irqs.argsz).from_buffer(bytearray(bytes(irqs)) + struct.pack('i', self.irq_fd.fd)))
+    else: FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/enable", os.O_RDWR).write("1")
+
+    self.cfg_fd = FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/config", os.O_RDWR | os.O_SYNC | os.O_CLOEXEC)
+
+  def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
+    return System.alloc_sysmem(size, vaddr, contiguous)
+
+  def reset(self): os.system(f"sudo sh -c 'echo 1 > /sys/bus/pci/devices/{self.pcibus}/reset'")
+  def read_config(self, offset:int, size:int): return int.from_bytes(self.cfg_fd.read(size, binary=True, offset=offset), byteorder='little')
+  def write_config(self, offset:int, value:int, size:int): self.cfg_fd.write(value.to_bytes(size, byteorder='little'), binary=True, offset=offset)
+  def write_config_flush(self, offset:int, value:int, size:int):
+    self.write_config(offset, value, size)
+    self.read_config(offset, size)
+
+  @functools.cache
+  def bar_fd(self, bar_idx:int) -> FileIOInterface:
+    return FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/resource{bar_idx}", os.O_RDWR | os.O_SYNC | os.O_CLOEXEC)
+  @functools.cache
+  def bar_info(self, bar_idx:int) -> tuple[int, int]:
+    s, e, _ = FileIOInterface(f"/sys/bus/pci/devices/{self.pcibus}/resource", os.O_RDONLY).read().splitlines()[bar_idx].split()
+    return (int(s, 16), int(e, 16) - int(s, 16) + 1)
+  def map_bar(self, bar:int, off:int=0, addr:int=0, size:int|None=None, fmt='B') -> MMIOInterface:
+    fd, sz = self.bar_fd(bar), size or (self.bar_info(bar)[1] - off)
+    libc.madvise(loc:=fd.mmap(addr, sz, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED | (MAP_FIXED if addr else 0), off), sz, libc.MADV_DONTFORK)
+    return MMIOInterface(loc, sz, fmt=fmt)
+  def resize_bar(self, bar_idx:int):
+    rpath = f"/sys/bus/pci/devices/{self.pcibus}/resource{bar_idx}_resize"
+    try: FileIOInterface(rpath, os.O_RDWR).write(str(int(FileIOInterface(rpath, os.O_RDONLY).read(), 16).bit_length() - 1))
+    except OSError as e: raise RuntimeError(f"Cannot resize BAR {bar_idx}: {e}. Ensure the resizable BAR option is enabled.") from e
+
+class USBPCIDevice(PCIDevice):
+  def __init__(self, devpref:str, dev, pcibus):
+    self.pcibus, self.peer_group = pcibus, f"USBPCIDevice_{pcibus}"
+    self.lock_fd = System.flock_acquire(f"{devpref.lower()}_{pcibus.lower()}.lock")
+    usb = USB3(dev)
+    if DEBUG >= 1: print(f"am {self.pcibus}: product string: {usb.product!r}")
+    self.usb: CustomASM24Controller = CustomASM24Controller(usb)
+    self._bar_info = System.pci_setup_usb_bars(self.usb, gpu_bus=4, mem_base=0x10000000, pref_mem_base=(32 << 30))
+    self.sram = BumpAllocator(size=0x80000, wrap=False) # asm24 controller sram
+
+  def dma_view(self, ctrl_addr, size): return USBMMIOInterface(self.usb, ctrl_addr, size, fmt='B', pcimem=False)
+  def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
+    return self.dma_view(0xf000 + (off:=self.sram.alloc(size)), size), [0x200000 + off]
+
+  def read_config(self, offset:int, size:int): return self.usb.pcie_cfg_req(offset, bus=4, dev=0, fn=0, size=size)
+  def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=4, dev=0, fn=0, value=value, size=size)
+
+  def bar_info(self, bar_idx:int) -> tuple[int, int]: return self._bar_info[bar_idx]  # type: ignore[override]
+  def map_bar(self, bar, off=0, addr=0, size=None, fmt='B'):
+    return USBMMIOInterface(self.usb, self.bar_info(bar)[0] + off, size or self.bar_info(bar)[1], fmt)
+  def resize_bar(self, bar_idx:int): pass # already resized
+
+@dataclasses.dataclass
+class PCIAllocationMeta: mapping:VirtMapping; has_cpu_mapping:bool; hMemory:int=0 # noqa: E702
+
+class PCIIfaceBase:
+  @property
+  def peer_group(self) -> str: return getattr(self.pci_dev, 'peer_group', type(self.pci_dev).__name__)
+  @property
+  def remote(self) -> RemotePCIDevice|None: return self.pci_dev if isinstance(self.pci_dev, RemotePCIDevice) else None
+  def is_bar_small(self) -> bool: return self.pci_dev.bar_info(self.vram_bar)[1] == (256 << 20)
+
+  def __init__(self, dev, dev_id, vendor, devices:tuple[tuple[int, tuple[int, ...]], ...], vram_bar, va_start, va_size,
+               dev_impl_t, base_class:int|None=None):
+    self.pci_dev = System.pci_probe_device(dn:=dev.__class__.__name__[:-6], dev_id, vendor, devices, base_class=base_class)
+    if self.remote is None: System.reserve_va(va_start, va_size)
+    with contextlib.suppress(Exception): self.pci_dev.resize_bar(vram_bar)
+    self.dev_impl = dev_impl_t(self.pci_dev)
+    self.dev, self.vram_bar, self.count = dev, vram_bar, len(filter_visible_devices(System.list_devices(vendor, devices, base_class), dn))
+
+  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, zero=False,
+            **kwargs) -> BufferStorage:
+    should_use_sysmem = host or (cpu_access and self.is_bar_small() and not force_devmem)
+
+    # Align size to huge pages for large allocations, otherwise the unaligned tail falls back to 4KB pages, increasing TLB pressure.
+    size = round_up(size, mmap.PAGESIZE if should_use_sysmem else ((2 << 20) if size >= (8 << 20) else (4 << 10)))
+
+    if should_use_sysmem:
+      vaddr = self.dev_impl.mm.alloc_vaddr(size:=round_up(size, mmap.PAGESIZE), align=mmap.PAGESIZE)
+      memview, paddrs = self.pci_dev.alloc_sysmem(size, vaddr=vaddr, contiguous=contiguous)
+      mapping = self.dev_impl.mm.map_range(vaddr, size, [(paddr, 0x1000) for paddr in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
+      return BufferStorage(vaddr, PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0]), memview)
+
+    mapping = self.dev_impl.mm.valloc(size:=round_up(size, 0x1000), uncached=uncached, contiguous=cpu_access, zero=zero)
+    barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
+    return BufferStorage(mapping.va_addr, PCIAllocationMeta(mapping, cpu_access, hMemory=mapping.paddrs[0][0]), barview)
+
+  def free(self, storage:BufferStorage):
+    if storage.meta.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(storage.meta.mapping)
+    if storage.meta.has_cpu_mapping and self.remote is None: FileIOInterface.munmap(storage.buf, storage.meta.mapping.size)
+
+  def unmap(self, mapping:BufferStorage): self.dev_impl.mm.unmap_range(*mapping.meta)
+
+  def p2p_paddrs(self, paddrs:list[tuple[int,int]]) -> tuple[list[tuple[int,int]], AddrSpace]:
+    return [(p + self.pci_dev.bar_info(self.vram_bar)[0], sz) for p, sz in paddrs], AddrSpace.SYS
+
+  def map(self, b:Buffer) -> BufferStorage:
+    if b.device.split(":")[0] in {"CPU", "PYTHON", "NPY"}:
+      if self.dev.host != Device[b.device].host: raise RuntimeError(f"host memory is not on the node of {self.dev.device}")
+      if b._buf % 0x1000: raise RuntimeError("Host mapping requires a page-aligned address")
+      lo, size = b._buf, round_up(b.nbytes, 0x1000)
+      if not self.dev_impl.mm.va_base <= lo < lo + size <= self.dev_impl.mm.va_base + (1 << self.dev_impl.mm.va_bits):
+        raise RuntimeError(f"Host address {lo:#x} is outside the GPU virtual address range")
+      if self.remote is None: System.lock_memory(lo, size)
+      paddrs = [(x, 0x1000) for x in (b.meta if self.remote is not None else System.system_paddrs(lo, size))]
+      aspace, snooped, uncached = AddrSpace.SYS, True, True
+    elif isinstance(ifa:=getattr(Device[b.device], "iface", None), PCIIfaceBase):
+      if ifa.is_bar_small(): raise RuntimeError(f"P2P mapping not supported for small bar devices: {b.device} -> {self.dev.device}")
+      if ifa.peer_group != self.peer_group: raise RuntimeError(f"P2P mapping across peer groups: {b.device} -> {self.dev.device}")
+      lo, size, snooped, uncached = b._buf, b.meta.mapping.size, True, b.meta.mapping.uncached
+      if b.meta.mapping.aspace is AddrSpace.SYS: paddrs, aspace = b.meta.mapping.paddrs, AddrSpace.SYS
+      else: paddrs, aspace = ifa.p2p_paddrs(b.meta.mapping.paddrs)
+    else: raise RuntimeError(f"map failed: {b.device} -> {self.dev.device}")
+
+    self.dev_impl.mm.map_range(lo, size, paddrs, aspace=aspace, snooped=snooped, uncached=uncached)
+    return BufferStorage(b._buf, (lo, size))
+
+# *** Remote PCI: memory and program execution on extra/remote/serve.py
+
+class RemoteCmd(enum.IntEnum):
+  PROBE,MAP_BAR,MAP_SYSMEM_FD,CFG_READ,CFG_WRITE,RESET,MMIO_READ,MMIO_WRITE,MAP_SYSMEM,SYSMEM_READ,SYSMEM_WRITE,RESIZE_BAR,PING = range(13)
+  LOAD_PROG,EXEC_PROG,UNMAP_SYSMEM = range(13, 16)
+
+REMOTE_REQ, REMOTE_RESP = '<BIIQQQ', '<BQQ' # (cmd, dev, bar, arg0, arg1, arg2) and (status, resp0, resp1)
+
+class RemoteMMIOInterface(MMIOInterface):
+  # memory of the node at its address: reads are round trips, writes are posted in order
+  def __init__(self, dev:RemotePCIDevice, residx:int, addr:int, nbytes:int, fmt='B', off=0, sysmem=False):
+    self.dev, self.residx, self.addr, self.nbytes, self.fmt, self.off, self.sysmem = dev, residx, addr, nbytes, fmt, off, sysmem
+  def __getitem__(self, k):
+    sl, el = k if isinstance(k, slice) else slice(k, k + 1), struct.calcsize(self.fmt)
+    st, en = (sl.start or 0) * el, (len(self) if sl.stop is None else sl.stop) * el
+    cmd, addr = (RemoteCmd.SYSMEM_READ, self.addr) if self.sysmem else (RemoteCmd.MMIO_READ, self.off)
+    data = self.dev.rpc(cmd, addr + st, en - st, bar=self.residx, readout_size=en - st)[2]
+    res = data if self.fmt == 'B' else list(struct.unpack(f'<{(en - st) // el}{self.fmt}', data))
+    return res if isinstance(k, slice) else res[0]
+  def __setitem__(self, k, v):
+    st = ((k.start or 0) if isinstance(k, slice) else k) * struct.calcsize(self.fmt)
+    data = (bytes(v) if self.fmt == 'B' else struct.pack(f'<{len(v)}{self.fmt}', *v)) if isinstance(k, slice) else struct.pack(f'<{self.fmt}', v)
+    cmd = RemoteCmd.SYSMEM_WRITE if self.sysmem else RemoteCmd.MMIO_WRITE
+    self.dev._post(self.dev.sock, cmd, (self.addr if self.sysmem else self.off) + st, len(data), dev=self.dev.dev_id, bar=self.residx, payload=data)
+  def view(self, offset:int=0, size:int|None=None, fmt=None) -> MMIOInterface:
+    return RemoteMMIOInterface(self.dev, self.residx, self.addr + offset, (self.nbytes - offset) if size is None else size,
+                               fmt or self.fmt, self.off + offset, self.sysmem)
+
+class RemotePCIDevice(PCIDevice):
+  @staticmethod
+  def connect(host:str, port:int) -> socket.socket: return RemotePCIDevice._connect(socket.gethostbyname(host), port)
+  @staticmethod
+  @functools.cache
+  def _connect(host:str, port:int) -> socket.socket:
+    sock = socket.create_connection((host, port), timeout=getenv("REMOTE_TIMEOUT", 60))
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF): sock.setsockopt(socket.SOL_SOCKET, opt, 64 << 20)
+    return sock
+
+  @staticmethod
+  def scan(vendor:int, devices:tuple[tuple[int, tuple[int, ...]], ...], base_class:int|None):
+    payload, ret = array.array('I', itertools.chain.from_iterable((m, d) for m, ds in devices for d in ds)).tobytes(), list[tuple]()
+    for r in [r.strip() for r in getenv("REMOTE", "").split(",") if r.strip()]:
+      if r == "local": ret += [(PCIDevice, d) for d in System.pci_scan_bus(vendor, devices, base_class)]
+      else:
+        host, port = r.split(":")[0], int(r.split(":")[1]) if ":" in r else 6667
+        sock = RemotePCIDevice.connect(host, port)
+        n, _, _ = RemotePCIDevice._rpc(sock, RemoteCmd.PROBE, base_class or 0, len(payload), vendor, payload=payload)
+        data = RemotePCIDevice._recvall(sock, n)
+        ret += [(functools.partial(RemotePCIDevice, sock=sock), f"remote:{host}:{port}:{d}") for d in data.decode().split()]
+    return ret
+
+  @staticmethod
+  def _recvall(sock:socket.socket, n:int) -> bytes:
+    data = bytearray()
+    while len(data) < n:
+      if not (chunk:=sock.recv(n - len(data))): raise ConnectionError("remote connection closed")
+      data += chunk
+    return bytes(data)
+  @staticmethod
+  def _post(sock:socket.socket, cmd:RemoteCmd, *args:int, dev:int=0, bar:int=0, payload:bytes|memoryview=b''):
+    sock.sendall(struct.pack(REMOTE_REQ, cmd, dev, bar, *(*args, 0, 0, 0)[:3]))
+    if len(payload): sock.sendall(payload)
+  @staticmethod
+  def _rpc(sock:socket.socket, cmd:RemoteCmd, *args:int, dev:int=0, bar:int=0, payload:bytes|memoryview=b'',
+           readout_size:int=0) -> tuple[int, int, bytes]:
+    RemotePCIDevice._post(sock, cmd, *args, dev=dev, bar=bar, payload=payload)
+    status, r0, r1 = struct.unpack(REMOTE_RESP, RemotePCIDevice._recvall(sock, struct.calcsize(REMOTE_RESP)))
+    if status: raise RuntimeError(f"remote {cmd.name} failed: {RemotePCIDevice._recvall(sock, r0).decode()}")
+    return r0, r1, RemotePCIDevice._recvall(sock, readout_size)
+
+  def __init__(self, devpref:str, pcibus:str, sock:socket.socket):
+    self.sock, self.pcibus, self.dev_id, self.irq_poller = sock, pcibus, int(pcibus.split(':')[-1]), None
+    self.peer_group = "remote:%s:%d" % sock.getpeername()[:2]
+
+  def rpc(self, cmd:RemoteCmd, *args:int, bar:int=0, payload:bytes|memoryview=b'', readout_size:int=0) -> tuple[int, int, bytes]:
+    return RemotePCIDevice._rpc(self.sock, cmd, *args, dev=self.dev_id, bar=bar, payload=payload, readout_size=readout_size)
+
+  def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
+    n, _, _ = self.rpc(RemoteCmd.MAP_SYSMEM, size, int(contiguous), vaddr)
+    host_va, *paddrs = struct.unpack(f'<{n // 8}Q', self._recvall(self.sock, n))
+    return self.cpu_view(host_va, size), paddrs
+  def free_sysmem(self, view:MMIOInterface): self.rpc(RemoteCmd.UNMAP_SYSMEM, view.addr, view.nbytes)
+  def cpu_view(self, addr:int, size:int) -> MMIOInterface: return RemoteMMIOInterface(self, 0, addr, size, sysmem=True)
+  def reset(self): self.rpc(RemoteCmd.RESET)
+  def read_config(self, offset:int, size:int): return self.rpc(RemoteCmd.CFG_READ, offset, size)[0]
+  def write_config(self, offset:int, value:int, size:int): self.rpc(RemoteCmd.CFG_WRITE, offset, size, value)
+  def resize_bar(self, bar_idx:int): self.rpc(RemoteCmd.RESIZE_BAR, bar=bar_idx)
+  @functools.cache
+  def _bar(self, bar:int) -> tuple[int, int, int]: # paddr, size, the node's address of the whole bar
+    paddr, size, data = self.rpc(RemoteCmd.MAP_BAR, bar=bar, readout_size=8)
+    return paddr, size, struct.unpack('<Q', data)[0]
+  def bar_info(self, bar_idx:int) -> tuple[int, int]: return self._bar(bar_idx)[:2]  # type: ignore[override]
+  def map_bar(self, bar:int, off:int=0, addr:int=0, size:int|None=None, fmt='B') -> MMIOInterface:
+    _, sz, host_va = self._bar(bar)
+    return RemoteMMIOInterface(self, bar, host_va + off, size or (sz - off), fmt, off=off)
+
+if DEV.interface.startswith("MOCK"): from test.mockgpu.mockgpu import MockFileIOInterface as FileIOInterface  # noqa: F401 # pylint: disable=unused-import
+
+import ctypes, struct, time, functools, itertools
+from tinygrad.runtime.autogen import libusb, libc
+from tinygrad.helpers import DEBUG, DEV, to_mv, round_up, ceildiv, flatten
+from tinygrad.dtype import dtypes, DType, AddrSpace
+from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, uopfunc
+from tinygrad.device import Buffer, BufferSpec, Compiled
+from tinygrad.runtime.support.hcq2 import HCQ_RUNTIME_DEV, HCQ_DEVS, CDTYPE, ccall, patch, unwrap_view, all_devices_in, to_name
+from tinygrad.runtime.support.memory import MMIOInterface
+from tinygrad.runtime.support import c
+
+def alloc_cbuffer(sz:int) -> tuple[ctypes.Array, memoryview]: return (buf:=(ctypes.c_ubyte * sz)()), to_mv(ctypes.addressof(buf), sz)
+def checked(fn, msg=None):
+  @functools.wraps(fn)
+  def wrapper(*args):
+    if (rc:=fn(*args)) < 0: raise RuntimeError(f"{msg or fn.__name__}: {ctypes.string_at(libusb.libusb_strerror(rc)).decode()}")
+    return rc
+  return wrapper
+
+class USB3:
+  @staticmethod
+  @functools.cache
+  def ctx():
+    ctx = c.init_c_var(ctypes.POINTER(libusb.struct_libusb_context), checked(libusb.libusb_init))
+    if DEBUG >= 6: checked(libusb.libusb_set_option)(ctx, libusb.LIBUSB_OPTION_LOG_LEVEL, 4)
+    return ctx
+
+  @classmethod
+  @functools.cache
+  def list_devices(cls, vendor:int, dev:int) -> list[tuple[c.POINTER[libusb.struct_libusb_device], str]]:
+    ret = []
+    for i in range(checked(libusb.libusb_get_device_list)(cls.ctx(), devs:=ctypes.POINTER(ctypes.POINTER(libusb.struct_libusb_device))())):
+      desc = c.init_c_var(libusb.struct_libusb_device_descriptor, lambda x: checked(libusb.libusb_get_device_descriptor)(devs[i], x))
+      if (desc.idVendor, desc.idProduct) == (vendor, dev):
+        ret.append((libusb.libusb_ref_device(devs[i]), f"usb:{libusb.libusb_get_bus_number(devs[i])}-{libusb.libusb_get_device_address(devs[i])}"))
+    libusb.libusb_free_device_list(devs, 1)
+    return ret
+
+  def __init__(self, dev:c.POINTER[libusb.struct_libusb_device], *args, **kwargs):
+    self._tags, self._transferred = itertools.count(1), ctypes.c_int(0)
+    self._bulk_buf, self._bulk_mv = alloc_cbuffer(4 << 20)
+    self._ctrl_buf, self._ctrl_mv = alloc_cbuffer(0x1000)
+
+    self.handle = c.init_c_var(c.POINTER[libusb.struct_libusb_device_handle], lambda x: checked(libusb.libusb_open)(dev, x))
+
+    # Read product string descriptor
+    _buf = (ctypes.c_ubyte * 256)()
+    _desc = libusb.struct_libusb_device_descriptor()
+    checked(libusb.libusb_get_device_descriptor)(libusb.libusb_get_device(self.handle), ctypes.byref(_desc))
+    _ret = checked(libusb.libusb_get_string_descriptor_ascii)(self.handle, _desc.iProduct, _buf, 256)
+    self.product = bytes(_buf[:_ret]).decode("ascii", errors="replace")
+    assert self.product.startswith("custom") or self.product.startswith("AS2462")
+
+    # Detach kernel driver if needed
+    if checked(libusb.libusb_kernel_driver_active)(self.handle, 0):
+      checked(libusb.libusb_detach_kernel_driver)(self.handle, 0)
+      checked(libusb.libusb_reset_device)(self.handle)
+
+    # Set configuration and claim interface
+    checked(libusb.libusb_set_configuration)(self.handle, 1)
+    checked(libusb.libusb_claim_interface)(self.handle, 0)
+    checked(libusb.libusb_set_interface_alt_setting)(self.handle, 0, 0)
+
+  def control_write(self, request:int, value:int=0, index:int=0, data:bytes=b'', timeout:int=1000):
+    assert len(data) <= len(self._ctrl_mv)
+    self._ctrl_mv[:len(data)] = data
+    assert checked(libusb.libusb_control_transfer)(self.handle, 0x40, request, value, index, self._ctrl_buf, len(data), timeout) == len(data)
+
+  def control_read(self, request:int, length:int, value:int=0, index:int=0, timeout:int=1000) -> memoryview:
+    assert length <= len(self._ctrl_mv)
+    assert checked(libusb.libusb_control_transfer)(self.handle, 0xC0, request, value, index, self._ctrl_buf, length, timeout) == length
+    return self._ctrl_mv[:length]
+
+  def bulk_write(self, payload:bytes, timeout:int=1000):
+    if len(payload) > len(self._bulk_mv): self._bulk_buf, self._bulk_mv = alloc_cbuffer(len(payload))
+    self._bulk_mv[:len(payload)] = payload
+    checked(libusb.libusb_bulk_transfer, "bulk OUT 0x02 failed") \
+      (self.handle, 0x02, self._bulk_buf, len(payload), self._transferred, timeout)
+    assert self._transferred.value == len(payload), f"bulk OUT short write: {self._transferred.value}/{len(payload)} bytes"
+
+  def bulk_read(self, length:int, timeout:int=1000) -> memoryview:
+    if length > len(self._bulk_mv): self._bulk_buf, self._bulk_mv = alloc_cbuffer(length)
+    checked(libusb.libusb_bulk_transfer, "bulk IN 0x81 failed")(self.handle, 0x81, self._bulk_buf, length, self._transferred, timeout)
+    return self._bulk_mv[:self._transferred.value]
+
+  # NOTE: keep it for flash.py
+  def send_batch(self, cdbs:list[bytes], odata:list[bytes|None]|None=None):
+    for cdb, data in zip(cdbs, odata or [None] * len(cdbs)):
+      self.bulk_write(struct.pack("<IIIBBB16s", 0x43425355, tag:=next(self._tags), len(data) if data is not None else 0, 0, 0, len(cdb), cdb))
+      if data is not None: self.bulk_write(data)
+      sig, rtag, _, status = struct.unpack("<IIIB", self.bulk_read(13, timeout=2000))
+      assert (sig, rtag, status) == (0x53425355, tag, 0)
+
+class CustomASM24Controller:
+  def __init__(self, usb:USB3):
+    self.usb = usb
+
+    # Custom firmware now boots with PCIe off. Power it on before probing the link.
+    ltssm = self.read(0xB450, 1)[0]
+    if ltssm != 0x78: self.set_pcie_power(True)
+    ltssm = self.read(0xB450, 1)[0]
+    if ltssm != 0x78: raise RuntimeError(f"PCIe link not up (LTSSM=0x{ltssm:02X}), custom firmware not ready")
+
+  def set_pcie_power(self, enabled:bool, timeout:int=10000): self.usb.control_write(0xF3, value=int(enabled), timeout=timeout)
+
+  def _f0_out(self, fmt_type:int, byte_en:int, address:int, value:int, mode:int=0):
+    self.usb.control_write(0xF0, fmt_type | (byte_en << 8), mode & 0x03, struct.pack('<III', address & 0xFFFFFFFF, address >> 32, value), 5000)
+
+  def _f0_in(self) -> tuple[int, int, int]:
+    data = self.usb.control_read(0xF0, 8, timeout=5000)
+    return struct.unpack_from('<I', data)[0], (data[4] >> 5) & 0x7, data[7]
+
+  def pcie_request(self, fmt_type:int, address:int, value:int|None=None, size:int=4, cnt:int=10):
+    assert size > 0 and size <= 4, f"Invalid size {size}"
+    if DEBUG >= 5: print("pcie_request", hex(fmt_type), hex(address), value, size)
+
+    offset = address & 0x3
+    byte_en = ((1 << size) - 1) << offset
+    self._f0_out(fmt_type, byte_en, address & ~0x3, (value << (8 * offset)) if value is not None else 0)
+
+    # Fast path: memory writes and messages don't return completions.
+    if ((fmt_type & 0b11011111) == 0b01000000) or ((fmt_type & 0b10111000) == 0b00110000): return
+
+    # Read TLPs and config writes: read completion via 0xF0 IN. Retry on error/timeout.
+    data, cpl_status, ret_status = self._f0_in()
+    if ret_status != 0:
+      time.sleep(0.001)  # TODO: this sleep is very picky
+      if cnt > 0: return self.pcie_request(fmt_type, address, value, size, cnt=cnt-1)
+      raise RuntimeError(f"TLP error after retries: ret_status={ret_status}, address={address:#x}")
+
+    if cpl_status:
+      status_map = {0b001: f"Unsupported Request: {address:#x}", 0b100: "Completer Abort", 0b010: "Config Retry"}
+      raise RuntimeError(f"TLP completion status: {status_map.get(cpl_status, f'Reserved (0b{cpl_status:03b})')}")
+
+    if value is None: return (data >> (8 * offset)) & ((1 << (8 * size)) - 1)
+
+  def pcie_cfg_req(self, byte_addr:int, bus:int=1, dev:int=0, fn:int=0, value:int|None=None, size:int=4):
+    assert byte_addr >> 12 == 0 and bus >> 8 == 0 and dev >> 5 == 0 and fn >> 3 == 0
+    fmt_type = (0x44 if value is not None else 0x4) | int(bus > 0)
+    address = (bus << 24) | (dev << 19) | (fn << 16) | (byte_addr & 0xfff)
+    return self.pcie_request(fmt_type, address, value, size)
+
+  def pcie_mem_write(self, address:int, data:bytes):
+    """Streaming PCIe memory write via 0xF0 mode 1 + bulk OUT. Data is little-endian dwords on the wire."""
+    if not data: return
+    assert len(data) % 4 == 0, f"pcie_mem_write requires 4-byte aligned size, got {len(data)}"
+    for off in range(0, len(data), STREAM):
+      chunk = data[off:off+STREAM]
+      self._f0_out(0x60, 0x0F, address + off, len(chunk) // 4, mode=1)
+      self.usb.bulk_write(chunk)
+
+  def pcie_mem_read(self, address:int, nbytes:int) -> memoryview:
+    """Streaming PCIe memory read via 0xF0 mode 2 + bulk IN. Returns little-endian bytes."""
+    assert nbytes % 4 == 0, f"pcie_mem_read requires 4-byte aligned size, got {nbytes}"
+    self._f0_out(0x20, 0x0F, address, nbytes // 4, mode=2)
+    return self.usb.bulk_read(nbytes, timeout=30000)
+
+  def read(self, base_addr:int, length:int) -> bytes:
+    """Read from chip XDATA via vendor control IN (bRequest=0xE4). wValue=addr, wLength=size."""
+    result = b''
+    for off in range(0, length, 0xFF):
+      chunk = min(0xFF, length - off)
+      result += self.usb.control_read(0xE4, chunk, value=base_addr + off)
+    return result
+
+  def write(self, base_addr:int, data:bytes):
+    """Write to chip XDATA via vendor control OUT (bRequest=0xE5). wValue=addr, wIndex=val."""
+    for off, val in enumerate(data): self.usb.control_write(0xE5, value=base_addr + off, index=val)
+
+  def scsi_write(self, buf:bytes, slot_start:int=0):
+    """Write to SRAM via 0xF2 vendor command + bulk OUT."""
+    buf_padded = buf + b'\x00' * (round_up(len(buf), 512) - len(buf))
+    self.usb.control_write(0xF2, value=len(buf_padded) // 512, index=(slot_start & 0xFF) | (ceildiv(len(buf_padded), 0x4000) << 8))
+    self.usb.bulk_write(buf_padded)
+
+class USBMMIOInterface(MMIOInterface):
+  def __init__(self, usb, addr, size, fmt, pcimem=True): # pylint: disable=super-init-not-called
+    self.usb, self.addr, self.nbytes, self.fmt, self.el_sz, self.pcimem = usb, addr, size, fmt, struct.calcsize(fmt), pcimem
+
+  def _off_from_index(self, index):
+    if isinstance(index, slice): return ((index.start or 0) * self.el_sz, ((index.stop or len(self))-(index.start or 0)) * self.el_sz)
+    return (index * self.el_sz, self.el_sz)
+
+  def __getitem__(self, index):
+    off, sz = self._off_from_index(index)
+    if self.pcimem:
+      assert sz % 4 == 0 and off % 4 == 0, f"pcie_mem_read requires 4-byte aligned access, got off={off}, sz={sz}"
+      data = self.usb.pcie_mem_read(self.addr + off, sz)
+    else: data = self.usb.read(self.addr + off, sz)
+    return data if isinstance(index, slice) else int.from_bytes(data, "little")
+
+  def __setitem__(self, index, data):
+    off, _ = self._off_from_index(index)
+    data = struct.pack(self.fmt, data) if isinstance(data, int) else bytes(data)
+    if not self.pcimem: self.usb.scsi_write(data) if self.addr == 0xf000 else self.usb.write(self.addr + off, data)
+    else:
+      # writes are whole dwords
+      assert len(data) % 4 == 0 and off % 4 == 0, f"pcie_mem_write requires 4-byte aligned access, got off={off}, sz={len(data)}"
+      self.usb.pcie_mem_write(self.addr+off, data)
+
+  def view(self, offset:int=0, size:int|None=None, fmt=None):
+    return USBMMIOInterface(self.usb, self.addr+offset, self.nbytes-offset if size is None else size, fmt=fmt or self.fmt, pcimem=self.pcimem)
+
+# *****************
+# 1. placeholders
+
+HALF, CHUNK, SLOT, STREAM = 0x40000, 0x40000 - 512, 0x4000, 1 << 20 # sram half, payload, slot, stream
+HOST_SIZE = 64 + 2 * HALF + STREAM # link, staging, zeros
+
+def usb_host(dev:str) -> UOp: return UOp.alloc((HOST_SIZE,), dtypes.uint8, 0, device=HCQ_RUNTIME_DEV.value).rtag(to_name(dev, "usb_host"))
+def usb_link(dev:str) -> UOp: return usb_host(dev)[:48].bitcast(dtypes.uint64) # handle, context, prev chunks, two transfers, error state
+def usb_stage(dev:str) -> UOp: return usb_host(dev)[64:64 + 2 * HALF]
+def usb_zeros(dev:str) -> UOp: return usb_host(dev)[64 + 2 * HALF:]
+
+def usb_go(dev:str) -> UOp: return UOp.alloc((1,), dtypes.uint32, 0, device=dev).rtag(to_name(dev, "usb_go")) # chunk + 1: read armed
+
+def usb_asm24(dev:str) -> UOp: return UOp.alloc((0x85000,), dtypes.uint8, 0, device=dev).rtag(to_name(dev, "usb_asm24")) # sys, cq, sram
+def usb_fence(dev:str) -> UOp: return usb_asm24(dev)[0x800:0x804].bitcast(dtypes.uint32) # gpu chunks done
+def usb_cq(dev:str) -> UOp: return usb_asm24(dev)[0x100c:0x1010].bitcast(dtypes.uint32) # completion queue
+def usb_sram(dev:str) -> UOp: return usb_asm24(dev)[0x5000:0x5000 + 2 * HALF]
+
+# *****************
+# 2. transfers
+
+def usb_word(v:UOp|int, dt:DType) -> UOp: return v.cast(dt) if isinstance(v, UOp) else UOp.const(v, dt)
+def usb_stack(dt:DType, *vals:UOp|int) -> UOp:
+  return (r:=UOp.placeholder((len(vals) or 1,), dt, addrspace=AddrSpace.REG)).after(*[r.index(i).store(usb_word(v, dt)) for i, v in enumerate(vals)])
+
+def usb_fail(link:UOp, code:UOp) -> UOp: return link.index(UOp.const(5).valid(link.after(code).index(5).load().eq(0))).store(code.cast(dtypes.uint64))
+def usb_ctrl(link:UOp, rtype:int, req:int, val:UOp|int, idx:UOp|int, data:UOp, n:UOp|int, timeout:int=1000) -> UOp:
+  return usb_fail(link, ccall(libusb.libusb_control_transfer, link.index(0).load(), rtype, req, val, idx, data, n, timeout).minimum(0))
+def usb_bulk(link:UOp, ep:int, data:UOp, n:UOp|int, timeout:int=10000) -> UOp: # NULL actual_length
+  return usb_fail(link, ccall(libusb.libusb_bulk_transfer, link.index(0).load(), ep, data, n, UOp.const(0, dtypes.uint64), timeout).minimum(0))
+
+@uopfunc
+def usb_poke(link:UOp, addr:UOp, val:UOp) -> UOp: # 0xF0 mode 0: a dword
+  return usb_ctrl(link, 0x40, 0xF0, 0x60 | 0x0F00, 0, usb_stack(dtypes.uint64, addr, val.cast(dtypes.uint64)).index(0), 12, 5000).sink()
+
+@uopfunc
+def usb_stream(link:UOp, addr:UOp, data:UOp, n:UOp, write:bool, fill:bool=False) -> UOp: # 0xF0 mode 1/2: header, then bulk per STREAM
+  i = UOp.range((n + (STREAM - 1)) // STREAM, next(UOp.unique_num), dtype=dtypes.int, src=(link,))
+  off, cnt = i * STREAM, (n - i * STREAM).minimum(STREAM)
+  payload = usb_stack(dtypes.uint64, addr + off.cast(dtypes.uint64), cnt // 4)
+  live = UOp.range(link.after(i).index(5).load().eq(0).cast(dtypes.int), next(UOp.unique_num), dtype=dtypes.int, src=(link,)) # no trips once failed
+  header = usb_ctrl(link.after(live), 0x40, 0xF0, (0x60 if write else 0x20) | 0x0F00, 1 if write else 2, payload.index(0), 12, 5000)
+  return usb_bulk(link.after(header), 0x02 if write else 0x81, data.index(0 if fill else off // data.dtype.itemsize), cnt).end(live, i).sink()
+
+def usb_poke_word(link:UOp, addr:UOp, val:UOp) -> UOp:
+  low = usb_poke(link, addr, val.cast(dtypes.uint32))
+  return usb_poke(link.after(low), addr + 4, (val >> 32).cast(dtypes.uint32)) if val.dtype.itemsize == 8 else low
+
+@uopfunc
+def usb_patch(link:UOp, addr:UOp, val:UOp, slot:UOp) -> UOp: # poke only on change
+  changed = UOp.range(slot.index(0).load().ne(val).cast(dtypes.int), next(UOp.unique_num), dtype=dtypes.int, src=(link,))
+  return slot.after(usb_poke_word(link.after(changed), addr, val).end(changed)).index(0).store(val).sink()
+
+# *****************
+# 3. lower
+
+def is_host(b:UOp) -> bool: return b.device is None or not all_devices_in(b.device, HCQ_DEVS - {"CPU"}) # register or host memory
+def is_remote(b:UOp) -> bool: return (p:=unwrap_view(b)[0]).op in (Ops.PARAM, Ops.ALLOC) and not is_host(p)
+def usb_addr(b:UOp, idx:UOp, dt:DType) -> UOp: return b.getaddr("CPU") + (idx * dt.itemsize).cast(dtypes.uint64) # byte address of b[idx]
+def usb_deps(b:UOp) -> tuple[UOp, ...]: # deps through views
+  return (b.src[1:] if b.op is Ops.AFTER else ()) + (usb_deps(b.src[0]) if b.op in (Ops.BITCAST, Ops.SHRINK, Ops.AFTER) else ())
+def usb_affine(idx:UOp, r:UOp) -> UOp|None: # base of base + r
+  if idx is r: return UOp.const(0, r.dtype)
+  if idx.op is not Ops.ADD or r not in idx.src: return None
+  base = idx.src[1] if idx.src[0] is r else idx.src[0]
+  return base if r not in base.ranges else None
+
+def usb_copy(dst:UOp, di:UOp, v:UOp, r:UOp) -> UOp|None: # ranged store: one stream
+  if not is_remote(dst): return None
+  if v.op is Ops.LOAD and not is_remote(sb:=v.src[0].src[0]): s0, deps, fill = usb_affine(v.src[0].src[1], r), usb_deps(sb), False
+  elif v.vmin == v.vmax == 0: sb, s0, deps, fill = usb_zeros(dst.device), UOp.const(0, dtypes.int), (), True
+  else: return usb_store(dst, di, v).end(r)
+  if s0 is None or (d0:=usb_affine(di, r)) is None: return usb_store(dst, di, v).end(r)
+  link = usb_link(dst.device).after(*usb_deps(dst), *deps, *r.src[1:])
+  return usb_stream(link, usb_addr(dst, d0, v.dtype), sb.index(s0), r.src[0] * v.dtype.itemsize, True, fill)
+
+def usb_store(b:UOp, idx:UOp, v:UOp) -> UOp: # kernargs: poke on change
+  if idx.op is Ops.STACK: # word by word
+    stored = usb_store(b, idx.src[0], v.src[0])
+    for i, w in zip(idx.src[1:], v.src[1:]): stored = usb_store(b.after(stored), i, w)
+    return stored
+  link, addr, v = usb_link(b.device).after(*usb_deps(b)), usb_addr(b, idx, v.dtype), v.bitcast(CDTYPE[v.dtype.itemsize])
+  if str(unwrap_view(b)[0].tag).startswith("kernargs"):
+    cache = UOp.alloc((int(idx.vmax - idx.vmin) + 1,), v.dtype, device=HCQ_RUNTIME_DEV.value).rtag("usb_arg_cache")
+    return usb_patch(link, addr, v, patch(cache, [], bytes(v.dtype.itemsize * cache.max_numel())).index(idx - idx.vmin))
+  return usb_poke_word(link, addr, v)
+
+def usb_load(b:UOp, idx:UOp, ld:UOp) -> UOp:
+  slot, n = usb_stack(ld.dtype), UOp.const(ld.dtype.itemsize, dtypes.int)
+  return slot.after(usb_stream(usb_link(b.device).after(*usb_deps(b)), usb_addr(b, idx, ld.dtype), slot.index(0), n, False)).index(0).load()
+
+pm_usb_lower = PatternMatcher([
+  (UPat.var("dst").index(UPat.var("di")).store(UPat.var("v")).end(UPat(Ops.RANGE, name="r")), usb_copy),
+  (UPat.var("b").index(UPat.var("idx")).store(UPat.var("v")), lambda b, idx, v: None if idx.ranges or not is_remote(b) else usb_store(b, idx, v)),
+  (UPat.var("b").index(UPat.var("idx")).load(name="ld"), lambda b, idx, ld: usb_load(b, idx, ld) if is_remote(b) else None),
+])
+
+# *****************
+# 4. copies
+
+def usb_wire(size:UOp|int) -> UOp|int: return (size + 512 + SLOT - 1) // SLOT * SLOT # payload + sentinel block, slot aligned
+def usb_sentinel(n:UOp) -> UOp: return ((n & 0xFFFFFF) | 0x51000000).cast(dtypes.uint32)
+def usb_put(link:UOp, ptr:UOp, dt:DType, *vals:UOp|int) -> UOp: # store through a pointer
+  return ccall(libc.memcpy, ptr, usb_stack(dt, *vals).after(link).index(0), dt.itemsize * len(vals)).cast(dtypes.void)
+
+@uopfunc
+def usb_reap(link:UOp, xfer:UOp) -> UOp: # poll while pending (0xff), any other status but completed fails the link
+  loop, slot = UOp.range(UOp(Ops.NOOP), next(UOp.unique_num), dtype=dtypes.void, src=(link,)), usb_stack(dtypes.uint32)
+  events = ccall(libusb.libusb_handle_events_timeout, link.after(loop).index(1).load(), usb_stack(dtypes.uint64, 0, 0).index(0)) # zero timeout
+  peeked = ccall(libc.memcpy, slot.after(events).index(0), xfer + 16, 4)
+  ok = link.index(5).load().eq(0) & ((events >= 0) | events.eq(libusb.LIBUSB_ERROR_INTERRUPTED))
+  return usb_fail(link, slot.after(events.backedge(loop, slot.after(peeked).index(0).load().eq(0xff) & ok)).index(0).load()).sink()
+
+@uopfunc
+def usb_drain(link:UOp, fence:UOp, need:UOp) -> UOp: # fence == need - 1 or need, mod 256
+  loop, slot = UOp.range(UOp(Ops.NOOP), next(UOp.unique_num), dtype=dtypes.void, src=(link,)), usb_stack(dtypes.uint32, 0)
+  read = usb_ctrl(link.after(loop), 0xC0, 0xE4, fence, 0, slot.index(0), 1)
+  lag = (need - slot.after(read).index(0).load().cast(dtypes.uint64)) & 0xff
+  return read.backedge(loop, link.after(read).index(5).load().eq(0) & (lag > 1)).sink()
+
+@uopfunc
+def usb_begin(link:UOp, fence:UOp, prev:UOp) -> UOp: # previous batch drained, count restarts
+  return usb_ctrl(link.after(usb_drain(link, fence, prev + 1)), 0x40, 0xE5, fence, 0, UOp.const(0, dtypes.uint64), 0).sink()
+
+@uopfunc
+def usb_send(link:UOp, table:UOp, i:UOp, run:UOp, fence:UOp, stage:UOp) -> UOp: # chunk i -> sram half i & 1
+  addr, size = table.index(2 * i).load(), table.index(2 * i + 1).load().cast(dtypes.int)
+  n, half, wire = (i + run).cast(dtypes.uint64), i & 1, usb_wire(size)
+  xfer, end = link.index(3 + half).load(), (half + 1) * HALF
+
+  # host half free: fill it
+  reaped = usb_reap(link, xfer)
+  copied = ccall(libc.memcpy, stage.after(reaped).index(end - wire), addr, size.cast(dtypes.uint64))
+  sealed = stage.after(copied).bitcast(dtypes.uint32).index(end // 4 - 1).store(usb_sentinel(n))
+
+  # sram half free: arm, submit
+  drained = usb_drain(link.after(sealed), fence, n)
+  armed = usb_ctrl(link.after(drained), 0x40, 0xF2, wire // 512, ((end - wire) // SLOT) | (wire // SLOT << 8), UOp.const(0, dtypes.uint64), 0)
+  status = usb_put(link.after(armed), xfer + 16, dtypes.uint32, 0xff, wire)
+  buffer = usb_put(link.after(armed), xfer + 48, dtypes.uint64, stage.getaddr("CPU") + (end - wire).cast(dtypes.uint64))
+  ret = ccall(libusb.libusb_submit_transfer, link.after(status, buffer).index(3 + half).load()) # read after the fields
+  return usb_fail(link, ret.minimum(0)).sink()
+
+@uopfunc
+def usb_recv(link:UOp, table:UOp, i:UOp, run:UOp, go:UOp, stage:UOp) -> UOp: # chunk i <- both halves
+  addr, size = table.index(2 * i).load(), table.index(2 * i + 1).load().cast(dtypes.int)
+  first, second = size.minimum(CHUNK), (size - CHUNK).maximum(0) # bytes per half
+  wire = (size + (second > 0).cast(dtypes.int) * 512 + 511) // 512 * 512 # the gap block is read too
+
+  # arm, let the gpu copy, receive
+  armed = usb_ctrl(link, 0x40, 0xF2, (wire // 512) | 0x8000, (wire + SLOT - 1) // SLOT << 8, UOp.const(0, dtypes.uint64), 0)
+  released = usb_poke(link.after(armed), go, (i + run + 1).cast(dtypes.uint32))
+  received = usb_bulk(link.after(released), 0x81, stage.index(0), wire)
+  lower = ccall(libc.memcpy, addr, stage.after(received).index(0), first.cast(dtypes.uint64))
+  return ccall(libc.memcpy, addr + CHUNK, stage.after(lower).index(HALF), second.cast(dtypes.uint64)).cast(dtypes.void).sink()
+
+# *****************
+# 5. batch and encode
+
+def is_staged(call:UOp) -> bool: return call.op is Ops.CALL and call.body.op is Ops.STORE and is_host(call.src[1]) != is_host(call.src[2])
+def usb_window(call:UOp) -> tuple[UOp, int]: return (call.src[2], CHUNK) if is_host(call.src[2]) else (call.src[1], 2 * CHUNK) # host, chunk bytes
+def usb_split(nbytes:int, win:int) -> list[tuple[UOp|int, int]]: # (chunk, bytes): full chunks as a range, then the tail
+  full, tail = divmod(nbytes, win)
+  r = UOp.range(full, next(UOp.unique_num), dtype=dtypes.int) if full > 1 else 0 # no one-trip loops
+  return ([(r, win)] if full else []) + ([(full, tail)] if tail else [])
+def usb_ins(name:str, *src:UOp|int) -> UOp:
+  return UOp(Ops.INS, arg=(name, dtypes.void), src=tuple(s if isinstance(s, UOp) else UOp.const(s, dtypes.uint32) for s in src))
+def usb_hostaddr(host:UOp, dev:str) -> UOp:
+  base, boff = unwrap_view(host)
+  return base.bitcast(dtypes.uint8)[boff:boff + host.nbytes()].getaddr(dev)
+
+def usb_table(hosts:list[tuple[UOp, int]], n:int, win:int, dev:str) -> UOp: # [address, bytes] per chunk
+  rows = [(16 * (k + r) + o, w) for host, k in hosts for r, nb in usb_split(host.nbytes(), win)
+          for o, w in ((0, usb_hostaddr(host, dev) + usb_word(r, dtypes.uint64) * win), (8, UOp.const(nb, dtypes.uint64)))]
+  return patch(UOp.alloc((2 * n,), dtypes.uint64, device=HCQ_RUNTIME_DEV.value).rtag("usb_table"), rows)
+
+def usb_chunks(call:UOp, first:int, run:int) -> list[UOp]: # gpu side. first: chunk id of the copy and of its run
+  dst, src = call.src[1:]
+  vram, (host, win), ops = (dst if is_host(src) else src).bitcast(dtypes.uint8), usb_window(call), list[UOp]()
+  sram = usb_sram(dev:=vram.device).getaddr(dev)
+
+  for r, nb in usb_split(host.nbytes(), win):
+    n, va = (i:=usb_word(r, dtypes.uint64)) + first, vram.getaddr(dev) + i * win
+    if is_host(src): # copyin: wait sentinel, copy, release
+      end = sram + (((n - run) & 1) + 1) * HALF
+      ins = [usb_ins("wait_eq", end - 4, usb_sentinel(n)), usb_ins("copy", va, end - usb_wire(nb), nb), usb_ins("store", end - 4, 0)]
+    else: # copyout: wait go, fill, signal
+      ins = [usb_ins("wait", usb_go(dev), n + 1), usb_ins("store", usb_go(dev), 0)]
+      ins += [usb_ins("copy", sram + wo, va + po, pb) for wo, po, pb in ((0, 0, min(nb, CHUNK)), (HALF, CHUNK, nb - CHUNK)) if pb > 0]
+      ins += [usb_ins("store", usb_cq(dev), 0)]
+    ins += [usb_ins("store", usb_fence(dev), n + 1)]
+    ops += [UOp(Ops.LINEAR, src=tuple(ins)).end(r)] if isinstance(r, UOp) else ins # full chunks as one block
+  return ops
+
+def usb_copy_rewriter(s:UOp) -> UOp|None:
+  lins = [submit.without_after.src[1].without_after for submit in s.src]
+  if not (copies:=[call for lin in lins for call in lin.src if is_staged(call)]): return None
+  dev = lins[0].arg[0][0]
+
+  # a run: one direction, one table
+  runs, nums, n = list[tuple[bool, int, UOp, int]](), list[tuple[int, int]](), 0
+  for cin, grp in itertools.groupby(copies, key=lambda call: is_host(call.src[2])):
+    hosts, k = list[tuple[UOp, int]](), 0 # (host view, first chunk)
+    for host, win in map(usb_window, grp): nums, hosts, k = nums + [(n + k, n)], hosts + [(host, k)], k + ceildiv(host.nbytes(), win)
+    runs, n = runs + [(cin, n, usb_table(hosts, k, win, dev), k)], n + k
+
+  # gpu side
+  chunks = (usb_chunks(call, *num) for call, num in zip(copies, nums))
+  s = s.substitute({lin: lin.replace(src=tuple(flatten(next(chunks) if is_staged(c) else [c] for c in lin.src))) for lin in lins})
+
+  # host side, after the submits
+  link = usb_link(dev).after(s.src[-1])
+  done = UOp.custom_function("usb_begin").call(link, usb_fence(dev), link.index(2).load())
+  for cin, run, table, k in runs:
+    if run: done = UOp.custom_function("usb_drain").call(link.after(done), usb_fence(dev), UOp.const(run + 1, dtypes.uint64)) # a run uses both halves
+    i = UOp.range(k, next(UOp.unique_num), dtype=dtypes.int)
+    word = usb_fence(dev) if cin else usb_go(dev)
+    live = UOp.range(link.after(done, i).index(5).load().eq(0).cast(dtypes.int), next(UOp.unique_num), dtype=dtypes.int) # no trips once failed
+    done = UOp.custom_function("usb_send" if cin else "usb_recv").call(link.after(live), table, i, UOp.const(run, dtypes.int), word).end(live, i)
+  return s.replace(src=(*s.src, link.after(done).index(2).store(UOp.const(n, dtypes.uint64))))
+pm_usb_batch = PatternMatcher([(UPat(Ops.SINK, name="s"), usb_copy_rewriter)])
+
+pm_usb_encode = PatternMatcher([
+  (UPat(Ops.CALL, src=(UPat.custom_function("usb_begin"), UPat.var("link"), UPat.var("fence"), UPat.var("prev"))),
+   lambda link, fence, prev: usb_begin(link, fence.getaddr("CPU"), prev)),
+  (UPat(Ops.CALL, src=(UPat.custom_function("usb_drain"), UPat.var("link"), UPat.var("fence"), UPat.var("need"))),
+   lambda link, fence, need: usb_drain(link, fence.getaddr("CPU"), need)),
+  (UPat(Ops.CALL, src=(UPat.custom_function("usb_send"), UPat.var("link"), UPat.var("table"), UPat.var("i"), UPat.var("run"), UPat.var("fence"))),
+   lambda link, table, i, run, fence: usb_send(link, table, i, run, fence.getaddr("CPU"), usb_stage(fence.device))),
+  (UPat(Ops.CALL, src=(UPat.custom_function("usb_recv"), UPat.var("link"), UPat.var("table"), UPat.var("i"), UPat.var("run"), UPat.var("go"))),
+   lambda link, table, i, run, go: usb_recv(link, table, i, run, go.getaddr("CPU"), usb_stage(go.device))),
+])
+
+# *****************
+# 6. bufferize
+
+@functools.cache
+def _host_block(dev) -> Buffer:
+  xfers = [libusb.libusb_alloc_transfer(0).contents for _ in range(2)]
+  for t in xfers: t.dev_handle, t.endpoint, t.type, t.timeout = dev.iface.pci_dev.usb.usb.handle, 0x02, libusb.LIBUSB_TRANSFER_TYPE_BULK, 10000
+  words = [ctypes.addressof(x.contents) for x in (dev.iface.pci_dev.usb.usb.handle, USB3.ctx())] + [0] + [ctypes.addressof(t) for t in xfers]
+  return Buffer("CPU", HOST_SIZE, dtypes.uint8, options=BufferSpec(nolru=True), initial_value=struct.pack('5Q', *words).ljust(HOST_SIZE, b'\0'))
+
+@functools.cache
+def _go(dev) -> Buffer:
+  return Buffer(dev.device, 1, dtypes.uint32, options=BufferSpec(uncached=True, cpu_access=True, nolru=True), initial_value=bytes(4))
+
+def usb_reset(dev):
+  for buf, off, n in ((dev.iface.ctrl, 0x800, 4), (dev.iface.ctrl, 0x5000, 0x80000), (_host_block(dev), 16, 8)): buf.host.view(off, n)[:] = bytes(n)
+  for t in map(libusb.struct_libusb_transfer.from_address, _host_block(dev).host.view(fmt='Q')[3:5]): t.status = 0xff * (t.status == 0xff)
+
+def setup_usb_rules(dev):
+  dev.pm_batch, dev.pm_lower, dev.pm_encode = dev.pm_batch + pm_usb_batch, dev.pm_lower + pm_usb_lower, dev.pm_encode + pm_usb_encode
+  Compiled.pm_bufferize += PatternMatcher([(UPat(Ops.ALLOC, tag=dev.tag("usb_host")), lambda d=dev: _host_block(d)), # placeholders the gpu owns
+                                           (UPat(Ops.ALLOC, tag=dev.tag("usb_go")), lambda d=dev: _go(d)),
+                                           (UPat(Ops.ALLOC, tag=dev.tag("usb_asm24")), lambda d=dev: d.iface.ctrl)])
+  dev.error_state = _host_block(dev).view(1, dtypes.int64, 40) # the link's error word
+
+if DEV.interface.startswith("MOCK"): from test.mockgpu.usb import MockUSB3 as USB3  # type: ignore  # noqa: F811
+
+import time, inspect
+from collections import deque
+from dataclasses import dataclass, field, replace
+from tinygrad.dtype import AddrSpace
+from tinygrad.uop.ops import GroupOp, remove_all_tags, UOp, Ops, UOpMetaClass, graph_rewrite, gate_kernel_sink, KernelInfo
+from tinygrad.uop.spec import type_verify, spec_tensor
+from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, SCACHE, BASEDIR, partition, dedup, all_int, VIZ
+from tinygrad.helpers import diskcache_get, diskcache_put, colored
+
+# **** schedule linearizer
+
+# unwrap VIEW/CAST/etc to find the actual data source (kernel output, buffer, or multi-device op)
+def _unwrap_src(s: UOp) -> UOp:
+  while len(s.src) and s.op not in {Ops.AFTER, Ops.BUFFER, Ops.ALLOC, Ops.PARAM, Ops.MSELECT, Ops.MSTACK}: s = s.src[0]
+  return s
+
+# a buffer state is AFTER | BUFFER | ALLOC | PARAM. MSELECT/MSTACK join per-device states
+def _states(s: UOp) -> list[UOp]:
+  s = _unwrap_src(s)
+  if s.op in {Ops.MSELECT, Ops.MSTACK}: return [st for ss in s.src for st in _states(ss)]
+  assert s.op in {Ops.AFTER, Ops.BUFFER, Ops.ALLOC, Ops.PARAM}, f"input to kernel must resolve to a buffer state, not {s.op}"
+  return [s]
+
+def _split_after(after: UOp) -> tuple[tuple[UOp, ...], tuple[UOp, ...]]:
+  kernels, remaining = partition(after.src[1:], lambda s: s.op in {Ops.CALL, Ops.END})
+  deps, remaining = partition(remaining, lambda s: s.op is Ops.AFTER)
+  if invalid := [s for s in remaining if s.op is not Ops.STORE]:
+    raise AssertionError(f"AFTER source should be CALL, END, STORE, or AFTER, not {invalid[0].op}")
+  return tuple(kernels), tuple(deps)
+
+def create_schedule(sched_sink:UOp) -> UOp:
+  with cpu_profile(TracingKey("toposort sched_sink")):
+    # build kernel dependency graph: edges from producer kernel to consumer kernels
+    children: dict[UOp, list[UOp]] = {}
+    in_degree: dict[UOp, int] = {}
+    writes: dict[UOp, list[tuple[UOp, tuple[UOp, ...]]]] = {}  # superseded state -> (AFTER, new kernels)
+    reads: list[tuple[UOp, UOp, UOp]] = []  # (reader AFTER, reader kernel, buffer state read)
+    for u in sched_sink.toposort(gate_kernel_sink):
+      if u.op is not Ops.AFTER: continue
+      kernels, after_deps = _split_after(u)
+      prev_state = _unwrap_src(u.src[0])
+      prev_kernels = set(_split_after(prev_state)[0]) if prev_state.op is Ops.AFTER else set()
+      writes.setdefault(prev_state, []).append((u, tuple(k for k in kernels if k not in prev_kernels)))
+      for k in kernels:
+        in_degree.setdefault(k, 0)
+        if k.op is Ops.END: assert k.src[0].op is Ops.CALL, f"END src[0] should be KERNEL, not {k.src[0].op}"
+        kernel_deps = k.src[0].src[1:] if k.op is Ops.END else k.src[1:]
+        read_states = [st for s in kernel_deps for st in _states(s)]
+        reads += [(u, k, st) for st in read_states]
+        # RAW deps: a kernel runs after the kernels that produced the states it reads or joins
+        for st in read_states + [st for s in after_deps for st in _states(s)]:
+          if st.op is Ops.AFTER:
+            for t in _split_after(st)[0]:
+              children.setdefault(t, []).append(k)
+              in_degree[k] += 1
+    # WAR deps: a kernel reading buffer state S must run before another write that supersedes S. an AFTER only
+    # supersedes its immediate prior state; join members already present in that prior state are ordering deps, not writes
+    for u, k, s in reads:
+      for a, write_kernels in writes.get(s, []):
+        if a is u: continue
+        for t in write_kernels:
+          if t is not k and t not in k.backward_slice:
+            children.setdefault(k, []).append(t)
+            in_degree[t] += 1
+
+  with cpu_profile(TracingKey("linearize schedule")):
+    queue: deque[UOp] = deque(k for k,v in in_degree.items() if v == 0)
+    linearized: list[UOp] = []
+    while len(queue):
+      rk = queue.popleft()
+      k = rk.src[0] if rk.op is Ops.END else rk
+      assert k.op is Ops.CALL, f"unexpected op in queue: {k.op}"
+      buf_uops = tuple(_unwrap_src(s).buf_uop for s in k.src[1:] if not s.is_bound_var)
+      linearized.append(k.replace(src=(k.body, *buf_uops)))
+      for x in children.get(rk, []):
+        in_degree[x] -= 1
+        if in_degree[x] == 0: queue.append(x)
+    if any(in_degree.values()): raise RuntimeError("cycle detected in assign graph")
+  return UOp(Ops.LINEAR, src=tuple(linearized))
+
+from tinygrad.schedule.memory import memory_plan_rewrite
+from tinygrad.engine.realize import capturing, pm_flatten_linear
+from tinygrad.schedule.prepare import prepare_rangeify
+from tinygrad.schedule.multi import multi_pm
+from tinygrad.schedule.rangeify import get_kernel_graph
+from tinygrad.helpers import CAPTURING
+from tinygrad.uop.ops import PatternMatcher, UPat
+
+def create_new_buffer(ctx:tuple[dict[UOp, UOp], tuple[UOp, ...]], b:UOp):
+  if (ret:=ctx[0].get(b, None)) is None:
+    device = b.device if b.device is not None else next(a.device for a in ctx[1] if a.device is not None)
+    ctx[0][b] = ret = UOp.new_buffer(device, b.max_numel(), b.dtype)
+  return ret
+
+pm_post_sched_cache = PatternMatcher([
+  # Resolve positional arguments outside kernel bodies; free Variables have slot -1.
+  (UPat(Ops.PARAM, name="x"), lambda ctx,x: ctx[1][x.arg.slot] if x.arg.slot >= 0 else None),
+  # bind ALLOCs to fresh BUFFERs for this invocation
+  (UPat(Ops.ALLOC, name="b"), create_new_buffer),
+])
+
+def resolve_linear_call(linear_call:UOp, outer_binds:dict[int, UOp]|None=None):
+  linear = graph_rewrite(linear_call.body, pm_post_sched_cache, ctx=({}, linear_call.src[1:]), walk=True, name="params to buffers")
+  # nested LINEAR calls are lexical scopes: their positional params shadow the enclosing scope, while calls without
+  # scalar args (e.g. precompiled allreduce) inherit it
+  binds = {**(outer_binds or {}),
+           **{i:x.unbound() if x.is_variable else x for i,x in enumerate(linear_call.src[1:])
+              if x.op is Ops.PARAM and x.addrspace is AddrSpace.ALU}}
+  def apply_binds(si:UOp) -> UOp:
+    if si.op is Ops.CALL and si.body.op is Ops.LINEAR: return resolve_linear_call(si, binds)
+    if si.op is Ops.CALL and si.body.op is Ops.PROGRAM: return si  # compiled parameters already have ABI slots
+    subs = {v:binds[v.arg.slot] for s in si.src for v in s.variables() if v.arg.slot in binds}
+    return si.replace(src=tuple(s.substitute(subs, name="resolve scalar params") for s in si.src))
+  return linear.replace(src=tuple(apply_binds(si) for si in linear.src))
+
+pm_resolve_linear_call = PatternMatcher([
+  # call LINEAR is resolved here
+  (UPat(Ops.CALL, src=(UPat(Ops.LINEAR),), name="linear_call", allow_any_len=True), resolve_linear_call),
+])+pm_flatten_linear
+
+schedule_cache: dict[bytes, UOp] = {}
+# ctx is just for DEBUG on inner
+def lower_sink_to_linear(call:UOp) -> UOp|None:
+  function = call.body
+  if function.op is not Ops.SINK or isinstance(function.arg, KernelInfo) or not call.arg.precompile: return None
+  st = time.perf_counter()
+  cache_key = function.key
+  # SCACHE >= 2 also persists the cache to disk
+  sc_ret, disk_hit = schedule_cache.get(cache_key, None) if SCACHE else None, False
+  if sc_ret is None and SCACHE >= 2: disk_hit = (sc_ret:=diskcache_get("schedule_cache", {"key": cache_key})) is not None
+  if sc_ret is None:
+    if SPEC: type_verify(function, spec_tensor)
+    # support recursive CALLs
+    linear = create_schedule(get_kernel_graph(prepare_rangeify(function)))
+    if SCACHE: schedule_cache[cache_key] = linear
+    if SCACHE >= 2: diskcache_put("schedule_cache", {"key": cache_key}, linear)
+  else:
+    # schedule cache hit (memory or disk)
+    linear = schedule_cache[cache_key] = sc_ret
+  if (DEBUG >= 1 and len(linear.src) > 1) or DEBUG >= 3:
+    for frm in inspect.stack():
+      if frm.filename == "<string>": continue
+      if not frm.filename.startswith(str(BASEDIR)) and not frm.filename.endswith("/contextlib.py"): break
+    else:
+      frm = None
+    print(f"scheduled {len(linear.src):5d} kernels in {(time.perf_counter()-st)*1000:8.2f} ms"+\
+          f" | {colored(' cache hit', 'yellow') if disk_hit else (' cache hit' if sc_ret is not None else 'CACHE MISS')} {cache_key.hex()[:8]}"+\
+          f" | {len(UOpMetaClass.ucache):7d} uops in cache"+("" if frm is None else f" | {frm.filename}:{frm.lineno}"))
+  return call.replace(src=(linear,)+call.src[1:])
+
+pm_schedule = PatternMatcher([
+  (UPat(Ops.CALL, name="call"), lower_sink_to_linear),
+])
+
+def assert_all_same_devices(ast:UOp):
+  devices = dedup([x.device for x in ast.toposort() if x.op is Ops.PARAM and x.device is not None])
+  if len(devices) >= 2: raise RuntimeError(f"all buffers must be on the same device: {devices}")
+
+def copy_kernel_to_store(call:UOp, dst:UOp, src:UOp, r:UOp|None=None):
+  if dst.device == src.device and not (isinstance(dst.device, str) and dst.device.startswith("DISK")): return None
+  return call.replace(src=(dst.store(src),) + call.src[1:])
+
+def simplify_copy_kernel(call:UOp, ast:UOp, dst:UOp, src:UOp):
+  # NOTE: this is a codegen for SDMA devices
+  if dst.device == src.device and not (isinstance(dst.device, str) and dst.device.startswith("DISK")): return None
+  from tinygrad.codegen.simplify import pm_flatten_range, pm_simplify_ranges
+  from tinygrad.schedule.prepare import pm_mops
+  from tinygrad.uop.symbolic import sym
+  sink = graph_rewrite(ast, sym+pm_mops+pm_flatten_range+pm_simplify_ranges, ctx={}, name="simplify ranges in copy")
+  return call.replace(src=(sink,) + call.src[1:])
+
+pm_copy_from_store = PatternMatcher([
+  # simplify copy kernels
+  (UPat(Ops.CALL, src=(UPat(Ops.SINK, name="ast"), UPat.var("dst"), UPat.var("src")), name="call"), simplify_copy_kernel),
+
+  # lower copy kernels to bulk STOREs
+  (UPat(Ops.CALL, src=(UPat(Ops.PARAM, name="dst").index(UPat(Ops.CONST, arg=0))
+                .store(UPat(Ops.PARAM, name="src").index(UPat(Ops.CONST, arg=0))).sink(),),
+                name="call", allow_any_len=True), copy_kernel_to_store),
+  (UPat(Ops.CALL, src=(UPat(Ops.PARAM, name="dst").index(UPat(Ops.RANGE, name="r"))
+                .store(UPat(Ops.PARAM, name="src").index(UPat(Ops.RANGE, name="r"))).end(UPat(Ops.RANGE, name="r")).sink(),),
+                name="call", allow_any_len=True), copy_kernel_to_store),
+
+  # if it wasn't copy, it currently can't be cross device
+  (UPat(Ops.CALL, src=(UPat(Ops.SINK, name="ast"),), allow_any_len=True), assert_all_same_devices),
+])
+
+# **** callify: transform a tensor graph into a CALL UOp such that all state is properly scoped
+
+@dataclass
+class CallifyCtx:
+  replacements: list[UOp] = field(default_factory=list)
+  allocs: dict[UOp, UOp] = field(default_factory=dict)
+  views: set[UOp] = field(default_factory=set)
+  stores: list[UOp] = field(default_factory=list)
+
+def contiguous_mops_to_view(ctx:CallifyCtx|None, c:UOp, src:UOp):
+  """MOPS(BUFFER) → SHRINK when movement ops collapse to a contiguous range."""
+  if not all_int(c.shape): return None
+  buf = src.base
+  while buf.op is Ops.BITCAST: buf = buf.src[0].base
+  if buf.op is Ops.UNSHARD:
+    if isinstance(c.device, str): return None
+    if (unshard := graph_rewrite(src, multi_pm, name="multi_buffer_view")).op is not Ops.UNSHARD: return None
+    view = contiguous_mops_to_view(ctx, unshard.src[0], unshard.src[0])
+    return None if view is None else view.unshard(unshard.arg, unshard.src[1:])
+
+  if buf.op is not Ops.BUFFER or (cv := src.contiguous_view()) is None or cv[0].op is not Ops.BUFFER: return None
+  buf, offset = cv
+  view = buf[offset:offset + src.max_numel() * src.element_size() // buf.element_size()].bitcast(src.dtype)
+  if ctx is not None: ctx.views.add(view)
+  view = view.reshape(c.shape)
+  return c.replace(src=(view,)+c.src[1:]) if c.op in {Ops.COPY, Ops.STORE} else view
+
+def is_store_after(u:UOp) -> bool:
+  return u.op is Ops.AFTER and (u.src[0].unsharded_base.op is not Ops.ALLOC or u.src[1].op is Ops.STORE)
+
+def collect_stores(ctx:CallifyCtx, u:UOp):
+  if is_store_after(u): ctx.stores.append(u)
+
+# NOTE: scheduling rewrites belong in prepare; only storage/interface normalization belongs here.
+pm_callify_ctx_collect = PatternMatcher([
+  # fold MOPS+BITCAST over BUFFER into SHRINK when movement ops collapse to contiguous range
+  (UPat((Ops.COPY, Ops.STAGE), src=(UPat(GroupOp.Movement|{Ops.BITCAST}, name="src"),), allow_any_len=True, name="c"), contiguous_mops_to_view),
+  (UPat(Ops.STORE, src=(UPat(Ops.BITCAST, name="src"), UPat()), name="c", allow_any_len=True), contiguous_mops_to_view),
+
+  # Collect effects after their sources have been rewritten, without entering call bodies.
+  (UPat(Ops.AFTER, name="u"), collect_stores),
+])
+
+# ALLOCs get canonical scope-local id slots here so structurally identical calls hash identically for the
+# schedule cache (fresh slots are all positive from the global counter; negative slots are already canonical)
+def canonicalize_alloc(ctx:CallifyCtx, b:UOp):
+  if b.arg.slot >= 0 and b not in ctx.allocs: ctx.allocs[b] = b.replace(arg=replace(b.arg, slot=-1-len(ctx.allocs)))
+  return ctx.allocs.get(b)
+
+def canonicalize_call_body(c:UOp):
+  return c.replace(src=(graph_rewrite(c.body, pm_canonicalize_alloc, ctx=CallifyCtx(), bottom_up=True),)+c.src[1:])
+
+pm_canonicalize_alloc = PatternMatcher([
+  # NOTE: lambda for late binding, canonicalize_call_body references pm_canonicalize_alloc
+  (UPat(Ops.CALL, name="c"), lambda c: canonicalize_call_body(c)),
+  (UPat(Ops.ALLOC, name="b"), canonicalize_alloc),
+])
+
+def replace_input_buffer(ctx:CallifyCtx, b:UOp):
+  ctx.replacements.append(b)
+  return b.param_like(len(ctx.replacements)-1)
+
+pm_replace_buf = PatternMatcher([
+  # replace GLOBAL BUFFERs with PARAMs for cache key normalization (Variables are ALU PARAMs, they don't match this)
+  (UPat(Ops.BUFFER, name="b"), lambda ctx,b: replace_input_buffer(ctx, b) if b.addrspace is AddrSpace.GLOBAL else None),
+  # replace buffer views (SHRINK/BITCAST) with PARAM (only the views created by contiguous_mops_to_view)
+  (UPat((Ops.SHRINK, Ops.BITCAST), name="b"), lambda ctx,b: replace_input_buffer(ctx, b) if b in ctx.views else None),
+  # replace bound Variables with renamed value-stripped PARAMs for cache key normalization, so different values hit same cache
+  (UPat(Ops.PARAM, name="b"), lambda ctx,b: replace_input_buffer(ctx, b) if b.is_bound_var else None),
+])
+
+def transform_to_call(big_sink:UOp) -> UOp:
+  if VIZ: graph_rewrite(big_sink, PatternMatcher([]), name="View Graph")
+  if SPEC: type_verify(big_sink, spec_tensor)
+
+  # The tensor replacement map is collected before these rewrites change node identities.
+  graph_rewrite(big_sink, pm_callify_ctx_collect, ctx=(ctx:=CallifyCtx()), name="early transform tensor graph")
+  ret = graph_rewrite(UOp.sink(*ctx.stores), pm_canonicalize_alloc+pm_replace_buf+remove_all_tags, ctx=ctx, bottom_up=True, name="replace bufs")
+  ret = ret.call(*ctx.replacements, precompile=True)
+  if VIZ: graph_rewrite(ret, PatternMatcher([]), name="View Call")
+  return ret
+
+def create_linear_with_vars(big_sink:UOp) -> tuple[UOp, dict[str, int]]:
+  big_sink = transform_to_call(big_sink)
+  # big_sink srcs are all the Tensors
+  linear_call = graph_rewrite(big_sink, pm_schedule, name="schedule to linear", enter_calls=True)
+
+  # this recursively resolves the linear_call and allocates buffers
+  linear = graph_rewrite(linear_call, pm_resolve_linear_call, name="resolve linear call")
+
+  # create copies
+  linear = graph_rewrite(linear, pm_copy_from_store, name="lower copy kernels to STORE calls")
+
+  # vars used in the schedule
+  used_vars = set().union(*[{v.expr for v in si.src[0].variables()} for si in linear.src])
+  # get var_vals from the bound Variables in the call args
+  var_vals: dict[str, int] = {}
+  for b in big_sink.src[1:]:
+    if b.is_bound_var:
+      nm, val = b.expr, b.arg.val
+      if nm not in used_vars: continue
+      if var_vals.get(nm, val) != val: raise RuntimeError(f"bind mismatch on {nm}, {var_vals[nm]} != {val}")
+      var_vals[nm] = val
+
+  # jit captures this schedule, no need to execute.
+  if len(capturing) and CAPTURING:
+    capturing[0].add_linear(linear)
+    return UOp(Ops.LINEAR, src=()), var_vals
+
+  held_bufs = {b for b in linear_call.src[1:] if b.op is Ops.BUFFER}
+  return memory_plan_rewrite(linear, held_bufs), var_vals
+
+import functools, itertools
+from tinygrad.helpers import all_int, prod, DEBUG, RING, ALL2ALL, ALLREDUCE_NODE_NDEVS, getenv
+from tinygrad.uop.ops import UOp, Ops, ParamArg
+
+# *** allreduce implementation ***
+def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
+  if not isinstance(buf.device, tuple): return None
+  ndev, shape, numel = len(buf.device), buf.shape, prod(buf.shape)
+  op, device = red.arg
+
+  # ring allreduce doesn't provide a benefit with only 2 nodes or where number of elements is less than 256k (empirically)
+  # fallback to naive allreduce to save on kernel dispatch, chunking and reassembling chunks.
+  concrete = all_int(shape)
+  use_all2all = concrete and (ALL2ALL >= 2 or (ndev > 2 and numel > getenv("RING_ALLREDUCE_THRESHOLD", 256_000) and ALL2ALL >= 1))
+  use_ring = concrete and not use_all2all and (RING >= 2 or (ndev > 2 and numel > getenv("RING_ALLREDUCE_THRESHOLD", 256_000) and RING >= 1))
+  if DEBUG >= 2: print(f"{'ALL2ALL' if use_all2all else 'RING' if use_ring else 'NAIVE'} ALLREDUCE {ndev}x{numel} | {buf.dtype}")
+
+  buf = buf.pad_to(buf.max_shape)
+  # contiguous before we copy it
+  buf = buf.contiguous()
+
+  if concrete and (hdev:=ALLREDUCE_NODE_NDEVS.value) > 0 and ndev % hdev == 0:
+    d, flat, fold = buf.device, buf.reshape((numel,)), functools.partial(functools.reduce, lambda x, y: x.alu(op, y))
+    boxes, cs = [range(b, b + hdev) for b in range(0, ndev, hdev)], [(numel * k // hdev, numel * (k + 1) // hdev) for k in range(hdev)]
+    owned = {i: fold([flat.mselect(j).shrink((cs[k],)).copy_to_device(d[i]) for j in box]) for box in boxes for k, i in enumerate(box)}
+    summed = {i: fold([owned[i], *(owned[j].copy_to_device(d[i]) for j in rank if j != i)]) for rank in zip(*boxes) for i in rank}
+    gathered = [UOp.mstack(*(summed[box[k]].copy_to_device(d[j]) for box in boxes for j in box)) for k in range(hdev)]
+    return UOp.usum(*[c.pad(((s, numel - e),)) for (s, e), c in zip(cs, gathered)]).reshape(shape)
+
+  # naive: copy to all devices. if you shrink later, that'll be handled
+  if not use_ring and not use_all2all:
+    return functools.reduce(lambda x,y: x.alu(op, y), [buf.mselect(i).copy_to_device(device) for i in range(ndev)]).shrink_to(shape)
+
+  # chunk data into ndev pieces
+  assert isinstance(numel, int)
+  factor = next((f for f in [32, 16, 8, 4, 2] if numel % f == 0), 1)
+  base, left = divmod(numel // factor,  ndev)
+  chunks = list(itertools.pairwise(itertools.accumulate([(base + 1) * factor] * left + [base * factor] * (ndev - left), initial=0)))
+
+  # reduce-scatter
+  reduced_chunks:list[UOp] = []
+  for i,(s,e) in enumerate(chunks):
+    if use_all2all:
+      chunks_on_i = [buf.mselect(j).reshape((numel,)).shrink(((s,e),)).copy_to_device(buf.device[i]) for j in range(ndev)]
+      reduced_chunks.append(functools.reduce(lambda x,y: x.alu(op, y), chunks_on_i))
+    else:
+      chunk, reduced = buf.reshape((numel,)).shrink(((s,e),)), buf.reshape((numel,)).shrink(((s,e),))
+      for step in range(ndev-1):
+        src, dest = (i+step)%ndev, (i+step+1)%ndev
+        cp = reduced.copy_to_device(buf.device[dest], src if isinstance(reduced.device, tuple) else None)
+        reduced = cp.alu(op, chunk.copy_to_device(buf.device[dest], dest))
+      reduced_chunks.append(reduced)
+
+  # allgather
+  copied_chunks:list[UOp] = []
+  for i,rc in enumerate(reduced_chunks):
+    if isinstance(device, str): copied_chunks.append(rc.copy_to_device(device))
+    elif use_all2all: copied_chunks.append(UOp.mstack(*(rc.copy_to_device(buf.device[j]) for j in range(ndev))))
+    else:
+      chain:list[UOp] = [rc]
+      for step in range(ndev-1):
+        chain.append(rc := rc.copy_to_device(buf.device[(i+step)%ndev]))
+      copied_chunks.append(UOp.mstack(*(chain[(j-i+1)%ndev] for j in range(ndev))))
+
+  # reassemble
+  return UOp.usum(*[c.pad(((s,numel-e),)) for (s,e),c in zip(chunks, copied_chunks)]).reshape(shape)
+
+def create_allreduce_function(buf:UOp, red:UOp, output:UOp|None=None) -> UOp|None:
+  if output is None:
+    output = UOp(Ops.ALLOC, src=UOp.device_range_src(red.device), arg=ParamArg(next(UOp.unique_num), red.dtype, red.max_numel(), device=red.device))
+    output = output.reshape(red.max_shape).shrink_to(red.shape)
+  to = red.param_like(0)
+  src = buf.param_like(1)
+  red = src.allreduce(*red.arg)
+  return output.after(to.after(to.store(handle_allreduce(src, red))).sink().call(output.base, buf.contiguous(), name="allreduce", precompile=True))
+
+from typing import Iterator
+import functools, itertools
+from dataclasses import dataclass, field, replace
+from tinygrad.dtype import AddrSpace
+from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, resolve, GroupOp, graph_rewrite, sint, AxisType, rewrite_group, broadcast_axes
+from tinygrad.uop.ops import gate_kernel_sink
+from tinygrad.uop.symbolic import symbolic, pm_simplify_valid, pm_drop_and_clauses
+from tinygrad.helpers import argsort, all_same, cpu_profile, colored, Context, SPEC
+
+@dataclass
+class IndexingContext:
+  realize_map: dict[UOp, None|list[int]] = field(default_factory=dict)
+  non_removable: dict[UOp, None] = field(default_factory=dict)
+  range_map: dict[UOp, tuple[tuple[UOp, ...], tuple[UOp, ...]]] = field(default_factory=dict)
+
+  # create ranges
+  range_idx: Iterator[int] = field(default_factory=itertools.count)
+  def new_range(self, s:sint) -> UOp:
+    if isinstance(s, UOp) and s.op is Ops.RANGE: return s
+    # if a range has a 1 src, it's the same as UOp.const(0)
+    return UOp.range(s, next(self.range_idx)) if resolve(s!=1) else UOp.const(0)
+
+
+ALWAYS_CONTIGUOUS: set[Ops] = {Ops.AFTER, Ops.BUFFER, Ops.ALLOC,
+                      Ops.CONST, Ops.MSELECT, Ops.MSTACK, Ops.PARAM,
+                      Ops.LOAD, Ops.CALL}
+
+def realize(ctx:IndexingContext, tr:UOp) -> None: ctx.realize_map[tr] = None
+
+def realize_srcs(ctx:IndexingContext, rb:UOp) -> None:
+  for s in rb.src:
+    if s.base.op not in ALWAYS_CONTIGUOUS: ctx.realize_map[s] = None
+
+def realize_store_after_src(ctx:IndexingContext, dest:UOp, src:UOp):
+  # you don't usually have to do this for assign unless there's a WAR hazard like TestAssign.test_assign_double_diamond_reduce
+  if dest.base in src.toposort(enter_calls=False): ctx.realize_map[src] = None
+
+def realize_custom_kernel_srcs(ctx:IndexingContext, c:UOp) -> None:
+  for s in c.src[1:]:
+    while s.op is Ops.RESHAPE: s = s.src[0]
+    if s.op not in ALWAYS_CONTIGUOUS:
+      ctx.realize_map[s] = None
+      ctx.non_removable[s] = None
+
+pm_generate_realize_map = PatternMatcher([
+  # realize the inputs of custom kernel calls
+  (UPat(Ops.CALL, src=(UPat((Ops.SINK, Ops.PROGRAM)),), name="c", allow_any_len=True), realize_custom_kernel_srcs),
+  # always realize
+  (UPat(Ops.STORE, name="tr"), realize),
+  # realize srcs of these
+  (UPat((Ops.MSELECT, Ops.MSTACK), name="rb"), realize_srcs),
+  # sometimes we need to realize the src of STORE if there's a self-access, or if it's a cross device store
+  (UPat(Ops.STORE, src=(UPat.var("dest"), UPat.var("src"))), realize_store_after_src),
+])
+
+@dataclass(frozen=True)
+class BufferizeOpts:
+  device: str|tuple[str, ...]|None
+  addrspace: AddrSpace = AddrSpace.GLOBAL
+  removable: bool = True
+
+def broadcast_rngs(x:UOp, src:UOp, rngs:tuple[UOp, ...]) -> tuple[UOp, ...]:
+  if x.op not in GroupOp.Broadcastable: return rngs
+  baxes, nleft = broadcast_axes(src.shape, x.shape), len(x.shape)-len(src.shape)
+  return tuple(r.const_like(0) if j in baxes else r for j,r in enumerate(rngs) if j >= nleft)
+
+# TODO: srcs contain (real data srcs, something else, ranges) and the boundary is confusing. see range_start
+def data_srcs(op:Ops, src:tuple[UOp, ...]) -> tuple[UOp, ...]:
+  if op in {Ops.PARAM, Ops.BUFFER, Ops.ALLOC, Ops.RANGE, Ops.SPECIAL}: return ()
+  if op in GroupOp.Movement|{Ops.INDEX, Ops.STAGE, Ops.REDUCE, Ops.AFTER, Ops.END, Ops.BACKEDGE, Ops.COPY}: return src[:1]
+  return src
+
+def create_bufferize_and_index_srcs(ctx:IndexingContext, x:UOp) -> list[UOp]:
+  new_srcs = []
+  # shape/bound/index args that are not data src should not be indexed
+  data_src_count = len(data_srcs(x.op, x.src))
+  for i, s in enumerate(x.src):
+    new_src = s
+    src_rngs = broadcast_rngs(x, s, ctx.range_map[x][0]) if x in ctx.range_map else ()
+    if s.op in {Ops.PARAM, Ops.BUFFER, Ops.ALLOC, Ops.MSTACK, Ops.MSELECT, Ops.AFTER}:
+      if x in ctx.range_map and i < data_src_count: new_src = new_src.index(*src_rngs)
+    elif s in ctx.realize_map:
+      assert isinstance(ctx.realize_map[s], list), "realize map must contain range list"
+      closed_ranges = ctx.range_map[s][1]
+      if s.op is Ops.STORE:
+        # add the ends if this is a store
+        new_src = s.end(*[r for r in closed_ranges if r.op is Ops.RANGE])
+        del ctx.realize_map[s]
+      else:
+        removable = s.op not in ALWAYS_CONTIGUOUS and s not in ctx.non_removable
+        opts = BufferizeOpts(device=s.device, removable=removable)
+        new_src = UOp(Ops.STAGE, src=(new_src,)+closed_ranges, arg=opts)
+        if x in ctx.range_map: new_src = new_src.index(*src_rngs)
+    new_srcs.append(new_src)
+  return new_srcs
+
+def create_bufferize_and_index_based_on_ranges(ctx:IndexingContext, x:UOp):
+  if x.op in {Ops.STAGE, Ops.INDEX}: return None
+  return x.replace(src=tuple(create_bufferize_and_index_srcs(ctx, x)))
+
+def convert_pad_to_where_to_keep_behavior_local(ctx:IndexingContext, x:UOp):
+  if x not in ctx.range_map: return None
+  bx = create_bufferize_and_index_based_on_ranges(ctx, x)
+  valid: UOp = UOp.const(True).uprod([r.get_valid() for r in ctx.range_map[x][0]])
+  return valid.where(bx.src[0], UOp.const(x.dtype.const(0)))
+
+def convert_reduce_to_reduce_with_ranges(ctx:IndexingContext, x:UOp):
+  if x.arg[1] == 0: return None
+  if x not in ctx.range_map: raise RuntimeError("REDUCE has no ranges in rangeify, UOp verification failed")
+  bx = create_bufferize_and_index_based_on_ranges(ctx, x)
+  # input ranges
+  new_ranges = list(ctx.range_map[x][0][:x.arg[1]])
+  return UOp(Ops.REDUCE, src=(bx.src[0],)+tuple(new_ranges), arg=(x.arg[0], 0))
+
+def _stack_select(r0:UOp, srcs:list[UOp], lo:int, hi:int) -> UOp:
+  # Bound lookup depth for large constant tables, rather than building a linear chain of thousands of WHEREs.
+  if hi-lo <= 8:
+    ret = srcs[hi-1]
+    for k in range(hi-2, lo-1, -1): ret = r0.eq(k).where(srcs[k], ret)
+    return ret
+  mid = (lo+hi)//2
+  return (r0 < mid).where(_stack_select(r0, srcs, lo, mid), _stack_select(r0, srcs, mid, hi))
+
+def convert_stack_to_where(ctx:IndexingContext, x:UOp):
+  # only data STACKs: shape tuple STACKs aren't in range_map
+  if x not in ctx.range_map: return None
+  # use the src list directly, a transient STACK of mid-rangeify srcs violates the spec shape rule
+  srcs = create_bufferize_and_index_srcs(ctx, x)
+  r0 = ctx.range_map[x][1][0]
+  ret = _stack_select(r0, srcs, 0, len(srcs))
+  return (r0 < 0).where(srcs[-1], ret) if len(srcs) > 8 else ret
+
+def remove_movement_op_after_rangeify(ctx:IndexingContext, x:UOp):
+  if x in ctx.range_map or x.src[0].op is Ops.INDEX: return x.src[0]
+
+pm_apply_rangeify = PatternMatcher([
+  # REDUCE(op, axis) -> REDUCE(op) with ranges
+  (UPat(Ops.REDUCE, name="x"), convert_reduce_to_reduce_with_ranges),
+  # PAD -> WHERE
+  (UPat(Ops.PAD, name="x"), convert_pad_to_where_to_keep_behavior_local),
+  # STACK -> WHERE select on the leading range
+  (UPat(Ops.STACK, name="x"), convert_stack_to_where),
+  # finally, apply_rangeify
+  (UPat(GroupOp.All, name="x"), create_bufferize_and_index_based_on_ranges),
+  # remove movement op
+  (UPat(GroupOp.Movement, name="x"), remove_movement_op_after_rangeify),
+])
+
+pm_fix_deviceless = PatternMatcher([
+  (UPat(Ops.STAGE, name="b"),
+    lambda ctx,b: b.replace(arg=replace(b.arg, device=ctx)) if b.arg.device is None else None),
+])
+
+@functools.cache
+def _apply_reshape(in_shape:tuple[sint,...], out_shape:tuple[sint, ...], urngs:UOp) -> UOp:
+  acc:sint = 1
+  axes_in:list[UOp] = []
+  for s,src in list(zip(out_shape, urngs.src))[::-1]:
+    axes_in.append(acc*src)
+    acc *= s
+  combined_axes = UOp.const(0).usum(axes_in)
+  axes_out:list[UOp] = []
+  for s in in_shape[::-1]:
+    axes_out.append(combined_axes % s)
+    combined_axes //= s
+  # this simplify is doing a lot of heavy lifting. this is the replacement for the reshape view merging code
+  return graph_rewrite(UOp.sink(*axes_out[::-1]), symbolic+pm_simplify_valid+pm_drop_and_clauses, name="reshape")
+
+# this is the definition of the movement ops
+@functools.cache
+def apply_movement_op(op:Ops, in_shape:tuple[sint,...], arg:tuple, rngs:tuple[UOp, ...]) -> tuple[UOp, ...]:
+  match op:
+    case Ops.SHRINK:  rngs = tuple(a if off == 0 else a+off for a,(off,_) in zip(rngs, arg))
+    case Ops.PERMUTE: rngs = tuple(rngs[p] for p in argsort(arg))
+    case Ops.FLIP:    rngs = tuple(((s-1)-a) if f else a for a,s,f in zip(rngs, in_shape, arg))
+    case Ops.EXPAND:  rngs = rngs[len(arg):]
+    case Ops.PAD:
+      # NOTE: the .where(r-s, i) is not inside the graph_rewrite so that `convert_pad_to_where_to_keep_behavior_local`
+      #       wraps the pad with only the newly added valid
+      rngs = tuple(r if (sz == sh and off == 0) else (r-off).valid(graph_rewrite((r >= off) & (r < (sh+off)),
+        symbolic+pm_simplify_valid, name="pad")) for r,sh,(off,sz) in zip(rngs, in_shape, arg))
+    case Ops.RESHAPE:
+      sink = UOp.sink(*rngs).simplify() # NOTE: this applies any commutative flips to the rngs early
+      sub_array = {r:r.replace(src=r.src[:1], arg=(AxisType.PLACEHOLDER, i)) for i,r in enumerate(sink.ranges)}
+      rngs = _apply_reshape(in_shape, arg, sink.substitute(sub_array)).substitute({v:k for k,v in sub_array.items()}).src
+    case _: raise RuntimeError(f"{op} is not a MovementOp")
+  return rngs
+
+@rewrite_group(new_ctx=False)
+def run_rangeify(tsink:UOp, debug:bool=False) -> UOp:
+  if debug: print("**************************")
+  rctx = IndexingContext()
+
+  # get ops to realize
+  graph_rewrite(tsink, pm_generate_realize_map, ctx=rctx, name="get realize")
+
+  # get the consumer map
+  with cpu_profile("consumer map in rangeify", "TINY"):
+    tsink_toposort = tsink.toposort(gate_kernel_sink)
+    consumer_map: dict[UOp, dict[UOp, None]] = {x:{} for x in tsink_toposort}
+    for c in tsink_toposort:
+      for x in data_srcs(c.op, c.src):
+        if x in consumer_map: consumer_map[x][c] = None
+
+  # explicit rangeify
+  ending_ranges: dict[UOp, list[UOp]] = {}
+  for x in reversed(tsink_toposort):
+    # no ranges on kernels, they are internal
+    if x.op is Ops.CALL: continue
+
+    # AFTER doesn't have range
+    if x.op is Ops.AFTER: continue
+
+    # treat MSTACK/MSELECT like SINK
+    if x.op in {Ops.MSTACK, Ops.MSELECT}: continue
+
+    ending_ranges[x] = sum([ending_ranges.get(u, []) for u in consumer_map[x]], [])
+    # ranges the consumers iterate that this node broadcasts over
+    ended = [rctx.range_map[c][0][i] for c in consumer_map[x] if c in rctx.range_map and c.op in GroupOp.Broadcastable
+             for i in broadcast_axes(x.shape, c.shape)]
+    broadcast_ending_ranges = list(UOp.sink(*ended).ranges)
+    # fusion decision: REDUCE before the broadcast
+    if x.op is Ops.REDUCE: ending_ranges[x] += broadcast_ending_ranges
+
+    # *** the ranges on the output are
+    #  1. new if this op is realized
+    #  2. from the single consumer if this op only has one consumer
+    #  3. potentially new if this op has 2+ consumers
+
+    consumer_rngs = [broadcast_rngs(c, x, rctx.range_map[c][0]) for c in consumer_map[x] if c in rctx.range_map]
+    if x in rctx.realize_map:
+      # if this is in the realize_map, we create new ranges (at the output)
+      out_rngs = tuple(rctx.new_range(s) for s in x.shape)
+      # all ranges are ended now
+      ending_ranges[x] = []
+      # mark all ranges as ended
+      assert rctx.realize_map[x] is None
+      rctx.realize_map[x] = list(range(len(x.shape)))
+    elif len(consumer_rngs) == 0:
+      # if no consumers have ranges and this isn't realized, this doesn't have ranges either.
+      continue
+    elif len(consumer_rngs) == 1:
+      # if this has one consumer, it inherits the ranges from it
+      out_rngs = consumer_rngs[0]
+    elif len(consumer_rngs) > 1:
+      # if this has two consumers, we have to merge the ranges and might create new ones
+      all_rngs: list[tuple[UOp, ...]] = list(zip(*consumer_rngs))
+      rngs_valids = []
+      for valid_rngs in all_rngs:
+        local_rngs, valids = zip(*[(r.get_idx(), r.get_valid()) for r in valid_rngs])
+        rngs_valids.append((local_rngs, valids))
+
+      all_all_same = all(all_same(local_rngs) for local_rngs,_ in rngs_valids)
+      _out_rngs = []
+      _realize_axis = []
+      for i,(local_rngs,valids) in enumerate(rngs_valids):
+        # we compare the ranges without their valids
+        if all_all_same:
+          # the new valid is the OR of all the children valids
+          minimum_valid = UOp.const(False).usum(valids)
+          _out_rngs.append(graph_rewrite(local_rngs[0].valid(minimum_valid), symbolic, name="minimum_valid"))
+        else:
+          _out_rngs.append(rctx.new_range(x.shape[i]))
+          _realize_axis.append(i)
+      out_rngs = tuple(_out_rngs)
+
+      # we have to (partially) realize here if there's new ranges
+      if len(_realize_axis): rctx.realize_map[x] = _realize_axis
+
+    # if this element is a reduce and there's ended ranges, we might have to end some other ranges
+    if len(ending_ranges[x]) and x.op in GroupOp.Elementwise.union({Ops.REDUCE}):
+      _realize_axis = list(range(len(out_rngs)))
+      ending_ranges[x] = []
+      if len(_realize_axis):
+        rctx.realize_map[x] = _realize_axis
+        out_rngs = tuple(rctx.new_range(x.shape[i]) for i in range(len(out_rngs)))
+    ending_ranges[x] += broadcast_ending_ranges
+
+    # TODO: some ops don't have shape, enable this after the `.st` property is removed
+    #assert len(out_rngs) == len(x.shape), \
+    #  f"shape len mismatch {len(out_rngs)} != {len(x.shape)} on {x.op} with {len(consumer_map[x])} consumers and realize {x in realize_map}"
+
+    # *** the ranges on the inputs are
+    #  1. swizzled for MovementOps
+    #  2. newly created for REDUCE (tensor graph form with axis)
+    #  3. passed through for everything else
+
+    rngs = out_rngs  # rngs is the input ranges  # pylint: disable=possibly-used-before-assignment
+
+    # apply movement ops
+    if x.op in GroupOp.Movement: rngs = apply_movement_op(x.op, x.src[0].shape, x.marg, rngs)
+    # STACK: the leading range selects the src, srcs get the trailing ranges
+    if x.op is Ops.STACK: rngs = out_rngs[1:]
+    # if the EXPAND is used to inject a range, we don't mark it as ending_ranges. otherwise we do.
+    # NOTE: this doesn't actually always end a range, but this is why convs are realized, so for now we need it
+    if x.op is Ops.EXPAND and all(isinstance(y, int) or y.op is not Ops.RANGE for y in x.shape):
+      ending_ranges[x] += list(UOp.sink(*out_rngs[:len(x.marg)]).ranges.keys())
+
+    # REDUCE creates ranges for the axes it is reducing
+    if x.op is Ops.REDUCE:
+      rngs = tuple(rctx.new_range(s) for s in x.src[0].shape[:x.arg[1]]) + out_rngs
+
+    if debug:
+      realized_ranges = rctx.realize_map.get(x, None)
+      if x.op is Ops.RESHAPE or len(rngs) != len(out_rngs):
+        disp = render_ranges(rngs, realized=realized_ranges) + " -> " + render_ranges(out_rngs, realized=realized_ranges)
+      else:
+        disp = render_ranges(rngs, out_rngs, realized=realized_ranges)
+      print("***" if x in rctx.realize_map else "   ",
+            f"{len(consumer_map[x]):2d} {str(x.op):20s} {str(x._shape):35s} {len(ending_ranges[x]):2d}", disp)
+
+    # assign to the range map. rngs are the input ranges, out_rngs are the output ranges, from the x op.
+    rctx.range_map[x] = (rngs, out_rngs)
+
+  # NOTE: SPEC=3 is broken here with shape
+  with Context(SPEC=min(SPEC.value, 2)):
+    tsink = graph_rewrite(tsink, pm_apply_rangeify, ctx=rctx, bottom_up=True, name="apply rangeify")
+  # if a deviceless value must materialize, place it on the sink device
+  tsink = graph_rewrite(tsink, pm_fix_deviceless, ctx=tsink.device, name="add device to deviceless")
+  return tsink
+
+def render_ranges(*rngs_list, realized) -> str:
+  disp = []
+  for i, rs in enumerate(zip(*[[r.render() for r in rngs] for rngs in rngs_list])):
+    rng = rs[0] if all_same(rs) else " -> ".join(rs)
+    if realized is not None and i in realized: rng = colored(rng, "yellow")
+    disp.append("["+rng+"]")
+  return ''.join(disp)
+
+from collections import defaultdict
+from tinygrad.helpers import NO_MEMORY_PLANNER, DEBUG, round_up
+from tinygrad.uop.ops import UOp, Ops
+from tinygrad.dtype import dtypes
+from tinygrad.runtime.support.memory import TLSFAllocator
+
+def _collect_bufs(u:UOp) -> list[UOp]:
+  if u.op is Ops.BUFFER: return [u]
+  if u.op in {Ops.MSELECT, Ops.MSTACK}: return [b for s in u.src for b in _collect_bufs(s)]
+  return []
+
+def _can_plan(b:UOp, held_bufs:set[UOp]) -> bool:
+  if b in held_bufs: return False
+  devs = (b.device,) if isinstance(b.device, str) else b.device
+  # CL and WEBGPU do not support views, see explanation in contiguous_view_offset
+  return all(not d.startswith(("DISK", "CL", "WEBGPU")) for d in devs)
+
+LaneKey = tuple[str, int]
+
+def memory_plan_rewrite(linear:UOp, held_bufs:set[UOp]|None=None) -> UOp:
+  if NO_MEMORY_PLANNER: return linear
+  if held_bufs is None: held_bufs = set()
+
+  # compute lifetimes for all plannable internal buffers
+  first_appearance:dict[UOp, int] = {}
+  last_appearance:dict[UOp, int] = {}
+  copy_bufs: set[UOp] = set()
+  for i, si in enumerate(linear.src):
+    si_bufs = [b for src in si.src[1:] for b in _collect_bufs(src) if _can_plan(b, held_bufs)]
+    for b in si_bufs:
+      if b not in first_appearance: first_appearance[b] = i
+      last_appearance[b] = i
+    if si.src[0].op is Ops.STORE: copy_bufs.update(si_bufs)
+  if not first_appearance: return linear
+
+  # separate copy and compute buffers into different lanes to avoid introducing dependencies (copy->compute->copy)
+  def _key(b:UOp): return (b.device, 1 if b in copy_bufs else 0)
+  buf_hold = {b: last_appearance[b] - first_appearance[b] + 1 for b in first_appearance if b in copy_bufs}
+
+  # suballocation: build sorted open/close events, then alloc/free in order
+  block_size = 256
+  nbytes = {b: round_up(b.max_numel() * b.dtype.itemsize, block_size) for b in first_appearance}
+  events = sorted([(first_appearance[b], True, b) for b in first_appearance] +
+                  [(last_appearance[b] + 1 + buf_hold.get(b, 0), False, b) for b in first_appearance], key=lambda x: (x[0], x[1]))
+  total_memory = sum(nbytes.values()) * 2
+
+  offsets:dict[UOp, int] = {}
+  peaks:dict[LaneKey, tuple[int, TLSFAllocator]] = defaultdict(lambda: (0, TLSFAllocator(total_memory, block_size=block_size, lv2_cnt=32)))
+  for _, is_open, buf in events:
+    if is_open: offsets[buf] = peaks[_key(buf)][1].alloc(nbytes[buf])
+    else: peaks[_key(buf)][1].free(offsets[buf])
+    peaks[_key(buf)] = (max(peaks[_key(buf)][0], offsets[buf] + buf.max_numel() * buf.dtype.itemsize), peaks[_key(buf)][1])
+  arena_sizes = {key: round_up(peak, block_size) for key, (peak, _) in peaks.items()}
+
+  # build replace_map: each buffer becomes a SHRINK/BITCAST into a shared per-device-lane arena
+  arenas = {key: UOp.new_buffer(key[0], sz, dtypes.int8) for key, sz in arena_sizes.items()}
+  replace_map = {buf_uop:arenas[_key(buf_uop)][offset:offset+buf_uop.nbytes()].bitcast(buf_uop.dtype) for buf_uop, offset in offsets.items()}
+
+  if DEBUG >= 1 and (omem:=sum(nbytes.values()) / 1e6) != (nmem:=sum(arena_sizes.values()) / 1e6):
+    print(f"memory reduced from {omem:.2f} MB -> {nmem:.2f} MB, {len(first_appearance)} -> {len(arenas)} bufs")
+
+  return linear.substitute(replace_map, name="memory plan", walk=True)
+
+from tinygrad.helpers import all_same, prod, getenv, ALLREDUCE_CAST
+from tinygrad.uop.ops import Ops, UOp, PatternMatcher, UPat, GroupOp, AxisType, graph_rewrite, broadcast_axes, _broadcast_shape, sint_to_uop
+from tinygrad.uop.ops import sint, ssimplify
+from tinygrad.dtype import dtypes
+from tinygrad.schedule.allreduce import handle_allreduce
+
+# ***** multi rewrite MSELECT/MSTACK *****
+
+def _apply_shrink(marg, s:UOp, i:int) -> UOp:
+  new_arg = [tuple([x.substitute({drng[0]:drng[0].const_like(i)}) if isinstance(x, UOp) and
+                    (drng:=[r for r in x.ranges if r.axis_type is AxisType.DEVICE]) else x for x in ss]) for ss in marg]
+  return s._mop(Ops.SHRINK, tuple(new_arg))
+
+def mstack_early_shrink(ms:UOp, shrink:UOp):
+  ret:list[UOp] = []
+  for i, x in enumerate(ms.src):
+    if x.op is Ops.COPY:
+      src = _apply_shrink(shrink.marg, x.src[0], i)
+      ret.append(src.contiguous() if src.device == x.device else src.copy_to_device(x.device))
+    else:
+      ret.append(_apply_shrink(shrink.marg, x, i).contiguous())
+  return ms.replace(src=tuple(ret))
+
+def lower_broadcast_copy(c:UOp, x:UOp):
+  if not (isinstance(c.device, tuple) and isinstance(x.device, str)): return None
+  if (sx:=x.simplify()).device is None: return UOp(Ops.MSTACK, src=(sx,)*len(c.device))
+  return UOp(Ops.MSTACK, src=tuple(x.pad_to(x.max_shape).contiguous().copy_to_device(d) for d in c.device)).shrink_to(c.shape)
+
+replace_allreduce = PatternMatcher([
+  # BROADCAST: explicitly expand broadcast copies and combine with MSTACK
+  (UPat(Ops.COPY, name="c", src=(UPat(name="x"),), allow_any_len=True), lower_broadcast_copy),
+  # COPY_TO_ONE: if copying from multidevice to one, MSELECT the first (TODO: a little from each?)
+  (UPat(Ops.COPY, name="c", src=(UPat(name="x"),), allow_any_len=True), lambda c,x:
+    (m if (m:=x.mselect(0)).device == c.device else m.copy_to_device(c.device))
+    if isinstance(c.device, str) and isinstance(x.device, tuple) else None),
+  # MSELECT on MSTACK is replaced with nothing
+  (UPat(Ops.MSELECT, src=(UPat(Ops.MSTACK, name="mstack"),), name="ms"), lambda mstack, ms: mstack.src[ms.arg]),
+  # move shrink before MSTACK
+  (UPat(Ops.SHRINK, src=(UPat(Ops.MSTACK, name="ms"),), allow_any_len=True, name="shrink"), mstack_early_shrink),
+  # move MSELECT before movement/ALU ops
+  (UPat(Ops.MSELECT, src=(UPat(GroupOp.Movement, src=(UPat.var("s"),), allow_any_len=True, name="v"),), name="ms"),
+   lambda s,v,ms: v.replace(src=(s.mselect(ms.arg),)+v.src[1:])),
+  (UPat(Ops.MSELECT, src=(UPat(GroupOp.ALU, name="a"),), name="ms"), lambda a,ms:
+   a.replace(src=tuple(s.mselect(ms.arg) if isinstance(s.device, tuple) else s for s in a.src))),
+])
+
+_early_allreduce = PatternMatcher([
+  (UPat(Ops.ALLREDUCE, src=(UPat.var("buf"),), name="red"), handle_allreduce),
+])
+if not getenv("LATE_ALLREDUCE", 1): replace_allreduce = _early_allreduce + replace_allreduce
+
+# ***** multi functions *****
+
+def shard_srcs(msrcs:tuple[UOp, ...], axis:int) -> list[UOp]:
+  # normalize srcs to local shards on axis
+  devices = [x.device for x in msrcs if x.device is not None]
+  assert all_same(devices), f"all buffers must have the same device {devices}"
+  # without devices the sharding range comes from the UNSHARD itself (e.g. a LOCAL thread range);
+  # device shards range over the devices instead
+  if len(devices): sharding_rng = UOp.range(len(devices[0]), 0, AxisType.DEVICE)
+  else:
+    sharding_rng = next((m.src[1] for m in msrcs if m.op is Ops.UNSHARD), None)
+    assert sharding_rng is not None, "shard_srcs requires a device or a sharding range"
+
+  out_shape = _broadcast_shape(*[x.shape for x in msrcs])
+  srcs:list[UOp] = []
+  for mlb in msrcs:
+    src_axis = axis - (len(out_shape)-len(mlb.shape))
+    if mlb.axis == src_axis:
+      # same axis, just copy through
+      srcs.append(mlb.src[0])
+    else:
+      # otherwise every shard gets the full copy, sharded iff this src has the axis (broadcast srcs stay whole)
+      full = mlb if mlb.axis is None else copy_multi(mlb, mlb.device)
+      srcs.append(full if axis in broadcast_axes(mlb.shape, out_shape) else full._shard(src_axis, sharding_rng))
+  return srcs
+
+def shard_subview(full:UOp, multi:UOp) -> UOp:
+  """the sub-view of an unsharded full-shape value (shape == multi.shape) that belongs to this shard:
+  _shard along every sharded axis (contiguous blocks, like the device path)."""
+  assert tuple(full.shape) == tuple(multi.shape), f"shard sub-view shape mismatch {full.shape} != {multi.shape}"
+  # an EXPAND of a scalar over the full shape is the same broadcast on every shard: re-expand over the shard shape
+  if full.op is Ops.EXPAND and full.src[0].shape == (): return full.src[0].expand(multi.src[0].shape)
+  for ax, rng in multi.sharding: full = full._shard(ax, rng)
+  return full
+
+def alu_multi(root:UOp):
+  multis = [m for m in root.src if m.op is Ops.UNSHARD]
+  sharding = multis[0].sharding
+  target = multis[0]
+  def can_handle(m:UOp) -> bool:
+    # same sharding (peel the UNSHARD), or a whole unsharded value of the full tile shape (takes its per-shard
+    # sub-view), or a broadcast scalar
+    if m.sharding: return m.sharding == sharding
+    return m.shape == () or tuple(m.shape) == tuple(target.shape)
+  if all(can_handle(m) for m in root.src):
+    # every src either has the target sharding or is whole on every shard: run the alu per-shard
+    srcs = [m.src[0] if m.op is Ops.UNSHARD else m if m.shape == () else shard_subview(m, target) for m in root.src]
+    return srcs[0].alu(root.op, *srcs[1:]).unshard(target.arg, target.src[1:])
+  # resharding: single-axis fallback via shard_srcs
+  axis = root.axis
+  assert axis is not None
+  srcs = shard_srcs(root.src, axis)
+  return srcs[0].alu(root.op, *srcs[1:]).unshard(axis, next(m.src[1] for m in root.src if m.op is Ops.UNSHARD))
+
+def reduce_multi(root:UOp, multi:UOp):
+  op, num_axes = root.arg
+  sharding = multi.sharding
+  reduced = [(ax, rng) for ax, rng in sharding if ax < num_axes]
+  remaining = [(ax, rng) for ax, rng in sharding if ax >= num_axes]
+  local = multi.src[0]._rop(op, tuple(range(num_axes)))
+  if reduced:
+    assert not remaining, f"partial allreduce not supported for multi-axis sharding {sharding}"
+    # all sharded axes are reduced: full allreduce
+    if ALLREDUCE_CAST and multi.src[0].op is Ops.CAST and multi.src[0].src[0].dtype in (dtypes.bfloat16, dtypes.half):
+      orig_dtype = multi.src[0].src[0].dtype
+      return local.cast(orig_dtype).allreduce(op, multi.device).cast(local.dtype)
+    return local.allreduce(op, multi.device)
+  # no sharded axes reduced: piecewise, keep all remaining sharding
+  new_axes = tuple(ax - num_axes for ax, _ in remaining)
+  new_rngs = tuple(rng for _, rng in remaining)
+  return local.unshard(new_axes, new_rngs)
+
+def reshape_multi(root:UOp, multi:UOp):
+  if prod(multi.shape) != prod(new_shape:=root.marg): raise RuntimeError("reshape must maintain prod(shape)")
+  # map every sharded axis through the reshape: the axis boundary must survive intact and stay divisible by its shard count
+  arg_acc:list[sint] = [1]
+  for s in new_shape: arg_acc.append(ssimplify(arg_acc[-1]*s))
+  new_shardings = []
+  for ax, rng in multi.sharding:
+    count = int(rng.vmax)+1
+    target = ssimplify(prod(multi.shape[:ax]))
+    if target not in arg_acc: raise RuntimeError(f"reshape {multi.shape} -> {new_shape} moved items between shards")
+    new_ax = len(arg_acc) - arg_acc[::-1].index(target) - 1
+    if new_shape[new_ax] % count != 0: raise RuntimeError(f"reshape {multi.shape} -> {new_shape} moved items between shards")
+    new_shardings.append((new_ax, rng))
+  new_axs = {a for a, _ in new_shardings}
+  new_shape = tuple(s//(int(rng.vmax)+1) if a in new_axs else s for a,s in enumerate(new_shape))
+  return multi.src[0].reshape(new_shape).unshard(tuple(a for a,_ in new_shardings), tuple(r for _,r in new_shardings))
+
+def expand_multi(root:UOp, multi:UOp):
+  shift = len(root.marg)
+  return multi.src[0]._mop(Ops.EXPAND, arg=root.marg) \
+    .unshard(tuple(ax+shift for ax,_ in multi.sharding), tuple(r for _,r in multi.sharding))
+
+def pad_multi(root:UOp, multi:UOp):
+  for ax, _ in multi.sharding:
+    assert root.marg[ax] == (0, multi.shape[ax]), f"padding not supported for {root.marg=}"
+  counts = {a for a,_ in multi.sharding}
+  local_pad = tuple((0, multi.src[0].shape[a]) if a in counts else s for a,s in enumerate(root.marg))
+  return multi.src[0]._mop(Ops.PAD, local_pad).unshard(multi.arg, multi.src[1:])
+
+def permute_multi(root:UOp, multi:UOp):
+  # all permutes supported!
+  return multi.src[0].permute(root.marg) \
+    .unshard(tuple(root.marg.index(ax) for ax,_ in multi.sharding), tuple(r for _,r in multi.sharding))
+
+def shrink_multi(root:UOp, multi:UOp):
+  # resolve each sharded axis independently: a shrink to exactly this range's own shard resolves the UNSHARD along
+  # that axis (e.g. a fragment indexed by its LOCAL thread range becomes that thread's REG shard, no copy needed)
+  local_marg = list(root.marg)
+  remaining = list(multi.sharding)
+  for ax, rng in multi.sharding:
+    shard_sz = multi.src[0].shape[ax]
+    s, l = root.marg[ax]  # SHRINK marg is (start, length)
+    if sint_to_uop(l).ssimplify() == shard_sz and (sint_to_uop(s)-rng*shard_sz).ssimplify() == 0:
+      local_marg[ax] = (0, shard_sz)
+      remaining.remove((ax, rng))
+      continue
+    part_bounds = tuple((i*shard_sz, shard_sz) for i in range(int(rng.vmax)+1))
+    if (s, l) == (0, multi.shape[ax]): local_marg[ax] = (0, shard_sz)  # full axis stays sharded, shrink the other axes locally
+    else:
+      # NOTE: otherwise a shrink on the shard axis is only allowed on the legacy device path, selecting a single
+      # partition (which is copied to all the devices and optimized out later)
+      if len(multi.sharding) != 1 or not isinstance(multi.device, tuple) or (s, l) not in part_bounds:
+        raise RuntimeError(f"shrinking not supported for {root.marg=}")
+      non_shard_shrink = tuple((0, shard_sz) if i == ax else t for i, t in enumerate(root.marg))
+      return multi.src[0].copy_to_device(multi.device, arg=part_bounds.index((s, l)))._mop(Ops.SHRINK, non_shard_shrink)
+  val = multi.src[0]._mop(Ops.SHRINK, tuple(local_marg))
+  return val if not remaining else val.unshard(tuple(a for a,_ in remaining), tuple(r for _,r in remaining))
+
+def flip_multi(root:UOp, multi:UOp):
+  for ax, _ in multi.sharding:
+    if root.marg[ax]: raise RuntimeError(f"flipping not supported on sharded axis {ax}")
+  return multi.src[0].flip([i for i,x in enumerate(root.marg) if x]).unshard(multi.arg, multi.src[1:])
+
+def stack_multi(root:UOp):
+  # STACK adds a leading axis: srcs are sharded one axis below the output
+  multis = [m for m in root.src if m.op is Ops.UNSHARD]
+  sharding = multis[0].sharding
+  if all(m.sharding == sharding for m in multis):
+    srcs = [m.src[0] if m.op is Ops.UNSHARD else m for m in root.src]
+    new_sharding = tuple((ax+1, rng) for ax, rng in sharding)
+    return UOp(Ops.STACK, src=tuple(srcs)).unshard(tuple(a for a,_ in new_sharding), tuple(r for _,r in new_sharding))
+  # resharding: single-axis fallback
+  axis = root.axis
+  assert axis is not None
+  return UOp(Ops.STACK, src=tuple(shard_srcs(root.src, axis-1))).unshard(axis, next(m.src[1] for m in root.src if m.op is Ops.UNSHARD))
+
+def index_multi(root:UOp, multi:UOp):
+  # INDEX on UNSHARD: resolve each sharded axis into this range's own shard.
+  # Two ownership patterns are supported:
+  #   contiguous: idx = rng*shard_sz + local   (thread rng owns [rng*shard_sz, ...))
+  #   strided:    idx = rng + ir*shard_sz      (thread rng owns {rng, rng+shard_sz, ...})
+  idxs = list(root.src[1:])
+  for ax, rng in multi.sharding:
+    shard_sz = multi.src[0].shape[ax]
+    local = (idxs[ax] - rng*shard_sz).simplify()
+    if local.vmin >= 0 and local.vmax < shard_sz:
+      idxs[ax] = local
+      continue
+    # strided ownership: idx ≡ rng (mod shard_sz), intra-shard position is (idx - rng) // shard_sz
+    diff = (idxs[ax] - rng).simplify()
+    if (mod:=(diff % shard_sz).simplify()).op is Ops.CONST and mod.val == 0:
+      local = (diff // shard_sz).simplify()
+      if local.vmin >= 0 and local.vmax < shard_sz:
+        idxs[ax] = local
+        continue
+    raise RuntimeError(f"index_multi: cannot shard index {idxs[ax]} for UNSHARD axis {ax} with shard size {shard_sz}")
+  return multi.src[0].index(*idxs)
+
+def _shard_idx(rng:UOp, dev_idx:int) -> int:
+  drngs = [r for r in rng.ranges if r.axis_type is AxisType.DEVICE]
+  return 0 if not drngs else int(rng.substitute({drngs[0]: drngs[0].const_like(dev_idx)}).ssimplify())
+
+def copy_multi(multi:UOp, device:str | tuple[str, ...]):
+  sharding = multi.sharding
+  if isinstance(device, str):
+    # reconstruct by concatenating along each axis from last to first
+    piece_info: list[tuple[tuple, UOp]] = []
+    for i in range(len(multi.device)):
+      idxs = tuple(_shard_idx(r, i) for _, r in sharding)
+      piece_info.append((idxs, multi.src[0].mselect(i).copy_to_device(device)))
+    for j in range(len(sharding) - 1, -1, -1):
+      ax, rng = sharding[j]
+      groups: dict[tuple, list[tuple[int, UOp]]] = {}
+      for idxs, p in piece_info:
+        key = idxs[:j] + idxs[j+1:]
+        groups.setdefault(key, []).append((idxs[j], p))
+      piece_info = []
+      for key in sorted(groups):
+        grp = sorted(groups[key], key=lambda x: x[0])
+        piece_info.append((key, grp[0][1].cat(*[x[1] for x in grp[1:]], dim=ax)))
+    return piece_info[0][1]
+  # multi-device target: unshard all axes and allreduce
+  val = multi.src[0]
+  for ax, rng in sharding:
+    bsz = val.shape[ax]
+    val = val.pad(tuple((0,0) if a != ax else (bsz*rng, bsz*int(rng.vmax) - bsz*rng) for a in range(len(val.shape))))
+  return val.allreduce(Ops.ADD, device)
+
+def store_after_multi(dest:UOp, src:UOp): return dest.after(dest.store(src.src[0])).unshard(src.arg, src.src[1:])
+
+def store_value_multi(dest:UOp, multi:UOp):
+  # storing a sharded value into an unsharded dest: every shard stores into its own sub-view of the dest
+  return shard_subview(dest, multi).store(multi.src[0])
+
+def store_dest_multi(root:UOp, multi:UOp):
+  # STORE with a sharded dest: every shard stores into its own shard of the dest.
+  # the value is handled like in alu_multi: UNSHARD srcs peel, full-shape values take their per-shard sub-view
+  # (scalars arrive EXPANDed to the full shape by UOp.store's const_like, so they sub-view like everything else)
+  srcs = [multi.src[0]] + [x.src[0] if x.op is Ops.UNSHARD else shard_subview(x, multi) if tuple(x.shape) == tuple(multi.shape) else x
+                           for x in root.src[1:]]
+  return UOp(root.op, src=tuple(srcs), arg=root.arg)
+
+def passthrough_multi(root:UOp, multi:UOp):
+  new_src = (multi.src[0],)+tuple(x.src[0] if x.op is Ops.UNSHARD else x for x in root.src[1:])
+  return UOp(root.op, src=new_src, arg=root.arg).unshard(multi.arg, multi.src[1:])
+
+def rewrite_into_function(call:UOp):
+  if not call.is_inline_call: return None
+  # the call body is a plain parametric program: multi rewrites it like anything else (the output PARAM dests sub-view per
+  # shard through the normal store rules), and all srcs (args and RETURNEDs) become their per-shard views
+  new_body = graph_rewrite(call.body, multi_pm, name="subcall")
+  assert new_body.op is Ops.SINK
+  return call.replace(src=(new_body,) + tuple(a.src[0] if a.op is Ops.UNSHARD else a for a in call.src[1:]))
+
+# NOTE: this is the same pattern as unrolled ranges
+multi_pm = PatternMatcher([
+  (UPat(GroupOp.ALU, name="root", custom_early_reject=set([Ops.UNSHARD])), alu_multi),
+  (UPat(Ops.REDUCE, src=(UPat(Ops.UNSHARD, name="multi"), ), name="root"), reduce_multi),
+  (UPat(Ops.RESHAPE, src=(UPat(Ops.UNSHARD, name="multi"), UPat()), name="root"), reshape_multi),
+  (UPat(Ops.EXPAND, src=(UPat(Ops.UNSHARD, name="multi"), UPat()), name="root"), expand_multi),
+  (UPat(Ops.PAD, src=(UPat(Ops.UNSHARD, name="multi"), UPat(), UPat()), name="root"), pad_multi),
+  (UPat(Ops.SHRINK, src=(UPat(Ops.UNSHARD, name="multi"), UPat(), UPat()), name="root"), shrink_multi),
+  (UPat(Ops.PERMUTE, src=(UPat(Ops.UNSHARD, name="multi"), ), name="root"), permute_multi),
+  (UPat(Ops.FLIP, src=(UPat(Ops.UNSHARD, name="multi"), ), name="root"), flip_multi),
+  (UPat(Ops.STACK, name="root", custom_early_reject=set([Ops.UNSHARD])), stack_multi),
+  (UPat(Ops.INDEX, src=(UPat(Ops.UNSHARD, name="multi"),), name="root", allow_any_len=True), index_multi),
+  (UPat(Ops.AFTER, src=(UPat(Ops.UNSHARD), UPat(Ops.STORE, src=(UPat(Ops.UNSHARD, name="dest"), UPat(Ops.UNSHARD, name="src"))))), store_after_multi),
+  # a COPY of a sharded value copies every shard to the target device
+  (UPat(Ops.COPY, src=(UPat(Ops.UNSHARD, name="multi"),), allow_any_len=True, name="copy"), lambda multi,copy: copy_multi(multi, copy.arg)),
+  (UPat(Ops.ALLREDUCE, src=(UPat(Ops.UNSHARD, name="multi"),), name="red"),
+    lambda multi,red: multi.src[0].allreduce(*red.arg).unshard(multi.arg, multi.src[1:])),
+
+  # rewrite value-producing calls explicitly for UNSHARD
+  # NOTE: lambda for late binding, rewrite_into_function references multi_pm
+  (UPat(Ops.CALL, name="call"), lambda call: rewrite_into_function(call)),
+  (UPat(Ops.AFTER, src=(UPat(Ops.UNSHARD, name="multi"), ), name="root", allow_any_len=True), passthrough_multi),
+  # just strip the UNSHARD from non-value-producing CALLs (custom kernels, etc.) — value-producing CALLs are handled by rewrite_into_function
+  (UPat(Ops.CALL, dtype=dtypes.void, name="root", custom_early_reject=set([Ops.UNSHARD])), lambda root:
+    UOp(root.op, src=tuple(x.src[0] if x.op is Ops.UNSHARD else x for x in root.src), arg=root.arg)),
+  (UPat((Ops.CAST, Ops.BITCAST, Ops.STAGE, Ops.DETACH, Ops.CONTIGUOUS_BACKWARD),
+        src=(UPat(Ops.UNSHARD, name="multi"), ), name="root"), passthrough_multi),
+  # STORE of a sharded value into an unsharded dest (e.g. a fragment into a full output tile)
+  (UPat(Ops.STORE, src=(UPat.var("dest"), UPat(Ops.UNSHARD, name="multi"))), store_value_multi),
+  # STORE into a sharded dest (e.g. the fragment init): every shard stores into its own shard
+  (UPat(Ops.STORE, src=(UPat(Ops.UNSHARD, name="multi"), ), name="root", allow_any_len=True), store_dest_multi),
+])+replace_allreduce
+
+from dataclasses import replace
+from tinygrad.dtype import dtypes, to_dtype
+from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, resolve, GroupOp, ParamArg
+from tinygrad.uop.ops import graph_rewrite, rewrite_group, identity_element, resolve_returned_after
+from tinygrad.uop.movement import mop_cleanup
+from tinygrad.helpers import prod, getenv, all_int, DEBUG, SPLIT_REDUCEOP, OPENPILOT_HACKS, FLOAT16, argsort
+from tinygrad.schedule.indexing import apply_movement_op
+from tinygrad.schedule.allreduce import create_allreduce_function
+from tinygrad.schedule.multi import multi_pm
+
+def forward_call_outputs(sink:UOp) -> UOp:
+  placed:dict[UOp, UOp] = {}
+  items:list[UOp] = []
+  for item in sink.src:
+    st = item.src[1] if item.op is Ops.AFTER and len(item.src) == 2 and item.src[1].op is Ops.STORE else item
+    if st.op is not Ops.STORE or (item is not st and item.src[0] is not st.src[0]):
+      items.append(item)
+      continue
+    target, src = st.src
+    while src.op is Ops.AFTER: src = src.src[0]
+    base = src.storage_base
+    if item is not st and base.op is not Ops.ALLOC:
+      items.append(item)
+      continue
+    # Forward the allocation, not just one view of it, so saved values and other aliases follow the same placement.
+    key = base if base.op is Ops.ALLOC else src
+    if key not in placed and (src.op is Ops.STAGE or target.has_buffer_identity()) and \
+       target.storage_base not in st.src[1].toposort(enter_calls=False):
+      if base.op is Ops.ALLOC and src.has_buffer_identity() and base.max_numel() == target.storage_base.max_numel():
+        placed[key] = target.storage_base
+      elif src.op is Ops.STAGE: placed[key] = target.after(target.store(src.src[0]))
+      elif src.op in {Ops.BUFFER, Ops.UNSHARD} and src.has_buffer_identity(): placed[key] = target
+      if key in placed:
+        if item is not st: placed[item] = st.src[1]
+        items.append(st.src[1])
+        continue
+    items.append(target.after(st))
+  return UOp.sink(*items).substitute(placed, walk=True)
+
+def walk_mop(u:UOp):
+  if u.op in GroupOp.Movement or u.op in {Ops.INDEX, Ops.UNSHARD, Ops.BITCAST}: return walk_mop(u.src[0])
+  if u.op is Ops.AFTER and (b:=walk_mop(u.src[0])) is not u.src[0]: return b.after(*u.src[1:])
+  return u
+
+def found_after(ctx:dict[UOp, UOp], after:UOp, src:UOp):
+  if (x:=src).op is Ops.CAST and x.dtype == dtypes.half and FLOAT16: x, after = x.src[0], after.cast(dtypes.float)
+  while True:
+    if x.op is Ops.PERMUTE: x, after = x.src[0], after.permute(argsort(x.marg))
+    elif x.op is Ops.RESHAPE: x, after = x.src[0], after.reshape(x.src[0].shape)
+    elif x.op is Ops.WHERE and x.src[2].base.is_invalid and x.src[1].op is Ops.PAD:
+      x, after = x.src[1].src[0], after.shrink(tuple((o, s+o) for (o,_),s in zip(x.src[1].marg, x.src[1].src[0].shape)))
+    else: break
+  ctx[x] = after
+
+# *** fold moved AFTERs (hack for openpilot) ***
+pm_fold_moved_after = PatternMatcher([
+  (UPat(Ops.AFTER, src=(UPat(), UPat(Ops.STORE, src=(UPat(), UPat((*GroupOp.Movement,Ops.CAST,Ops.WHERE), name="src")))), name="after"), found_after),
+  # contiguous is also a materialization point (it bufferizes in the scheduler)
+  (UPat(Ops.STAGE, src=(UPat((*GroupOp.Movement,Ops.CAST,Ops.WHERE), name="src"),), name="after"), found_after),
+  # replace ALU sources with AFTER versions found above
+  (UPat(GroupOp.ALU, name="alu"), lambda ctx,alu: alu.replace(src=new_src) if (new_src:=tuple(ctx.get(s, s) for s in alu.src)) != alu.src else None),
+])
+
+# movement op on INDEX as a PatternMatcher
+def _mop_index(r:UOp, idx:UOp):
+  idxs = idx.src[1:]
+  if len(idxs) == len(r.shape):
+    return r.src[0].index(*apply_movement_op(r.op, r.src[0].shape, r.marg, idxs), arg=idx.arg)
+  if r.op is Ops.RESHAPE:
+    src_prefix = len(r.src[0].shape) - len(r.shape[len(idxs):])
+    if src_prefix >= 0 and r.src[0].shape[src_prefix:] == r.shape[len(idxs):]:
+      if src_prefix == 0: return r.src[0]
+      ret = r.src[0].index(*apply_movement_op(r.op, r.src[0].shape[:src_prefix], r.shape[:len(idxs)], idxs), arg=idx.arg)
+      return ret if ret.shape == idx.shape else None
+
+pm_mops = PatternMatcher([
+  # handle movement ops on INDEX
+  (UPat(GroupOp.Movement, name="r").f(Ops.INDEX, allow_any_len=True, name="idx"), _mop_index),
+  # move movement ops and INDEX after AFTER
+  (UPat(GroupOp.Movement|{Ops.INDEX}, name="r").after(name="a", allow_any_len=True),
+   lambda r,a: UOp(r.op, src=(a.replace(src=(r.src[0],)+a.src[1:]),)+r.src[1:], arg=r.arg)),
+  (UPat(GroupOp.Movement, name="r").end(name="a", allow_any_len=True), lambda r,a: a.replace(src=(r.src[0],)+a.src[1:])),
+])
+
+# *****************
+# 0. do some cleanup rewrites, mostly copied from the old stuff
+
+# stop at materialization boundaries, including COPYs/STAGEs already lowered to AFTER+STORE
+def store_hazard_boundary(s:UOp):
+  if s.op in {Ops.COPY, Ops.STAGE}: return False
+  if s.op is Ops.AFTER: return not any(d.op is Ops.STORE and d.src[0].base is s.src[0].base for d in s.src[1:])
+  return True
+
+def fix_store_hazard(target:UOp, src:UOp):
+  if (base:=target.base) not in src.toposort(enter_calls=False): return None
+  # PERMUTE and FLIP reorder indices, SHRINK can have overlapping regions when dest is also shrunk
+  unsafe = {Ops.PERMUTE, Ops.FLIP} | ({Ops.SHRINK} if target.op_in_backward_slice_with_self(Ops.SHRINK) else set())
+  reaches_base: dict[UOp, bool] = {}
+  for s in src.toposort(gate=store_hazard_boundary):
+    reaches_base[s] = s is base or any(reaches_base.get(c) for c in s.src)
+    if reaches_base[s] and s.op in unsafe and not (s is target and s.op is Ops.SHRINK): return target.store(src.contiguous())
+
+def split_reduceop(reduce:UOp, x:UOp):
+  if prod(reduce.shape) == 0: return None
+  if not SPLIT_REDUCEOP or not all_int(x.shape) or (prod(x.shape)//prod(reduce.shape))<getenv("REDUCEOP_SPLIT_THRESHOLD", 32768): return None
+  # if there are few globals, make some reduces into globals by splitting into two kernels
+  # cap output buffer to 2**22: heuristic number of global outputs to achieve max occupancy with enough locals+upcasts for gemm
+  #   ~2**10 should be enough if GROUP is used
+  # 256 split maximum should be "negligible reduce" for low prod(reduce.shape), 8 split minimum.
+  # split is moved to the end to provide maximum locality for the second phase reduce.
+
+  # get expanded by rangeifying the UOp x
+  indexed = x.index(*[UOp.range(s, i) if resolve(s>1) else 0 for i,s in enumerate(x.shape)])
+  range_nums = [y.axis_id[0] for y in indexed.substitute({x.base:UOp(Ops.NOOP)}, extra_pm=pm_mops).ranges]
+  is_expanded = [i not in range_nums for i in range(len(x.shape))]
+
+  if not (split_candidates:=[(i,d) for i in range(reduce.arg[1])
+                             for d in range(min(256,2**getenv("REDUCEOP_SPLIT_SIZE",22)//prod(reduce.shape)),8-1,-1)
+                             if x.shape[i]%d==0 and not is_expanded[i]]): return None
+  dim_to_split, divisor = split_candidates[0]
+  splitted_shape = x.shape[:dim_to_split]+(divisor,)+(x.shape[dim_to_split]//divisor,)+x.shape[dim_to_split+1:]
+  splitted = x.reshape(splitted_shape).permute(tuple([d for d in range(len(splitted_shape)) if d!=dim_to_split]+[dim_to_split]))
+  if DEBUG >= 3: print(f"split {divisor}: {x.shape} -> {splitted.shape} -> {reduce.shape}")
+  # reduce original axes, then split
+  return splitted._rop(reduce.arg[0], tuple(range(reduce.arg[1]))).contiguous()._rop(reduce.arg[0], (len(reduce.shape),))
+
+def resolve_function(c:UOp) -> UOp|None:
+  if not c.is_inline_call: return None
+  nodes = c.body.toposort(enter_calls=False)
+  # Input and output PARAMs both bind to explicit arguments by slot; unused arguments are allowed.
+  args = c.src[1:]
+
+  # params have a flat storage size in the arg, the logical shape is a view (RESHAPE/SHRINK/UNSHARD) on top of it.
+  # substitute args by their flat max-shaped storage view so the movement views on the params stay valid
+  def flat_storage(a:UOp) -> tuple[int, UOp]:  # returns (size, view of a as flat max-shaped storage)
+    shp = a.max_shard_shape if a.axis is not None and isinstance(a.device, tuple) else a.max_shape
+    if a.op is Ops.SHRINK and a.src[0].shape == shp and all(s == 0 for s,_ in a.marg): a = a.src[0]
+    return (n:=prod(shp)), a if a.shape == (n,) else a.pad_to(shp).reshape((n,))
+  dict_map = {p:args[p.arg.slot] for p in nodes if p.op is Ops.PARAM and p.arg.slot >= 0}
+  for p, a in dict_map.items():
+    if p.arg.size is not None:
+      n, flat = flat_storage(a)
+      if p.arg.size != n: raise TypeError(f"arg {p.arg.slot} shape mismatch: expected size {p.arg.size}, got {a.shape}")
+      dict_map[p] = flat
+    elif a.shape != ():
+      raise TypeError(f"arg {p.arg.slot} shape mismatch: expected scalar, got {a.shape}")
+    if p.dtype != a.dtype: raise TypeError(f"arg {p.arg.slot} dtype mismatch: expected {p.dtype}, got {a.dtype}")
+  # Inlining removes the call scope, so its local allocations need fresh identities.
+  dict_map.update({b:b.replace(arg=replace(b.arg, slot=next(UOp.unique_num))) for b in nodes if b.op is Ops.ALLOC})
+  return c.body.substitute(dict_map, walk=True)
+
+# shape-changing bitcast
+def expand_bitcast(bc:UOp) -> UOp|None:
+  x = bc.src[0]
+  if (ns:=bc.dtype.itemsize) == (os:=x.dtype.itemsize) or (isinstance(x.device, str) and x.device.startswith("DISK")): return None
+  new_uint, tmp = to_dtype(f"uint{8*ns}"), x.bitcast(to_dtype(f"uint{8*os}"))
+  if ns > os:
+    tmp = tmp.reshape(x.shape[:-1] + (x.shape[-1]//(rate := ns//os), rate))
+    parts = [tmp.shrink((None,)*(len(tmp.shape)-1) + ((i, i+1),)).cast(new_uint)<<8*i*os for i in range(rate)]
+    return parts[0].usum(*parts[1:]).squeeze(-1).bitcast(bc.dtype)
+  parts = [tmp>>8*i*ns for i in range(os//ns)]
+  return parts[0].stack(*parts[1:], dim=-1).flatten(-2).cast(new_uint).bitcast(bc.dtype)
+
+def copy_to_anon_store(x:UOp, copy:UOp):
+  # copies are always cross device: pad to the max shape so the copy reads a whole buffer (SDMA can't do offset copies)
+  x = x.pad_to(x.max_shape)
+  # the buffer takes the DEVICE range from the copy (no-op for single device copies)
+  buf = UOp(Ops.ALLOC, src=copy.src[1:],
+            arg=ParamArg(next(UOp.unique_num), copy.dtype, prod(x.max_shape), device=copy.device)).reshape(x.max_shape)
+  return buf.after(buf.store(x)).shrink_to(copy.shape)
+
+def stage_to_anon_store(x:UOp, stg:UOp):
+  # the buffer created here is inside the call and is not persisted, like the buffers created for copies
+  buf = UOp(Ops.ALLOC, src=UOp.device_range_src(x.device),
+            arg=ParamArg(next(UOp.unique_num), stg.dtype, prod(x.max_shape), device=x.device)).reshape(x.max_shape)
+  view = buf.shrink_to(stg.shape)
+  return view.after(view.store(x))
+
+def materialize_cross_device_src(dest:UOp, src:UOp):
+  # cross-device copies must read a whole buffer (SDMA can't do offset copies)
+  if src.device is None or dest.device == src.device or src.has_buffer_identity(after_ok=True): return None
+  return dest.store(src.contiguous())
+
+pm_inline_calls = PatternMatcher([
+  (UPat(Ops.CALL, name="c"), resolve_function),
+  (UPat(Ops.AFTER, src=(UPat(name="r"), UPat(Ops.SINK, name="t")), allow_any_len=True), resolve_returned_after),
+])
+
+pm_disk_copy = PatternMatcher([
+  # remove contiguous on movement ops before a copy on disk
+  (UPat(GroupOp.Movement, name="x").f(Ops.STAGE).f(Ops.COPY, name="copy"), lambda x,copy:
+   copy.replace(src=(x,)) if x.on_disk() else None),
+  # push all movement ops to the destination: views exposed here are no longer normalized into input PARAMs,
+  # so leaving SHRINK/RESHAPE behind can cause materialize_cross_device_src to allocate a temporary on disk
+  (UPat(GroupOp.Movement, name="x").f(Ops.COPY, name="copy"), lambda x,copy:
+   x.replace(src=(copy.replace(src=(x.src[0],)),)+x.src[1:]) if x.on_disk() else None),
+])
+
+earliest_rewrites = mop_cleanup+PatternMatcher([
+  # resolve allreduce (must be bottom up)
+  (UPat(Ops.ALLREDUCE, src=(UPat.var("buf"),), name="red"), create_allreduce_function),
+
+  # split_reduceop
+  (UPat(Ops.REDUCE, name="reduce", src=(UPat.var("x"),)), split_reduceop),
+
+  # remove DETACH/CONTIGUOUS_BACKWARD (TODO: this is copied in allocations)
+  (UPat((Ops.DETACH, Ops.CONTIGUOUS_BACKWARD), name="x"), lambda x: x.src[0]),
+
+  # SINK only ever references the base
+  (UPat(Ops.SINK, name="x"), lambda x: x.replace(src=tuple(y.unsharded_base for y in x.src))),
+
+  # ** copy rules **
+
+  # a copy to the same device as the source is not allowed: it is a no-op, STAGE materializes on the same device
+  (UPat(Ops.COPY, src=(UPat.var("x"),), allow_any_len=True, name="copy"), lambda x,copy: x if x.device == copy.device else None),
+
+  # a COPY in src[1] of a plain STORE can just be removed: a STORE to a buffer on a different device is a COPY
+  (UPat(Ops.STORE, src=(UPat.var("dst"), UPat(Ops.COPY, src=(UPat.var("x"),), allow_any_len=True, name="cpy"))),
+   lambda dst,x,cpy: dst.store(x) if dst.device == cpy.device and dst.has_buffer_identity(after_ok=True) else None),
+
+  # a bare COPY is an anonymous store: realize it as a STORE into a fresh call-local buffer on the copy device
+  (UPat(Ops.COPY, src=(UPat.var("x"),), allow_any_len=True, name="copy"), copy_to_anon_store),
+
+  # ** stage rules **
+
+  # a STAGE of an already materialized value (or of a COPY, which materializes itself) is a no-op
+  (UPat(Ops.STAGE, src=(UPat.var("x"),)),
+   lambda x: x if x.has_buffer_identity(after_ok=True) or x.op is Ops.COPY else None),
+
+  # a bare STAGE is an anonymous same-device materialization: realize it as a STORE into a fresh call-local buffer
+  (UPat(Ops.STAGE, src=(UPat.var("x"),), name="stg"), stage_to_anon_store),
+
+  # reshaping on STORE can be a NOOP
+  (UPat(Ops.STORE, src=(UPat(Ops.RESHAPE, src=(UPat.var("dst",),), allow_any_len=True),
+                        UPat(Ops.RESHAPE, src=(UPat.var("src",),), allow_any_len=True))),
+   lambda dst,src: dst.store(src) if dst.shape == src.shape else None),
+
+  # ** store rules **
+
+  # materialize the src of a cross device STORE on its own device first: the STORE itself is the copy
+  (UPat(Ops.STORE, src=(UPat(name="dest"), UPat(name="src"))), materialize_cross_device_src),
+
+  # fix store hazard (dest is in used in src) by adding contiguous: TestAssign.test_post_flipped_assignment
+  (UPat(Ops.STORE, src=(UPat(name="target"), UPat(name="src"))), fix_store_hazard),
+
+  # remove two STOREs that store the same thing to the same place: TestSchedule.test_dedup_Assign
+  (UPat.var("buf").after(UPat.var("buf").store(UPat.var("src")), name="a1").after(UPat.var("a1").store(UPat.var("src"))), lambda buf,src,a1:a1),
+
+  # store a buffer's own current contents back into itself: TestAssign.test_assign_from_alias
+  (UPat.var("buf").after(UPat.var("buf").store(UPat.var("buf").after(UPat.var("buf").store(UPat()), name="a1"))), lambda buf,a1:a1),
+
+  # move bitcast from store dest to source: TestAssign.test_assign_bitcast
+  (UPat(Ops.STORE, src=(UPat(Ops.BITCAST, src=(UPat(name="target"),)), UPat(name="src"))),
+   lambda target, src: target.store(src.bitcast(target.dtype))),
+
+  (UPat(Ops.BITCAST, name="bc"), expand_bitcast),
+
+  # ** size 0 **
+
+  # reduce of size 0 is the identity element
+  (UPat(Ops.REDUCE, name="reduce", src=(UPat.var("x"),)),
+   lambda reduce,x: reduce.const_like(identity_element(reduce.arg[0], reduce.dtype)) if 0 in x.shape and 0 not in reduce.shape else None),
+  # handle size 0
+  (UPat(GroupOp.All-{Ops.SINK}, name="x"), lambda x: x.const_like(0).rtag(x.tag) if x._shape is not None and 0 in x.shape else None),
+
+  # remove movement ops from SINK/AFTER. TODO: should be generic
+  (UPat(Ops.SINK, name="s"), lambda s: s.replace(src=tuple(walk_mop(u) for u in s.src if u.op is not Ops.NOOP))),
+  (UPat(Ops.AFTER, name="s"), lambda s: s.replace(src=(s.src[0],)+tuple(walk_mop(u) for u in s.src[1:] if u.op is not Ops.NOOP))),
+])
+
+@rewrite_group(new_ctx=False)
+def prepare_rangeify(sink:UOp) -> UOp:
+  # prepare for rangeify
+  tsink = graph_rewrite(forward_call_outputs(sink), multi_pm, name="multi_pm")
+  tsink = graph_rewrite(tsink, pm_mops+pm_inline_calls+pm_disk_copy, name="inline calls")
+  if OPENPILOT_HACKS: tsink = graph_rewrite(tsink, pm_fold_moved_after, ctx={}, name="fold moved afters")
+  tsink = graph_rewrite(tsink, pm_mops+earliest_rewrites, bottom_up=True, name="earliest rewrites")
+  return tsink
+
+from dataclasses import dataclass, field, replace
+from typing import cast
+import itertools
+from tinygrad.dtype import dtypes, AddrSpace, Invalid
+from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, resolve, GroupOp, KernelInfo, ParamArg
+from tinygrad.uop.ops import graph_rewrite, sint, AxisType, BottomUpGate, rewrite_group
+from tinygrad.uop.symbolic import symbolic
+from tinygrad.helpers import prod, dedup, DEBUG_RANGEIFY, VIZ, MAX_KERNEL_BUFFERS, SPEC
+from tinygrad.helpers import get_single_element
+from tinygrad.codegen.simplify import pm_flatten_range, pm_reduce_simplify
+from tinygrad.schedule.indexing import run_rangeify, BufferizeOpts, apply_movement_op
+from tinygrad.schedule.prepare import pm_mops
+
+# creation can recurse a lot
+import sys
+sys.setrecursionlimit(10000)
+
+# *****************
+# 3.5 cleanups
+
+# you don't know in the first pass if axes are going to die, this happens if there's an EXPAND to the left
+def cleanup_dead_axes(b:UOp):
+  if not b.arg.removable: return None
+  # don't optimize AFTER (AFTER is a buffer identity — ranges define consumer access, not computation)
+  if b.src[0].op is Ops.AFTER: return None
+
+  new_rng = []
+  hit = False
+  reshape: list[sint] = []
+  for s,rng in zip(b.shape, b.src[1:]):
+    # skip for symbolic. TODO: fix this
+    if rng.op is Ops.RANGE and rng.src[0].op is not Ops.CONST: return None
+    # CONSTs are already dead axes
+    if rng.op is Ops.CONST or (rng.op is Ops.RANGE and rng not in b.src[0].ranges):
+      reshape.append(1)
+      hit = True
+    else:
+      reshape.append(s)
+      new_rng.append(rng)
+  if hit:
+    return b.replace(src=b.src[0:1]+tuple(new_rng)).reshape(tuple(reshape)).expand(b.shape)
+
+def gate_substitute(ctx, b:UOp) -> None:
+  if not any(r in b.ranges for r in ctx.keys()): raise BottomUpGate()
+pm_gate_substitute = PatternMatcher([(UPat(GroupOp.All, name="b"), gate_substitute)], compiled=False)
+# if a buffer is being stored just for permutes or something, remove it
+# we want to reexpress the indexes of idx2 in terms of the implied b1
+def remove_bufferize(src:UOp, buf:UOp, idx:UOp):
+  # see if we can't do it, should this ever hit?
+  assert len(buf.src) == len(idx.src), f"index on wrong bufferize, {len(buf.src)} != {len(idx.src)}"
+  assert all(x.op in {Ops.RANGE, Ops.CONST} for x in buf.src[1:])
+
+  # if it's user contiguous, we never remove it
+  if not buf.arg.removable: return None
+
+  # *** here is where we compute the cost ***
+  # if we return None, the bufferize is kept
+
+  accessed_buffers: list[UOp] = []
+  reduces: list[UOp] = []
+  def red_gate(x:UOp):
+    if x.op is Ops.AFTER:
+      accessed_buffers.append(x.buf_uop)
+      return False
+    if (x.op is Ops.STAGE and x.arg.addrspace == AddrSpace.GLOBAL) or x.op is Ops.MSTACK:
+      accessed_buffers.append(x)
+      return False
+    if x.op is Ops.STORE:
+      # don't look inside stores, this doesn't count toward buffer accesses
+      return False
+    if x.op is Ops.PARAM:
+      accessed_buffers.append(x)
+    if x.op is Ops.REDUCE: reduces.append(x)
+    return True
+  src.toposort(gate=red_gate)
+  del red_gate
+  accessed_buffers = dedup(accessed_buffers)
+
+  # if this is generated from multiple buffers, don't remove this buffer
+  if len(accessed_buffers) > 3: return None
+
+  # if any reduces access a buffer, don't remove this buffer
+  buffer_in_reduce = False
+  def buf_gate(x:UOp):
+    nonlocal buffer_in_reduce
+    if x.op in {Ops.PARAM, Ops.STAGE, Ops.AFTER}: buffer_in_reduce = True
+    return not buffer_in_reduce
+  UOp.sink(*[x.src[0] for x in reduces]).toposort(gate=buf_gate)
+  del buf_gate
+  if buffer_in_reduce:
+    return None
+
+  # if it makes it here, the bufferize is removed
+  # this is the ranges replaced
+  # NOTE: if buf src is a const, we don't replace it. if idx is Invalid (dead load), don't replace it either
+  replaced = {k:v for k,v in zip(buf.src[1:], idx.src[1:]) if k.op is not Ops.CONST and not (v.op is Ops.CONST and v.val is Invalid)}
+  return src.substitute(replaced, extra_pm=pm_gate_substitute)
+
+def remove_noop_bufferize(idx,b2):
+  if idx.src[1:] != b2.src[1:]: return None
+  return idx.src[0].shrink(tuple((0, s) for s in b2.shape)) if b2.shape else idx.src[0]
+
+def after_all_invalid(after:UOp):
+  buf = after.src[0].buf_uop
+  # check all ranges are used (no expand), and same size (no pad and shrink)
+  return all(s.op is Ops.END and (st:=s.src[0]).op is Ops.STORE and st.src[1].base.is_invalid and st.src[0].buf_uop is buf
+    and all(r in st.src[0].ranges for r in s.ended_ranges)
+    and resolve(cast(UOp, prod(r.src[0] for r in s.ended_ranges)).eq(buf.numel()), False) for s in after.src[1:])
+
+pm_const_buffer_folding = pm_mops+PatternMatcher([
+  (UPat(Ops.STAGE, name="b"), cleanup_dead_axes),
+  # remove noop buffers. if we look at the next index we can remove even more of these
+  (UPat(Ops.INDEX, name="idx").f(Ops.STAGE, allow_any_len=True, name="b2"), remove_noop_bufferize),
+  # no buffers for a const, in either spelling
+  (UPat.cvar('c').or_casted().f(Ops.STAGE, allow_any_len=True, name="b"), lambda c,b: b.const_like(c.val)),
+  # indexing a const is the const
+  (UPat(Ops.INDEX, src=(UPat.cvar().or_casted("c"),),), lambda c: c),
+  # indexing an after with all fully invalid stores is invalid
+  (UPat(Ops.INDEX, src=(UPat(Ops.AFTER, name="after"),), allow_any_len=True, name="idx"),
+   lambda idx,after: idx.const_like(Invalid) if after_all_invalid(after) else None),
+  # a deviceless MSTACK src is the same value on every device, so indexing the stack is just indexing that value
+  (UPat(Ops.MSTACK, src=(UPat.var("s"),), allow_any_len=True).f(Ops.INDEX, allow_any_len=True, name="idx"),
+   lambda s,idx: idx.replace(src=(s,)+idx.src[1:]) if s.device is None else None),
+])
+
+pm_remove_bufferize = PatternMatcher([
+  # remove reindexing with cost function
+  (UPat.var("src").f(Ops.STAGE, allow_any_len=True, name="buf").f(Ops.INDEX, allow_any_len=True, name="idx"), remove_bufferize),
+  # STORE to self is NOOP
+  (UPat.var("x").store(UPat.var("x")), lambda x: UOp(Ops.NOOP)),
+  # END on NOOP is NOOP
+  (UPat(Ops.END, src=(UPat(Ops.NOOP, name="x"),), allow_any_len=True), lambda x: x),
+])
+
+def strip_zero_offset_shrink(x:UOp) -> UOp:
+  return x.src[0] if x.op is Ops.SHRINK and all(resolve(start == 0, False) for start,_ in x.marg) else x
+
+def no_indexing_calls(u:UOp):
+  new_srcs = []
+  for x in u.src:
+    if x.op is Ops.INDEX:
+      # sometimes if call srcs have children the call will get an INDEX. we remove it here.
+      # TODO: we should add safety checks here for contiguous
+      new_srcs.append(x.src[0])
+    elif x.op is Ops.SHRINK:
+      # SHRINK with offset 0 is fine
+      new_srcs.append(strip_zero_offset_shrink(x))
+    elif x.op is Ops.MSTACK:
+      new_srcs.append(x.replace(src=tuple(strip_zero_offset_shrink(s) for s in x.src)))
+    else:
+      # everything else we pass through
+      new_srcs.append(x)
+  return u.replace(src=tuple(new_srcs))
+
+pm_no_indexing_calls = PatternMatcher([
+  (UPat(Ops.CALL, name="u"), no_indexing_calls),
+])
+
+# the kernel graph is what gets executed: no shape views left in it, the storage of a value is just the storage
+pm_no_views = PatternMatcher([
+  (UPat((Ops.RESHAPE, Ops.SHRINK), name="v",
+        src=(UPat((Ops.AFTER, Ops.PARAM, Ops.UNSHARD, Ops.MSTACK, Ops.BUFFER, Ops.ALLOC)),), allow_any_len=True), lambda v: v.src[0]),
+])
+
+DEVICE_MAX_BUFS = {"WEBGPU": 8} # TODO: get from device?
+@dataclass
+class LimitBufsContext:
+  buf_cache: dict[UOp, frozenset[UOp]] = field(default_factory=dict)
+  range_idx: itertools.count = field(default_factory=itertools.count)
+
+def _limit_bufs(ctx:LimitBufsContext, root:UOp):
+  if (device:=root.device) is None: return None # no device, index related calculations
+  device = device if isinstance(device, str) else device[0].split(":")[0]
+  if not (MAX_BUFS:=MAX_KERNEL_BUFFERS.value or DEVICE_MAX_BUFS.get(device, 0)): return None
+
+  def visitor(u:UOp) -> frozenset[UOp]:
+    if u.op in {Ops.STAGE, Ops.AFTER, Ops.PARAM, Ops.MSELECT, Ops.MSTACK}: return frozenset((u,))
+    if len(u.src) == 1: return ctx.buf_cache[u.src[0]]
+    return frozenset().union(*[ctx.buf_cache[s] for s in u.src])
+  bufs = root.topovisit(visitor, ctx.buf_cache)
+
+  if len(bufs) > MAX_BUFS - 1: # NOTE: this -1 is for the output buffer
+    srcs = []
+    for s in root.src:
+      if s.op in GroupOp.Elementwise and s.device is not None:
+        # Insert bufferize: use fresh WEAK ranges, while the DEVICE range stays a launched axis
+        orig_ranges = s.ranges
+        end_ranges = [x.replace(arg=(AxisType.WEAK, next(ctx.range_idx))) if x.axis_type is not AxisType.DEVICE else x
+                      for x in s.ranges]
+        s = s.substitute(dict(zip(orig_ranges, end_ranges))).bufferize(*end_ranges, arg=BufferizeOpts(device=s.device)).index(*orig_ranges)
+      srcs.append(s)
+    return root.replace(src=tuple(srcs))
+pm_limit_bufs = PatternMatcher([(UPat(set.union(GroupOp.Binary, GroupOp.Ternary), name="root"), _limit_bufs)])
+
+# *****************
+# 4. put in buffers for bufferize
+# TODO: should BUFFERIZE look a lot more like STORE
+# BUFFERIZE has device in arg
+# BUFFERIZE doesn't have indexing, that's implied by the ranges it closes
+# BUFFERIZE returns the BUFFER ready for INDEXing (doing this will make splitting a lot easier)
+# NOTE: this has been fixed up a bit
+
+def bufferize_to_store(ctx:itertools.count, x:UOp, idx:UOp):
+  size = prod(x.shape)
+  dtype = x.commit_dtype()  # a BUFFER is never weak: store at the committed dtype, the .cast(x.dtype) on the result keeps readers unchanged
+  rngs = sorted(idx.ranges, key=lambda x: x.arg)
+  assert size > 0 and isinstance(size, int), f"no zero sized or symbolic sized buffers {size}"
+
+  # AFTER: add END to the existing STORE, return buffer with kernel dependency
+  if (after:=x.src[0]).op is Ops.AFTER:
+    buf = after.src[0].buf_uop.base
+    if not (stores := [s for s in after.src[1:] if s.op is Ops.STORE and s.src[0].op is Ops.INDEX]): return buf
+    # BUFFERIZE(INDEX(...)); store through the underlying global index instead.
+    ended_stores = []
+    for store in stores:
+      store_target = store.src[0]
+      if store_target.src[0].op is Ops.STAGE and store_target.src[0].src[0].op is Ops.INDEX:
+        store_target = store_target.src[0].src[0]
+      if store.src[1] is store_target: continue  # skip self-assign
+      end_rngs = sorted(dedup(tuple(store_target.ranges) + tuple(rngs)), key=lambda x: x.arg)
+      ended_stores.append(store_target.store(store.src[1]).end(*end_rngs))
+    return buf.after(*ended_stores)
+
+  if x.arg.addrspace == AddrSpace.GLOBAL:
+    buf = UOp(Ops.ALLOC, src=UOp.device_range_src(x.arg.device), arg=ParamArg(next(ctx), dtype, size, device=x.arg.device))
+    do_store = buf.index(idx).store(x.src[0].cast(dtype)).end(*rngs)
+    return buf.after(do_store).cast(x.dtype)
+
+# collapse any BUFFERIZE to single input BUFFERIZE
+def flatten_bufferize(x:UOp):
+  if len(x.src) == 2: return None
+  ret = x.replace(src=(x.src[0], get_single_element(apply_movement_op(Ops.RESHAPE, (prod(x.shape),), x.shape, x.src[1:]))))
+  rngs = x.src[1:]
+  ret = ret.reshape(x.shape)
+  if any(r.op is Ops.RANGE and r.src[0].op is not Ops.CONST for r in rngs):
+    sym_shape = tuple([r.src[0] if r.op is not Ops.CONST else 1 for r in rngs])
+    ret = ret.shrink(tuple([(0,x) for x in sym_shape]))
+  return ret
+pm_flatten_bufferize = PatternMatcher([(UPat(Ops.STAGE, name="x"), flatten_bufferize)])
+
+def is_noop_after_dep(x:UOp) -> bool:
+  return (x.op is Ops.NOOP and len(x.src) == 0) or (x.op is Ops.END and is_noop_after_dep(x.src[0]))
+
+def remove_noop_afters(x:UOp) -> UOp|None:
+  src = (x.src[0],) + tuple(s for s in x.src[1:] if not is_noop_after_dep(s))
+  if len(src) != len(x.src): return src[0] if len(src) == 1 else x.replace(src=src)
+  return None
+
+pm_add_buffers = pm_mops+pm_flatten_bufferize+PatternMatcher([
+  (UPat(Ops.STAGE, src=(UPat(), UPat(name="idx")), name="x"), bufferize_to_store),
+
+  # INDEX of a buffer through the weak cast added above: index the buffer directly and cast the loaded value instead.
+  # this must run in the same rewrite that adds the cast, or the expander expands the whole casted buffer into one big VECTORIZE
+  (UPat(Ops.INDEX, src=(UPat(Ops.CAST, dtype=dtypes.weaks, src=(UPat.var("buf"),)),), allow_any_len=True, name="u"),
+   lambda u,buf: u.replace(src=(buf,)+u.src[1:]).cast(u.dtype)),
+
+  # move RESHAPEs through MSELECT/MSTACK
+  (UPat((Ops.MSELECT, Ops.MSTACK), src=UPat(Ops.RESHAPE), name="m"),
+   lambda m: m.replace(src=tuple([x.src[0].base for x in m.src])).reshape(m.shape)),
+
+  # remove any RESHAPEs on KERNEL
+  (UPat(Ops.CALL, name="k"), lambda k: k.replace(src=tuple(x.src[0] if x.op is Ops.RESHAPE else x for x in k.src))),
+
+  # remove invalid writes
+  (UPat(Ops.STORE, src=(UPat(), UPat(Ops.CONST, arg=Invalid))), lambda: UOp(Ops.NOOP)),
+  (UPat(Ops.AFTER, name="x"), remove_noop_afters),
+])
+
+# *****************
+# 5. split into kernels
+
+@dataclass
+class LocalAddBufferContext:
+  dg:int = 0
+  map:dict = field(default_factory=dict)
+  range:int = 0
+
+def debuf(ctx:LocalAddBufferContext, buf:UOp):
+  param = UOp(Ops.PARAM, arg=ParamArg(ctx.dg, buf.dtype, prod(buf.max_shape), addrspace=buf.addrspace, device=buf.device))
+  ret = param.reshape(buf.max_shape)
+  # if the buffer has symbolic shape, shrink the max-sized view to the actual shape
+  if buf.max_shape != buf.shape: ret = ret.shrink(tuple((0, s) for s in buf.shape))
+  if buf not in ctx.map: ctx.map[buf] = buf
+  ctx.dg += 1
+  return ret
+
+def handle_after(ctx:LocalAddBufferContext, after:UOp):
+  if after.addrspace == AddrSpace.LOCAL: return None
+  buf = after.buf_uop
+  # NOTE: this is bottom up, so we only add it once
+  if buf not in ctx.map: ctx.map[buf] = after
+  return buf
+
+def renumber_range(ctx:LocalAddBufferContext, r:UOp):
+  if r.tag != (): return None
+  ret = r.replace(arg=(r.axis_type, ctx.range)+r.axis_id[1:], tag=None)
+  ctx.range += 1
+  return ret
+
+def check_buf_states(x:UOp):
+  idxs = [s for s in x.toposort(gate=lambda x: x.op is not Ops.AFTER) if s.op is Ops.INDEX]
+  read_from: dict[UOp, UOp] = {}
+  if any((buf:=idx.buf_uop).op in {Ops.BUFFER, Ops.ALLOC, Ops.PARAM} and read_from.setdefault(buf, state:=idx.src[0]) is not state for idx in idxs):
+    raise RuntimeError(f"cycle detected while indexing {buf}")
+
+to_define_global = PatternMatcher([
+  (UPat(Ops.STORE, name="x"), check_buf_states),
+  (UPat((Ops.BUFFER, Ops.ALLOC, Ops.MSTACK, Ops.MSELECT), name="buf"), debuf),
+  # Only storage parameters get kernel-local slots; scalar parameters retain their enclosing call's slots.
+  (UPat(Ops.PARAM, name="buf"), lambda ctx, buf:
+   None if buf.tag != () or buf.addrspace is AddrSpace.ALU else debuf(ctx, buf)),
+
+  # ALU params are scalar symbolic values, not buffers.
+  (UPat(Ops.INDEX, src=(UPat(Ops.PARAM, name="v"),)), lambda v: v if v.addrspace == AddrSpace.ALU else None),
+
+  (UPat(Ops.AFTER, name="after"), handle_after),
+
+  # remove device from local BUFFERIZE
+  (UPat(Ops.STAGE, name="b"), lambda b: b.replace(arg=replace(b.arg, device=None))),
+
+  # renumber the ranges starting with 0 so that kernel deduping works
+  (UPat(Ops.RANGE, name="r"), renumber_range),
+])
+
+pm_add_param_range_tags = PatternMatcher([
+  # Scalar parameters keep their identity across the call boundary.
+  (UPat((Ops.PARAM, Ops.RANGE), name="x"), lambda x: None if x.op is Ops.PARAM and x.addrspace is AddrSpace.ALU else x.rtag(())),
+])
+
+def split_store(x:UOp) -> UOp|None:
+  # if we have any open ranges here, we don't split. open DEVICE ranges are fine, they are bound per device at launch
+  if any(r.axis_type is not AxisType.DEVICE for r in x.ranges): return None
+
+  # local kernel rewrite
+  lctx = LocalAddBufferContext()
+  ret = graph_rewrite(x, to_define_global+pm_flatten_range, ctx=lctx, name="kernel split", bottom_up=True)
+
+  # create the Kernel. NOTE: buffers can be on different devices here now, they are compiled to SDMA copies later by schedule
+  return ret.sink(arg=KernelInfo()).call(*lctx.map.values())
+
+split_kernels = PatternMatcher([
+  (UPat((Ops.STORE, Ops.END), name="x"), split_store),
+])
+
+@rewrite_group(new_ctx=False)
+def get_kernel_graph(tsink:UOp) -> UOp:
+  # convert movement ops to ranges
+  tsink = run_rangeify(tsink, bool(DEBUG_RANGEIFY))
+
+  # cleanups for speed and runability
+  tsink = graph_rewrite(tsink,
+                        symbolic+pm_reduce_simplify+pm_const_buffer_folding+pm_remove_bufferize,
+                        name="symbolic+reduce_collapse+debuf")
+  next_range = max((x.axis_id[0] for x in tsink.toposort() if x.op is Ops.RANGE), default=-1) + 1
+  tsink = graph_rewrite(tsink, pm_limit_bufs, ctx=LimitBufsContext(range_idx=itertools.count(next_range)), name="limit buffers")
+  if VIZ: graph_rewrite(tsink, PatternMatcher([]), name="View Rangeify")
+
+  # bufferize -> store
+  slots = [x.arg.slot for x in tsink.toposort() if x.op is Ops.ALLOC]
+  paramarg_start: int = max([-1]+slots) + 1
+  tsink = graph_rewrite(tsink, pm_add_buffers+pm_add_param_range_tags, ctx=itertools.count(paramarg_start), bottom_up=True, name="stage to store")
+  tsink = graph_rewrite(tsink, split_kernels, bottom_up=True, name="split kernels")
+  tsink = graph_rewrite(tsink, pm_no_indexing_calls, name="remove indexing from call args")
+  tsink = graph_rewrite(tsink, pm_no_views, name="remove views from the kernel graph")
+
+  if VIZ: graph_rewrite(tsink, PatternMatcher([]), name="View Kernel Graph")
+  if SPEC:
+    # validate the kernel graph
+    from tinygrad.uop.spec import type_verify, spec_kernel_graph
+    type_verify(tsink, spec_kernel_graph, enter_calls=False)
+  return tsink
+
+# inspired by https://github.com/karpathy/micrograd/blob/master/micrograd/engine.py
+from __future__ import annotations
+import time, functools, sys, inspect, pathlib, hashlib, weakref
+from typing import Any, Callable, cast, get_args, ParamSpec, TypeVar, Generic, TYPE_CHECKING
+if TYPE_CHECKING: import numpy
+from tinygrad.dtype import DType, DTypeLike, dtypes, ConstType, least_upper_dtype, to_dtype, _from_np_dtype, _to_np_dtype, PyConst
+from tinygrad.helpers import all_int, getenv, fetch, Metadata, TRACEMETA, TracingKey, is_numpy_ndarray, prod
+from tinygrad.helpers import cpu_profile, suppress_finalizing, disable_gc, VIZ
+from tinygrad.uop.ops import UOp, Ops, sint, all_metadata, Variable, ConstLike, PatternMatcher, GroupOp, graph_rewrite, rewrite_group, pm_drop_after
+from tinygrad.mixin.rand import RandMixin
+from tinygrad.schedule import create_linear_with_vars, contiguous_mops_to_view, is_store_after
+from tinygrad.device import Buffer, canonicalize_device, is_disk_device
+from tinygrad.engine.realize import run_linear
+
+# *** all in scope Tensors are here. this gets relevant UOps ***
+
+all_tensors: dict[weakref.ref[Tensor], None] = {}
+def _apply_map_to_tensors(applied_map:dict[UOp, UOp], name:str) -> None:
+  with cpu_profile(TracingKey(name), "TINY"):
+    # get tensors in scope
+    in_scope: dict[UOp, bool] = {}
+    def visitor(node: UOp) -> bool: return True if node in applied_map else any(in_scope.get(s, False) for s in node.src)
+    scope_tensors: list[Tensor] = [t for tref in list(all_tensors) if (t:=tref()) is not None and t.uop.topovisit(visitor, in_scope)]
+
+    # get all Tensors and apply the map. always walk: replace exactly the nodes the map names, values are final
+    sink = UOp.sink(*[t.uop for t in scope_tensors])
+    new_sink = sink.substitute(applied_map, name=f"su

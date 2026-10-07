@@ -1,0 +1,2721 @@
+self.qmd = QMD(dev)
+    self.qmd.write(**qmd, qmd_group_id=0x3f, invalidate_texture_header_cache=1, invalidate_texture_sampler_cache=1,
+      invalidate_texture_data_cache=1, invalidate_shader_data_cache=1, api_visible_call_limit=1, sampler_index=1, barrier_count=1,
+      cwd_membar_type=nv_gpu.NVC6C0_QMDV03_00_CWD_MEMBAR_TYPE_L1_SYSMEMBAR, constant_buffer_invalidate_0=1, min_sm_config_shared_mem_size=smem_cfg,
+      target_sm_config_shared_mem_size=smem_cfg, max_sm_config_shared_mem_size=0x1a, program_prefetch_size=min(prog_sz>>8, 0x1ff),
+      sass_version=dev.sass_version)
+    for i,(_,sz) in self.constbufs.items(): self.qmd.write(**{f'constant_buffer_size_shifted4_{i}': sz, f'constant_buffer_valid_{i}': 1})
+
+    # Registers allocation granularity per warp is 256, warp allocation granularity is 4. Register file size is 65536.
+    self.max_threads = ((65536 // round_up(max(1, regs) * 32, 256)) // 4) * 4 * 32
+
+  def _parse_elf_info(self, sh, start_off=0):
+    while start_off < sh.header.sh_size:
+      typ, param, sz = struct.unpack_from("BBH", sh.content, start_off)
+      yield typ, param, sh.content[start_off+4:start_off+sz+4] if typ == 0x4 else sz
+      start_off += (sz if typ == 0x4 else 0) + 4
+
+_nv_program_cache:dict[tuple[bytes, tuple[str, ...]], tuple[NVProgramData, UOp]] = {}
+def nv_build_program(dev:NVDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[NVProgramData, UOp]:
+  if (cached:=_nv_program_cache.get(key:=(prg.src[3].arg, devs))) is None:
+    data = NVProgramData(dev, prg.to_elf())
+    buf = UOp.alloc((len(data.image),), dtypes.uint8, next(UOp.unique_num), device=devs[0]).rtag("program")
+    rows = [(off, ((buf.getaddr(devs) + sym) >> sh).ccast(dt)) for off, sym, dt, sh in data.relocs]
+    cached = _nv_program_cache[key] = (data, patch(buf, rows, data.image))
+  return cached
+
+class NVAllocator(Allocator['NVDevice']):
+  def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
+    return self.dev.iface.alloc(size, cpu_access=options.cpu_access, host=options.host)
+
+  def _free(self, storage:BufferStorage, options:BufferSpec):
+    self.dev.synchronize()
+    self.dev.iface.free(storage)
+  def _map(self, buf:Buffer) -> BufferStorage: return self.dev.iface.map(buf)
+  def _unmap(self, mapping:BufferStorage): self.dev.iface.unmap(mapping)
+  def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
+
+# *****************
+# device
+
+@dataclass
+class GPFifo: ring: Buffer; gpput: Buffer; doorbell: Buffer; put_value: Buffer; notifier: Buffer; entries: int; token: int # noqa: E702
+
+class NVKIface:
+  root = None
+  fd_ctl: FileIOInterface
+  fd_uvm: FileIOInterface
+  count: int
+  gpus_info: list|ctypes.Array = []
+
+  # TODO: Need a proper allocator for va addresses
+  # 0x1000000000 - 0x2000000000, reserved for system/cpu mappings
+  # VA space is 48bits.
+  low_uvm_vaddr_allocator: BumpAllocator = BumpAllocator(size=0x1000000000, base=0x8000000000 if OSX else 0x1000000000, wrap=False)
+  uvm_vaddr_allocator: BumpAllocator = BumpAllocator(size=(1 << 48) - 1, base=low_uvm_vaddr_allocator.base + low_uvm_vaddr_allocator.size, wrap=False)
+  host_object_enumerator: int = 0x1000
+
+  def __init__(self, dev, device_id):
+    if NVKIface.root is None:
+      global nv_gpu
+
+      NVKIface.fd_ctl = FileIOInterface("/dev/nvidiactl", os.O_RDWR | os.O_CLOEXEC)
+      NVKIface.fd_uvm = FileIOInterface("/dev/nvidia-uvm", os.O_RDWR | os.O_CLOEXEC)
+      self.fd_uvm_2 = FileIOInterface("/dev/nvidia-uvm", os.O_RDWR | os.O_CLOEXEC)
+      NVKIface.root = self.rm_alloc(0, nv_gpu.NV01_ROOT_CLIENT, None, root=0)
+
+      drvver = self.rm_control(self.root, nv_gpu.NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION_V2, nv_gpu.NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_V2_PARAMS())
+      if int(drvver.driverVersionBuffer.decode().split('.')[0], 10) >= 610: nv_gpu = nv_610
+      elif int(drvver.driverVersionBuffer.decode().split('.')[0], 10) >= 580: nv_gpu = nv_580
+
+      self.uvm(nv_gpu.UVM_INITIALIZE, nv_gpu.UVM_INITIALIZE_PARAMS())
+
+      # this error is okay, CUDA hits it too
+      with contextlib.suppress(RuntimeError): self.uvm(nv_gpu.UVM_MM_INITIALIZE, nv_gpu.UVM_MM_INITIALIZE_PARAMS(uvmFd=self.fd_uvm.fd), self.fd_uvm_2)
+
+      nv_iowr(NVKIface.fd_ctl, nv_gpu.NV_ESC_CARD_INFO, gpus_info:=(nv_gpu.nv_ioctl_card_info_t*64)())
+      NVKIface.gpus_info = filter_visible_devices([gi for gi in gpus_info if gi.valid], "NV")
+      NVKIface.count = len(NVKIface.gpus_info)
+
+    self.dev, self.device_id = dev, device_id
+    if self.device_id >= len(NVKIface.gpus_info) or not NVKIface.gpus_info[self.device_id].valid:
+      raise RuntimeError(f"No device found for {device_id}. Requesting more devices than the system has?")
+
+    self.fd_dev = self._new_gpu_fd()
+    self.gpu_info = self.rm_control(self.root, nv_gpu.NV0000_CTRL_CMD_GPU_GET_ID_INFO_V2,
+      nv_gpu.NV0000_CTRL_GPU_GET_ID_INFO_V2_PARAMS(gpuId=NVKIface.gpus_info[self.device_id].gpu_id))
+    self.gpu_minor = NVKIface.gpus_info[self.device_id].minor_number
+    self.gpu_instance = self.gpu_info.deviceInstance
+
+  def rm_alloc(self, parent, clss, params=None, root=None) -> int:
+    nv_iowr(self.fd_ctl, nv_gpu.NV_ESC_RM_ALLOC, made:=nv_gpu.NVOS21_PARAMETERS(hRoot=root if root is not None else self.root,
+      hObjectParent=parent, hClass=clss, pAllocParms=ctypes.cast(ctypes.byref(params), ctypes.c_void_p) if params is not None else None))
+    if made.status == nv_gpu.NV_ERR_NO_MEMORY: raise MemoryError(f"rm_alloc returned {get_error_str(made.status)}")
+    if made.status != 0: raise RuntimeError(f"rm_alloc returned {get_error_str(made.status)}")
+    return made.hObjectNew
+
+  def rm_control(self, obj, cmd, params=None, **kwargs):
+    nv_iowr(self.fd_ctl, nv_gpu.NV_ESC_RM_CONTROL, made:=nv_gpu.NVOS54_PARAMETERS(hClient=self.root, hObject=obj, cmd=cmd,
+      paramsSize=ctypes.sizeof(params) if params is not None else 0,
+      params=ctypes.cast(ctypes.byref(params), ctypes.c_void_p) if params is not None else None))
+    if made.status != 0: raise RuntimeError(f"rm_control returned {get_error_str(made.status)}")
+    return params
+
+  def uvm(self, cmd, params, fd=None):
+    nv_iowr(fd or self.fd_uvm, None, params, cmd=cmd)
+    if params.rmStatus != 0: raise RuntimeError(f"uvm returned {get_error_str(params.rmStatus)}")
+
+  def setup_usermode(self):
+    clsnum = self.rm_control(self.dev.nvdevice, nv_gpu.NV0080_CTRL_CMD_GPU_GET_CLASSLIST, nv_gpu.NV0080_CTRL_GPU_GET_CLASSLIST_PARAMS(numClasses=0))
+    clsinfo = self.rm_control(self.dev.nvdevice, nv_gpu.NV0080_CTRL_CMD_GPU_GET_CLASSLIST, nv_gpu.NV0080_CTRL_GPU_GET_CLASSLIST_PARAMS(
+      numClasses=clsnum.numClasses, classList=mv_address(classlist:=memoryview(bytearray(clsnum.numClasses * 4)).cast('I'))))
+    self.nvclasses = {classlist[i] for i in range(clsinfo.numClasses)}
+    self.usermode_class:int = next(c for c in [nv_gpu.HOPPER_USERMODE_A, nv_gpu.TURING_USERMODE_A] if c in self.nvclasses)
+    self.gpfifo_class:int = next(c for c in [nv_gpu.BLACKWELL_CHANNEL_GPFIFO_A, nv_gpu.AMPERE_CHANNEL_GPFIFO_A] if c in self.nvclasses)
+    self.compute_class:int = next(c for c in [nv_gpu.BLACKWELL_COMPUTE_B, nv_gpu.ADA_COMPUTE_A, nv_gpu.AMPERE_COMPUTE_B] if c in self.nvclasses)
+    self.dma_class:int = next(c for c in [nv_gpu.BLACKWELL_DMA_COPY_B, nv_gpu.AMPERE_DMA_COPY_B] if c in self.nvclasses)
+    self.viddec_class:int|None = next((c for c in [nv_gpu.NVCFB0_VIDEO_DECODER, nv_gpu.NVC9B0_VIDEO_DECODER] if c in self.nvclasses), None)
+
+    usermode = self.rm_alloc(self.dev.subdevice, self.usermode_class)
+    return usermode, MMIOInterface(self._gpu_map_to_cpu(usermode, mmio_sz:=0x10000), mmio_sz, fmt='I')
+
+  def setup_vm(self, vaspace):
+    self.rm_control(self.dev.subdevice, nv_gpu.NV2080_CTRL_CMD_GPU_GET_GID_INFO, raw_uuid:=nv_gpu.NV2080_CTRL_GPU_GET_GID_INFO_PARAMS(
+      flags=nv_gpu.NV2080_GPU_CMD_GPU_GET_GID_FLAGS_FORMAT_BINARY, length=16))
+    self.gpu_uuid = nv_gpu.struct_nv_uuid(uuid=(ctypes.c_ubyte*16)(*[raw_uuid.data[i] for i in range(16)]))
+
+    self.uvm(nv_gpu.UVM_REGISTER_GPU, nv_gpu.UVM_REGISTER_GPU_PARAMS(rmCtrlFd=-1, gpu_uuid=self.gpu_uuid))
+    self.uvm(nv_gpu.UVM_REGISTER_GPU_VASPACE, nv_gpu.UVM_REGISTER_GPU_VASPACE_PARAMS(
+      gpuUuid=self.gpu_uuid, rmCtrlFd=self.fd_ctl.fd, hClient=self.root, hVaSpace=vaspace))
+
+    for dev in [d for x in Device._opened_devices if isinstance(d:=Device[x], NVDevice) and not d.is_nvd()]:
+      try: self.uvm(nv_gpu.UVM_ENABLE_PEER_ACCESS, nv_gpu.UVM_ENABLE_PEER_ACCESS_PARAMS(gpuUuidA=self.gpu_uuid, gpuUuidB=dev.iface.gpu_uuid))
+      except RuntimeError as e: raise RuntimeError(f"{e}. Make sure GPUs #{self.gpu_minor} & #{dev.iface.gpu_minor} have P2P enabled.") from e
+
+  def setup_gpfifo_vm(self, gpfifo):
+    self.uvm(nv_gpu.UVM_REGISTER_CHANNEL, nv_gpu.UVM_REGISTER_CHANNEL_PARAMS(gpuUuid=self.gpu_uuid, rmCtrlFd=self.fd_ctl.fd, hClient=self.root,
+      hChannel=gpfifo, base=self._alloc_gpu_vaddr(0x4000000, force_low=True), length=0x4000000))
+
+  def _new_gpu_fd(self):
+    fd_dev = FileIOInterface(f"/dev/nvidia{NVKIface.gpus_info[self.device_id].minor_number}", os.O_RDWR | os.O_CLOEXEC)
+    nv_iowr(fd_dev, nv_gpu.NV_ESC_REGISTER_FD, nv_gpu.nv_ioctl_register_fd_t(ctl_fd=self.fd_ctl.fd))
+    return fd_dev
+
+  def _gpu_map_to_cpu(self, memory_handle, size, target=None, flags=0, system=False):
+    fd_dev = self._new_gpu_fd() if not system else FileIOInterface("/dev/nvidiactl", os.O_RDWR | os.O_CLOEXEC)
+    made = nv_gpu.nv_ioctl_nvos33_parameters_with_fd(fd=fd_dev.fd,
+      params=nv_gpu.NVOS33_PARAMETERS(hClient=self.root, hDevice=self.dev.nvdevice, hMemory=memory_handle, length=size, flags=flags))
+    nv_iowr(self.fd_ctl, nv_gpu.NV_ESC_RM_MAP_MEMORY, made)
+    if made.params.status != 0: raise RuntimeError(f"_gpu_map_to_cpu returned {get_error_str(made.params.status)}")
+    return fd_dev.mmap(target, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED | (MAP_FIXED if target is not None else 0), 0)
+
+  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, map_flags=0, cpu_addr=None, **kwargs) -> BufferStorage:
+    # Uncached memory is "system". Use huge pages only for gpu memory.
+    page_size = mmap.PAGESIZE if uncached or host else ((2 << 20) if size >= (8 << 20) else (mmap.PAGESIZE if isinstance(self, MOCKIface) else
+                                                                                             4 << 10))
+    size = round_up(size, page_size)
+    va_addr = self._alloc_gpu_vaddr(size, alignment=page_size, force_low=cpu_access) if (alloced:=cpu_addr is None) else cpu_addr
+
+    if host:
+      if alloced: va_addr = FileIOInterface.anon_mmap(va_addr, size, mmap.PROT_READ|mmap.PROT_WRITE, MAP_FIXED|mmap.MAP_SHARED|mmap.MAP_ANONYMOUS, 0)
+
+      flags = (nv_gpu.NVOS02_FLAGS_PHYSICALITY_NONCONTIGUOUS << 4) | (nv_gpu.NVOS02_FLAGS_COHERENCY_CACHED << 12) \
+            | (nv_gpu.NVOS02_FLAGS_MAPPING_NO_MAP << 30)
+
+      NVKIface.host_object_enumerator += 1
+      made = nv_gpu.nv_ioctl_nvos02_parameters_with_fd(params=nv_gpu.NVOS02_PARAMETERS(hRoot=self.root, hObjectParent=self.dev.nvdevice, flags=flags,
+        hObjectNew=NVKIface.host_object_enumerator, hClass=nv_gpu.NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, pMemory=va_addr, limit=size-1), fd=-1)
+      nv_iowr(self.fd_dev, nv_gpu.NV_ESC_RM_ALLOC_MEMORY, made)
+
+      if made.params.status != 0: raise RuntimeError(f"host alloc returned {get_error_str(made.params.status)}")
+      mem_handle = made.params.hObjectNew
+    else:
+      attr = ((nv_gpu.NVOS32_ATTR_PHYSICALITY_CONTIGUOUS if contiguous else nv_gpu.NVOS32_ATTR_PHYSICALITY_ALLOW_NONCONTIGUOUS) << 27) \
+          | (nv_gpu.NVOS32_ATTR_PAGE_SIZE_HUGE if page_size > 0x1000 else 0) << 23 | ((nv_gpu.NVOS32_ATTR_LOCATION_PCI if uncached else 0) << 25)
+
+      attr2 = ((nv_gpu.NVOS32_ATTR2_GPU_CACHEABLE_NO if uncached else nv_gpu.NVOS32_ATTR2_GPU_CACHEABLE_YES) << 2) \
+            | ((nv_gpu.NVOS32_ATTR2_PAGE_SIZE_HUGE_2MB if page_size > 0x1000 else 0) << 20) | nv_gpu.NVOS32_ATTR2_ZBC_PREFER_NO_ZBC \
+            | ((nv_gpu.NVOS32_ATTR2_PROTECTION_USER_READ_ONLY << 22) if kwargs.get('read_only') else 0)
+
+      fl = nv_gpu.NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED | nv_gpu.NVOS32_ALLOC_FLAGS_MEMORY_HANDLE_PROVIDED | nv_gpu.NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE \
+         | nv_gpu.NVOS32_ALLOC_FLAGS_IGNORE_BANK_PLACEMENT | (nv_gpu.NVOS32_ALLOC_FLAGS_PERSISTENT_VIDMEM if not uncached else 0)
+
+      alloc_func = nv_gpu.NV1_MEMORY_SYSTEM if uncached else nv_gpu.NV1_MEMORY_USER
+      alloc_params = nv_gpu.NV_MEMORY_ALLOCATION_PARAMS(owner=self.root, alignment=page_size, offset=0, limit=size-1, format=6, size=size,
+        type=nv_gpu.NVOS32_TYPE_NOTIFIER if uncached else nv_gpu.NVOS32_TYPE_IMAGE, attr=attr, attr2=attr2, flags=fl)
+      mem_handle = self.rm_alloc(self.dev.nvdevice, alloc_func, alloc_params)
+
+      if cpu_access: va_addr = self._gpu_map_to_cpu(mem_handle, size, target=va_addr, flags=map_flags, system=uncached)
+
+    return self._gpu_uvm_map(va_addr, size, mem_handle, has_cpu_mapping=cpu_access or host)
+
+  def free(self, storage:BufferStorage):
+    mem = storage.meta
+    if mem.hMemory > NVKIface.host_object_enumerator: # not a host object, clear phys mem.
+      made = nv_gpu.NVOS00_PARAMETERS(hRoot=self.root, hObjectParent=self.dev.nvdevice, hObjectOld=mem.hMemory)
+      nv_iowr(self.fd_ctl, nv_gpu.NV_ESC_RM_FREE, made)
+      if made.status != 0: raise RuntimeError(f"_gpu_free returned {get_error_str(made.status)}")
+    self.uvm(nv_gpu.UVM_FREE, nv_gpu.UVM_FREE_PARAMS(base=storage.buf, length=mem.length))
+    if storage.host is not None: FileIOInterface.munmap(storage.buf, mem.length)
+
+  def unmap(self, mapping:BufferStorage):
+    mem, owns_range = mapping.meta
+    if owns_range: self.uvm(nv_gpu.UVM_FREE, nv_gpu.UVM_FREE_PARAMS(base=mapping.buf, length=mem.length))
+
+  def _gpu_uvm_map(self, va_base, size, mem_handle, create_range=True, has_cpu_mapping=False) -> BufferStorage:
+    if create_range:
+      self.uvm(nv_gpu.UVM_CREATE_EXTERNAL_RANGE, nv_gpu.UVM_CREATE_EXTERNAL_RANGE_PARAMS(base=va_base, length=size))
+      made = nv_gpu.NVOS46_PARAMETERS(hClient=self.root, hDevice=self.dev.nvdevice, hDma=self.dev.virtmem, hMemory=mem_handle, length=size,
+        flags=(nv_gpu.NVOS46_FLAGS_PAGE_SIZE_4KB<<8)|(nv_gpu.NVOS46_FLAGS_CACHE_SNOOP_ENABLE<<4)|(nv_gpu.NVOS46_FLAGS_DMA_OFFSET_FIXED_TRUE<<15),
+        dmaOffset=va_base)
+      nv_iowr(self.fd_ctl, nv_gpu.NV_ESC_RM_MAP_MEMORY_DMA, made)
+      if made.status != 0: raise RuntimeError(f"nv_sys_alloc 1 returned {get_error_str(made.status)}")
+      assert made.dmaOffset == va_base, f"made.dmaOffset != va_base {made.dmaOffset=} {va_base=}"
+
+    attrs = (nv_gpu.UvmGpuMappingAttributes*256)(nv_gpu.UvmGpuMappingAttributes(gpuUuid=self.gpu_uuid, gpuMappingType=1))
+
+    self.uvm(nv_gpu.UVM_MAP_EXTERNAL_ALLOCATION, uvm_map:=nv_gpu.UVM_MAP_EXTERNAL_ALLOCATION_PARAMS(base=va_base, length=size,
+      rmCtrlFd=self.fd_ctl.fd, hClient=self.root, hMemory=mem_handle, gpuAttributesCount=1, perGpuAttributes=attrs, mapped_gpu_ids=[self.gpu_uuid]))
+    return BufferStorage(va_base, uvm_map, MMIOInterface(va_base, size, fmt='B') if has_cpu_mapping else None)
+
+  def map(self, buf:Buffer) -> BufferStorage:
+    mem = buf.meta
+    if buf.device.split(":")[0] in {"CPU", "PYTHON", "NPY"}:
+      if buf._buf % 0x1000: raise RuntimeError("Host mapping requires a page-aligned address")
+      if (mem:=next((m.meta[0] for d, m in buf.get_storage().maps.items() if d.device.startswith("NV")), None)) is None:
+        return replace(mem:=self.alloc(buf.nbytes, host=True, cpu_addr=buf._buf), meta=(mem.meta, True))
+    elif buf.device.split(":")[0] != "NV": raise RuntimeError(f"Cannot map {buf.device} on {self.dev.device}")
+    return replace(mapping:=self._gpu_uvm_map(buf._buf, mem.length, mem.hMemory, create_range=False), meta=(mapping.meta, False))
+
+  def _alloc_gpu_vaddr(self, size, alignment=(4 << 10), force_low=False):
+    return NVKIface.low_uvm_vaddr_allocator.alloc(size, alignment) if force_low else NVKIface.uvm_vaddr_allocator.alloc(size, alignment)
+
+  def sleep(self, tm:int): pass
+
+class PCIIface(PCIIfaceBase):
+  def __init__(self, dev, dev_id):
+    # PCIIface's MAP_FIXED mmap will overwrite UVM allocations made by NVKIface, so don't try PCIIface if kernel driver was already used.
+    if NVKIface.root is not None: raise RuntimeError("Cannot use PCIIface after NVKIface has been initialized (would corrupt UVM memory)")
+    super().__init__(dev, dev_id, vendor=0x10de, devices=((0xff00, (0x2200,0x2400,0x2500,0x2600,0x2700,0x2800,0x2b00,0x2c00,0x2d00,0x2f00)),),
+      base_class=0x03, vram_bar=1, va_start=NVMemoryManager.va_allocator.base, va_size=NVMemoryManager.va_allocator.size, dev_impl_t=NVDev)
+
+    self.root, self.gpu_instance = 0xc1000000, 0
+    self.rm_alloc(0, nv_gpu.NV01_ROOT, nv_gpu.NV0000_ALLOC_PARAMETERS())
+
+    # Setup classes for the GPU
+    self.gpfifo_class, self.compute_class, self.dma_class = (gsp:=self.dev_impl.gsp).gpfifo_class, gsp.compute_class, gsp.dma_class
+    self.viddec_class = gsp.viddec_class
+
+  def setup_usermode(self): return 0xce000000, self.pci_dev.map_bar(bar=0, fmt='I', off=0xbb0000, size=0x10000)
+  def setup_vm(self, vaspace): pass
+  def setup_gpfifo_vm(self, gpfifo): pass
+
+  def rm_alloc(self, parent, clss, params=None, root=None) -> int: return self.dev_impl.gsp.rpc_rm_alloc(parent, clss, params, self.root)
+  def rm_control(self, obj, cmd, params=None, **kwargs): return self.dev_impl.gsp.rpc_rm_control(obj, cmd, params, self.root, **kwargs)
+
+  def device_fini(self): self.dev_impl.fini()
+
+  def sleep(self, timeout):
+    for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
+    if self.dev_impl.is_err_state: raise RuntimeError("Device fault detected")
+
+class MOCKIface(NVKIface): count = 1
+
+class NVDevice(Compiled):
+  ifaces = [NVKIface, PCIIface, MOCKIface]
+  sleep_timeout_ms = 200
+  pm_encode = PatternMatcher([
+    (UPat(Ops.CALL, src=(UPat.custom_function("submit_nv_compute"), UPat()), name="s"), lambda s: NVComputeQueue(s).encode()),
+    (UPat(Ops.CALL, src=(UPat.custom_function("submit_nv_copy"), UPat()), name="s"), lambda s: NVCopyQueue(s).encode()),
+    (UPat(Ops.CALL, src=(UPat.custom_function("submit_nv_encdec"), UPat()), name="s"), lambda s: NVEncDecQueue(s).encode()),
+    (UPat(Ops.CALL, src=(UPat.custom_function("submit_nv_raw"), UPat()), name="s"), lambda s: NVQueue(s).encode()),
+  ])
+
+  def is_nvd(self) -> bool: return isinstance(self.iface, PCIIface)
+
+  def __init__(self, device:str=""):
+    self.iface = self._select_iface(device)
+
+    device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(deviceId=self.iface.gpu_instance, hClientShare=self.iface.root,
+                                                   vaMode=nv_gpu.NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES)
+    self.nvdevice = self.iface.rm_alloc(self.iface.root, nv_gpu.NV01_DEVICE_0, device_params)
+    self.subdevice = self.iface.rm_alloc(self.nvdevice, nv_gpu.NV20_SUBDEVICE_0, nv_gpu.NV2080_ALLOC_PARAMETERS())
+    self.virtmem = self.iface.rm_alloc(self.nvdevice, nv_gpu.NV01_MEMORY_VIRTUAL, nv_gpu.NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS(limit=0x1ffffffffffff))
+    self.usermode, self.gpu_mmio = self.iface.setup_usermode()
+
+    self.iface.rm_control(self.subdevice, nv_gpu.NV2080_CTRL_CMD_PERF_BOOST, nv_gpu.NV2080_CTRL_PERF_BOOST_PARAMS(duration=0xffffffff,
+      flags=((nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_YES << 4) | (nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_PRIORITY_HIGH << 6) | \
+             (nv_gpu.NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX))))
+
+    vaspace_params = nv_gpu.NV_VASPACE_ALLOCATION_PARAMETERS(vaBase=0x1000, vaSize=0x1fffffb000000,
+      flags=nv_gpu.NV_VASPACE_ALLOCATION_FLAGS_ENABLE_PAGE_FAULTING | nv_gpu.NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED)
+    self.vaspace = vaspace = self.iface.rm_alloc(self.nvdevice, nv_gpu.FERMI_VASPACE_A, vaspace_params)
+
+    self.iface.setup_vm(vaspace)
+
+    channel_params = nv_gpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS(engineType=nv_gpu.NV2080_ENGINE_TYPE_GRAPHICS)
+    self.channel_group = self.iface.rm_alloc(self.nvdevice, nv_gpu.KEPLER_CHANNEL_GROUP_A, channel_params)
+
+    self.ctxshare = self.iface.rm_alloc(self.channel_group, nv_gpu.FERMI_CONTEXT_SHARE_A,
+      nv_gpu.NV_CTXSHARE_ALLOCATION_PARAMETERS(hVASpace=vaspace, flags=nv_gpu.NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC))
+
+    self.num_gpcs, self.num_tpc_per_gpc, self.num_sm_per_tpc, self.max_warps_per_sm, self.sm_version = self._query_gpu_info('num_gpcs',
+      'num_tpc_per_gpc', 'num_sm_per_tpc', 'max_warps_per_sm', 'sm_version')
+
+    # FIXME: no idea how to convert this for blackwells
+    self.arch: str = "sm_120" if self.sm_version==0xa04 else f"sm_{(self.sm_version>>8)&0xff}{(val>>4) if (val:=self.sm_version&0xff) > 0xf else val}"
+    self.sass_version = ((self.sm_version & 0xf00) >> 4) | (self.sm_version & 0xf)
+
+    self.slm_per_thread = 0
+    self.shader_local_mem:Buffer|None = None
+    # Set windows addresses to not collide with other allocated buffers.
+    self.shared_mem_window, self.local_mem_window = 0x729400000000, 0x729300000000
+
+    super().__init__(device, NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer], None, arch=self.arch)
+
+    self.pma_enabled, self.pma_exec_counter = PMA.value > 0 and PROFILE >= 1, itertools.count(0)
+
+  @functools.cached_property
+  def fifos(self) -> dict[str, GPFifo]:
+    mem = self.iface.alloc(3<<20, contiguous=True, cpu_access=True, force_devmem=True, map_flags=nv_gpu.NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED<<23)
+    self.gpfifo_buf = Buffer(self.device, 3<<20, dtypes.uint8, opaque=mem)
+
+    compute = self._new_gpu_fifo("COMPUTE:0", self.ctxshare, self.channel_group, offset=0, entries=0x10000, compute=True)
+    copy = self._new_gpu_fifo("COPY:0", self.ctxshare, self.channel_group, offset=0x100000, entries=0x10000)
+    self.iface.rm_control(self.channel_group, nv_gpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
+    self.fifos = {"COMPUTE:0": compute, "COPY:0": copy}
+
+    self._submit_cmds("COMPUTE:0", *nvm(1, nv_gpu.NVC6C0_SET_OBJECT, self.iface.compute_class),
+                       *nvm(1, nv_gpu.NVC6C0_SET_SHADER_LOCAL_MEMORY_WINDOW_A, *data64(self.local_mem_window)),
+                       *nvm(1, nv_gpu.NVC6C0_SET_SHADER_SHARED_MEMORY_WINDOW_A, *data64(self.shared_mem_window)))
+    self._submit_cmds("COPY:0", *nvm(4, nv_gpu.NVC6C0_SET_OBJECT, self.iface.dma_class))
+
+    if self.pma_enabled: self._prof_init() # the sampler binds to the channel group, so it only comes up once the channels do
+    return self.fifos
+
+  def _new_gpu_fifo(self, name:str, ctxshare, channel_group, offset=0, entries=0x400, compute=False, video=False) -> GPFifo:
+    notifier = Buffer(self.device, size:=48 << 20, dtypes.uint8, opaque=self.iface.alloc(size, uncached=True))
+    params = nv_gpu.NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS(gpFifoOffset=self.gpfifo_buf._buf+offset, gpFifoEntries=entries,
+      hObjectError=notifier.meta.hMemory, hObjectBuffer=self.virtmem if video else self.gpfifo_buf.meta.hMemory,
+      hUserdMemory=(ctypes.c_uint32*8)(self.gpfifo_buf.meta.hMemory), userdOffset=(ctypes.c_uint64*8)(entries*8+offset),
+      engineType=19 if video else 0, hContextShare=ctxshare,
+      hVASpace=self.vaspace if video and self.is_nvd() else 0) # gsp has no default vaspace, rm maps the decoder ctx into its own
+    gpfifo = self.iface.rm_alloc(channel_group, self.iface.gpfifo_class, params)
+
+    if compute:
+      self.debug_compute_obj, self.debug_channel = self.iface.rm_alloc(gpfifo, self.iface.compute_class), gpfifo
+      debugger_params = nv_gpu.NV83DE_ALLOC_PARAMETERS(hAppClient=self.iface.root, hClass3dObject=self.debug_compute_obj)
+      self.debugger = self.iface.rm_alloc(self.nvdevice, nv_gpu.GT200_DEBUGGER, debugger_params)
+    elif not video: self.iface.rm_alloc(gpfifo, self.iface.dma_class)
+    else: self.iface.rm_alloc(gpfifo, self.iface.viddec_class)
+
+    if channel_group == self.nvdevice:
+      self.iface.rm_control(gpfifo, nv_gpu.NVA06F_CTRL_CMD_BIND, nv_gpu.NVA06F_CTRL_BIND_PARAMS(engineType=params.engineType))
+      self.iface.rm_control(gpfifo, nv_gpu.NVA06F_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
+
+    ws_token_params = self.iface.rm_control(gpfifo, nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN,
+      nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS(workSubmitToken=-1))
+    if ctxshare != 0: self.iface.setup_gpfifo_vm(gpfifo)
+
+    gpput_off = offset + entries*8 + getattr(nv_gpu.AmpereAControlGPFifo, 'GPPut').offset
+    fifo = GPFifo(ring=self.gpfifo_buf.view(entries, dtypes.uint64, offset).ensure_allocated(),
+      gpput=self.gpfifo_buf.view(1, dtypes.uint32, gpput_off).ensure_allocated(),
+      doorbell=Buffer("CPU", 1, dtypes.uint32, options=BufferSpec(external_ptr=self.gpu_mmio.addr + 0x90), preallocate=True),
+      put_value=Buffer("CPU", 1, dtypes.uint64, initial_value=bytes(8)), notifier=notifier, entries=entries, token=ws_token_params.workSubmitToken)
+    Compiled.pm_bufferize += PatternMatcher([(UPat(Ops.ALLOC, tag=self.tag(n, name)), lambda b=getattr(fifo, n): b)
+                                             for n in ("ring", "gpput", "doorbell", "put_value")])
+    return fifo
+
+  def _query_gpu_info(self, *reqs):
+    nvrs = [getattr(nv_gpu,'NV2080_CTRL_GR_INFO_INDEX_'+r.upper(), getattr(nv_gpu,'NV2080_CTRL_GR_INFO_INDEX_LITTER_'+r.upper(), None)) for r in reqs]
+
+    if self.is_nvd():
+      x = self.iface.rm_control(self.subdevice, nv_gpu.NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_INFO,
+        nv_gpu.NV2080_CTRL_INTERNAL_STATIC_GR_GET_INFO_PARAMS())
+      return [x.engineInfo[0].infoList[nvr].data for nvr in nvrs]
+
+    infos = (nv_gpu.NV2080_CTRL_GR_INFO*len(nvrs))(*[nv_gpu.NV2080_CTRL_GR_INFO(index=nvr) for nvr in nvrs])
+    self.iface.rm_control(self.subdevice, nv_gpu.NV2080_CTRL_CMD_GR_GET_INFO,
+      nv_gpu.NV2080_CTRL_GR_GET_INFO_PARAMS(grInfoListSize=len(infos), grInfoList=ctypes.addressof(infos)))
+    return [x.data for x in infos]
+
+  def _submit_cmds(self, queue:str, *cmds:int): # channel setup uses the same runtime submit as kernels
+    tl = timeline(devs:=(self.device,))
+    value = tl.index(1).load()
+    submit = make_submit(
+      UOp(Ops.INS, arg=("wait", dtypes.void), src=(tl, value)),
+      UOp(Ops.INS, arg=("nv", dtypes.void), src=(UOp(Ops.BINARY, arg=array.array('I', cmds).tobytes()),)),
+      UOp(Ops.INS, arg=("store", dtypes.void), src=(tl, value + 1)), devs=devs, queue=queue, fn="submit_nv_raw")
+    call = UOp.sink(tl.after(submit).index(1).store(value + 1), arg=KernelInfo("nv_setup")).call(aux=HCQInfo(devs))
+    linear = lower_and_compile(UOp(Ops.LINEAR, src=(unwrap(lower_call(call)),)))
+    run_linear(hcq_link(linear, allow_cache=True), jit=True, update_stats=False, wait=True)
+
+  def _ensure_has_local_memory(self, required):
+    if self.slm_per_thread >= required: return
+
+    self.slm_per_thread = round_up(required, 32)
+    bytes_per_tpc = round_up(round_up(self.slm_per_thread * 32, 0x200) * self.max_warps_per_sm * self.num_sm_per_tpc, 0x8000)
+    self.shader_local_mem = Buffer(self.device, round_up(bytes_per_tpc*self.num_tpc_per_gpc*self.num_gpcs, 0x20000), dtypes.uint8,
+                                   options=BufferSpec(nolru=True), preallocate=True)
+
+    self._submit_cmds("COMPUTE:0", *nvm(1, nv_gpu.NVC6C0_SET_SHADER_LOCAL_MEMORY_A, *data64(self.shader_local_mem._buf)),
+                       *nvm(1, nv_gpu.NVC6C0_SET_SHADER_LOCAL_MEMORY_NON_THROTTLED_A, *data64(bytes_per_tpc), 0xff))
+
+  def _ensure_has_vid_hw(self, w, h):
+    if self.iface.viddec_class is None: raise RuntimeError(f"{self.device} Video decoder class not available.")
+
+    coloc_sz = round_up((round_up(h, 64) * round_up(h, 64)) + (round_up(w, 64) * round_up(h, 64) // 16), 2 << 20)
+    self.intra_top_off = round_up(h, 64) * (608 + 4864 + 152 + 2000)
+    intra_unk_size = ((2 << 20) if self.iface.viddec_class >= nv_gpu.NVCFB0_VIDEO_DECODER else 0)
+    self.intra_unk_off = (round_up(self.intra_top_off, 0x10000) + (64 << 10)) if intra_unk_size > 0 else None
+    filter_sz = round_up(round_up(self.intra_top_off, 0x10000) + (64 << 10) + intra_unk_size, 2 << 20)
+
+    def _vid_buf(sz): return Buffer(self.device, sz, dtypes.uint8, options=BufferSpec(nolru=True), initial_value=bytes(sz))
+    if "ENCDEC:0" not in self.fifos:
+      self.fifos["ENCDEC:0"] = self._new_gpu_fifo("ENCDEC:0", 0, self.nvdevice, offset=0x200000, entries=2048, video=True)
+      self.vid_coloc_buf, self.vid_filter_buf, self.vid_stat_buf = _vid_buf(coloc_sz), _vid_buf(filter_sz), _vid_buf(0x1000)
+      self._submit_cmds("ENCDEC:0", *nvm(4, nv_gpu.NVC6C0_SET_OBJECT, self.iface.viddec_class))
+    else:
+      if coloc_sz > self.vid_coloc_buf.nbytes: self.vid_coloc_buf = _vid_buf(coloc_sz)
+      if filter_sz > self.vid_filter_buf.nbytes: self.vid_filter_buf = _vid_buf(filter_sz)
+
+  def collect_prof(self):
+    # the pc samples of a whole batch come back as one stream, so they are reported against the first kernel of it
+    if self.pma_enabled and (ents:=list(self.prof_ents.values())) and (blob:=self._prof_readback()) is not None:
+      Compiled.profile_events.append(ProfilePMAEvent(self.device, str(ents[0].name), blob, next(self.pma_exec_counter), ents[0].profile_key))
+    super().collect_prof()
+
+  def invalidate_caches(self):
+    if self.is_nvd(): self.iface.rm_control(self.subdevice, nv_gpu.NV2080_CTRL_CMD_INTERNAL_BUS_FLUSH_WITH_SYSMEMBAR, None)
+    else:
+      self.iface.rm_control(self.subdevice, nv_gpu.NV2080_CTRL_CMD_FB_FLUSH_GPU_CACHE, nv_gpu.NV2080_CTRL_FB_FLUSH_GPU_CACHE_PARAMS(
+        flags=((nv_gpu.NV2080_CTRL_FB_FLUSH_GPU_CACHE_FLAGS_WRITE_BACK_YES << 2) | (nv_gpu.NV2080_CTRL_FB_FLUSH_GPU_CACHE_FLAGS_INVALIDATE_YES << 3) |
+              (nv_gpu.NV2080_CTRL_FB_FLUSH_GPU_CACHE_FLAGS_FLUSH_MODE_FULL_CACHE << 4))))
+
+  def on_device_hang(self):
+    # Prepare fault report.
+    # TODO: Restore the GPU using NV83DE_CTRL_CMD_CLEAR_ALL_SM_ERROR_STATES if needed.
+
+    report = []
+    sm_errors = self.iface.rm_control(self.debugger, nv_gpu.NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES,
+      nv_gpu.NV83DE_CTRL_DEBUG_READ_ALL_SM_ERROR_STATES_PARAMS(hTargetChannel=self.debug_channel, numSMsToRead=100))
+
+    if sm_errors.mmuFault.valid:
+      mmu = self.iface.rm_control(self.debugger, nv_gpu.NV83DE_CTRL_CMD_DEBUG_READ_MMU_FAULT_INFO,
+        nv_gpu.NV83DE_CTRL_DEBUG_READ_MMU_FAULT_INFO_PARAMS())
+      for i in range(mmu.count):
+        pfinfo = mmu.mmuFaultInfoList[i]
+        report += [f"MMU fault: 0x{pfinfo.faultAddress:X} | {NV_PFAULT_FAULT_TYPE[pfinfo.faultType]} | {NV_PFAULT_ACCESS_TYPE[pfinfo.accessType]}"]
+    else:
+      for i, e in enumerate(sm_errors.smErrorStateArray):
+        if e.hwwGlobalEsr or e.hwwWarpEsr: report += [f"SM {i} fault: esr={e.hwwGlobalEsr} warp_esr={e.hwwWarpEsr:#x} warp_pc={e.hwwWarpEsrPc64:#x}"]
+
+    raise RuntimeError("\n".join(report))
+
+  def _prof_init(self):
+    self.profiler = self.iface.rm_alloc(self.subdevice, nv_gpu.MAXWELL_PROFILER_DEVICE,
+      nv_gpu.NVB2CC_ALLOC_PARAMETERS(hClientTarget=self.iface.root, hContextTarget=self.channel_group))
+
+    power_params = nv_gpu.struct_NVB0CC_CTRL_POWER_REQUEST_FEATURES_PARAMS(controlMask=(nv_gpu.NVB0CC_CTRL_POWER_FEATURE_MASK_ELCG_DISABLE << 0) | \
+      (nv_gpu.NVB0CC_CTRL_POWER_FEATURE_MASK_BLCG_DISABLE << 2) | (nv_gpu.NVB0CC_CTRL_POWER_FEATURE_MASK_ELPG_DISABLE << 6) | \
+      (nv_gpu.NVB0CC_CTRL_POWER_FEATURE_MASK_IDLE_SLOWDOWN_DISABLE << 8) | (nv_gpu.NVB0CC_CTRL_POWER_FEATURE_MASK_VAT_DISABLE << 10))
+    self.iface.rm_control(self.profiler, nv_gpu.NVB0CC_CTRL_CMD_POWER_REQUEST_FEATURES, power_params)
+
+    self.pma_buf = Buffer(self.device, size:=getenv("PMA_BUFFER_SIZE", 512) << 20, dtypes.uint8,
+                          opaque=self.iface.alloc(size, host=True, uncached=True, cpu_cached=True, cpu_access=True))
+    self.pma_bytes = Buffer(self.device, size:=0x1000, dtypes.uint8,
+                            opaque=self.iface.alloc(size, uncached=True, cpu_cached=True, cpu_access=self.is_nvd(), read_only=True))
+    self.pma_rptr = 0
+
+    pma_stream = nv_gpu.struct_NVB0CC_CTRL_ALLOC_PMA_STREAM_PARAMS(hMemPmaBuffer=self.pma_buf.meta.hMemory,
+      pmaBufferSize=self.pma_buf.nbytes, hMemPmaBytesAvailable=self.pma_bytes.meta.hMemory, pmaBufferVA=self.pma_buf._buf)
+    self.iface.rm_control(self.profiler, nv_gpu.NVB0CC_CTRL_CMD_ALLOC_PMA_STREAM, pma_stream, extra=(self.pma_buf, self.pma_bytes))
+
+    self.iface.rm_control(self.profiler, nv_gpu.NVB0CC_CTRL_CMD_RESERVE_HWPM_LEGACY, nv_gpu.struct_NVB0CC_CTRL_RESERVE_HWPM_LEGACY_PARAMS(ctxsw=0))
+    self.iface.rm_control(self.profiler, nv_gpu.NVB0CC_CTRL_CMD_RESERVE_PM_AREA_PC_SAMPLER)
+    self.iface.rm_control(self.profiler, nv_gpu.NVB0CC_CTRL_CMD_BIND_PM_RESOURCES)
+
+    self._prof_setup_pc_sampling()
+
+  def _prof_setup_pc_sampling(self):
+    is_bw = self.iface.compute_class >= nv_gpu.BLACKWELL_COMPUTE_A
+    PMASYS_BASE, PMAGPC_BASE, GR_GPC_BASE, GPC_BASE = (0x2b1000, 0x2b0000, 0x424000, 0x200000) if is_bw else (0x24a000, 0x244000, 0x419800, 0x180000)
+
+    tpc_masks = [m for i in range(self.num_gpcs) if (m:=self.iface.rm_control(self.subdevice, nv_gpu.NV2080_CTRL_CMD_GR_GET_TPC_MASK,
+      nv_gpu.NV2080_CTRL_GR_GET_TPC_MASK_PARAMS(gpcId=i)).tpcMask) > 0]
+    tpc_cnt = [bin(mask).count('1') for mask in tpc_masks]
+
+    # enables pma on gpc
+    if not is_bw: self.reg_ops(*[(PMAGPC_BASE + gpc * 0x200, 0x100, 0x100) for gpc in range(len(tpc_masks))])
+
+    # sets streaming bw for each gpc
+    hs = nv_gpu.struct_NVB0CC_CTRL_HS_CREDITS_PARAMS(pmaChannelIdx=0, numEntries=len(tpc_masks))
+    for i, mask in enumerate(tpc_masks):
+      hs.creditInfo[i] = nv_gpu.struct_NVB0CC_CTRL_PMA_STREAM_HS_CREDITS_INFO(
+        chipletType=nv_gpu.NVB0CC_CHIPLET_TYPE_GPC, chipletIndex=i, numCredits=bin(mask).count('1'))
+    self.iface.rm_control(self.profiler, nv_gpu.NVB0CC_CTRL_CMD_SET_HS_CREDITS, hs)
+
+    if is_bw:
+      # enables pma on gpcs
+      self.reg_ops(*[op for i in range(3) for op in [(PMASYS_BASE + 0x128 + i*8, 480), (PMASYS_BASE + 0x12c + i*8, 0x80000000)]])
+      self.reg_ops((PMAGPC_BASE + 0xa24, 0x04000001), (PMAGPC_BASE + 0xa10, 0x80000002))
+      self.reg_ops(*[(GPC_BASE + gpc * 0x4000 + 0x200 + tpc * 0x200 + reg, 0)
+                     for gpc in range(len(tpc_masks)) for tpc in range(tpc_cnt[gpc]) for reg in [0x100, 0x108, 0x110, 0x120]])
+
+      def SM_REG(gpc, tpc, sm, reg): return GPC_BASE + gpc * 0x4000 + 0x800 + (tpc * self.num_sm_per_tpc + sm) * 0x200 + reg
+    else:
+      self.reg_ops(*[(PMASYS_BASE + 0x65c + off * 4, 0xffffffff) for off in range(self.num_gpcs * 2)])
+      self.reg_ops((PMASYS_BASE + 0x620, 0x2000007))
+
+      def SM_REG(gpc, tpc, sm, reg): return GPC_BASE + gpc * 0x4000 + (self.num_tpc_per_gpc - tpc_cnt[gpc] + tpc) * 0x200 + [0x400, 0x1000][sm] + reg
+
+    # enable pc sampling for the context
+    self.reg_ops((GR_GPC_BASE + 0x304, 0x80808a))
+
+    # sm config and enable
+    self.reg_ops(*[op for gpc in range(len(tpc_masks)) for tpc in range(tpc_cnt[gpc]) for sm in range(self.num_sm_per_tpc) for op in [
+      (SM_REG(gpc, tpc, sm, 0x128), (gpc << 5) | (tpc << 1) | sm), # enumeration. NOTE: different from cuda
+      (SM_REG(gpc, tpc, sm, 0x40), 0x19181716), (SM_REG(gpc, tpc, sm, 0x48), 0x1d1c1b1a), (SM_REG(gpc, tpc, sm, 0x50), 0x1e201f), # unk, counters?
+      (SM_REG(gpc, tpc, sm, 0xec), 0x1), (SM_REG(gpc, tpc, sm, 0x6c), 0x2), (SM_REG(gpc, tpc, sm, 0x9c), 0x5),
+      (SM_REG(gpc, tpc, sm, 0x108), 0xa0 if is_bw else 0x20), *([(SM_REG(gpc, tpc, sm, 0x120), 0x100000)] if is_bw else [])]])
+    self.reg_ops((GR_GPC_BASE + 0x3dc, 0x1), reg_type=1)
+
+  def reg_ops(self, *ops, reg_type=0, op=nv_gpu.NV2080_CTRL_GPU_REG_OP_WRITE_32):
+    for i in range(0, len(ops), 124):
+      params = nv_gpu.struct_NVB0CC_CTRL_EXEC_REG_OPS_PARAMS(regOpCount=len(chunk:=ops[i:i+124]))
+      for j, (off, val, *rest) in enumerate(chunk):
+        params.regOps[j] = nv_gpu.struct_NV2080_CTRL_GPU_REG_OP(regOp=op, regType=reg_type,
+          regOffset=off, regValueLo=val, regAndNMaskLo=rest[0] if rest else 0xffffffff)
+      with contextlib.suppress(RuntimeError): self.iface.rm_control(self.profiler, nv_gpu.NVB0CC_CTRL_CMD_EXEC_REG_OPS, params)
+
+  def _prof_readback(self) -> bytes|None:
+    params = self.iface.rm_control(self.profiler, nv_gpu.NVB0CC_CTRL_CMD_PMA_STREAM_UPDATE_GET_PUT,
+      nv_gpu.struct_NVB0CC_CTRL_PMA_STREAM_UPDATE_GET_PUT_PARAMS(bUpdateAvailableBytes=1, bWait=1))
+
+    if params.bOverflowStatus: raise RuntimeError("PMA profiler: buffer overflow detected")
+    if params.bytesAvailable == 0: return None
+
+    start, end, view = self.pma_rptr, self.pma_rptr + params.bytesAvailable, self.pma_buf.host
+    pma_data = bytes(view[start:min(end, self.pma_buf.nbytes)]) + bytes(view[:max(0, end - self.pma_buf.nbytes)])
+    self.pma_rptr = end % self.pma_buf.nbytes
+
+    self.iface.rm_control(self.profiler, nv_gpu.NVB0CC_CTRL_CMD_PMA_STREAM_UPDATE_GET_PUT,
+      nv_gpu.struct_NVB0CC_CTRL_PMA_STREAM_UPDATE_GET_PUT_PARAMS(bytesConsumed=params.bytesAvailable))
+    return pma_data
+
+  def device_props(self) -> dict[str, Any]: return {'arch': self.arch, 'sm_version': self.sm_version}
+
+# pylint: disable=cell-var-from-loop
+# a python uops emulator
+# works to test the tensor cores, and all the uops in general
+# this is the (living) definition of uops
+from typing import Any, TYPE_CHECKING
+import pickle, base64, itertools, time, sys, ctypes
+from dataclasses import replace
+from tinygrad.dtype import bitcast, DType, dtypes, AddrSpace, truncate, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
+from tinygrad.helpers import all_same, getenv, Target, IMAGE, is_image_shape, to_mv, mv_address
+from tinygrad.device import HostAllocator, Compiled, Compiler, Program, TinyELF
+from tinygrad.renderer import tc
+from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp
+from tinygrad.renderer import Renderer
+from tinygrad.runtime.support.elf import link_sym
+from tinygrad.runtime.support.c import DLL
+
+def _load(m, i, dtype: DType):
+  if i is None: return 0.0
+  if i < 0 or i >= len(m): raise IndexError(f"load out of bounds, size is {len(m)} and access is {i}")
+  if (w:=m.nbytes // len(m)) >= dtype.itemsize: return from_storage_scalar(m[i], dtype)
+  return sum(m[i+k] << (8*w*k) for k in range(dtype.itemsize // w)) # a bitcast can read wider than the buffer, _store splits it the same way
+
+def _step(m, dtype: DType): return max(1, dtype.itemsize // (m.nbytes // len(m))) # storage elements per lane
+
+def load(inp, j, dtype: DType):
+  if len(inp) >= 3: return [_load(m, x+j*_step(m, dtype) if x is not None else None, dtype) if gate else alt for (m,x),alt,gate in zip(*inp[:3])]
+  return [_load(m, x+j*_step(m, dtype) if x is not None else None, dtype) for m,x in inp[0]]
+
+def _store(m, i, v, dtype: DType):
+  if i < 0 or i >= len(m): raise IndexError(f"store out of bounds, size is {len(m)}, access is {i}, value is {v}")
+  if (w:=m.nbytes // len(m)) >= dtype.itemsize: m[i] = to_storage_scalar(v, dtype)
+  else:
+    for k in range(dtype.itemsize // w): m[i+k] = (v >> 8*w*k) & ((1 << 8*w) - 1)
+
+def wmma(tensor_cores:list[tc.TensorCore], arg, inp, warp_size:int):
+  # cores sharing (dims, dtype_in, threads) share fragments, so the first match is the layout
+  tcore = next(x for x in tensor_cores if (x.dims, x.dtype_in, x.threads) == arg[:3])
+  frags = tcore.frag_coords()
+  for cc,x,co in zip("ABC", inp, frags): assert len(x) == len(co[0]), f"{cc} must have {len(co[0])} elements per thread, it has {len(x)}"
+  assert warp_size % tcore.threads == 0, f"must have multiples of {tcore.threads} warp threads"
+  out = [x[:] for x in inp[2]]
+  for goff in range(0, warp_size, tcore.threads):
+    a, b = ({c: x[e][goff+lane] for lane,lc in enumerate(co) for e,c in enumerate(lc)} for co,x in zip(frags[:2], inp))
+    for lane,lc in enumerate(frags[2]):
+      for e,(m,n) in enumerate(lc): out[e][goff+lane] += sum(a[m,k]*b[k,n] for k in range(tcore.dims[2]))
+  return out
+
+class PythonProgram(Program['PythonDevice']):
+  def __init__(self, dev:'PythonDevice', obj:TinyELF, uops:list[UOp]|None=None):
+    self.uops: list[UOp] = uops or pickle.loads(obj.lib)
+    self.fxns = {u: PythonProgram(dev, obj, list(u.body.src)) for u in self.uops if u.op is Ops.CALL and u.body.op is Ops.LINEAR}
+    self.tensor_cores = PythonRenderer(obj.target).tensor_cores
+    self.uop_to_index: dict[UOp, int] = {u:i for i,u in enumerate(self.uops)}
+    self.loop_ends: dict[UOp, int] = {u.src[1]:i for i, u in enumerate(self.uops) if u.op in {Ops.END, Ops.BACKEDGE}}
+  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False, **kw):
+    st = time.perf_counter()
+    warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
+    warp_size = len(warp)
+    for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
+      values: dict[UOp, Any] = dict(env:=kw.get("env", ())) # a function runs with its params bound to the caller's args
+      pbufs: list[int] = list(bufs)
+      pvals: list[int] = list(vals)
+      exec_masks = [[True] * warp_size]
+      i = 0
+      while i < len(self.uops):
+        u = self.uops[i]
+        src_values = [values[v] for v in u.src_without_body if v.dtype is not dtypes.void]
+        src_dtypes = [v.dtype for v in u.src_without_body if v.dtype is not dtypes.void]
+        if getenv("TRACE"): print(i, u.op, u.dtype, u.arg, src_values, src_dtypes)
+        if u.op is Ops.BACKEDGE:
+          i = self.uop_to_index[u.src[1]] if values[u.src[2]][0] else i+1
+          continue
+        if u.op is Ops.END:
+          i = self.uop_to_index[u.src[1]]
+          continue
+        if u.op is Ops.IF:
+          exec_masks.append([x and y for x,y in zip(exec_masks[-1], src_values[0])])
+          i += 1
+          continue
+        if u.op is Ops.ENDIF:
+          exec_masks.pop()
+          i += 1
+          continue
+        if u.op in (Ops.BARRIER, Ops.SINK, Ops.NOOP, Ops.GROUP, Ops.CUSTOM_FUNCTION) or (u.op is Ops.RANGE and u.dtype == dtypes.void) or u in env:
+          # in the python emulator, the warp is always in sync
+          i += 1
+          continue
+        if u.op is Ops.STORE:
+          assert len(src_values) == 2, f"STORE must be lowered to 2 srcs, got {len(src_values)}"
+          store_gate = exec_masks[-1]
+          for j,val in enumerate(src_values[1] if u.max_numel() > 1 else [src_values[1]]):
+            for (m,o),v,g in zip(src_values[0], val, store_gate):
+              if g: _store(m, o+j*_step(m, src_dtypes[1]), v, src_dtypes[1])
+          i += 1
+          continue
+        if u.op is Ops.AFTER or (u.op is Ops.BITCAST and u.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL)): values[u] = src_values[0]
+        elif u.op is Ops.PARAM and u.addrspace is AddrSpace.ALU: values[u] = [pvals.pop(0)] * warp_size
+        elif u.op in {Ops.PARAM, Ops.BUFFER}:
+          storage_fmt = storage_fmt_for_dtype(u.dtype)
+          if storage_fmt is None: raise RuntimeError(f"dtype={u.dtype} is not supported")
+          if TYPE_CHECKING or sys.version_info < (3, 12): assert storage_fmt != "e"
+          if u.addrspace == AddrSpace.REG:
+            # REGs are per thread
+            values[u] = [memoryview(bytearray(u.max_numel()*u.dtype.itemsize)).cast(storage_fmt) for _ in range(warp_size)]
+          else:
+            size = u.max_numel() * u.dtype.itemsize
+            buf = memoryview(bytearray(size)) if u.op is not Ops.PARAM else to_mv(pbufs.pop(0), size)
+            values[u] = [buf.cast(storage_fmt)] * warp_size
+        elif u.op is Ops.BINARY: values[u] = [memoryview(u.arg)] * warp_size
+        elif u.op is Ops.SPECIAL:
+          if u.arg[0] == 'g': values[u] = [idxs[2-int(u.arg[-1])]] * warp_size
+          elif u.arg[0] == 'l': values[u] = [x[2-int(u.arg[-1])] for x in warp]
+        elif u.op is Ops.CONST: values[u] = [u.val] * warp_size
+        elif u.op in {Ops.INDEX, Ops.SHRINK}:
+          ret:list = []
+          if u.src[0].addrspace == AddrSpace.ALU:
+            ret = [src_values[0][i][t] for t,i in enumerate(src_values[1])]
+          elif is_image_shape(u.src[0]._shape):
+            for m,oy,ox in zip(*src_values):
+              if ox < 0 or ox >= u.src[0]._shape[1] or oy < 0 or oy >= u.src[0]._shape[0]: ret.append((m, None))
+              else: ret.append((m, ox*4 + oy*u.src[0]._shape[1]*4))
+          else:
+            scale = v.dtype.itemsize // v.src[0].dtype.itemsize if (v:=u.src[0].without_after).op is Ops.BITCAST else 1
+            for m,o in zip(src_values[0], src_values[1]): ret.append((m[0], m[1]+o*scale) if isinstance(m, tuple) else (m, o*scale))
+          values[u] = ret
+        elif u.op is Ops.RANGE:
+          if u not in values: values[u] = [0] * warp_size
+          else:
+            for j in range(len(values[u])):
+              values[u][j] += 1
+          if values[u][0] == src_values[0][0]:
+            del values[u]
+            i = self.loop_ends[u] + 1
+            continue
+        elif u.op is Ops.STACK: values[u] = src_values
+        elif u.op is Ops.BITCAST: values[u] = [bitcast(x, src_dtypes[0], u.dtype) for x in src_values[0]]
+        elif u.op is Ops.CAST:
+          values[u] = [truncate.get(u.dtype, lambda dt: dt)(u.dtype.const(x)) for x in src_values[0]]
+        elif u.op is Ops.LOAD:
+          if (load_sz := u.max_numel()) > 1:
+            # buf and gate are not vecs
+            values[u] = [load([src_values[k] if k in [0,2] else src_values[k][j] \
+                               for k in range(len(src_values))], j, u.dtype) for j in range(load_sz)]
+          else:
+            values[u] = load(src_values, 0, u.dtype)
+        elif u in self.fxns: values[u] = [self.fxns[u](env={p: values[u.src[p.arg.slot+1]] for p in u.body.src if p.op is Ops.PARAM})]
+        elif u.op is Ops.CALL: # a C function by symbol, linked against the loaded libraries
+          restype = None if u.dtype is dtypes.void else getattr(ctypes, f"c_{'u' if u.dtype in dtypes.uints else ''}int{u.dtype.bitsize}")
+          cfunc = ctypes.CFUNCTYPE(restype, *[ctypes.c_uint64] * len(src_values))(link_sym(u.src[0].arg.name, list(DLL._loaded_.values())))
+          values[u] = []
+          for args,gate in zip(zip(*src_values), exec_masks[-1]):
+            call_args = [(mv_address(x[0]) + x[1]*dt.itemsize) if isinstance(x, tuple) else x for x,dt in zip(args, src_dtypes)]
+            values[u].append(cfunc(*call_args) if gate else None)
+        elif u.op is Ops.WMMA: values[u] = wmma(self.tensor_cores, u.arg, src_values, warp_size)
+        elif u.op in GroupOp.ALU:
+          assert all_same([len(x) for x in src_values]), f"{[len(x) for x in src_values]} doesn't match on {u.op}"
+          assert all_same([u.dtype] + src_dtypes) or u.op in {*GroupOp.Comparison, Ops.WHERE, Ops.SHL, Ops.SHR}, f"dtype mismatch on {u.op}"
+          values[u] = [exec_alu(u.op, u.dtype, p) for p in zip(*src_values)]
+        assert u in values, u
+        i += 1
+    return time.perf_counter() - st
+
+class PythonCompiler(Compiler):
+  def compile(self, src:str) -> bytes: return base64.b64decode(src)
+
+class PythonRenderer(Renderer):
+  code_for_op = python_alu
+  compiler = PythonCompiler()
+
+  def __init__(self, target:Target):
+    assert (emu:=getenv("EMULATE", "")) == "", ("EMULATE is deprecated, use DEV=PYTHON::" +
+      {"AMD":"gfx1100", "AMD_RDNA4":"gfx1201", "AMD_MFMA":"gfx950", "CUDA":"sm_80", "CUDA_SM75":"sm_75", "CUDA_SM89":"sm_89"}.get(emu, emu))
+    target = replace(target, renderer="PYTHON")
+    if target.arch == "METAL": self.target, self.tensor_cores = replace(target, device="METAL"), tc.metal
+    elif target.arch.startswith("gfx"):
+      self.target = replace(target, device="AMD")
+      self.tensor_cores = tc.get_amd(target.arch)
+    elif target.arch.startswith("sm"):
+      self.target = replace(target, device="CUDA")
+      self.tensor_cores = tc.get_cuda(target.arch)
+    elif IMAGE and not target.arch: self.target = replace(target, arch="IMAGE_PITCH_ALIGNMENT=1")
+    else: self.target = target
+
+  def render(self, uops:list[UOp]) -> str: return base64.b64encode(pickle.dumps(uops)).decode()
+
+  def supported_dtypes(self): return {d for d in super().supported_dtypes() if d != dtypes.half or sys.version_info >= (3, 12)}
+
+class PythonDevice(Compiled):
+  def __init__(self, device:str):
+    super().__init__(device, HostAllocator(self), [PythonRenderer], PythonProgram)
+
+from __future__ import annotations
+import os, ctypes, functools, mmap, struct, array, math, sys, contextlib
+assert sys.platform != 'win32'
+from typing import Any
+from tinygrad.device import Compiled, BufferStorage, BufferSpec, Buffer, Device, Allocator, TinyELF
+from tinygrad.runtime.support.hcq2 import HWQueue, HCQ_RUNTIME_DEV, ccall, cstruct, patch, unwrap_view, layout_args, pack_args
+from tinygrad.runtime.support.memory import MMIOInterface
+from tinygrad.runtime.support.system import FileIOInterface
+from tinygrad.runtime.autogen import kgsl, mesa, libc
+from tinygrad.renderer.cstyle import QCOMCLRenderer
+from tinygrad.renderer.nir import IR3Renderer
+from tinygrad.helpers import getenv, mv_address, round_up, ceildiv, prod, is_image_shape
+from tinygrad.helpers import next_power2, flatten, PROFILE, IMAGE
+from tinygrad.dtype import dtypes, AddrSpace
+from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, uopfunc
+from tinygrad.engine.realize import get_call_arg_uops, get_call_var_uops
+from tinygrad.runtime.support.system import System
+if getenv("IOCTL"): import extra.qcom_gpu_driver.opencl_ioctl  # noqa: F401  # pylint: disable=unused-import
+
+BUFTYPE_BUF, BUFTYPE_TEX, BUFTYPE_IBO = 0, 1, 2
+
+@functools.cache
+def dcache_flush():
+  from tinygrad.uop.ops import KernelInfo
+  from tinygrad.codegen import to_program
+  buf, n = UOp.param(0, dtypes.uint8, 1), UOp.param(1, dtypes.int, shape=(), name="n", addrspace=AddrSpace.ALU)
+  i = UOp.range(n, 0, dtype=dtypes.int)
+  flush = UOp(Ops.CUSTOM, src=(buf.index(i * 64),), arg=('__asm__ volatile("dc cvac, %0" :: "r"({0}) : "memory");', dtypes.void))
+  sink = UOp.sink(flush.end(i), UOp(Ops.CUSTOM, arg=('__asm__ volatile("dsb sy" ::: "memory");', dtypes.void)),
+                  arg=KernelInfo(name="dcache_flush"), tag=1)
+  prg = to_program(sink, Device["CPU"].renderer)
+  return Device["CPU"].runtime(prg.to_elf())
+
+#Parse C-style defines: <regname>_<field_x>__SHIFT and <regname>_<field_y>__MASK from the adreno module into the following format:
+# qreg.<regname>(<field_x>=..., <field_y>=..., ..., <field_n>=...)
+def _qreg_exec(__reg, __val=0, **kwargs):
+  for k, v in kwargs.items():
+    reg_name = f"{__reg[4:]}_{k.removeprefix('_').upper()}"
+    __val |= (getattr(mesa, reg_name) if v else 0) if type(v) is bool else (v << getattr(mesa, f'{reg_name}__SHIFT'))
+  return __val
+qreg: Any = type("QREG", (object,), {name[4:].lower(): functools.partial(_qreg_exec, name) for name in mesa.__dict__.keys() if name[:4] == 'REG_'})
+
+def ctz(v): return (v & -v).bit_length() - 1
+
+def parity(val: int):
+  for i in range(4,1,-1): val ^= val >> (1 << i)
+  return (~0x6996 >> (val & 0xf)) & 1
+
+def pkt7_hdr(opcode: int, cnt: int): return mesa.CP_TYPE7_PKT | cnt & 0x3FFF | parity(cnt) << 15 | (opcode & 0x7F) << 16 | parity(opcode) << 23
+
+def pkt4_hdr(reg: int, cnt: int): return mesa.CP_TYPE4_PKT | cnt & 0x7F | parity(cnt) << 7 | (reg & 0x3FFFF) << 8 | parity(reg) << 27
+
+def _read_lib(lib, off) -> int: return struct.unpack("I", lib[off:off+4])[0]
+
+@uopfunc
+def qcom_submit(req:UOp, ret:UOp, fd:UOp) -> UOp: # the kernel driver takes the command buffer
+  idir, base, nr, struct_t = kgsl.IOCTL_KGSL_GPU_COMMAND.args
+  ioctl_cmd = (idir << 30) | (ctypes.sizeof(struct_t) << 16) | (base << 8) | nr
+  return ret.index(0).store(ccall(libc.dll.ioctl, fd, UOp.const(ioctl_cmd, dtypes.uint32), req.index(0))).sink()
+
+class QCOMComputeQueue(HWQueue):
+  dev:QCOMDevice
+  def cmd(self, opcode:int, *vals): self.q(pkt7_hdr(opcode, sum(x.dtype.itemsize // 4 if isinstance(x, UOp) else 1 for x in vals)), *vals)
+
+  def reg(self, reg:int, *vals): self.q(pkt4_hdr(reg, sum(x.dtype.itemsize // 4 if isinstance(x, UOp) else 1 for x in vals)), *vals)
+
+  def _cache_flush(self, write_back=True, invalidate=False, sync=True, memsync=False):
+    # TODO: 7xx support.
+    if write_back: # dirty cache write-back, into the device's dummy buffer
+      dummy = UOp.alloc((0x1000,), dtypes.uint8, 0, device=self.devs[0]).rtag(self.dev.tag("dummy"))
+      self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_FLUSH_TS, dummy.getaddr(self.devs), 0)
+    if invalidate: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_INVALIDATE) # invalidate cache lines (following reads from RAM).
+    if memsync: self.cmd(mesa.CP_WAIT_MEM_WRITES)
+    if sync: self.cmd(mesa.CP_WAIT_FOR_IDLE)
+
+  def memory_barrier(self): self._cache_flush(write_back=True, invalidate=True, sync=True, memsync=True)
+
+  def signal(self, signal:UOp, value:UOp):
+    self.cmd(mesa.CP_WAIT_FOR_IDLE)
+    if self.dev.gpu_id[:2] < (7, 3):
+      self.cmd(mesa.CP_EVENT_WRITE, qreg.cp_event_write_0(event=mesa.CACHE_FLUSH_TS), signal.getaddr(self.devs), value.cast(dtypes.uint32))
+      self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
+    else:
+      # TODO: support devices starting with 8 Gen 1. Also, 700th series have convenient CP_GLOBAL_TIMESTAMP and CP_LOCAL_TIMESTAMP
+      raise RuntimeError('CP_EVENT_WRITE7 is not supported')
+
+  def timestamp(self, signal:UOp):
+    self.cmd(mesa.CP_WAIT_FOR_IDLE)
+    self.cmd(mesa.CP_REG_TO_MEM, qreg.cp_reg_to_mem_0(reg=mesa.REG_A6XX_CP_ALWAYS_ON_COUNTER, cnt=2, _64b=True), signal.getaddr(self.devs))
+
+  def wait(self, signal:UOp, value:UOp):
+    self.cmd(mesa.CP_WAIT_REG_MEM, qreg.cp_wait_reg_mem_0(function=mesa.WRITE_GE, poll=mesa.POLL_MEMORY), signal.getaddr(self.devs),
+             value.cast(dtypes.uint32), qreg.cp_wait_reg_mem_4(mask=0xFFFFFFFF), qreg.cp_wait_reg_mem_5(delay_loop_cycles=32))
+
+  def kernargs(self, call:UOp, prg:UOp, data:QCOMProgramData) -> UOp:
+    bufs, vals = [get_call_arg_uops(call)[g] for g in prg.arg.globals], get_call_var_uops(call, prg)
+    ubos = [bufs[slot] for _,slot,_,shape in data.signature if slot < len(bufs) and not is_image_shape(shape)]
+    uavs = [(dt,shape,bufs[slot]) for _,slot,dt,shape in data.signature if slot < len(bufs) and is_image_shape(shape)]
+    # NIR can reorder images to different texture slots
+    ibos, texs = uavs[:data.ibo_cnt], [uavs[data.ibo_cnt + (data.tex_to_image[i] if data.NIR else i)] for i in range(data.tex_cnt)]
+
+    args = [(off, UOp.const(val, dtypes.uint32 if sz == 4 else dtypes.uint16)) for val,off,sz in data.consts_info]
+    args += layout_args(data.samplers, data.samp_off)
+    vals = [v.ccast(dt) for v,(_,_,dt,_) in zip(vals, data.signature[len(bufs):])]
+    if data.NIR:
+      args += layout_args([b.getaddr(self.devs) for b in ubos] + vals, data.buf_off)
+      if data.wgsz != 0xfc: args += layout_args(list(prg.arg.local_size), data.wgsz * 4)
+    else: args += list(zip(data.buf_offs, [b.getaddr(self.devs) for b in ubos] + vals))
+
+    def _tex(b, ibo=False):
+      imgdt, shape, buf = b
+      pitch = shape[1] * 4 * imgdt.itemsize
+      fmt = mesa.FMT6_32_32_32_32_FLOAT if imgdt.itemsize == 4 else mesa.FMT6_16_16_16_16_FLOAT
+      return [qreg.a6xx_tex_const_0(fmt=fmt) if ibo else qreg.a6xx_tex_const_0(0x8, swiz_x=0, swiz_y=1, swiz_z=2, swiz_w=3, fmt=fmt),
+              qreg.a6xx_tex_const_1(width=shape[1], height=shape[0]),
+              qreg.a6xx_tex_const_2(type=mesa.A6XX_TEX_2D, pitch=pitch, pitchalign=ctz(pitch)-6), 0, buf.getaddr(self.devs),
+              qreg.a6xx_tex_const_6(plane_pitch=0x400000), qreg.a6xx_tex_const_7(13), 0, 0, 0, 0, 0, 0, 0, 0]
+    args += layout_args(flatten(map(_tex, texs)), data.tex_off) + layout_args(flatten(map(functools.partial(_tex, ibo=True), ibos)), data.ibo_off)
+    return UOp(Ops.LINEAR, src=tuple(pack_args(args, data.kernargs_alloc_size)), arg="kernargs")
+
+  def exec(self, call:UOp, prg:UOp):
+    data, lib = qcom_build_program(self.dev, prg, self.devs)
+    global_size, local_size = prg.arg.global_size, prg.arg.local_size
+    if data.max_threads < prod(local_size): raise RuntimeError("Too many resources requested for launch")
+    if any(g*l>mx for g,l,mx in zip(global_size, local_size, [65536, 65536, 65536])) and any(l>mx for l,mx in zip(local_size, [1024, 1024, 1024])):
+      raise RuntimeError(f"Invalid global/local dims {global_size=}, {local_size=}")
+
+    def cast_int(x, ceil=False): return (math.ceil(x) if ceil else int(x)) if isinstance(x, float) else x
+    global_size_mp = [cast_int(g*l) for g,l in zip(global_size, local_size)]
+
+    args_addr, lib_addr = self.kernargs(call, prg, data).getaddr(self.devs), lib.getaddr(self.devs)
+    stack_addr = UOp.alloc((data.hw_stack_offset * 4,), dtypes.uint8, 0, device=self.devs[0]).rtag(self.dev.tag("stack")).getaddr(self.devs)
+
+    self.cmd(mesa.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=mesa.RM6_COMPUTE))
+    self.reg(mesa.REG_A6XX_SP_UPDATE_CNTL, qreg.a6xx_sp_update_cntl(cs_state=True, cs_uav=True))
+    self.reg(mesa.REG_A6XX_SP_UPDATE_CNTL, 0x0)
+    self.reg(mesa.REG_A6XX_SP_CS_TSIZE, qreg.a6xx_sp_cs_tsize(0x80)) # is this right? mesa uses 1
+    self.reg(mesa.REG_A6XX_SP_CS_USIZE, qreg.a6xx_sp_cs_usize(0x40)) # mesa also uses 1
+    self.reg(mesa.REG_A6XX_SP_MODE_CNTL, qreg.a6xx_sp_mode_cntl(isammode=mesa.ISAMMODE_GL if data.NIR else mesa.ISAMMODE_CL,
+                                                                constant_demotion_enable=data.NIR))
+    self.reg(mesa.REG_A6XX_SP_PERFCTR_SHADER_MASK, qreg.a6xx_sp_perfctr_shader_mask(cs=True))
+    self.reg(mesa.REG_A6XX_TPL1_MODE_CNTL, qreg.a6xx_tpl1_mode_cntl(isammode=mesa.ISAMMODE_GL if data.NIR else mesa.ISAMMODE_CL))
+    self.reg(mesa.REG_A6XX_TPL1_DBG_ECO_CNTL, 0)
+    self.cmd(mesa.CP_WAIT_FOR_IDLE)
+
+    self.reg(mesa.REG_A6XX_SP_CS_NDRANGE_0,
+             qreg.a6xx_sp_cs_ndrange_0(kerneldim=3, localsizex=local_size[0] - 1, localsizey=local_size[1] - 1, localsizez=local_size[2] - 1),
+             global_size_mp[0], 0, global_size_mp[1], 0, global_size_mp[2], 0, 0xccc0cf, 0xfc | qreg.a6xx_sp_cs_wge_cntl(threadsize=mesa.THREAD64),
+             cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))
+
+    self.reg(mesa.REG_A6XX_SP_CS_CNTL_0,
+             qreg.a6xx_sp_cs_cntl_0(threadsize=mesa.THREAD64, halfregfootprint=data.hregs, fullregfootprint=data.fregs, branchstack=data.brnchstck),
+             qreg.a6xx_sp_cs_cntl_1(constantrammode=mesa.CONSTLEN_256, shared_size=data.shared_size), # should this be CONSTLEN_512?
+             0, data.prg_offset, lib_addr,
+             qreg.a6xx_sp_cs_pvt_mem_param(memsizeperitem=data.pvtmem_size_per_item), stack_addr,
+             qreg.a6xx_sp_cs_pvt_mem_size(totalpvtmemsize=data.pvtmem_size_total))
+
+    # the kernargs sit in the cmdbuf, so the const upload is sized to them (in vec4s) rather than to the whole constlen: it must not read past
+    self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
+                                                             state_block=mesa.SB6_CS_SHADER, num_unit=data.kernargs_alloc_size // 16), args_addr)
+    self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_SHADER, state_src=mesa.SS6_INDIRECT,
+                                                             state_block=mesa.SB6_CS_SHADER, num_unit=ceildiv(data.image_size, 128)), lib_addr)
+
+    self.reg(mesa.REG_A6XX_SP_REG_PROG_ID_0, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc, qreg.a6xx_sp_cs_const_config(constlen=1024 // 4, enabled=True))
+
+    self.reg(mesa.REG_A6XX_SP_CS_PVT_MEM_STACK_OFFSET, qreg.a6xx_sp_cs_pvt_mem_stack_offset(data.hw_stack_offset))
+    # image_size is in bytes, but INSTR_SIZE is measured in units of instruction groups (16 instructions, 8 bytes each)
+    # https://elixir.bootlin.com/mesa/mesa-26.1.5/source/src/freedreno/ir3/ir3_shader.h#L719-L723
+    self.reg(mesa.REG_A6XX_SP_CS_INSTR_SIZE, qreg.a6xx_sp_cs_instr_size(ceildiv(data.image_size, 128)))
+
+    if data.samp_cnt > 0:
+      self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_SHADER, state_src=mesa.SS6_INDIRECT,
+                                                               state_block=mesa.SB6_CS_TEX, num_unit=data.samp_cnt), args_addr + data.samp_off)
+      self.reg(mesa.REG_A6XX_SP_CS_SAMPLER_BASE, args_addr + data.samp_off)
+      self.reg(mesa.REG_A6XX_TPL1_CS_BORDER_COLOR_BASE,
+               UOp.alloc((0x1000,), dtypes.uint8, 0, device=self.devs[0]).rtag(self.dev.tag("border_color")).getaddr(self.devs))
+
+    if data.tex_cnt > 0:
+      self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
+                                                               state_block=mesa.SB6_CS_TEX, num_unit=min(16, data.tex_cnt)), args_addr + data.tex_off)
+      self.reg(mesa.REG_A6XX_SP_CS_TEXMEMOBJ_BASE, args_addr + data.tex_off)
+
+    if data.ibo_cnt > 0:
+      self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST6_UAV, state_src=mesa.SS6_INDIRECT,
+                                                               state_block=mesa.SB6_CS_SHADER, num_unit=data.ibo_cnt), args_addr + data.ibo_off)
+      self.reg(mesa.REG_A6XX_SP_CS_UAV_BASE, args_addr + data.ibo_off)
+
+    self.reg(mesa.REG_A6XX_SP_CS_CONFIG, qreg.a6xx_sp_cs_config(enabled=True, nsamp=data.samp_cnt, ntex=data.tex_cnt, nuav=data.ibo_cnt))
+
+    if data.NIR:
+      self.reg(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0,
+               qreg.a6xx_sp_cs_const_config_0(wgidconstid=data.wgid, wgsizeconstid=data.wgsz, wgoffsetconstid=0xfc, localidregid=data.lid),
+               qreg.a6xx_sp_cs_wge_cntl(linearlocalidregid=0xfc, threadsize=mesa.THREAD64))
+      self.cmd(mesa.CP_EXEC_CS, 0,
+               qreg.cp_exec_cs_1(ngroups_x=global_size[0]), qreg.cp_exec_cs_2(ngroups_y=global_size[1]), qreg.cp_exec_cs_3(_ngroups_z=global_size[2]))
+    else: self.cmd(mesa.CP_RUN_OPENCL, 0)
+
+    self._cache_flush(write_back=True, invalidate=False, sync=False, memsync=False)
+
+  def submit(self, cmdbuf:UOp) -> UOp:
+    ib, ib_off = unwrap_view(cmdbuf)
+    fd, ctxid = [UOp.variable(n, 0, 2**31 - 1, dtypes.int32) for n in ("kgsl_fd", "kgsl_ctx")]
+    obj = cstruct(kgsl.struct_kgsl_command_object, gpuaddr=ib.getaddr(self.devs) + ib_off, size=cmdbuf.max_numel(), flags=kgsl.KGSL_CMDLIST_IB)
+    req = cstruct(kgsl.struct_kgsl_gpu_command, cmdlist=obj.getaddr(HCQ_RUNTIME_DEV.value), cmdsize=ctypes.sizeof(kgsl.struct_kgsl_command_object),
+                  numcmds=1, context_id=ctxid)
+    return qcom_submit(req.after(cmdbuf), UOp.alloc((1,), dtypes.int32, device=self.devs[0]).rtag("submit_ret"), fd)
+
+class QCOMProgramData:
+  def __init__(self, dev:QCOMDevice, obj:TinyELF):
+    self.signature, self.name, self.NIR = obj.signature, obj.name, isinstance(dev.renderer, IR3Renderer)
+
+    if self.NIR:
+      from tinygrad.runtime.support.compiler_mesa import IR3Compiler
+      v, cs, imm_vals, self.image = IR3Compiler.unpack_lib(obj.lib)
+      self.prg_offset, self.brnchstck, self.image_size, self.pvtmem, self.shmem = 0, v.branchstack, v.info.size, v.pvtmem_size, v.shared_size
+      self.wgsz = alloc.offset_vec4 * 4 + 8 if (alloc:=cs.allocs.consts[mesa.IR3_CONST_ALLOC_DRIVER_PARAMS]).size_vec4 else 0xfc
+
+      self.wgid, self.lid = v.cs.work_group_id, v.cs.local_invocation_id # register ids
+      self.buf_off, imm_off = cs.ubo_state.range[0].offset, cs.allocs.max_const_offset_vec4 * 16
+      self.consts_info = [(struct.unpack_from("<I", imm_vals, i)[0], imm_off + i, 4) for i in range(0, len(imm_vals), 4)]
+
+      # see https://elixir.bootlin.com/mesa/mesa-25.3.0/source/src/freedreno/ir3/ir3_shader.h#L525
+      # and https://elixir.bootlin.com/mesa/mesa-25.3.0/source/src/freedreno/ir3/ir3_compiler_nir.c#L5389
+      self.samp_cnt, self.tex_cnt, self.ibo_cnt = (nt:=v.image_mapping.num_tex), nt, v.num_uavs - nt
+      self.tex_to_image = v.image_mapping.tex_to_image[:]
+      # IR3 outputs a sampler for every texture (https://elixir.bootlin.com/mesa/mesa-25.3.0/source/src/freedreno/ir3/ir3_compiler_nir.c#L1714)
+      self.samplers = [qreg.a6xx_tex_samp_0(wrap_s=(clamp_mode:=mesa.A6XX_TEX_CLAMP_TO_BORDER), wrap_t=clamp_mode, wrap_r=clamp_mode),
+                       qreg.a6xx_tex_samp_1(unnorm_coords=True, cubemapseamlessfiltoff=True), 0, 0] * self.samp_cnt
+
+      self.tex_off, self.ibo_off, self.samp_off = 2048, 2048 + 0x40 * self.tex_cnt, 2048 + 0x40 * (self.tex_cnt + self.ibo_cnt)
+      self.fregs, self.hregs = v.info.max_reg + 1, v.info.max_half_reg + 1
+    else: self._parse_lib(obj.lib)
+
+    self.pvtmem_size_per_item: int = round_up(self.pvtmem, 512) >> 9
+    self.pvtmem_size_total: int = self.pvtmem_size_per_item * 128 * 2
+    self.hw_stack_offset: int = round_up(next_power2(round_up(self.pvtmem, 512)) * 128 * 16, 0x1000)
+    self.shared_size: int = max(1, (self.shmem - 1) // 1024)
+    self.max_threads = min(1024, ((384 * 32) // (max(1, (self.fregs + round_up(self.hregs, 2) // 2)) * 128)) * 128)
+    self.kernargs_alloc_size = round_up(2048 + (self.tex_cnt + self.ibo_cnt) * 0x40 + len(self.samplers) * 4, 0x100)
+
+  def _parse_lib(self, lib):
+    # Extract image binary
+    self.image_size = _read_lib(lib, 0x100)
+    self.image = lib[(image_offset:=_read_lib(lib, 0xc0)):image_offset+self.image_size]
+
+    # Parse image descriptors
+    image_desc_off = _read_lib(lib, 0x110)
+    self.prg_offset, self.brnchstck = _read_lib(lib, image_desc_off+0xc4), _read_lib(lib, image_desc_off+0x108) // 2
+    self.pvtmem, self.shmem = _read_lib(lib, image_desc_off+0xc8), _read_lib(lib, image_desc_off+0xd8)
+
+    # Fill up constants and buffers info
+    self.consts_info = []
+
+    # Collect sampler info.
+    self.samp_cnt = samp_cnt_in_file = _read_lib(lib, image_desc_off + 0xdc)
+    assert self.samp_cnt <= 1, "Up to one sampler supported"
+    if self.samp_cnt:
+      self.samp_cnt += 1
+      self.samplers = [qreg.a6xx_tex_samp_0(wrap_s=(clamp_mode:=mesa.A6XX_TEX_CLAMP_TO_BORDER), wrap_t=clamp_mode, wrap_r=clamp_mode),
+                       qreg.a6xx_tex_samp_1(unnorm_coords=True, cubemapseamlessfiltoff=True), 0, 0, 0, 0, 0, 0]
+    else: self.samplers = []
+
+    # Collect kernel arguments (buffers) info.
+    bdoff, binfos = round_up(image_desc_off + 0x158 + len(self.name), 4) + 8 * samp_cnt_in_file, []
+    while bdoff + 32 <= len(lib):
+      length, _, _, offset_words, _, _, _, typ = struct.unpack("8I", lib[bdoff:bdoff+32])
+      if length == 0: break
+      binfos.append((offset_words * 4, typ))
+      bdoff += length
+    self.buf_offs = [off for off,typ in binfos if typ not in {BUFTYPE_TEX, BUFTYPE_IBO}]
+
+    # Setting correct offsets to textures/ibos.
+    self.tex_cnt, self.ibo_cnt = sum(typ is BUFTYPE_TEX for _,typ in binfos), sum(typ is BUFTYPE_IBO for _,typ in binfos)
+    self.ibo_off, self.tex_off, self.samp_off = 2048, 2048 + 0x40 * self.ibo_cnt, 2048 + 0x40 * self.tex_cnt + 0x40 * self.ibo_cnt
+
+    if _read_lib(lib, 0xb0) != 0: # check if we have constants.
+      cdoff = _read_lib(lib, 0xac)
+      while cdoff + 40 <= image_offset:
+        cnst, offset_words, _, is32 = struct.unpack("I", lib[cdoff:cdoff+4])[0], *struct.unpack("III", lib[cdoff+16:cdoff+28])
+        self.consts_info.append((cnst, offset_words * (sz_bytes:=(2 << is32)), sz_bytes))
+        cdoff += 40
+
+    # Registers info
+    reg_desc_off = _read_lib(lib, 0x34)
+    self.fregs, self.hregs = _read_lib(lib, reg_desc_off + 0x14), _read_lib(lib, reg_desc_off + 0x18)
+
+_qcom_program_cache:dict[tuple[bytes, tuple[str, ...]], tuple[QCOMProgramData, UOp]] = {}
+def qcom_build_program(dev:QCOMDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[QCOMProgramData, UOp]:
+  if (cached:=_qcom_program_cache.get(key:=(prg.src[3].arg, devs))) is None:
+    data = QCOMProgramData(dev, prg.to_elf())
+    image = bytes(data.image).ljust(round_up(len(data.image), 4), b"\x00")
+    buf = UOp.alloc((len(image),), dtypes.uint8, next(UOp.unique_num), device=devs[0]).rtag("program")
+    cached = _qcom_program_cache[key] = (data, patch(buf, [], image))
+  return cached
+
+class QCOMAllocator(Allocator['QCOMDevice']):
+  def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
+    return self.dev._gpu_map(options.external_ptr, size) if options.external_ptr else self.dev._gpu_alloc(size)
+
+  def _free(self, storage:BufferStorage, options:BufferSpec):
+    self.dev.synchronize()
+    self.dev._gpu_free(storage)
+  def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
+
+def flag(nm, val): return (val << getattr(kgsl, f"{nm}_SHIFT")) & getattr(kgsl, f"{nm}_MASK")
+
+class QCOMDevice(Compiled):
+  timestamp_divider = 19.2
+  pm_encode = PatternMatcher([
+    (UPat(Ops.CALL, src=(UPat.custom_function("submit_qcom_compute"), UPat()), name="s"), lambda s: QCOMComputeQueue(s).encode()),
+  ])
+
+  @property
+  def has_copy_queue(self) -> bool: return False
+
+  def __init__(self, device:str=""):
+    self.fd = FileIOInterface('/dev/kgsl-3d0', os.O_RDWR)
+
+    flags = kgsl.KGSL_CONTEXT_PREAMBLE | kgsl.KGSL_CONTEXT_PWR_CONSTRAINT | kgsl.KGSL_CONTEXT_NO_FAULT_TOLERANCE | kgsl.KGSL_CONTEXT_NO_GMEM_ALLOC \
+      | flag("KGSL_CONTEXT_PRIORITY", getenv("QCOM_PRIORITY", 8)) | flag("KGSL_CONTEXT_PREEMPT_STYLE", kgsl.KGSL_CONTEXT_PREEMPT_STYLE_FINEGRAIN)
+    self.ctx = kgsl.IOCTL_KGSL_DRAWCTXT_CREATE(self.fd, flags=flags).drawctxt_id
+    self._stack:Buffer|None = None # private-memory stack
+
+    # Set max power
+    struct.pack_into('IIQQ', pwr:=memoryview(bytearray(0x18)), 0, 1, self.ctx, mv_address(_:=memoryview(array.array('I', [1]))), 4)
+    kgsl.IOCTL_KGSL_SETPROPERTY(self.fd, type=kgsl.KGSL_PROP_PWR_CONSTRAINT, value=mv_address(pwr), sizebytes=pwr.nbytes)
+
+    # Load info about qcom device
+    info = kgsl.struct_kgsl_devinfo()
+    kgsl.IOCTL_KGSL_DEVICE_GETPROPERTY(self.fd, type=kgsl.KGSL_PROP_DEVICE_INFO, value=ctypes.addressof(info), sizebytes=ctypes.sizeof(info))
+    self.gpu_id = (info.chip_id >> 24, (info.chip_id >> 16) & 0xFF, (info.chip_id >> 8) & 0xFF)
+
+    # a7xx start with 730x or 'Cxxx', a8xx starts 'Exxx'
+    if self.gpu_id[:2] >= (7, 3): raise RuntimeError(f"Unsupported GPU: chip_id={info.chip_id:#x}")
+
+    if PROFILE and self.gpu_id[:2] < (7, 3):
+      System.write_sysfs("/sys/class/kgsl/kgsl-3d0/idle_timer", value="4000000000", msg="Failed to disable suspend mode", expected="4294967276")
+
+    super().__init__(device, QCOMAllocator(self), [QCOMCLRenderer, IR3Renderer], None,
+                     arch=("a%d%d%d" + (",IMAGE_PITCH_ALIGNMENT=64" if IMAGE else "")) % self.gpu_id)
+
+    self.var_vals = {"kgsl_fd": self.fd.fd, "kgsl_ctx": self.ctx}
+    Compiled.pm_bufferize += PatternMatcher([
+      (UPat(Ops.ALLOC, tag=self.tag("stack"), name="b"), lambda b, d=self: d._ensure_stack_size(b.max_numel())),
+      (UPat(Ops.ALLOC, tag=self.tag("dummy")), lambda d=self: d.dummy),
+      (UPat(Ops.ALLOC, tag=self.tag("border_color")), lambda d=self: d.border_color)])
+
+  @functools.cached_property
+  def dummy(self) -> Buffer: return Buffer(self.device, 0x1000, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True) # cache flush target
+
+  @functools.cached_property
+  def border_color(self) -> Buffer: # zeros: the samplers clamp to a black border
+    return Buffer(self.device, 0x1000, dtypes.uint8, options=BufferSpec(nolru=True), initial_value=bytes(0x1000))
+
+  def _gpu_alloc(self, size:int, flags:int=0, uncached=False, fill_zeroes=False) -> BufferStorage:
+    flags |= flag("KGSL_MEMALIGN", alignment_hint:=12) | kgsl.KGSL_MEMFLAGS_USE_CPU_MAP
+    if uncached: flags |= flag("KGSL_CACHEMODE", kgsl.KGSL_CACHEMODE_UNCACHED)
+
+    alloc = kgsl.IOCTL_KGSL_GPUOBJ_ALLOC(self.fd, size=(bosz:=round_up(size, 1<<alignment_hint)), flags=flags, mmapsize=bosz)
+    va_addr = self.fd.mmap(0, bosz, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, alloc.id * 0x1000)
+
+    if fill_zeroes: ctypes.memset(va_addr, 0, size)
+    return BufferStorage(va_addr, (alloc, True), MMIOInterface(va_addr, size, fmt='B'))
+
+  def _gpu_map(self, ptr:int, size:int) -> BufferStorage:
+    ptr_aligned, size_aligned = (ptr & ~0xfff), round_up(size + (ptr & 0xfff), 0x1000)
+    dcache_flush().fxn(ctypes.c_uint64(ptr_line_aligned:=ptr & ~63), ceildiv(ptr + size - ptr_line_aligned, 64))
+    try:
+      mi = kgsl.IOCTL_KGSL_MAP_USER_MEM(self.fd, hostptr=ptr_aligned, len=size_aligned, memtype=kgsl.KGSL_USER_MEM_TYPE_ADDR)
+      return BufferStorage(mi.gpuaddr + (ptr - ptr_aligned), (mi, False), MMIOInterface(ptr, size, fmt='B'))
+    except OSError as e:
+      if e.errno == 14: return BufferStorage(ptr, (None, False), MMIOInterface(ptr, size, fmt='B'))
+      raise RuntimeError("Failed to map external pointer to GPU memory") from e
+
+  def _gpu_free(self, storage:BufferStorage):
+    if storage.meta[0] is None: return # external (gpu) ptr
+    if not storage.meta[1]: kgsl.IOCTL_KGSL_SHAREDMEM_FREE(self.fd, gpuaddr=storage.meta[0].gpuaddr) # external (cpu) ptr
+    else:
+      kgsl.IOCTL_KGSL_GPUOBJ_FREE(self.fd, id=storage.meta[0].id)
+      FileIOInterface.munmap(storage.buf, storage.meta[0].mmapsize)
+
+  def _wait_signal(self, sig:MMIOInterface|memoryview, value:int, timeout:int|None=None):
+    if sig[0] < value:
+      ts = kgsl.IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID(self.fd, context_id=self.ctx, type=kgsl.KGSL_TIMESTAMP_QUEUED).timestamp
+      with contextlib.suppress(OSError, RuntimeError):
+        kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.fd, context_id=self.ctx, timestamp=ts, timeout=int(timeout or self.wait_timeout_ms))
+    super()._wait_signal(sig, value, timeout)
+
+  def _ensure_stack_size(self, sz:int) -> Buffer: # one stack for the device, grown to the deepest program's private memory
+    if self._stack is None or self._stack.nbytes < sz:
+      if self._stack is not None: self.synchronize()
+      self._stack = Buffer(self.device, sz, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)
+    return self._stack
+
+  def _at_profile_finalize(self):
+    super()._at_profile_finalize()
+    with contextlib.suppress(RuntimeError): System.write_sysfs("/sys/class/kgsl/kgsl-3d0/idle_timer", "10", "Failed to reenable suspend mode")
+
+from __future__ import annotations
+from typing import cast
+import functools, struct, operator, re, itertools
+from tinygrad.device import Allocator, Buffer, BufferSpec, BufferStorage, Compiled, Device
+from tinygrad.dtype import dtypes, DType
+from tinygrad.helpers import round_up, ceildiv, unwrap, to_tuple, flatten
+from tinygrad.engine.realize import get_call_arg_uops
+from tinygrad.runtime.autogen import bnxt
+from tinygrad.runtime.support.rdma.bnxtdev import BNXTDev, BNXTQP, db_value, send_wqe, recv_wqe, WQE_SIZE, RING_ENTRIES, CQ_ENTRIES, MTU
+from tinygrad.runtime.support.hcq2 import unwrap_view, to_name
+from tinygrad.runtime.support.memory import AddrSpace, MMIOInterface, VirtMapping, MemoryManager
+from tinygrad.runtime.support.system import PCIIfaceBase, PCIAllocationMeta, System
+from tinygrad.runtime.support.system import filter_visible_devices
+from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat
+
+RDMA_CHUNK = 1 << 30 # a wqe length is 32 bits
+
+BNXT_IDS = (0x14e4, ((0xffff, (0x1760,)),), 0x02) # vendor, (mask, device ids), base class
+
+class BNXTIface(PCIIfaceBase):
+  def __init__(self, dev:RDMADevice, index:int):
+    super().__init__(dev, index, *BNXT_IDS[:2], vram_bar=2, va_start=MemoryManager.va_allocator.base, va_size=MemoryManager.va_allocator.size,
+                     dev_impl_t=BNXTDev, base_class=BNXT_IDS[2])
+  def device_fini(self): self.dev_impl.fini()
+
+  def storage(self, mem:MMIOInterface, paddrs:list[int], snooped:bool=True) -> BufferStorage: # nic memory any gpu of the node maps
+    va = MemoryManager.alloc_vaddr(size:=round_up(mem.nbytes, 0x1000), 0x1000)
+    mapping = VirtMapping(va, size, [(p, 0x1000) for p in paddrs], AddrSpace.SYS, uncached=True, snooped=snooped)
+    return BufferStorage(va, PCIAllocationMeta(mapping, True), mem)
+  def buffer(self, mem:MMIOInterface, paddrs:list[int], snooped:bool=True) -> Buffer:
+    return Buffer(self.dev.device, mem.nbytes, dtypes.uint8, opaque=self.storage(mem, paddrs, snooped))
+
+  @functools.cached_property
+  def doorbell(self) -> Buffer:
+    off = self.dev_impl.db_off & ~0xfff
+    return self.buffer(self.pci_dev.map_bar(2, off=off, size=0x1000), [self.pci_dev.bar_info(2)[0] + off], snooped=False)
+
+class BNXTAllocator(Allocator):
+  def _alloc(self, size:int, options:BufferSpec) -> BufferStorage: # sysmem: the counters, the batch slots, the timeline
+    return self.dev.iface.storage(*self.dev.iface.pci_dev.alloc_sysmem(round_up(size, 0x1000)))
+  def _copyin(self, dest:BufferStorage, src:memoryview): unwrap(dest.host)[:len(src)] = src
+  def _map(self, buf:Buffer) -> BufferStorage: # a memory region over the buffer's pages, keyed at the gpu virtual address
+    iface = getattr(Device[buf.device], "iface", None)
+    if not isinstance(iface, PCIIfaceBase) or iface.peer_group != self.dev.peer_group: raise RuntimeError("RDMA requires memory on its node")
+    mapping = buf.meta.mapping # the nic reaches vram over pcie: the bar, even where gpus reach each other over xgmi
+    paddrs = mapping.paddrs if mapping.aspace is AddrSpace.SYS else PCIIfaceBase.p2p_paddrs(iface, mapping.paddrs)[0]
+    align = buf._buf | functools.reduce(operator.or_, (p | s for p, s in paddrs)) # every address a multiple of the page: fewer pbl entries
+    log_page = max(l for l in (12, 13, 16, 18, 20, 21, 22, 30) if not align & ((1 << l) - 1)) # the page sizes the nic has
+    key = self.dev.iface.dev_impl.register_mem([p + off for p, size in paddrs for off in range(0, size, 1 << log_page)],
+                                              mapping.size, log_page, va=buf._buf)
+    return BufferStorage(key, key)
+  def _offset(self, buf, size:int, offset:int): return buf
+  def _unmap(self, storage:BufferStorage): self.dev.iface.dev_impl.unregister_mem(storage.meta)
+
+@functools.cache
+def rdma_nic_for(dev, anchor) -> RDMADevice|None:
+  def node(s:str) -> str: return ":".join(s.split(":")[:3]) if s.startswith("remote:") else ""
+  def bus(s:str) -> int: return int(re.findall(r":([0-9a-f]{2}):[0-9a-f]{2}\.[0-7]", s)[-1], 16)
+  gpu = dev.iface.pci_dev.pcibus
+  try: nics = [(i, n) for i, (_, n) in enumerate(filter_visible_devices(System.list_devices(*BNXT_IDS), "RDMA")) if node(n) == node(gpu)]
+  except RuntimeError: return None # no pcie on this machine
+
+  # the closest nic to the anchor on dev's node
+  return cast(RDMADevice, Device[f"RDMA:{min(nics, key=lambda x: abs(bus(x[1]) - bus(anchor.iface.pci_dev.pcibus)))[0]}"]) if nics else None
+
+class RDMADevice(Compiled):
+  ifaces = [BNXTIface]
+
+  def __init__(self, device:str):
+    self.iface = self._select_iface(device)
+    super().__init__(device, BNXTAllocator(self), [], None)
+
+# *****************
+# UOps implementation
+
+@functools.cache
+def rdma_qp(pair:tuple[str, str]) -> dict[str, BNXTQP]:
+  # one qp per gpu pair
+  nics = [unwrap(rdma_nic_for(Device[d], Device[min(pair)])) for d in pair]
+  qps = {nic.device: BNXTQP(nic.iface.dev_impl) for nic in nics}
+  for nic, q in zip(nics, qps.values()):
+    bufs = {name: nic.iface.buffer(getattr(q, name).ring, getattr(q, name).paddrs) for name in ("sq", "rq", "scq", "rcq")}
+    bufs |= {name: Buffer(nic.device, 1, dtypes.uint64, initial_value=bytes(8)) for name in ("sq_seq", "rq_seq", "psn")} | {"db": nic.iface.doorbell}
+    Compiled.pm_bufferize += PatternMatcher([(UPat(Ops.ALLOC, tag=to_name("rdma", *pair, n)), lambda b=b: b) for n, b in bufs.items()])
+  for a, b in (nics, nics[::-1]): qps[a.device].connect(qps[b.device].qpn, b.iface.dev_impl.local_gid, b.iface.dev_impl.mac)
+  return qps
+
+def rdma_mem(nic:str, pair:tuple[str, str], name:str, size:int, dtype:DType=dtypes.uint8) -> UOp:
+  return UOp.alloc((size,), dtype, 0, device=nic).rtag(to_name("rdma", *pair, name))
+def rdma_ring(nic:str, pair:tuple[str, str], is_recv:bool) -> UOp:
+  return rdma_mem(nic, pair, "rq" if is_recv else "sq", RING_ENTRIES * (WQE_SIZE if is_recv else WQE_SIZE + 8))
+def rdma_cq(nic:str, pair:tuple[str, str], is_recv:bool) -> UOp: return rdma_mem(nic, pair, "rcq" if is_recv else "scq", CQ_ENTRIES * 32)
+def rdma_seq(nic:str, pair:tuple[str, str], is_recv:bool) -> UOp: return rdma_mem(nic, pair, "rq_seq" if is_recv else "sq_seq", 1, dtypes.uint64)
+def rdma_psn(nic:str, pair:tuple[str, str]) -> UOp: return rdma_mem(nic, pair, "psn", 1, dtypes.uint64) # the next psn of the sends
+def rdma_db(nic:str, pair:tuple[str, str]) -> UOp: return rdma_mem(nic, pair, "db", 0x1000)
+
+def rdma_wire(call:UOp) -> UOp|None:
+  if call.op is not Ops.CALL or call.src[0].op is not Ops.STORE: return None
+  return next((b for b in get_call_arg_uops(call) if to_tuple(b.device)[0].startswith("RDMA")), None)
+def is_rdma(call:UOp) -> bool: return rdma_wire(call) is not None
+
+def queue_of(call:UOp) -> tuple[tuple[str, str], bool]:
+  (dst, src), wire = get_call_arg_uops(call), unwrap(rdma_wire(call))
+  gpu = to_tuple((dst if wire is src else src).device)[0]
+  return (min(gpu, wire.tag), max(gpu, wire.tag)), wire is src
+
+def ins(name:str, *src:UOp|int) -> UOp:
+  return UOp(Ops.INS, arg=(name, dtypes.void), src=tuple(UOp.const(s, dtypes.uint32) if isinstance(s, int) else s for s in src))
+
+def rdma_copies(devs:tuple[str, ...], calls:list[UOp]) -> list[list[UOp]]: # the ops of each copy of a submit on one queue
+  (pair, is_recv), nic = queue_of(calls[0]), cast(RDMADevice, Device[unwrap(rdma_wire(calls[0])).device])
+  qp = rdma_qp(pair)[nic.device]
+  ring, cq = rdma_ring(nic.device, pair, is_recv), rdma_cq(nic.device, pair, is_recv)
+  seq, psn = rdma_seq(nic.device, pair, is_recv), rdma_psn(nic.device, pair)
+  bufs = [get_call_arg_uops(c)[0 if is_recv else 1] for c in calls]
+  chunks = [ceildiv(min(RDMA_CHUNK, b.nbytes() - o), MTU) for b in bufs for o in range(0, b.nbytes(), RDMA_CHUNK)]
+  wqes, packets = len(chunks), sum(chunks)
+
+  assert wqes <= min(RING_ENTRIES, CQ_ENTRIES), "a batch posts at most a ring of wqes per pair"
+
+  # next slot and psn persist in nic memory. read once per submit and own it
+  bumps = [seq.index(0).store(seq.index(0).load() + wqes)] + ([] if is_recv else [psn.index(0).store(psn.index(0).load() + packets)])
+  i = UOp.range(wqes, next(UOp.unique_num), dtype=dtypes.uint64)
+  psns = UOp(Ops.BINARY, arg=struct.pack(f"<{wqes + 1}I", *itertools.accumulate(chunks, initial=0))).bitcast(dtypes.uint32)
+  n, p = seq.after(*bumps).index(0).load() - wqes + i, psn.after(*bumps).index(0).load() - packets + psns[i]
+
+  ring_addr, cq_addr = ring.getaddr(devs), cq.getaddr(devs)
+  db = rdma_db(nic.device, pair).getaddr(devs) + (nic.iface.dev_impl.db_off & 0xfff)
+  ring_db = db_value(qp.qpn, bnxt.DBC_DBC_TYPE_RQ if is_recv else bnxt.DBC_DBC_TYPE_SQ, 0, 0)
+  cq_db = db_value(qp.rcq_id if is_recv else qp.scq_id, bnxt.DBC_DBC_TYPE_CQ, 0, 0)
+
+  copies = []
+  for buf in bufs:
+    ops:list[UOp] = []
+    for off in range(0, buf.nbytes(), RDMA_CHUNK): # a wqe per chunk, each completed
+      size = min(RDMA_CHUNK, buf.nbytes() - off)
+
+      # sdma fills in the wqe
+      hdr, key = struct.unpack("<8I", (recv_wqe if is_recv else send_wqe)(0, 0, size)[:32]), unwrap_view(buf)[0].getaddr(nic.device)
+      ops += [ins("write", ring_addr + (n % RING_ENTRIES) * WQE_SIZE, *hdr, buf.getaddr(devs) + off, key.cast(dtypes.uint32), size)]
+
+      # a send also fills in its msn entry: the slot, the psn after it (a psn per packet), its first psn
+      if not is_recv: ops += [ins("write", ring_addr + RING_ENTRIES * WQE_SIZE + (n % RING_ENTRIES) * 8,
+                                  ((n % RING_ENTRIES) << 48) | (((p + psns[i + 1] - psns[i]) & 0xffffff) << 24) | (p & 0xffffff))]
+
+      # rings the doorbell: the slot after the wqe and the epoch of its pass
+      ops += [ins("write", db, ((n + 1) % RING_ENTRIES | ((n + 1) // RING_ENTRIES & 1) << bnxt.BNXT_QPLIB_DBR_EPOCH_SHIFT) | ring_db)]
+
+      # waits for the cqe, acks the cq
+      ops += [ins("wait_eq", cq_addr + (n % CQ_ENTRIES) * 32 + 24, (n // CQ_ENTRIES & 1 ^ 1 | (2 if is_recv else 0)).cast(dtypes.uint16)),
+              ins("write", db, ((n + 1) % CQ_ENTRIES | ((n + 1) // CQ_ENTRIES & 1) << bnxt.BNXT_QPLIB_DBR_EPOCH_SHIFT) | cq_db)]
+
+    # and invalidate the gpu caches on recv
+    copies.append(ops + ([ins("barrier")] if is_recv else []))
+  return copies
+
+# *****************
+# encode rewrite
+
+def rdma_submit(ctx, submit:UOp, lin:UOp) -> UOp|None:
+  if not (queues:={i: queue_of(u) for i, u in enumerate(lin.src) if is_rdma(u)}): return None
+
+  ops = [[u] for u in lin.src]
+  for q in dict.fromkeys(queues.values()):
+    positions = [i for i in queues if queues[i] == q]
+    for i, copy_ops in zip(positions, rdma_copies(lin.arg[0], [lin.src[i] for i in positions])): ops[i] = copy_ops
+  return submit.replace(src=(submit.body, lin.replace(src=tuple(flatten(ops)))))
+pm_rdma_encode = PatternMatcher([(UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION), UPat(Ops.LINEAR, name="lin")), name="submit"), rdma_submit)])
+
+import functools, struct
+from tinygrad.device import BufferStorage, Compiled, Allocator, BufferSpec, Program, TinyELF
+from tinygrad.renderer.wgsl import WGSLRenderer
+from tinygrad.helpers import round_up, suppress_finalizing, getenv, to_mv
+from tinygrad.runtime.autogen import webgpu
+from tinygrad.runtime.support import c
+from typing import Callable
+import ctypes
+
+backend_types = {v: k for k, v in webgpu.enum_WGPUBackendType.items()}
+instance = webgpu.wgpuCreateInstance(webgpu.WGPUInstanceDescriptor(features=webgpu.WGPUInstanceFeatures(timedWaitAnyEnable=True)))
+
+def from_wgpu_str(string_view:webgpu.WGPUStringView) -> str: return ctypes.string_at(string_view.data, string_view.length).decode()
+def to_wgpu_str(_str:str) -> webgpu.WGPUStringView: return webgpu.WGPUStringView(data=ctypes.create_string_buffer(_str.encode()), length=len(_str))
+
+# gets a memoryview from a buffer, which is assumed to have MAP_READ (see _readable_buffer)
+def buf_to_mv(buf:webgpu.WGPUBuffer) -> memoryview:
+  BufferMapAsync(buf, webgpu.WGPUMapMode_Read, 0, size:=webgpu.wgpuBufferGetSize(buf))
+  return to_mv(webgpu.wgpuBufferGetConstMappedRange(buf, 0, size), size)
+
+# turns a webgpu function returning a future into python-synchronous function
+# the new function handles the status code and optional error message, returning the other callback arguments
+def synchronous(status_enum:dict[int, str], has_emsg:bool=False):
+  def wrap(fn:Callable[..., webgpu.WGPUFuture]) -> Callable:
+    @functools.wraps(fn)
+    def wrapper(*args):
+      status, payload, emsg = 0, [], None
+
+      @next(ty for nm, ty, *_ in fn.argtypes[-1]._real_fields_ if nm == "callback") # type: ignore
+      def cb(s:int, *args):
+        nonlocal status, payload, emsg
+        # the last two arguments are "userdata1" and "userdata2", which we drop
+        # we must process wgpu strings in this callback, as they will be freed after we return
+        status, (*payload, emsg) = s, [from_wgpu_str(a) if type(a) is webgpu.WGPUStringView else a for a in args[:-2]] + ([] if has_emsg else [None])
+
+      future = fn(*args, fn.argtypes[-1](mode=webgpu.WGPUCallbackMode_WaitAnyOnly, callback=cb)) # type: ignore
+      if (future_status:=webgpu.wgpuInstanceWaitAny(instance, 1, webgpu.WGPUFutureWaitInfo(future), 2**64-1)) != webgpu.WGPUWaitStatus_Success:
+        raise RuntimeError(f"error while waiting for future ({fn.__name__}): {webgpu.enum_WGPUWaitStatus.get(future_status)}")
+
+      if status != 1: raise RuntimeError(f"[{status_enum.get(status)}]{emsg or ''}")
+      return payload if len(payload) > 1 else payload[0] if len(payload) == 1 else None
+    return wrapper
+  return wrap
+
+BufferMapAsync = synchronous(webgpu.enum_WGPUBufferMapAsyncStatus, True)(webgpu.wgpuBufferMapAsync2)
+DevicePopErrorScope = synchronous(webgpu.enum_WGPUPopErrorScopeStatus)(webgpu.wgpuDevicePopErrorScope2)
+DeviceCreateComputePipeline = synchronous(webgpu.enum_WGPUCreatePipelineAsyncStatus, True)(webgpu.wgpuDeviceCreateComputePipelineAsync2)
+InstanceRequestAdapter = synchronous(webgpu.enum_WGPURequestAdapterStatus, True)(webgpu.wgpuInstanceRequestAdapter2)
+AdapterRequestDevice = synchronous(webgpu.enum_WGPURequestDeviceStatus, True)(webgpu.wgpuAdapterRequestDevice2)
+QueueOnSubmittedWorkDone = synchronous(webgpu.enum_WGPUQueueWorkDoneStatus)(webgpu.wgpuQueueOnSubmittedWorkDone2)
+
+class WebGPUProgram(Program['WebGpuDevice']):
+  def __init__(self, dev:'WebGpuDevice', obj:TinyELF):
+    self.dev, self.name = dev, to_wgpu_str(obj.name)
+
+    # Creating shader module
+    shader = webgpu.WGPUShaderModuleWGSLDescriptor(code=to_wgpu_str(obj.lib.decode()),
+                                                   chain=webgpu.WGPUChainedStruct(sType=webgpu.WGPUSType_ShaderSourceWGSL))
+    module = webgpu.WGPUShaderModuleDescriptor(nextInChain=ctypes.cast(ctypes.pointer(shader), ctypes.POINTER(webgpu.struct_WGPUChainedStruct)))
+
+    # Check compiler error
+    webgpu.wgpuDevicePushErrorScope(self.dev.device_res, webgpu.WGPUErrorFilter_Validation)
+    self.prg = webgpu.wgpuDeviceCreateShaderModule(self.dev.device_res, module)
+    if err := self.dev.pop_error(): raise RuntimeError(f"Shader compilation failed: {err}")
+
+  @suppress_finalizing
+  def __del__(self): webgpu.wgpuShaderModuleRelease(self.prg)
+
+  def __call__(self, *bufs:webgpu.WGPUBuffer, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1),
+               vals:tuple[int, ...]=(), wait=False, **kw) -> float|None:
+    wait = wait and webgpu.WGPUFeatureName_TimestampQuery in self.dev.features
+
+    # Creating bind group layout
+    def bgl_entry(n:int, ty:str):
+      return webgpu.WGPUBindGroupLayoutEntry(binding=n, visibility=webgpu.WGPUShaderStage_Compute,
+                                             buffer=webgpu.WGPUBufferBindingLayout(type=getattr(webgpu, f'WGPUBufferBindingType_{ty}')))
+    bind_entries = (webgpu.WGPUBindGroupLayoutEntry * (1+len(bufs)+len(vals)))(
+      bgl_entry(0, 'Uniform'), *(bgl_entry(i+1, 'Uniform' if i >= len(bufs) else 'Storage') for i in range(len(bufs)+len(vals))))
+
+    webgpu.wgpuDevicePushErrorScope(self.dev.device_res, webgpu.WGPUErrorFilter_Validation)
+    bind_layout = webgpu.wgpuDeviceCreateBindGroupLayout(self.dev.device_res,
+                                                         webgpu.WGPUBindGroupLayoutDescriptor(entryCount=len(bind_entries), entries=bind_entries))
+
+    if err := self.dev.pop_error(): raise RuntimeError(f"Error creating bind group layout: {err}")
+
+    # Creating pipeline layout
+    pipeline_layout_desc = webgpu.WGPUPipelineLayoutDescriptor(bindGroupLayoutCount=1, bindGroupLayouts=(webgpu.WGPUBindGroupLayout*1)(bind_layout))
+
+    webgpu.wgpuDevicePushErrorScope(self.dev.device_res, webgpu.WGPUErrorFilter_Validation)
+    pipeline_layout = webgpu.wgpuDeviceCreatePipelineLayout(self.dev.device_res, pipeline_layout_desc)
+    if err := self.dev.pop_error(): raise RuntimeError(f"Error creating pipeline layout: {err}")
+
+    # Creating bind group
+    def bg_entry(n:int, x:webgpu.WGPUBuffer|int|float):
+      buf = x if isinstance(x, webgpu.WGPUBuffer) else self.dev.create_uniform(x)
+      return webgpu.WGPUBindGroupEntry(binding=n, buffer=buf, offset=0, size=webgpu.wgpuBufferGetSize(buf))
+    bindings = (webgpu.WGPUBindGroupEntry * (1+len(bufs)+len(vals)))(bg_entry(0, float('inf')), *(bg_entry(i+1, x) for i,x in enumerate(bufs+vals)))
+
+    bind_group_desc = webgpu.WGPUBindGroupDescriptor(layout=bind_layout, entryCount=len(bindings), entries=bindings)
+    webgpu.wgpuDevicePushErrorScope(self.dev.device_res, webgpu.WGPUErrorFilter_Validation)
+    bind_group = webgpu.wgpuDeviceCreateBindGroup(self.dev.device_res, bind_group_desc)
+    if err := self.dev.pop_error(): raise RuntimeError(f"Error creating bind group: {err}")
+
+    # Creating compute pipeline
+    compute_desc = webgpu.WGPUComputePipelineDescriptor(layout=pipeline_layout,
+                                                        compute=webgpu.WGPUComputeState(module=self.prg, entryPoint=self.name))
+    pipeline_result = DeviceCreateComputePipeline(self.dev.device_res, compute_desc)
+
+    command_encoder = webgpu.wgpuDeviceCreateCommandEncoder(self.dev.device_res, webgpu.WGPUCommandEncoderDescriptor())
+    comp_pass_desc = webgpu.WGPUComputePassDescriptor()
+
+    if wait:
+      query_set = webgpu.wgpuDeviceCreateQuerySet(self.dev.device_res, webgpu.WGPUQuerySetDescriptor(type=webgpu.WGPUQueryType_Timestamp, count=2))
+      query_buf = webgpu.wgpuDeviceCreateBuffer(
+        self.dev.device_res, webgpu.WGPUBufferDescriptor(size=16, usage=webgpu.WGPUBufferUsage_QueryResolve | webgpu.WGPUBufferUsage_CopySrc))
+      comp_pass_desc.timestampWrites = c.pointer(webgpu.WGPUComputePassTimestampWrites(querySet=query_set, beginningOfPassWriteIndex=0,
+                                                                                       endOfPassWriteIndex=1))
+
+    # Begin compute pass
+    compute_pass = webgpu.wgpuCommandEncoderBeginComputePass(command_encoder, comp_pass_desc)
+    webgpu.wgpuComputePassEncoderSetPipeline(compute_pass, pipeline_result)
+    webgpu.wgpuComputePassEncoderSetBindGroup(compute_pass, 0, bind_group, 0, None)
+    webgpu.wgpuComputePassEncoderDispatchWorkgroups(compute_pass, *global_size)
+    webgpu.wgpuComputePassEncoderEnd(compute_pass)
+
+    if wait: webgpu.wgpuCommandEncoderResolveQuerySet(command_encoder, query_set, 0, 2, query_buf, 0)
+
+    cmd_buf = webgpu.wgpuCommandEncoderFinish(command_encoder, webgpu.WGPUCommandBufferDescriptor())
+    webgpu.wgpuQueueSubmit(self.dev.queue, 1, (webgpu.WGPUCommandBuffer*1)(cmd_buf))
+
+    # release created objects
+    webgpu.wgpuBindGroupLayoutRelease(bind_layout)
+    webgpu.wgpuPipelineLayoutRelease(pipeline_layout)
+    webgpu.wgpuBindGroupRelease(bind_group)
+    webgpu.wgpuComputePipelineRelease(pipeline_result)
+    webgpu.wgpuCommandEncoderRelease(command_encoder)
+    webgpu.wgpuComputePassEncoderRelease(compute_pass)
+    webgpu.wgpuCommandBufferRelease(cmd_buf)
+
+    if wait:
+      time = ((timestamps:=buf_to_mv(tmp_buf:=self.dev._readable_buffer(query_buf)).cast("Q").tolist())[1] - timestamps[0]) / 1e9
+      self.dev.free(query_buf)
+      self.dev.free(tmp_buf)
+      webgpu.wgpuQuerySetDestroy(query_set)
+      webgpu.wgpuQuerySetRelease(query_set)
+      return time
+    return None
+
+class WebGpuAllocator(Allocator['WebGpuDevice']):
+  def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
+    # WebGPU buffers have to be 4-byte aligned
+    return BufferStorage(webgpu.wgpuDeviceCreateBuffer(self.dev.device_res, webgpu.WGPUBufferDescriptor(size=round_up(size, 4),
+      usage=webgpu.WGPUBufferUsage_Storage | webgpu.WGPUBufferUsage_CopyDst | webgpu.WGPUBufferUsage_CopySrc)))
+  def _copyin(self, dest:webgpu.WGPUBuffer, src:memoryview):
+    if src.nbytes % 4:
+      padded_src = bytearray(round_up(src.nbytes, 4))
+      padded_src[:src.nbytes] = src
+    self.dev.write_buffer(dest, padded_src if src.nbytes % 4 else src)
+  def _copyout(self, dest:memoryview, src:webgpu.WGPUBuffer):
+    dest[:] = buf_to_mv(tmp_buf:=self.dev._readable_buffer(src))[:dest.nbytes]
+    self.dev.free(tmp_buf)
+
+  def _free(self, storage:BufferStorage, options:BufferSpec): self.dev.free(storage.buf)
+
+class WebGpuDevice(Compiled):
+  def __init__(self, device:str):
+    # Requesting an adapter
+    adapter_res = InstanceRequestAdapter(instance, webgpu.WGPURequestAdapterOptions(
+      powerPreference=webgpu.WGPUPowerPreference_HighPerformance, backendType=backend_types.get(getenv("WEBGPU_BACKEND", ""), 0)))
+
+    # Get supported features
+    webgpu.wgpuAdapterGetFeatures(adapter_res, supported_features:=webgpu.WGPUSupportedFeatures())
+    self.features = [feat for i in range(supported_features.featureCount)
+                     if (feat:=supported_features.features[i]) in [webgpu.WGPUFeatureName_TimestampQuery, webgpu.WGPUFeatureName_ShaderF16]]
+    webgpu.wgpuSupportedFeaturesFreeMembers(supported_features)
+    dev_desc = webgpu.WGPUDeviceDescriptor(requiredFeatureCount=len(self.features),
+                                           requiredFeatures=(webgpu.WGPUFeatureName * len(self.features))(*self.features))
+
+    # Limits
+    webgpu.wgpuAdapterGetLimits(adapter_res, supported_limits:=webgpu.WGPUSupportedLimits())
+    dev_desc.requiredLimits = c.pointer(webgpu.WGPURequiredLimits(limits=supported_limits.limits))
+
+    # Requesting a device
+    self.device_res = AdapterRequestDevice(adapter_res, dev_desc)
+    self.queue = webgpu.wgpuDeviceGetQueue(self.device_res)
+
+    webgpu.wgpuAdapterRelease(adapter_res)
+
+    super().__init__(device, WebGpuAllocator(self), [WGSLRenderer], WebGPUProgram,
+                     arch="shader-f16" * (webgpu.WGPUFeatureName_ShaderF16 in self.features))
+
+  def synchronize(self, timeout:int|None=None): QueueOnSubmittedWorkDone(self.queue)
+
+  @suppress_finalizing
+  def free(self, buf:webgpu.WGPUBuffer):
+    if webgpu.wgpuBufferGetMapState(buf) == webgpu.WGPUBufferMapState_Mapped: webgpu.wgpuBufferUnmap(buf)
+    webgpu.wgpuBufferDestroy(buf)
+    webgpu.wgpuBufferRelease(buf)
+
+  def pop_error(self) -> str: return DevicePopErrorScope(self.device_res)[1]
+  def create_uniform(self, val:int|float) -> webgpu.WGPUBuffer:
+    buf = webgpu.wgpuDeviceCreateBuffer(self.device_res,
+                                        webgpu.WGPUBufferDescriptor(size=4, usage=webgpu.WGPUBufferUsage_Uniform | webgpu.WGPUBufferUsage_CopyDst))
+    self.write_buffer(buf, val.to_bytes(4, "little", signed=val < 0) if isinstance(val, int) else struct.pack('<f', val))
+    return buf
+  def _readable_buffer(self, buf:webgpu.WGPUBuffer) -> webgpu.WGPUBuffer:
+    size = webgpu.wgpuBufferGetSize(buf)
+    ret = webgpu.wgpuDeviceCreateBuffer(self.device_res,
+      webgpu.WGPUBufferDescriptor(size=size, usage=webgpu.WGPUBufferUsage_CopyDst | webgpu.WGPUBufferUsage_MapRead, mappedAtCreation=False))
+
+    # copy_buffer_to_buffer
+    encoder = webgpu.wgpuDeviceCreateCommandEncoder(self.device_res, webgpu.WGPUCommandEncoderDescriptor())
+    webgpu.wgpuCommandEncoderCopyBufferToBuffer(encoder, buf, 0, ret, 0, size)
+    cmd_buf = webgpu.wgpuCommandEncoderFinish(encoder, webgpu.WGPUCommandBufferDescriptor())
+    webgpu.wgpuQueueSubmit(self.queue, 1, (webgpu.WGPUCommandBuffer*1)(cmd_buf))
+    webgpu.wgpuCommandBufferRelease(cmd_buf)
+    webgpu.wgpuCommandEncoderRelease(encoder)
+
+    return ret
+  def write_buffer(self, buf:webgpu.WGPUBuffer, src:memoryview|bytearray|bytes):
+    webgpu.wgpuQueueWriteBuffer(self.queue, buf, 0, (ctypes.c_uint8 * len(src)).from_buffer_copy(src), len(src))
+
+
+
+from __future__ import annotations
+import ctypes, collections, dataclasses, functools, hashlib, array, contextlib, time
+from tinygrad.helpers import mv_address, getenv, DEBUG, lo32, hi32, fetch_fw, to_mv, wait_cond
+from tinygrad.runtime.autogen import pci
+from tinygrad.runtime.autogen.am import am, fw
+from tinygrad.runtime.support.amd import AMDReg, import_module, import_asic_regs
+from tinygrad.runtime.support.memory import MemoryManager, AddrSpace
+from tinygrad.runtime.support.system import PCIDevice
+from tinygrad.runtime.support.am.ip import AM_IP, AM_SOC, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA
+
+AM_DEBUG = getenv("AM_DEBUG", 0)
+
+@dataclasses.dataclass
+class AMRegister(AMDReg):
+  adev:AMDev
+
+  def read(self, inst=0, direct=False): return self.adev.rreg(self.addr[inst], inst=inst, direct=direct)
+  def read_bitfields(self, inst=0) -> dict[str, int]: return self.decode(self.read(inst=inst))
+
+  def write(self, _am_val:int=0, inst=0, direct=False, **kwargs):
+    self.adev.wreg(self.addr[inst], _am_val|self.encode(**kwargs), inst=inst, direct=direct)
+
+  def update(self, inst=0, **kwargs): self.write(self.read(inst=inst) & ~self.fields_mask(*kwargs.keys()), inst=inst, **kwargs)
+
+class AMFirmware:
+  def __init__(self, adev):
+    self.adev = adev
+    def fmt_ver(hwip): return '_'.join(map(str, adev.ip_ver[hwip]))
+
+    # Load SOS firmware
+    self.sos_fw = {}
+
+    blob, sos_hdr = self.load_fw(f"psp_{fmt_ver(am.MP0_HWIP)}_sos.bin", versioned_header='struct_psp_firmware_header')
+    fw_bin = sos_hdr.psp_fw_bin
+
+    for fw_i in range(sos_hdr.psp_aux_fw_bin_index if sos_hdr.header.header_version_minor == 1 else sos_hdr.psp_fw_bin_count):
+      fw_bin_desc = am.struct_psp_fw_bin_desc.from_address(ctypes.addressof(fw_bin) + fw_i * ctypes.sizeof(am.struct_psp_fw_bin_desc))
+      ucode_start_offset = fw_bin_desc.offset_bytes + sos_hdr.header.ucode_array_offset_bytes
+      self.sos_fw[fw_bin_desc.fw_type] = blob[ucode_start_offset:ucode_start_offset+fw_bin_desc.size_bytes]
+
+    # Load other fw
+    self.ucode_start: dict[str, int] = {}
+    self.descs: list[tuple[list[int], memoryview]] = []
+
+    # SMU firmware
+    if adev.ip_ver[am.MP1_HWIP] != (13,0,12):
+      blob, hdr = self.load_fw(f"smu_{fmt_ver(am.MP1_HWIP)}.bin", versioned_header="struct_smc_firmware_header")
+      if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0):
+        self.smu_psp_desc = self.desc(blob, hdr.v1_0.header.ucode_array_offset_bytes, hdr.v1_0.header.ucode_size_bytes, am.GFX_FW_TYPE_SMU)
+      else:
+        p2stables = (am.struct_smc_soft_pptable_entry * hdr.pptable_count).from_buffer(blob[hdr.pptable_entry_offset:])
+        for p2stable in p2stables:
+          if p2stable.id == (__P2S_TABLE_ID_X:=0x50325358):
+            self.descs += [self.desc(blob, p2stable.ppt_offset_bytes, p2stable.ppt_size_bytes, am.GFX_FW_TYPE_P2S_TABLE)]
+
+    # SDMA firmware
+    blob, hdr = self.load_fw(f"sdma_{fmt_ver(am.SDMA0_HWIP)}.bin", versioned_header="struct_sdma_firmware_header")
+    if hdr.header.header_version_major == 1:
+      self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.header.ucode_size_bytes, am.GFX_FW_TYPE_SDMA0,
+                               am.GFX_FW_TYPE_SDMA1, am.GFX_FW_TYPE_SDMA2, am.GFX_FW_TYPE_SDMA3)]
+    elif hdr.header.header_version_major == 2:
+      self.descs += [self.desc(blob, hdr.ctl_ucode_offset, hdr.ctl_ucode_size_bytes, am.GFX_FW_TYPE_SDMA_UCODE_TH1)]
+      self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.ctx_ucode_size_bytes, am.GFX_FW_TYPE_SDMA_UCODE_TH0)]
+    else: self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.ucode_size_bytes, am.GFX_FW_TYPE_SDMA_UCODE_TH0)]
+
+    # PFP, ME, MEC firmware
+    for (fw_name, fw_cnt) in ([('PFP', 1), ('ME', 1)] if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else []) + [('MEC', 1)]:
+      blob, hdr = self.load_fw(f"gc_{fmt_ver(am.GC_HWIP)}_{fw_name.lower()}.bin", versioned_header="struct_gfx_firmware_header")
+
+      ucode_off = hdr.header.ucode_array_offset_bytes
+      if hdr.header.header_version_major == 1:
+        # Code
+        self.descs += [self.desc(blob, ucode_off, hdr.header.ucode_size_bytes - hdr.jt_size * 4, getattr(am, f'GFX_FW_TYPE_CP_{fw_name}'))]
+        # JT
+        self.descs += [self.desc(blob, ucode_off + hdr.jt_offset * 4, hdr.jt_size * 4, getattr(am, f'GFX_FW_TYPE_CP_{fw_name}_ME1'))]
+      else:
+        # Code
+        self.descs += [self.desc(blob, ucode_off, hdr.ucode_size_bytes, getattr(am, f'GFX_FW_TYPE_RS64_{fw_name}'))]
+        # Stack
+        stack_fws = [getattr(am, f'GFX_FW_TYPE_RS64_{fw_name}_P{fwnum}_STACK') for fwnum in range(fw_cnt)]
+        self.descs += [self.desc(blob, hdr.data_offset_bytes, hdr.data_size_bytes, *stack_fws)]
+        self.ucode_start[fw_name] = hdr.ucode_start_addr_lo | (hdr.ucode_start_addr_hi << 32)
+
+    # IMU firmware
+    if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0):
+      blob, hdr = self.load_fw(f"gc_{fmt_ver(am.GC_HWIP)}_imu.bin", am.struct_imu_firmware_header_v1_0)
+      imu_i_off, imu_i_sz, imu_d_sz = hdr.header.ucode_array_offset_bytes, hdr.imu_iram_ucode_size_bytes, hdr.imu_dram_ucode_size_bytes
+      self.descs += [self.desc(blob, imu_i_off, imu_i_sz, am.GFX_FW_TYPE_IMU_I), self.desc(blob, imu_i_off+imu_i_sz, imu_d_sz, am.GFX_FW_TYPE_IMU_D)]
+
+    # RLC firmware
+    blob, hdr0, hdr1, hdr2, hdr3 = self.load_fw(f"gc_{fmt_ver(am.GC_HWIP)}_rlc.bin", am.struct_rlc_firmware_header_v2_0,
+      am.struct_rlc_firmware_header_v2_1, am.struct_rlc_firmware_header_v2_2, am.struct_rlc_firmware_header_v2_3)
+
+    if hdr0.header.header_version_minor == 1:
+      for mem,fmem in [('LIST_SRM_CNTL', 'list_cntl'), ('LIST_GPM_MEM', 'list_gpm'), ('LIST_SRM_MEM', 'list_srm')]:
+        off, sz = getattr(hdr1, f'save_restore_{fmem}_offset_bytes'), getattr(hdr1, f'save_restore_{fmem}_size_bytes')
+        self.descs += [self.desc(blob, off, sz, getattr(am, f'GFX_FW_TYPE_RLC_RESTORE_{mem}'))]
+
+    if hdr0.header.header_version_minor >= 2:
+      for mem,fmem in [('IRAM', 'iram'), ('DRAM_BOOT', 'dram')]:
+        off, sz = getattr(hdr2, f'rlc_{fmem}_ucode_offset_bytes'), getattr(hdr2, f'rlc_{fmem}_ucode_size_bytes')
+        self.descs += [self.desc(blob, off, sz, getattr(am, f'GFX_FW_TYPE_RLC_{mem}'))]
+
+    if hdr0.header.header_version_minor == 3:
+      for mem in ['P', 'V']:
+        off, sz = getattr(hdr3, f'rlc{mem.lower()}_ucode_offset_bytes'), getattr(hdr3, f'rlc{mem.lower()}_ucode_size_bytes')
+        self.descs += [self.desc(blob, off, sz, getattr(am, f'GFX_FW_TYPE_RLC_{mem}'))]
+
+    self.descs += [self.desc(blob, hdr0.header.ucode_array_offset_bytes, hdr0.header.ucode_size_bytes, am.GFX_FW_TYPE_RLC_G)]
+
+  def load_fw(self, fname:str, *headers, versioned_header:str|None=None):
+    blob = memoryview(bytearray(fetch_fw("amdgpu", fname, fw.hashes[fname])))
+    if AM_DEBUG >= 1: print(f"am {self.adev.devfmt}: loading firmware {fname}: {hashlib.sha256(blob).hexdigest()}")
+    if versioned_header:
+      chdr = am.struct_common_firmware_header.from_address(mv_address(blob))
+      headers += (getattr(am, versioned_header + f"_v{chdr.header_version_major}_{chdr.header_version_minor}"),)
+    return tuple([blob] + [hdr.from_address(mv_address(blob)) for hdr in headers])
+
+  def desc(self, blob:memoryview, offset:int, size:int, *types:int) -> tuple[list[int], memoryview]: return (list(types), blob[offset:offset+size])
+
+class AMPageTableEntry:
+  def __init__(self, adev, paddr, lv): self.adev, self.paddr, self.lv, self.entries = adev, paddr, lv, adev.vram.view(paddr, 0x1000, fmt='Q')
+
+  def set_entry(self, entry_id:int, paddr:int, table=False, uncached=False, aspace=AddrSpace.PHYS, snooped=False, frag=0, valid=True):
+    is_sys = aspace is AddrSpace.SYS
+    if aspace is AddrSpace.PHYS: paddr = self.adev.paddr2xgmi(paddr)
+    assert paddr & self.adev.gmc.address_space_mask == paddr, f"Invalid physical address {paddr:#x}"
+    self.entries[entry_id] = self.adev.gmc.get_pte_flags(self.lv, table, frag, uncached, is_sys, snooped, valid) | (paddr & 0x0000FFFFFFFFF000)
+
+  def entry(self, entry_id:int) -> int: return self.entries[entry_id]
+  def valid(self, entry_id:int) -> bool: return (self.entries[entry_id] & am.AMDGPU_PTE_VALID) != 0
+  def address(self, entry_id:int) -> int:
+    assert self.entries[entry_id] & am.AMDGPU_PTE_SYSTEM == 0, "should not be system address"
+    return self.adev.xgmi2paddr(self.entries[entry_id] & 0x0000FFFFFFFFF000)
+  def is_page(self, entry_id:int) -> bool: return self.lv == am.AMDGPU_VM_PTB or self.adev.gmc.is_pte_huge_page(self.lv, self.entries[entry_id])
+  def supports_huge_page(self, paddr:int): return self.lv >= am.AMDGPU_VM_PDB2
+
+class AMMemoryManager(MemoryManager):
+  def on_range_mapped(self):
+    # Invalidate TLB after mappings.
+    self.dev.gmc.flush_tlb(ip='GC', vmid=0)
+    self.dev.gmc.flush_tlb(ip='MM', vmid=0)
+
+class AMDev:
+  Version = 0xA000000D
+
+  def _disable_aspm(self):
+    # L1 across retimers makes reads oscillate to 0xffffffff; power on defaults it enabled. Clearing the GPU endpoint
+    # alone suffices: L1 only engages when both ends of the link enable it.
+    cap, seen = self.pci_dev.read_config(0x34, 1) & 0xfc, set() # bound the walk: a dead link can return 0xff pointers forever
+    while cap and cap not in seen and self.pci_dev.read_config(cap, 1) != 0x10:
+      seen.add(cap)
+      cap = self.pci_dev.read_config(cap + 1, 1) & 0xfc
+    if cap and cap not in seen: self.pci_dev.write_config_flush(cap + 0x10, self.pci_dev.read_config(cap + 0x10, 2) & ~3, 2) # PCIe cap lnkctl
+
+  def __init__(self, pci_dev:PCIDevice, reset_mode=False):
+    self.pci_dev, self.devfmt = pci_dev, pci_dev.pcibus
+    self._disable_aspm()
+    self.vram, self.doorbell64, self.mmio = self.pci_dev.map_bar(0), self.pci_dev.map_bar(2, fmt='Q'), self.pci_dev.map_bar(5, fmt='I')
+
+    # VF related
+    self.is_vf = bool(self.mmio[am.mmRCC_IOV_FUNC_IDENTIFIER] & 1)
+    self.vf_mailbox = self.mmio.view(am.NV_MAIBOX_CONTROL_TRN_OFFSET_BYTE, 2, fmt='B')
+    self.vf_access = self._vf_mailbox_request(am.IDH_REQ_GPU_INIT_ACCESS) if self.is_vf else 0
+    self.vf_rlc_gated:list[tuple[int, int]] = []
+
+    self._run_discovery()
+    self._build_regs()
+
+    # AM boot Process:
+    # The GPU being passed can be in one of several states: 1. Not initialized. 2. Initialized by amdgpu. 3. Initialized by AM.
+    # The 1st and 2nd states require a full GPU setup since their states are unknown. The 2nd state also requires a mode1 reset to
+    # reinitialize all components.
+    #
+    # The 3rd state can be set up partially to optimize boot time. In this case, only the GFX and SDMA IPs need to be initialized.
+    # To enable this, AM uses a separate boot memory that is guaranteed not to be overwritten. This physical memory is utilized for
+    # all blocks that are initialized only during the initial AM boot.
+    # To determine if the GPU is in the third state, AM uses regSCRATCH_REG7 as a flag.
+    # To determine if the previous AM session finalized correctly, AM uses regSCRATCH_REG6 as a flag.
+    self.is_booting = True # During boot only boot memory can be allocated. This flag is to validate this.
+    self.init_sw(smi_dev=False)
+
+    self.partial_boot = (self.reg("regSCRATCH_REG7").read() == AMDev.Version) and (getenv("AM_RESET", 0) != 1)
+    if self.partial_boot and (self.reg("regSCRATCH_REG6").read() != 0 or self.reg(self.gmc.pf_status_reg("GC")).read() != 0):
+      if DEBUG >= 2: print(f"am {self.devfmt}: Malformed state. Issuing a full reset.")
+      self.partial_boot = False
+
+    # aqua (gc 9.5.0): full boot over live state can kill the fabric (power cycle recovers); partial boot+reset_mec is the deepest safe reset
+    if self.ip_ver[am.GC_HWIP] == (9,5,0) and self.reg("regSCRATCH_REG7").read() == AMDev.Version: self.partial_boot = True
+
+    # Init hw for IP blocks where it is needed
+    if not self.partial_boot:
+      if not self.is_vf and self.psp.is_sos_alive() and self.smu.is_smu_alive(): # skip in vf mode, these are pf funcs.
+        self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) & ~pci.PCI_COMMAND_MASTER, 2)
+        if self.is_hive():
+          if reset_mode: return # in reset mode, do not raise
+          raise RuntimeError("Malformed state. Use extra/amdpci/hive_reset.py to reset the hive")
+        # Quiesce first: mode1 reset over live engines at max clocks can wedge the GPU until power cycled.
+        self.gfx.fini_hw()
+        self.smu.set_clocks(level=0)
+        self.gfx.halt_engines()
+        self.sdma.halt_engines()
+        time.sleep(0.1)
+        self.smu.mode1_reset()
+      self.pci_dev.write_config_flush(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
+      self.init_hw(self.soc, self.gmc, self.ih, *(() if self.is_vf else (self.psp, self.smu)))
+    elif not self.is_vf: self.psp._tmr_init()
+
+    # Booting done
+    self.is_booting = False
+
+    # Re-initialize main blocks
+    self.init_hw(self.gfx, self.sdma)
+
+    if not self.is_vf: # skip in vf mode, these are pf funcs.
+      if (max_power:=getenv("AM_POWER_LIMIT", 0.0)) > 0:
+        self.smu.set_power_limit(max_power)
+        self.smu.set_clocks(level=None)
+      else: self.smu.set_clocks(level=-1) # last level, max perf.
+      for ip in [self.soc, self.gfx]: ip.set_clockgating_state()
+      self.reg("regSCRATCH_REG5").write(self.psp.tmr_size) # scratch registers are writable after GFX initialization
+      self.reg("regSCRATCH_REG7").write(AMDev.Version)
+      self.reg("regSCRATCH_REG6").write(1) # set initialized state.
+
+    if DEBUG >= 2: print(f"am {self.devfmt}: boot done")
+
+  def init_sw(self, smi_dev=False):
+    self.smi_dev, self.is_err_state = smi_dev, False
+
+    # Memory manager & firmware
+    self.mm = AMMemoryManager(self, self.vram_size - self.reserved_vram_size, boot_size=(3 << 20), pt_t=AMPageTableEntry, va_shifts=[12, 21, 30, 39],
+      va_bits=48, first_lv=am.AMDGPU_VM_PDB2, va_base=MemoryManager.va_allocator.base, reserve_ptable=not self.large_bar,
+      palloc_ranges=[(1 << (i + 12), (2 << 20) if i >= 9 else 0x1000) for i in range(9 * (3 - am.AMDGPU_VM_PDB2), -1, -1)])
+    self.fw = AMFirmware(self)
+
+    # Initialize IP blocks
+    self.soc:AM_SOC = AM_SOC(self)
+    self.gmc:AM_GMC = AM_GMC(self)
+    self.ih:AM_IH = AM_IH(self)
+    self.psp:AM_PSP = AM_PSP(self)
+    self.smu:AM_SMU = AM_SMU(self)
+    self.gfx:AM_GFX = AM_GFX(self)
+    self.sdma:AM_SDMA = AM_SDMA(self)
+
+    # Init sw for all IP blocks
+    for ip in [self.soc, self.gmc, self.ih, self.psp, self.smu, self.gfx, self.sdma]: ip.init_sw()
+
+  def init_hw(self, *blocks:AM_IP):
+    for ip in blocks:
+      ip.init_hw()
+      if DEBUG >= 2: print(f"am {self.devfmt}: {ip.__class__.__name__} initialized")
+
+  def fini(self):
+    if DEBUG >= 2: print(f"am {self.devfmt}: Finalizing")
+    # a VF may only touch the engines inside an access window, take one so the host does not have to FLR the VF later
+    if self.is_vf and not self.vf_access:
+      with contextlib.suppress(TimeoutError): self.vf_access = self._vf_mailbox_request(am.IDH_REQ_GPU_FINI_ACCESS)
+    for ip in [self.sdma, self.gfx]: ip.fini_hw()
+    if not self.is_vf: self.smu.set_clocks(level=0)
+    self.ih.interrupt_handler()
+    if not self.is_vf: self.reg("regSCRATCH_REG6").write(self.is_err_state) # set finalized state.
+    if self.vf_access: self.release_vf_access()
+
+  def release_vf_access(self):
+    rel, self.vf_access = self.vf_access, 0 # give back the same lease that was taken
+    with contextlib.suppress(TimeoutError): self._vf_mailbox_request(rel, wait_ready=False)
+
+  def _vf_mailbox_request(self, req:int, wait_ready=True) -> int:
+    self.vf_mailbox[0] = 0 # drop TRN_MSG_VALID
+
+    wait_cond(lambda: self.vf_mailbox[0] & 2, value=0, timeout_ms=1000, msg="VF mailbox acknowledgement did not clear")
+    for i, val in enumerate((req, 0, 0, 0)): self.mmio[am.mmMAILBOX_MSGBUF_TRN_DW0 + i] = val
+
+    self.vf_mailbox[0] = 1 # set TRN_MSG_VALID
+    wait_cond(lambda: self.vf_mailbox[0] & 2, value=2, timeout_ms=am.NV_MAILBOX_POLL_ACK_TIMEDOUT, msg=f"VF mailbox request {req:#x} was not acked")
+    self.vf_mailbox[0] = 0
+    if wait_ready:
+      wait_cond(lambda: self.mmio[am.mmMAILBOX_MSGBUF_RCV_DW0], value=am.IDH_READY_TO_ACCESS_GPU, timeout_ms=am.NV_MAILBOX_POLL_MSG_TIMEDOUT,
+                msg="VF mailbox: the pf never granted access")
+      self.vf_mailbox[1] = 2 # ack
+    return req + 1
+
+  def recover(self, force=False) -> bool:
+    if not force and not self.is_err_state: return False
+    if DEBUG >= 3: print(f"am {self.devfmt}: Start recovery")
+    self.ih.interrupt_handler()
+    self.gfx.reset_mec()
+    self.is_err_state = False
+    if DEBUG >= 3: print(f"am {self.devfmt}: Recovery complete")
+    return True
+
+  # a hive has multiple XGMI regions; single-node parts (like MI350P) may still program LFB_SIZE with region 0 only
+  def is_hive(self) -> bool: return self.gmc.xgmi_seg_sz > 0 and self.gmc.xgmi_max_region > 0
+
+  def paddr2mc(self, paddr:int) -> int: return self.gmc.mc_base + paddr
+  def paddr2xgmi(self, paddr:int) -> int: return self.gmc.paddr_base + paddr
+  def xgmi2paddr(self, xgmi_paddr:int) -> int: return xgmi_paddr - self.gmc.paddr_base
+
+  def reg(self, reg:str) -> AMRegister: return self.__dict__[reg]
+
+  def rreg(self, reg:int, inst=0, direct=False) -> int:
+    if not direct and any(lo <= reg <= hi for lo, hi in self.vf_rlc_gated): return self.rlcg_rw(reg, 0, inst, read=True)
+    val = self.indirect_rreg(reg) if reg >= len(self.mmio) else self.mmio[reg]
+    if AM_DEBUG >= 4 and getattr(self, '_prev_rreg', None) != (reg, val): print(f"am {self.devfmt}: Reading register {reg:#x} with value {val:#x}")
+    self._prev_rreg = (reg, val)
+    return val
+
+  def wreg(self, reg:int, val:int, inst=0, direct=False):
+    if AM_DEBUG >= 4: print(f"am {self.devfmt}: Writing register {reg:#x} with value {val:#x}")
+    if not direct and any(lo <= reg <= hi for lo, hi in self.vf_rlc_gated): self.rlcg_rw(reg, val, inst)
+    elif reg >= len(self.mmio): self.indirect_wreg(reg, val)
+    else: self.mmio[reg] = val
+
+  def rlcg_rw(self, addr:int, val:int, inst:int, read=False) -> int:
+    # the rlc gateway takes the grbm selection through its own scratch registers
+    if addr in {self.reg("regGRBM_GFX_CNTL").addr[inst], self.reg("regGRBM_GFX_INDEX").addr[inst]}:
+      self.reg("regSCRATCH_REG2" if addr == self.reg("regGRBM_GFX_CNTL").addr[inst] else "regSCRATCH_REG3").write(val, inst=inst, direct=True)
+      return val
+
+    self.wreg_pair("regSCRATCH_REG", "0", "1", (addr | (0x1 << 28 if read else 0)) << 32 | val, inst=inst, direct=True)
+    self.reg("regRLC_SPARE_INT").write(1, inst=inst, direct=True)
+    wait_cond(lambda: self.reg("regSCRATCH_REG1").read(inst=inst, direct=True) & 0xFFFFF, value=0, msg=f"RLC gateway timeout on {addr:#x}")
+
+    if AM_DEBUG >= 1 and (err:=self.reg("regSCRATCH_REG1").read(inst=inst, direct=True) & 0xF000000):
+      print(f"am {self.devfmt}: RLC gateway refused {addr:#x}: {err:#x}")
+    return self.reg("regSCRATCH_REG0").read(inst=inst, direct=True)
+
+  def wreg_pair(self, reg_base:str, lo_suffix:str, hi_suffix:str, val:int, inst:int=0, direct=False):
+    self.reg(f"{reg_base}{lo_suffix}").write(lo32(val), inst=inst, direct=direct)
+    self.reg(f"{reg_base}{hi_suffix}").write(hi32(val), inst=inst, direct=direct)
+
+  def indirect_rreg(self, reg:int) -> int:
+    self.reg("regBIF_BX_PF0_RSMU_INDEX").write(reg * 4)
+    return self.reg("regBIF_BX_PF0_RSMU_DATA").read()
+
+  def indirect_wreg(self, reg:int, val:int):
+    self.reg("regBIF_BX_PF0_RSMU_INDEX").write(reg * 4)
+    self.reg("regBIF_BX_PF0_RSMU_DATA").write(val)
+
+  def indirect_wreg_pcie(self, reg:int, val:int, aid:int=0):
+    reg_addr = reg * 4 + ((((aid & 0b11) << 32) | (1 << 34)) if aid > 0 else 0)
+    self.reg("regBIF_BX0_PCIE_INDEX2").write(lo32(reg_addr))
+    if hi32(reg_addr) > 0: self.reg("regBIF_BX0_PCIE_INDEX2_HI").write(hi32(reg_addr) & 0xff)
+    self.reg("regBIF_BX0_PCIE_DATA2").write(val)
+    if hi32(reg_addr) > 0: self.reg("regBIF_BX0_PCIE_INDEX2_HI").write(0)
+
+  def _read_vram(self, addr, size) -> bytes:
+    assert addr % 4 == 0 and size % 4 == 0, f"Invalid address {addr:#x} or size {size:#x}"
+    res = []
+    for caddr in range(addr, addr + size, 4):
+      self.wreg(0x06, caddr >> 31)
+      self.wreg(0x00, (caddr & 0x7FFFFFFF) | 0x80000000)
+      res.append(self.rreg(0x01))
+    return bytes(array.array('I', res))
+
+  def _run_discovery(self):
+    # NOTE: Fixed register to query memory size without known ip bases to find the discovery table.
+    #       The table is located at the end of VRAM - 64KB and is 10KB in size.
+    mmRCC_CONFIG_MEMSIZE = 0xde3
+    self.vram_size = self.rreg(mmRCC_CONFIG_MEMSIZE) << 20
+    self.large_bar = self.vram.nbytes >= self.vram_size
+    tmr_offset, tmr_size = self.vram_size - (64 << 10), (10 << 10)
+
+    disc_tbl = self.vram.view(tmr_offset, tmr_size)[:] if self.large_bar else self._read_vram(tmr_offset, tmr_size)
+    self.bhdr = am.struct_binary_header.from_buffer(bytearray(disc_tbl))
+    ihdr = am.struct_ip_discovery_header.from_address(ctypes.addressof(self.bhdr) + self.bhdr.table_list[am.IP_DISCOVERY].offset)
+    assert self.bhdr.binary_signature == am.BINARY_SIGNATURE and ihdr.signature == am.DISCOVERY_TABLE_SIGNATURE, "discovery signatures mismatch"
+
+    self.regs_offset:dict[int, dict[int, tuple]] = collections.defaultdict(dict)
+    self.ip_ver:dict[int, tuple[int, int, int]] = {}
+
+    for num_die in range(ihdr.num_dies):
+      dhdr = am.struct_die_header.from_address(ctypes.addressof(self.bhdr) + ihdr.die_info[num_die].die_offset)
+
+      ip_offset = ctypes.addressof(self.bhdr) + ctypes.sizeof(dhdr) + ihdr.die_info[num_die].die_offset
+      for _ in range(dhdr.num_ips):
+        ip = am.struct_ip_v4.from_address(ip_offset)
+        ba = ((ctypes.c_uint64 if ihdr.base_addr_64_bit else ctypes.c_uint32) * ip.num_base_address).from_address(ip_offset + 8)
+        for hw_ip in range(1, am.MAX_HWIP):
+          if hw_ip in am.hw_id_map and am.hw_id_map[hw_ip] == ip.hw_id:
+            self.regs_offset[hw_ip][ip.instance_number] = tuple(list(ba))
+            self.ip_ver[hw_ip] = (ip.major, ip.minor, ip.revision)
+
+        ip_offset += 8 + (8 if ihdr.base_addr_64_bit else 4) * ip.num_base_address
+
+    # HARV(EST) table: harvested instances must be excluded (like amdgpu_discovery_harvest_ip)
+    # layout: u32 signature, u16 version, u16 size, then 32 entries of {hw_id:u16, inst:u8, rsv:u8}
+    self.harvested:dict[int, set[int]] = collections.defaultdict(set)
+    if (harv_off:=self.bhdr.table_list[am.HARVEST_INFO].offset) != 0 and \
+       (blob:=to_mv(ctypes.addressof(self.bhdr) + harv_off, 8 + 32*4).cast('I'))[0] == am.HARVEST_TABLE_SIGNATURE:
+      inv_hw_id = {hw_id: hw_ip for hw_ip, hw_id in am.hw_id_map.items()}
+      for ent in blob[2:]:
+        if (ip_:=inv_hw_id.get(ent & 0xffff)) is not None: self.harvested[ip_].add((ent >> 16) & 0xff)
+
+    gc_info = am.struct_gc_info_v1_0.from_address(gc_addr:=ctypes.addressof(self.bhdr) + self.bhdr.table_list[am.GC].offset)
+    self.gc_info = getattr(am, f"struct_gc_info_v{gc_info.header.version_major}_{gc_info.header.version_minor}").from_address(gc_addr)
+    self.reserved_vram_size = (384 << 20) if self.ip_ver[am.GC_HWIP][:2] in {(9,4), (9,5)} else (64 << 20)
+
+  @functools.cached_property
+  def hwid_names(self) -> dict[int, str]: return {v:k.removesuffix('_HWID') for k,v in vars(am).items() if k.endswith('_HWID') and isinstance(v, int)}
+
+  def _ip_module(self, prefix:str, hwip): return import_module(prefix, self.ip_ver[hwip])
+
+  def _build_regs(self):
+    mods = [("mp", am.MP0_HWIP), ("hdp", am.HDP_HWIP), ("gc", am.GC_HWIP), ("mmhub", am.MMHUB_HWIP), ("osssys", am.OSSSYS_HWIP),
+      ("nbio" if self.ip_ver[am.GC_HWIP] < (12,0,0) else "nbif", am.NBIO_HWIP)]
+    if self.ip_ver[am.SDMA0_HWIP] in {(4,4,2), (4,4,4)}: mods += [("sdma", am.SDMA0_HWIP)]
+
+    for prefix, hwip in mods:
+      regs = import_asic_regs(prefix, self.ip_ver[hwip], cls=functools.partial(AMRegister, adev=self, bases=self.regs_offset[hwip]))
+      self.__dict__.update(regs)
+      if prefix == "gc" and self.is_vf:
+        ext = {seg: max(r.offset for r in regs.values() if r.segment == seg) for seg in {r.segment for r in regs.values()}}
+        self.vf_rlc_gated = sorted((bases[seg], bases[seg] + off) for bases in self.regs_offset[hwip].values() for seg, off in ext.items())
+    self.__dict__.update(import_asic_regs('mp', (11, 0, 0), cls=functools.partial(AMRegister, adev=self, bases=self.regs_offset[am.MP1_HWIP])))
+
+    # Live AIDs like the kernel: 4 SDMAs per AID; the AID lives iff its group's alive-mask is 0xf/0x3/0xc.
+    # Dead AIDs must never be touched via the indirect window: writes poison the whole fabric.
+    live_sdma = {k for k in self.regs_offset[am.SDMA0_HWIP] if k not in self.harvested[am.SDMA0_HWIP]}
+    max_aid = max((k >> 2 for k in self.regs_offset[am.SDMA0_HWIP]), default=0)
+    self.aids = [0] + [aid for aid in range(1, max_aid + 1) if sum(1 << (i & 3) for i in live_sdma if i >> 2 == aid) in {0xf, 0x3, 0xc}]
+
+import ctypes, time, contextlib, functools
+from typing import Iterable, Literal
+from tinygrad.helpers import to_mv, data64, data64_le, lo32, hi32, DEBUG, wait_cond, pad_bytes, getbits
+from tinygrad.runtime.autogen.am import am, pm4_soc15 as pm4
+from tinygrad.runtime.support.amd import import_soc
+from tinygrad.runtime.support.memory import AddrSpace
+
+class AM_IP:
+  def __init__(self, adev): self.adev = adev
+  def init_sw(self): pass # Prepare sw/allocations for this IP
+  def init_hw(self): pass # Initialize hw for this IP
+  def fini_hw(self): pass # Finalize hw for this IP
+  def set_clockgating_state(self): pass # Set clockgating state for this IP
+
+class AM_SOC(AM_IP):
+  def init_sw(self):
+    self.module = import_soc(self.adev.ip_ver[am.GC_HWIP])
+    self.ih_clients = am.enum_soc21_ih_clientid if (ih_soc21:=self.adev.ip_ver[am.GC_HWIP][0] >= 11) else am.enum_soc15_ih_clientid
+
+    self.gfx_ih_clients = [am.SOC21_IH_CLIENTID_GRBM_CP, am.SOC21_IH_CLIENTID_GFX] \
+      if ih_soc21 else [am.SOC15_IH_CLIENTID_GRBM_CP] + [getattr(am, f'SOC15_IH_CLIENTID_SE{i}SH') for i in range(4)]
+    self.sdma_ih_clients = [] if ih_soc21 else [getattr(am, f'SOC15_IH_CLIENTID_SDMA{i}') for i in range(8)]
+
+    def _ih_srcs(pref:str, hwip:int) -> dict[int, str]:
+      return {getattr(am, k): k[off+9:] for k in dir(am) if k.startswith(f'{pref}_{self.adev.ip_ver[hwip][0]}') and (off:=k.find('__SRCID__')) != -1}
+
+    gfx_srcs, sdma_srcs = _ih_srcs('GFX', am.GC_HWIP), _ih_srcs('SDMA0', am.SDMA0_HWIP)
+    self.ih_srcs_names:dict[int, dict[int, str]] = {**{k: gfx_srcs for k in self.gfx_ih_clients}, **{k: sdma_srcs for k in self.sdma_ih_clients}}
+
+  def init_hw(self):
+    if self.adev.ip_ver[am.NBIO_HWIP] in {(7,9,0), (7,9,1)}:
+      # fence doorbells for harvested xccs (0xff & ~xcc_mask in the kernel); a fully-unharvested chip keeps the previous 0x0
+      live_xccs = sum(1 << i for i in self.adev.regs_offset[am.GC_HWIP] if i not in self.adev.harvested[am.GC_HWIP] and i < 8)
+      self.adev.regXCC_DOORBELL_FENCE.write(0xff & ~live_xccs)
+      for aid in self.adev.aids[1:]:
+        self.adev.indirect_wreg_pcie(self.adev.regXCC_DOORBELL_FENCE.addr[0], self.adev.regXCC_DOORBELL_FENCE.encode(shub_slv_mode=1), aid=aid)
+      self.adev.regBIFC_GFX_INT_MONITOR_MASK.write(0x7ff)
+      self.adev.regBIFC_DOORBELL_ACCESS_EN_PF.write(0xfffff)
+    else: self.adev.regRCC_DEV0_EPF2_STRAP2.update(strap_no_soft_reset_dev0_f2=0x0)
+    self.adev.regRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN.write(0x1)
+  def set_clockgating_state(self):
+    if self.adev.ip_ver[am.HDP_HWIP] >= (5,2,1): self.adev.regHDP_MEM_POWER_CTRL.update(atomic_mem_power_ctrl_en=1, atomic_mem_power_ds_en=1)
+
+  def doorbell_enable(self, port, awid=0, awaddr_31_28_value=0, offset=0, size=0, aid=0):
+    reg = self.adev.reg(f"{'regGDC_S2A0_S2A' if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else 'regS2A'}_DOORBELL_ENTRY_{port}_CTRL")
+    val = reg.encode(**{f"s2a_doorbell_port{port}_enable":1, f"s2a_doorbell_port{port}_awid":awid,  f"s2a_doorbell_port{port}_range_size":size,
+      f"s2a_doorbell_port{port}_awaddr_31_28_value":awaddr_31_28_value, f"s2a_doorbell_port{port}_range_offset":offset})
+
+    if self.adev.ip_ver[am.NBIO_HWIP] in {(7,9,0), (7,9,1)}: self.adev.indirect_wreg_pcie(reg.addr[0], val, aid=aid)
+    else: reg.write(val)
+
+class AM_GMC(AM_IP):
+  def init_sw(self):
+    self.vmhubs = len(self.adev.regs_offset[am.MMHUB_HWIP])
+
+    xgmi_lfb_cntl = self.adev.regGCMC_VM_XGMI_LFB_CNTL.read_bitfields() if hasattr(self.adev, 'regGCMC_VM_XGMI_LFB_CNTL') else {}
+    self.xgmi_phys_id, self.xgmi_max_region = xgmi_lfb_cntl.get('pf_lfb_region', 0), xgmi_lfb_cntl.get('pf_max_region', 0)
+    self.xgmi_seg_sz = self.adev.regGCMC_VM_XGMI_LFB_SIZE.read_bitfields()['pf_lfb_size']<<24 if hasattr(self.adev, 'regGCMC_VM_XGMI_LFB_CNTL') else 0
+
+    self.paddr_base = self.xgmi_phys_id * self.xgmi_seg_sz
+
+    self.fb_base = (self.adev.regMMMC_VM_FB_LOCATION_BASE.read() & 0xFFFFFF) << 24
+    self.fb_end = (self.adev.regMMMC_VM_FB_LOCATION_TOP.read() & 0xFFFFFF) << 24
+
+    # Memory controller aperture
+    self.mc_base = self.fb_base + self.paddr_base
+
+    # VM aperture
+    self.vm_base = self.adev.mm.va_base
+    self.vm_end = min(self.vm_base + (1 << self.adev.mm.va_bits) - 1, 0x7fffffffffff)
+
+    self.trans_futher = self.adev.ip_ver[am.GC_HWIP] < (10, 0, 0)
+
+    # mi3xx has 48-bit, others have 44-bit address space
+    self.address_space_mask = (1 << (48 if self.adev.ip_ver[am.GC_HWIP][:2] in {(9,4), (9,5)} else 44)) - 1
+
+    self.memscratch_xgmi_paddr = self.adev.paddr2xgmi(self.adev.mm.palloc(0x1000, zero=False, boot=True))
+    self.dummy_page_xgmi_paddr = self.adev.paddr2xgmi(self.adev.mm.palloc(0x1000, zero=False, boot=True))
+
+    # MM hub is inited before any tlb flushes and is still valid during partial_boot, so set it to true
+    self.hub_initted = {"MM": True, "GC": False}
+
+    self.mm_insts = self.adev.aids if self.adev.ip_ver[am.NBIO_HWIP] in {(7,9,0), (7,9,1)} else list(range(self.vmhubs)) # dead mmhubs hang us
+
+    self.pf_status_reg = lambda ip: f"reg{ip}VM_L2_PROTECTION_FAULT_STATUS{'_LO32' if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else ''}"
+
+  def init_hw(self): self.init_hub("MM", insts=self.mm_insts)
+
+  def flush_hdp(self):
+    if self.adev.is_vf: self.adev.reg("regBIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL").write(0x0)
+    else: self.adev.wreg(self.adev.reg("regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL").read() // 4, 0x0)
+
+  def flush_tlb(self, ip:Literal["MM", "GC"], vmid, flush_type=0):
+    self.flush_hdp()
+
+    # Can't issue TLB invalidation if the hub isn't initialized.
+    if not self.hub_initted[ip]: return
+
+    req = self.adev.reg(f"reg{ip}VM_INVALIDATE_ENG17_REQ").encode(flush_type=flush_type, per_vmid_invalidate_req=(1 << vmid),
+      invalidate_l2_ptes=1, invalidate_l2_pde0=1, invalidate_l2_pde1=1, invalidate_l2_pde2=1, invalidate_l1_ptes=1,
+      clear_protection_fault_status_addr=0)
+
+    if self.adev.is_vf and hasattr(gfx:=self.adev.gfx, 'kiq'):
+      for inst in (self.mm_insts if ip == "MM" else range(gfx.xccs)):
+        xcc, reg_inst = (inst, 0) if ip == "GC" else (0, inst)
+        req_addr, ack_addr = (self.adev.reg(f"reg{ip}VM_INVALIDATE_ENG17_{r}").addr[reg_inst] for r in ("REQ", "ACK"))
+        ring, ptrs = gfx.kiq.view(base:=0x3000*xcc, 0x1000, fmt='I'), gfx.kiq.view(base + 0x1000, 0x18, fmt='Q') # rptr, wptr, fence
+        pkt = [pm4.PACKET3(pm4.PACKET3_WRITE_DATA, 3), 1 << 16, req_addr, 0, req, # write the request
+          pm4.PACKET3(pm4.PACKET3_WAIT_REG_MEM, 5), pm4.WAIT_REG_MEM_FUNCTION(3), ack_addr, 0, 1 << vmid, 1 << vmid, 0x20, # wait for the ack
+          pm4.PACKET3(pm4.PACKET3_WRITE_DATA, 3), pm4.WR_CONFIRM | pm4.WRITE_DATA_DST_SEL(5), *data64_le(gfx.kiq_va+base+0x1010), (wait:=ptrs[1]+1)]
+        for i, word in enumerate(pkt): ring[(ptrs[1] + i) % 0x400] = word
+        ptrs[1] = self.adev.doorbell64[am.AMDGPU_DOORBELL_KIQ + xcc*0x20] = ptrs[1] + len(pkt)
+        wait_cond(lambda: ptrs[2], value=wait, msg=f"kiq flush_tlb timeout on xcc {xcc}")
+      return
+
+    for inst in (self.adev.gmc.mm_insts if ip == "MM" else range(self.adev.gfx.xccs)):
+      if ip == "MM": wait_cond(lambda: self.adev.regMMVM_INVALIDATE_ENG17_SEM.read(inst=inst) & 0x1, value=1, msg="mm flush_tlb timeout")
+
+      self.adev.reg(f"reg{ip}VM_INVALIDATE_ENG17_REQ").write(req, inst=inst)
+
+      wait_cond(lambda: self.adev.reg(f"reg{ip}VM_INVALIDATE_ENG17_ACK").read(inst=inst) & (1 << vmid), value=(1 << vmid), msg="flush_tlb timeout")
+
+      if ip == "MM": self.adev.regMMVM_INVALIDATE_ENG17_SEM.write(0x0, inst=inst)
+      if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0) and ip == "MM":
+        self.adev.regMMVM_L2_BANK_SELECT_RESERVED_CID2.update(reserved_cache_private_invalidation=1, inst=inst)
+
+        # Read back the register to ensure the invalidation is complete
+        self.adev.regMMVM_L2_BANK_SELECT_RESERVED_CID2.read(inst=inst)
+
+  def enable_vm_addressing(self, page_table, ip:Literal["MM", "GC"], vmid, inst):
+    self.adev.wreg_pair(f"reg{ip}VM_CONTEXT{vmid}_PAGE_TABLE_START_ADDR", "_LO32", "_HI32", self.vm_base >> 12, inst=inst)
+    self.adev.wreg_pair(f"reg{ip}VM_CONTEXT{vmid}_PAGE_TABLE_END_ADDR", "_LO32", "_HI32", self.vm_end >> 12, inst=inst)
+    self.adev.wreg_pair(f"reg{ip}VM_CONTEXT{vmid}_PAGE_TABLE_BASE_ADDR", "_LO32", "_HI32", self.adev.paddr2xgmi(page_table.paddr) | 1, inst=inst)
+
+    fault_flags = {f'{x}_protection_fault_enable_interrupt':1 for x in ['pde0', 'dummy_page', 'range', 'valid', 'read', 'write', 'execute']}
+    en_def_flags = {f'{x}_protection_fault_enable_default':1 for x in ['pde0', 'dummy_page', 'range', 'valid', 'read', 'write', 'execute']}
+    self.adev.reg(f"reg{ip}VM_CONTEXT{vmid}_CNTL").write(0x1800000, **fault_flags, **en_def_flags, enable_context=1,
+      page_table_depth=((2 if self.trans_futher else 3) - page_table.lv), page_table_block_size=9 if self.trans_futher else 0, inst=inst)
+
+  def init_hub(self, ip:Literal["MM", "GC"], insts:Iterable[int]):
+    # Init system apertures
+    for inst in insts:
+      self.adev.reg(f"reg{ip}MC_VM_AGP_BASE").write(0, inst=inst)
+      self.adev.reg(f"reg{ip}MC_VM_AGP_BOT").write(0xffffffffffff >> 24, inst=inst) # disable AGP
+      self.adev.reg(f"reg{ip}MC_VM_AGP_TOP").write(0, inst=inst)
+
+      self.adev.reg(f"reg{ip}MC_VM_SYSTEM_APERTURE_LOW_ADDR").write(self.fb_base >> 18, inst=inst)
+      self.adev.reg(f"reg{ip}MC_VM_SYSTEM_APERTURE_HIGH_ADDR").write(self.fb_end >> 18, inst=inst)
+      self.adev.wreg_pair(f"reg{ip}MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR", "_LSB", "_MSB", self.memscratch_xgmi_paddr >> 12, inst=inst)
+      self.adev.wreg_pair(f"reg{ip}VM_L2_PROTECTION_FAULT_DEFAULT_ADDR", "_LO32", "_HI32", self.dummy_page_xgmi_paddr >> 12, inst=inst)
+
+      self.adev.reg(f"reg{ip}VM_L2_PROTECTION_FAULT_CNTL2").update(active_page_migration_pte_read_retry=1, inst=inst)
+
+      # Init TLB and cache
+      self.adev.reg(f"reg{ip}MC_VM_MX_L1_TLB_CNTL").update(enable_l1_tlb=1, system_access_mode=3, enable_advanced_driver_model=1,
+        system_aperture_unmapped_access=0, mtype=self.adev.soc.module.MTYPE_UC, inst=inst)
+
+      self.adev.reg(f"reg{ip}VM_L2_CNTL").update(enable_l2_cache=1, enable_default_page_out_to_system_memory=1,
+        l2_pde0_cache_tag_generation_mode=0, pde_fault_classification=0, context1_identity_access_mode=1, identity_mode_fragment_size=0,
+        enable_l2_fragment_processing=int(self.adev.ip_ver[am.GC_HWIP] < (10,0,0)), inst=inst)
+      self.adev.reg(f"reg{ip}VM_L2_CNTL2").update(invalidate_all_l1_tlbs=1, invalidate_l2_cache=1, inst=inst)
+      self.adev.reg(f"reg{ip}VM_L2_CNTL3").write(l2_cache_4k_associativity=1, l2_cache_bigk_associativity=1,
+        bank_select=12 if self.trans_futher else 9, l2_cache_bigk_fragment_size=9 if self.trans_futher else 6, inst=inst)
+      self.adev.reg(f"reg{ip}VM_L2_CNTL4").write(l2_cache_4k_partition_count=1, inst=inst)
+      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self.adev.reg(f"reg{ip}VM_L2_CNTL5").write(walker_priority_client_id=0x1ff, inst=inst)
+
+      self.enable_vm_addressing(self.adev.mm.root_page_table, ip, vmid=0, inst=inst)
+
+      # Disable identity aperture
+      self.adev.wreg_pair(f"reg{ip}VM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR", "_LO32", "_HI32", 0xfffffffff, inst=inst)
+      self.adev.wreg_pair(f"reg{ip}VM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR", "_LO32", "_HI32", 0x0, inst=inst)
+      self.adev.wreg_pair(f"reg{ip}VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET", "_LO32", "_HI32", 0x0, inst=inst)
+
+      for eng_i in range(18): self.adev.wreg_pair(f"reg{ip}VM_INVALIDATE_ENG{eng_i}_ADDR_RANGE", "_LO32", "_HI32", 0x1fffffffff, inst=inst)
+    self.hub_initted[ip] = True
+
+  @functools.cache  # pylint: disable=method-cache-max-size-none
+  def get_pte_flags(self, pte_lv, is_table, frag, uncached, system, snooped, valid, extra=0):
+    extra |= (am.AMDGPU_PTE_SYSTEM * system) | (am.AMDGPU_PTE_SNOOPED * snooped) | (am.AMDGPU_PTE_VALID * valid) | am.AMDGPU_PTE_FRAG(frag)
+    if not is_table: extra |= (am.AMDGPU_PTE_WRITEABLE | am.AMDGPU_PTE_READABLE | am.AMDGPU_PTE_EXECUTABLE)
+    if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0):
+      extra |= am.AMDGPU_PTE_MTYPE_GFX12(0, self.adev.soc.module.MTYPE_UC if uncached else 0)
+      extra |= (am.AMDGPU_PDE_PTE_GFX12 if not is_table and pte_lv != am.AMDGPU_VM_PTB else (am.AMDGPU_PTE_IS_PTE if not is_table else 0))
+    elif self.adev.ip_ver[am.GC_HWIP] >= (10,0,0):
+      extra |= am.AMDGPU_PTE_MTYPE_NV10(0, self.adev.soc.module.MTYPE_UC if uncached else 0)
+      extra |= (am.AMDGPU_PDE_PTE if not is_table and pte_lv != am.AMDGPU_VM_PTB else 0)
+    else:
+      extra |= am.AMDGPU_PTE_MTYPE_VG10(0, self.adev.soc.module.MTYPE_UC if uncached else 0)
+      if is_table and pte_lv == am.AMDGPU_VM_PDB1: extra |= am.AMDGPU_PDE_BFS(0x9)
+      if is_table and pte_lv == am.AMDGPU_VM_PDB0: extra |= am.AMDGPU_PTE_TF
+      if not is_table and pte_lv not in {am.AMDGPU_VM_PTB, am.AMDGPU_VM_PDB0}: extra |= am.AMDGPU_PDE_PTE
+    return extra
+  def is_pte_huge_page(self, pte_lv, pte):
+    if self.adev.ip_ver[am.GC_HWIP] < (10,0,0): return (pte & am.AMDGPU_PDE_PTE) if pte_lv != am.AMDGPU_VM_PDB0 else not (pte & am.AMDGPU_PTE_TF)
+    return pte & (am.AMDGPU_PDE_PTE_GFX12 if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else am.AMDGPU_PDE_PTE)
+
+class AM_SMU(AM_IP):
+  def init_sw(self):
+    self.smu_mod = self.adev._ip_module("smu", am.MP1_HWIP)
+    self.driver_table_paddr = self.adev.mm.palloc(0x4000, zero=False, boot=True)
+
+  def init_hw(self):
+    self._send_msg(self.smu_mod.PPSMC_MSG_SetDriverDramAddrHigh, hi32(self.adev.paddr2mc(self.driver_table_paddr)))
+    self._send_msg(self.smu_mod.PPSMC_MSG_SetDriverDramAddrLow, lo32(self.adev.paddr2mc(self.driver_table_paddr)))
+    self._send_msg(self.smu_mod.PPSMC_MSG_EnableAllSmuFeatures, 0)
+
+  def is_smu_alive(self):
+    with contextlib.suppress(TimeoutError): self._send_msg(self.smu_mod.PPSMC_MSG_GetSmuVersion, 0, timeout=100)
+    return self.adev.mmMP1_SMN_C2PMSG_90.read() != 0
+
+  def mode1_reset(self):
+    if DEBUG >= 2: print(f"am {self.adev.devfmt}: mode1 reset")
+    if self.adev.ip_ver[am.MP0_HWIP] >= (14,0,0) or self.adev.ip_ver[am.MP0_HWIP] in {(13,0,0), (13,0,7), (13,0,10)}:
+      self._send_msg(__DEBUGSMC_MSG_Mode1Reset:=2, 0, debug=True)
+    elif self.adev.ip_ver[am.MP0_HWIP] in {(13,0,6), (13,0,12), (13,0,15)}: self._send_msg(self.smu_mod.PPSMC_MSG_GfxDriverReset, 1)
+    else: self._send_msg(self.smu_mod.PPSMC_MSG_Mode1Reset, 0)
+
+    if self.adev.is_hive(): return # all hive members must receive the reset before waiting
+    time.sleep(0.5) # 500ms
+    # Config reads fail fast (0xffff) on a wedged gpu; mmio reads would hang until the root port
+    # completion timeout, so check config space before touching mmio.
+    wait_cond(self.adev.pci_dev.read_config, 0, 2, value=0x1002, timeout_ms=2000,
+      msg=f"am {self.adev.devfmt}: gpu did not return from mode1 reset, reboot required")
+
+  def read_table(self, table_t, arg):
+    if self.adev.ip_ver[am.MP0_HWIP] in {(13,0,6),(13,0,12),(13,0,15)}: self._send_msg(self.smu_mod.PPSMC_MSG_GetMetricsTable, arg)
+    else: self._send_msg(self.smu_mod.PPSMC_MSG_TransferTableSmu2Dram, arg)
+    return table_t.from_buffer(bytearray(self.adev.vram.view(self.driver_table_paddr, ctypes.sizeof(table_t))[:]))
+
+  @functools.cache  # pylint: disable=method-cache-max-size-none
+  def read_clocks(self, clk_list:tuple[int]) -> dict[int, list[int]]:
+    return {clck: [self._send_msg(self.smu_mod.PPSMC_MSG_GetDpmFreqByIndex, (clck<<16)|i, read_back_arg=True)&0x7fffffff for i in range(cnt)]
+      for clck in clk_list if (cnt:=self._send_msg(self.smu_mod.PPSMC_MSG_GetDpmFreqByIndex, (clck<<16)|0xff, read_back_arg=True)&0x7fffffff)}
+
+  def set_clocks(self, level:int|None):
+    clks = tuple([self.smu_mod.PPCLK_UCLK, self.smu_mod.PPCLK_FCLK, self.smu_mod.PPCLK_SOCCLK])
+    if self.adev.ip_ver[am.MP0_HWIP] not in {(13,0,6), (13,0,12), (13,0,15)}: clks += (self.smu_mod.PPCLK_GFXCLK,)
+
+    if level is None:
+      for clck in clks:
+        with contextlib.suppress(TimeoutError): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMinByFreq, clck << 16, timeout=20)
+        if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMaxByFreq, clck << 16 | 0xffff)
+      return
+
+    for clck, vals in self.read_clocks(clks).items():
+      with contextlib.suppress(TimeoutError): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMinByFreq, clck << 16 | (vals[level]), timeout=20)
+      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMaxByFreq, clck << 16 | (vals[level]))
+
+  def set_power_limit(self, watts:float):
+    ppt_limit = max(int(round(watts)), 1)
+    self._send_msg(self.smu_mod.PPSMC_MSG_SetPptLimit, ppt_limit)
+    if DEBUG >= 2: print(f"am {self.adev.devfmt}: GPU power limit set to {ppt_limit}W")
+
+  def _aca_read_reg(self, bank_idx:int, reg_idx:int, ue=True) -> int:
+    msg = self.smu_mod.PPSMC_MSG_McaBankDumpDW if ue else self.smu_mod.PPSMC_MSG_McaBankCeDumpDW
+    return (self._send_msg(msg, (bank_idx << 16) | (reg_idx * 8 + 4), read_back_arg=True) << 32) | \
+            self._send_msg(msg, (bank_idx << 16) | (reg_idx * 8), read_back_arg=True)
+
+  def _aca_read_banks(self, ue=True) -> list[list[int]]:
+    if not hasattr(self.smu_mod, 'PPSMC_MSG_QueryValidMcaCount'): return []
+    count_msg = self.smu_mod.PPSMC_MSG_QueryValidMcaCount if ue else self.smu_mod.PPSMC_MSG_QueryValidMcaCeCount
+    return [[self._aca_read_reg(idx, reg_idx, ue=ue) for reg_idx in range(16)] for idx in range(self._send_msg(count_msg, 0, read_back_arg=True))]
+
+  def _smu_cmn_send_msg(self, msg:int, param=0, debug=False):
+    (self.adev.mmMP1_SMN_C2PMSG_90 if not debug else self.adev.mmMP1_SMN_C2PMSG_54).write(0) # resp reg
+    (self.adev.mmMP1_SMN_C2PMSG_82 if not debug else self.adev.mmMP1_SMN_C2PMSG_53).write(param)
+    (self.adev.mmMP1_SMN_C2PMSG_66 if not debug else self.adev.mmMP1_SMN_C2PMSG_75).write(msg)
+
+  def _send_msg(self, msg:int, param:int, read_back_arg=False, timeout=10000, debug=False): # default timeout is 10 seconds
+    self._smu_cmn_send_msg(msg, param, debug=debug)
+    wait_cond((self.adev.mmMP1_SMN_C2PMSG_90 if not debug else self.adev.mmMP1_SMN_C2PMSG_54).read, value=1, timeout_ms=timeout,
+      msg=f"SMU msg {msg:#x} timeout")
+    return (self.adev.mmMP1_SMN_C2PMSG_82 if not debug else self.adev.mmMP1_SMN_C2PMSG_53).read() if read_back_arg else None
+
+class AM_GFX(AM_IP):
+  def init_sw(self):
+    self.xccs = sum(1 for i in self.adev.regs_offset[am.GC_HWIP] if i not in self.adev.harvested[am.GC_HWIP])
+    self.mqd_paddr = [self.adev.mm.palloc(0x1000 * self.xccs, zero=False, boot=True) for i in range(2 + self.adev.is_vf)]
+    self.mqd_mc = [self.adev.paddr2mc(mqd_paddr) for mqd_paddr in self.mqd_paddr]
+
+  def init_hw(self):
+    # Wait for RLC autoload to complete
+    wait_cond(lambda: self.adev.regCP_STAT.read() == 0 or self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 0,
+              value=True, msg="RLC autoload timeout")
+
+    self.adev.gmc.init_hub("GC", insts=range(self.xccs))
+    if self.adev.partial_boot: return self.reset_mec()
+
+    self._config_mec()
+
+    # NOTE: Golden reg for gfx11. No values for this reg provided. The kernel just ors 0x20000000 to this reg.
+    for xcc in range(self.xccs): self.adev.regTCP_CNTL.write(self.adev.regTCP_CNTL.read() | 0x20000000, inst=xcc)
+
+    for xcc in range(self.xccs): self.adev.regRLC_CNTL.write(0x1, inst=xcc)
+
+    for xcc in range(self.xccs): self.adev.regRLC_SRM_CNTL.update(srm_enable=1, auto_incr_addr=1, inst=xcc)
+
+    for xcc in range(self.xccs): self.adev.regRLC_SPM_MC_CNTL.write(0xf, inst=xcc)
+
+    if self.adev.ip_ver[am.NBIO_HWIP][:2] != (7,9):
+      self.adev.soc.doorbell_enable(port=0, awid=0x3, awaddr_31_28_value=0x3)
+      self.adev.soc.doorbell_enable(port=3, awid=0x6, awaddr_31_28_value=0x3)
+
+    for xcc in range(self.xccs):
+      if self.adev.ip_ver[am.GC_HWIP] in {(9,4,3), (9,5,0)}:
+        self.adev.regGB_ADDR_CONFIG.write(0x2a114042, inst=xcc) # Golden value for mi300/mi350
+        self.adev.regTCP_UTCL1_CNTL2.update(spare=1, inst=xcc)
+
+      self.adev.regGRBM_CNTL.update(read_timeout=0xff, inst=xcc)
+      for i in range(0, 16):
+        self._grbm_select(vmid=i, inst=xcc)
+        self.adev.regSH_MEM_CONFIG.write(**({'initial_inst_prefetch':3} if self.adev.ip_ver[am.GC_HWIP][0]>=10 else {'retry_disable':1}),
+          **({'f8_mode':1} if self.adev.ip_ver[am.GC_HWIP][:2]==(9,4) else {}),
+          address_mode=self.adev.soc.module.SH_MEM_ADDRESS_MODE_64, alignment_mode=self.adev.soc.module.SH_MEM_ALIGNMENT_MODE_UNALIGNED, inst=xcc)
+
+        # Configure apertures:
+        # LDS:         0x10000000'00000000 - 0x10000001'00000000 (4GB)
+        # Scratch:     0x20000000'00000000 - 0x20000001'00000000 (4GB)
+        self.adev.regSH_MEM_BASES.write(shared_base=0x1, private_base=0x2, inst=xcc)
+      self._grbm_select(inst=xcc)
+
+      # Configure MEC doorbell range
+      self.adev.regCP_MEC_DOORBELL_RANGE_LOWER.write(0x100 * xcc, inst=xcc)
+      self.adev.regCP_MEC_DOORBELL_RANGE_UPPER.write(0x100 * xcc + 0xf8, inst=xcc)
+
+    self._enable_mec()
+
+    if self.adev.is_vf: # create kiq for VF, PF requires RLC_CP_SCHEDULERS to be set
+      va = self.adev.mm.alloc_vaddr(size:=0x3000 * self.xccs) # per xcc: ring, pointers (rptr, wptr, fence), eop
+      kiq, paddrs = self.adev.pci_dev.alloc_sysmem(size, vaddr=va)
+      self.adev.mm.map_range(va, size, [(p, 0x1000) for p in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
+      for xcc in range(self.xccs): self.setup_ring(b:=va+0x3000*xcc, 0x1000, b+0x1000, b+0x1008, b+0x2000, 0x1000, 0, False, kiq_xcc=xcc)
+      for xcc in range(self.xccs): self.adev.reg("regRLC_CP_SCHEDULERS").update(scheduler0=(2 << 5) | (1 << 3) | 0x80, inst=xcc)
+      self.kiq, self.kiq_va = kiq, va
+
+    # set 1 partition on bare metal. a VF uses the spatial partition its host PF assigned.
+    if self.xccs > 1 and not self.adev.is_vf: self.adev.psp._spatial_partition_cmd(1)
+
+  def fini_hw(self): self._dequeue_hqds()
+
+  def reset_mec(self):
+    self._dequeue_hqds()
+
+    if self.adev.ip_ver[am.GC_HWIP] < (12,0,0): # gfx12+ uses mec_pipe0_reset
+      for xcc in range(self.xccs): self.adev.regGRBM_SOFT_RESET.write(soft_reset_cp=1, soft_reset_cpc=1, inst=xcc)
+      time.sleep(0.05)
+      for xcc in range(self.xccs): self.adev.regGRBM_SOFT_RESET.write(0x0, inst=xcc)
+
+    self._config_mec()
+    self._enable_mec()
+
+  def setup_ring(self, ring_addr:int, ring_size:int, rptr_addr:int, wptr_addr:int, eop_addr:int, eop_size:int, idx:int, aql:bool, kiq_xcc=-1) -> int:
+    me, pipe, queue = (2, 1, 0) if (kiq:=kiq_xcc >= 0) else (1, idx // 4, idx % 4)
+    doorbell = am.AMDGPU_DOORBELL_KIQ + kiq_xcc*0x20 if kiq else am.AMDGPU_NAVI10_DOORBELL_MEC_RING0
+
+    for xcc in ([kiq_xcc] if kiq else range(self.xccs if aql else 1)):
+      self._grbm_select(me=me, pipe=pipe, queue=queue, inst=xcc)
+
+      struct_t = getattr(am, f"struct_v{self.adev.ip_ver[am.GC_HWIP][0]}{'_compute' if self.adev.ip_ver[am.GC_HWIP][0] >= 10 else ''}_mqd")
+      mqd_struct = struct_t(header=0xC0310800, cp_mqd_base_addr_lo=lo32(self.mqd_mc[queue + 2*kiq] + 0x1000*xcc),
+        cp_mqd_base_addr_hi=hi32(self.mqd_mc[queue + 2*kiq] + 0x1000*xcc), cp_hqd_pipe_priority=0x2, cp_hqd_queue_priority=0xf, cp_hqd_quantum=0x111,
+        cp_hqd_persistent_state=self.adev.regCP_HQD_PERSISTENT_STATE.encode(preload_size=0x55, preload_req=1),
+        cp_hqd_pq_base_lo=lo32(ring_addr>>8), cp_hqd_pq_base_hi=hi32(ring_addr>>8),
+        cp_hqd_pq_rptr_report_addr_lo=lo32(rptr_addr), cp_hqd_pq_rptr_report_addr_hi=hi32(rptr_addr),
+        cp_hqd_pq_wptr_poll_addr_lo=lo32(wptr_addr), cp_hqd_pq_wptr_poll_addr_hi=hi32(wptr_addr),
+        cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=doorbell*2, doorbell_en=1),
+        cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=5, unord_dispatch=0, queue_size=(ring_size//4).bit_length()-2,
+          **({'priv_state':1, 'kmd_queue':1} if kiq else {}),
+          **({'queue_full_en':1, 'slot_based_wptr':2, 'no_update_rptr':xcc!=0 or self.xccs==1} if aql else {})),
+        cp_hqd_ib_control=self.adev.regCP_HQD_IB_CONTROL.encode(min_ib_avail_size=0x3), cp_hqd_hq_status0=0x20004000,
+        cp_mqd_control=self.adev.regCP_MQD_CONTROL.encode(priv_state=1), cp_hqd_vmid=0, cp_hqd_aql_control=int(aql),
+        cp_hqd_eop_base_addr_lo=lo32(eop_addr>>8), cp_hqd_eop_base_addr_hi=hi32(eop_addr>>8),
+        cp_hqd_eop_control=self.adev.regCP_HQD_EOP_CONTROL.encode(eop_size=(eop_size//4).bit_length()-2),
+        **({'compute_tg_chunk_size':1, 'compute_current_logic_xcc_id':xcc, 'cp_mqd_stride_size':0x1000} if aql and self.xccs > 1 else {}))
+      for se in range(8 if self.adev.ip_ver[am.GC_HWIP][0] >= 10 else 4): setattr(mqd_struct, f'compute_static_thread_mgmt_se{se}', 0xffffffff)
+
+      self.adev.vram.view(self.mqd_paddr[queue + 2*kiq] + 0x1000*xcc, ctypes.sizeof(mqd_struct))[:] = memoryview(mqd_struct).cast('B')
+
+      mqd_st_mv = to_mv(ctypes.addressof(mqd_struct), ctypes.sizeof(mqd_struct)).cast('I')
+      for i, reg in enumerate(range(self.adev.regCP_MQD_BASE_ADDR.addr[xcc], self.adev.regCP_HQD_PQ_WPTR_HI.addr[xcc] + 1)):
+        self.adev.wreg(reg, mqd_st_mv[0x80 + i], inst=xcc)
+      self.adev.regCP_HQD_ACTIVE.write(0x1, inst=xcc)
+
+      self.adev.gmc.flush_hdp()
+      self._grbm_select(inst=xcc)
+    return doorbell
+
+  def set_clockgating_state(self):
+    if hasattr(self.adev, 'regMM_ATC_L2_MISC_CG'): self.adev.regMM_ATC_L2_MISC_CG.write(enable=1, mem_ls_enable=1)
+
+    for xcc in range(self.xccs):
+      self.adev.regRLC_SAFE_MODE.write(message=1, cmd=1, inst=xcc)
+      wait_cond(lambda: self.adev.regRLC_SAFE_MODE.read(inst=xcc) & 0x1, value=0, msg="RLC safe mode timeout")
+
+      self.adev.regRLC_CGCG_CGLS_CTRL.update(cgcg_gfx_idle_threshold=0x36, cgcg_en=1, cgls_rep_compansat_delay=0xf, cgls_en=1, inst=xcc)
+
+      self.adev.regCP_RB_WPTR_POLL_CNTL.update(poll_frequency=0x100, idle_poll_count=0x90, inst=xcc)
+      self.adev.regCP_INT_CNTL.update(cntx_busy_int_enable=1, cntx_empty_int_enable=1, cmp_busy_int_enable=1, inst=xcc)
+      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0):
+        self.adev.regSDMA0_RLC_CGCG_CTRL.update(cgcg_int_enable=1, inst=xcc)
+        self.adev.regSDMA1_RLC_CGCG_CTRL.update(cgcg_int_enable=1, inst=xcc)
+
+      feats_gfx9 = {'gfxip_mgls_override':0, 'gfxip_rep_fgcg_override':0} if self.adev.ip_ver[am.GC_HWIP][0] == 9 else {}
+      feats_gfx11 = {'perfmon_clock_state':1, 'gfxip_repeater_fgcg_override':0} if self.adev.ip_ver[am.GC_HWIP][0] >= 11 else {}
+      self.adev.regRLC_CGTT_MGCG_OVERRIDE.update(**feats_gfx9, **feats_gfx11, gfxip_fgcg_override=0, grbm_cgtt_sclk_override=0,
+        rlc_cgtt_sclk_override=0, gfxip_mgcg_override=0, gfxip_cgls_override=0, gfxip_cgcg_override=0, inst=xcc)
+
+      self.adev.regRLC_SAFE_MODE.write(message=0, cmd=1, inst=xcc)
+
+  def _grbm_select(self, me=0, pipe=0, queue=0, vmid=0, inst=0):
+    self.adev.regGRBM_GFX_CNTL.write(meid=me, pipeid=pipe, vmid=vmid, queueid=queue, inst=inst)
+
+  def _enable_mec(self):
+    for xcc in range(self.xccs):
+      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self.adev.regCP_MEC_RS64_CNTL.update(mec_pipe0_reset=0, mec_pipe0_active=1, mec_halt=0, inst=xcc)
+      else: self.adev.regCP_MEC_CNTL.write(0x0, inst=xcc)
+    time.sleep(0.05)  # Wait for MEC to be ready
+
+  def halt_engines(self):
+    for xcc in range(self.xccs):
+      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self.adev.regCP_MEC_RS64_CNTL.update(mec_halt=1, inst=xcc)
+      else: self.adev.regCP_MEC_CNTL.update(mec_me1_halt=1, mec_me2_halt=1, inst=xcc)
+
+  def _config_mec(self):
+    def _config_helper(eng_name, cntl_reg, eng_reg, pipe_cnt, me=0, xcc=0):
+      for pipe in range(pipe_cnt):
+        self._grbm_select(me=me, pipe=pipe, inst=xcc)
+        self.adev.wreg_pair(f"regCP_{eng_reg}_PRGRM_CNTR_START", "", "_HI", self.adev.fw.ucode_start[eng_name] >> 2, inst=xcc)
+      self._grbm_select(inst=xcc)
+      self.adev.reg(f"regCP_{cntl_reg}_CNTL").update(**{f"{eng_name.lower()}_pipe{pipe}_reset": 1 for pipe in range(pipe_cnt)}, inst=xcc)
+      self.adev.reg(f"regCP_{cntl_reg}_CNTL").update(**{f"{eng_name.lower()}_pipe{pipe}_reset": 0 for pipe in range(pipe_cnt)}, inst=xcc)
+
+    for xcc in range(self.adev.gfx.xccs):
+      if self.adev.ip_ver[am.GC_HWIP] < (10,0,0):
+        self.adev.regCP_MEC_CNTL.update(mec_invalidate_icache=1, mec_me1_pipe0_reset=1, mec_me2_pipe0_reset=1, mec_me1_halt=1,mec_me2_halt=1,inst=xcc)
+      if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0):
+        _config_helper(eng_name="PFP", cntl_reg="ME", eng_reg="PFP", pipe_cnt=1, xcc=xcc)
+        _config_helper(eng_name="ME", cntl_reg="ME", eng_reg="ME", pipe_cnt=1, xcc=xcc)
+      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0):
+        _config_helper(eng_name="MEC", cntl_reg="MEC_RS64", eng_reg="MEC_RS64", pipe_cnt=1, me=1, xcc=xcc)
+
+  def _dequeue_hqds(self):
+    for me, pipe, q in [(1, 0, 0), (1, 0, 1)] + [(2, 1, 0)] * self.adev.is_vf:
+      for xcc in range(self.xccs):
+        self._grbm_select(me=me, pipe=pipe, queue=q, inst=xcc)
+        if self.adev.regCP_HQD_ACTIVE.read(inst=xcc) & 1:
+          self.adev.regCP_HQD_DEQUEUE_REQUEST.write(0x2, inst=xcc) # 1 - DRAIN_PIPE; 2 - RESET_WAVES
+          self.adev.regSPI_COMPUTE_QUEUE_RESET.write(0x1, inst=xcc)
+          if not self.adev.is_err_state:
+            try: wait_cond(lambda: self.adev.regCP_HQD_ACTIVE.read(inst=xcc) & 1, value=0, msg="HQD dequeue timeout")
+            # kernel tolerates this too; a wedged wave can survive RESET_WAVES
+            except TimeoutError:
+              if DEBUG >= 2: print(f"am {self.adev.devfmt}: HQD dequeue timeout xcc{xcc} q{q}, continuing")
+    self._grbm_select()
+
+class AM_IH(AM_IP):
+  def init_sw(self):
+    self.ring_size = 256 << 10
+    def _alloc_ring(size): return (self.adev.mm.palloc(size, zero=False, boot=True), self.adev.mm.palloc(0x1000, zero=False, boot=True))
+    self.rings = [(*_alloc_ring(self.ring_size), "", 0), (*_alloc_ring(self.ring_size), "_RING1", 1)]
+    self.ring_view = self.adev.vram.view(offset=self.rings[0][0], size=self.ring_size, fmt='I')
+
+  def init_hw(self):
+    for ring_vm, rwptr_vm, suf, ring_id in self.rings:
+      self.adev.wreg_pair("regIH_RB_BASE", suf, f"_HI{suf}", self.adev.paddr2mc(ring_vm) >> 8)
+
+      self.adev.reg(f"regIH_RB_CNTL{suf}").write(mc_space=4, wptr_overflow_clear=1, rb_size=((self.ring_size//4)-1).bit_length(),
+        mc_snoop=1, mc_ro=0, mc_vmid=0, **({'wptr_overflow_enable': 1, 'rptr_rearm': 1} if ring_id == 0 else {'rb_full_drain_enable': 1}))
+
+      if ring_id == 0: self.adev.wreg_pair("regIH_RB_WPTR_ADDR", "_LO", "_HI", self.adev.paddr2mc(rwptr_vm))
+
+      self.adev.reg(f"regIH_RB_WPTR{suf}").write(0)
+      self.adev.reg(f"regIH_RB_RPTR{suf}").write(0)
+
+      self.adev.reg(f"regIH_DOORBELL_RPTR{suf}").write(enable=0)
+
+    if self.adev.ip_ver[am.OSSSYS_HWIP] != (4,4,2):
+      self.adev.regIH_STORM_CLIENT_LIST_CNTL.update(client18_is_storm_client=1)
+      self.adev.regIH_INT_FLOOD_CNTL.update(flood_cntl_enable=1)
+      self.adev.regIH_MSI_STORM_CTRL.update(delay=3)
+
+    # toggle interrupts
+    for _, rwptr_vm, suf, ring_id in self.rings:
+      self.adev.reg(f"regIH_RB_CNTL{suf}").update(rb_enable=1, **({'enable_intr': 1} if ring_id == 0 else {}))
+
+  def drain(self):
+    _, _, suf, _ = self.rings[0]
+    wptr = self.adev.reg(f"regIH_RB_WPTR{suf}").read_bitfields()
+    self.adev.regIH_RB_RPTR.write(wptr['offset'] % (self.ring_size // 4))
+
+    if wptr['rb_overflow']:
+      self.adev.reg(f"regIH_RB_WPTR{suf}").update(rb_overflow=0)
+      self.adev.reg(f"regIH_RB_CNTL{suf}").update(wptr_overflow_clear=1)
+      self.adev.reg(f"regIH_RB_CNTL{suf}").update(wptr_overflow_clear=0)
+
+  def interrupt_handler(self):
+    _, _, suf, _ = self.rings[0]
+    wptr = self.adev.reg(f"regIH_RB_WPTR{suf}").read_bitfields()
+    rptr = self.adev.regIH_RB_RPTR.read()
+
+    while rptr != wptr['offset']:
+      entry = [self.ring_view[(rptr + i) % (self.ring_size // 4)] for i in range(8)]
+      rptr = (rptr + 8) % (self.ring_size // 4)
+
+      client, src, ring_id, vmid, vmid_type, pasid, node = \
+        [getattr(am, f'SOC15_{n}_FROM_IH_ENTRY')(entry) for n in ['CLIENT_ID', 'SOURCE_ID', 'RING_ID', 'VMID', 'VMID_TYPE', 'PASID', 'NODEID']]
+      ctx = [getattr(am, f'SOC15_CONTEXT_ID{i}_FROM_IH_ENTRY')(entry) for i in range(4)]
+
+      src_name = self.adev.soc.ih_srcs_names.get(client, {}).get(src, '')
+      if src_name in {"SDMA_TRAP", "CP_EOP_INTR"}: continue
+
+      print(f"am {self.adev.devfmt}: IH ({rptr:#x}/{wptr['offset']:#x}) client={self.adev.soc.ih_clients.get(client)} src={src_name}({src}) "
+            f"ring={ring_id} vmid={vmid}({vmid_type}) pasid={pasid} node={node} ctx=[{ctx[0]:#x}, {ctx[1]:#x}, {ctx[2]:#x}, {ctx[3]:#x}]")
+
+      if src_name == "SQ_INTERRUPT_ID":
+        enc_type = getbits(ctx[1], 6, 7) if (is_soc21:=self.adev.ip_ver[am.GC_HWIP][0] >= 11) else getbits(ctx[0], 26, 27)
+        err_type = getbits(ctx[0], 21, 24) if is_soc21 else getbits((ctx[0] & 0xfff) | ((ctx[0]>>16) & 0xf000) | ((ctx[1]<<16) & 0xff0000), 20, 23)
+        err_info = f" ({['EDC_FUE', 'ILLEGAL_INST', 'MEMVIOL', 'EDC_FED'][err_type]})" if enc_type == 2 else ""
+        print(f"am {self.adev.devfmt}: sq_intr: {['auto', 'wave', 'error'][enc_type]}{err_info}")
+        self.adev.is_err_state |= enc_type == 2
+      elif src_name == "UTCL2_FAULT" or (self.adev.ip_ver[am.GC_HWIP][0] == 9 and client == am.SOC15_IH_CLIENTID_UTCL2):
+        bf = self.adev.reg(self.adev.gmc.pf_status_reg('GC')).read_bitfields()
+        va = (self.adev.reg('regGCVM_L2_PROTECTION_FAULT_ADDR_HI32').read()<<32) | self.adev.reg('regGCVM_L2_PROTECTION_FAULT_ADDR_LO32').read()
+        print(f"am {self.adev.devfmt}: GCVM_L2_PROTECTION_FAULT_STATUS: {bf} {va<<12:#x}")
+        self.adev.reg('regGCVM_L2_PROTECTION_FAULT_CNTL').update(clear_protection_fault_status_addr=1)
+        self.adev.is_err_state = True
+      else: self.adev.is_err_state = True
+
+    self.drain()
+
+    if self.adev.is_vf: return # fatal RAS events are handled by the host PF
+    bif_intr = self.adev.regBIF_BX0_BIF_DOORBELL_INT_CNTL.read_bitfields()
+    athub_err, cntlr_err = bif_intr['ras_athub_err_event_interrupt_status'], bif_intr['ras_cntlr_interrupt_status']
+    if athub_err or cntlr_err:
+      print(f"am {self.adev.devfmt}: fatal hardware error detected: {'RAS_ATHUB_ERR_EVENT ' if athub_err else ''}{'RAS_CNTLR' if cntlr_err else ''}")
+
+      acas = self.adev.smu._aca_read_banks(ue=True) + self.adev.smu._aca_read_banks(ue=False)
+      for regs in acas:
+        acatyp = 'Uncorrectable' if (regs[1] >> 61) & 1 and (regs[1] >> 57) & 1 else 'Correctable'
+        hwname = f'{self.adev.hwid_names.get((regs[5] >> 32) & 0xFFF, "")} ({(regs[5] >> 32) & 0xFFF:#03x})'
+        print(f"am {self.adev.devfmt}: {acatyp} ACA: {hwname} mcatype={(regs[5] >> 48) & 0xFFFF:#06x} regs=[{', '.join(f'{r:#x}' for r in regs)}]")
+
+      self.adev.regBIF_BX0_BIF_DOORBELL_INT_CNTL.write(ras_cntlr_interrupt_clear=cntlr_err, ras_athub_err_event_interrupt_clear=athub_err)
+      self.adev.is_err_state = True
+
+class AM_SDMA(AM_IP):
+  def init_sw(self): self.sdma_reginst, self.sdma_name = [], "F32" if self.adev.ip_ver[am.SDMA0_HWIP] < (7,0,0) else "MCU"
+  def halt_engines(self):
+    if self.adev.ip_ver[am.SDMA0_HWIP] >= (6,0,0): self.adev.reg(f"regSDMA0_{self.sdma_name}_CNTL").update(halt=1)
+  def init_hw(self):
+    for pipe_id in range(16 if self.adev.ip_ver[am.SDMA0_HWIP] < (5,0,0) else 1):
+      pipe, inst = ("", pipe_id) if self.adev.ip_ver[am.SDMA0_HWIP] < (5,0,0) else (str(pipe_id), 0)
+
+      if self.adev.ip_ver[am.SDMA0_HWIP] >= (6,0,0):
+        self.adev.reg(f"regSDMA{pipe}_WATCHDOG_CNTL").update(queue_hang_count=100, inst=inst) # 10s, 100ms per unit
+        self.adev.reg(f"regSDMA{pipe}_UTCL1_CNTL").update(resp_mode=3, redo_delay=9, inst=inst)
+
+        # rd=noa, wr=bypass
+        self.adev.reg(f"regSDMA{pipe}_UTCL1_PAGE").update(rd_l2_policy=2, wr_l2_policy=3, **({'llc_noalloc':1} if self.sdma_name == "F32" else {}),
+                                                          inst=inst)
+        self.adev.reg(f"regSDMA{pipe}_{self.sdma_name}_CNTL").update(halt=0, **{f"{'th1_' if self.sdma_name == 'F32' else ''}reset":0}, inst=inst)
+
+      self.adev.reg(f"regSDMA{pipe}_CNTL").update(trap_enable=1,
+        **({'utc_l1_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0) else {}), inst=inst)
+
+    if self.adev.ip_ver[am.NBIO_HWIP] in {(7,9,0), (7,9,1)}:
+      for aid_id in self.adev.aids:
+        for dev_inst, (port, awid, offset, awaddr) in enumerate([(1, 0xe, 0xe, 0x1), (2, 0x8, 0x8, 0x2), (5, 0x9, 0x9, 0x8), (6, 0xa, 0xa, 0x9)]):
+          entry = dev_inst + 1 + 4 * aid_id
+          self.adev.reg(f"regDOORBELL0_CTRL_ENTRY_{entry}").write(**{f"bif_doorbell{entry}_range_size_entry": 20,
+            f"bif_doorbell{entry}_range_offset_entry": (am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 + (entry - 1) * 0xA) * 2})
+          self.adev.soc.doorbell_enable(port=port, awid=awid, awaddr_31_28_value=awaddr, offset=offset, size=4, aid=aid_id)
+    else: self.adev.soc.doorbell_enable(port=2, awid=0xe, awaddr_31_28_value=0x3, offset=am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0*2, size=4)
+
+  def fini_hw(self):
+    for reg, inst in self.sdma_reginst:
+      self.adev.reg(f"{reg}_RB_CNTL").update(rb_enable=0, inst=inst)
+      self.adev.reg(f"{reg}_IB_CNTL").update(ib_enable=0, inst=inst)
+      self.adev.reg(f"{reg}_DOORBELL").update(enable=0, inst=inst)
+      self.adev.reg(f"{reg}_DOORBELL_OFFSET").update(offset=0, inst=inst)
+
+    if self.adev.ip_ver[am.SDMA0_HWIP] >= (6,0,0):
+      self.adev.regGRBM_SOFT_RESET.write(soft_reset_sdma0=1)
+      time.sleep(0.01)
+      self.adev.regGRBM_SOFT_RESET.write(0x0)
+
+  def setup_ring(self, ring_addr:int, ring_size:int, rptr_addr:int, wptr_addr:int, idx:int) -> int:
+    if self.adev.ip_ver[am.SDMA0_HWIP] >= (5,0,0) and idx > 0: raise RuntimeError(f"am {self.adev.devfmt}: sdma queue {idx} is not available")
+
+    pipe, queue = idx // 4, idx % 4
+    reg, inst = ("regSDMA_GFX", pipe+queue*4) if self.adev.ip_ver[am.SDMA0_HWIP][:2] == (4,4) else (f"regSDMA{pipe}_QUEUE{queue}", 0)
+    doorbell = am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 + (pipe+queue*4) * 0xA
+    self.sdma_reginst.append((reg, inst))
+
+    self.adev.reg(f"{reg}_MINOR_PTR_UPDATE").write(0x1, inst=inst)
+    self.adev.wreg_pair(f"{reg}_RB_RPTR", "", "_HI", 0, inst=inst)
+    self.adev.wreg_pair(f"{reg}_RB_WPTR", "", "_HI", 0, inst=inst)
+    self.adev.wreg_pair(f"{reg}_RB_BASE", "", "_HI", ring_addr >> 8, inst=inst)
+    self.adev.wreg_pair(f"{reg}_RB_RPTR_ADDR", "_LO", "_HI", rptr_addr, inst=inst)
+    self.adev.wreg_pair(f"{reg}_RB_WPTR_POLL_ADDR", "_LO", "_HI", wptr_addr, inst=inst)
+    self.adev.reg(f"{reg}_DOORBELL_OFFSET").update(offset=doorbell * 2, inst=inst)
+    self.adev.reg(f"{reg}_DOORBELL").update(enable=1, inst=inst)
+    self.adev.reg(f"{reg}_MINOR_PTR_UPDATE").write(0x0, inst=inst)
+    self.adev.reg(f"{reg}_RB_CNTL").write(**({f'{self.sdma_name.lower()}_wptr_poll_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP][:2]!=(4,4) else {}),
+      rb_vmid=0, rptr_writeback_enable=1, rptr_writeback_timer=4, rb_enable=1, rb_priv=1, rb_size=(ring_size//4).bit_length()-1, inst=inst)
+    self.adev.reg(f"{reg}_IB_CNTL").update(ib_enable=1, inst=inst)
+    return doorbell
+
+class AM_PSP(AM_IP):
+  def init_sw(self):
+    self.reg_pref = "regMP0_SMN_C2PMSG" if self.adev.ip_ver[am.MP0_HWIP] < (14,0,0) else "regMPASP_SMN_C2PMSG"
+
+    if self.adev.devfmt.startswith("usb:"):
+      self.msg1_view, paddrs = self.adev.pci_dev.alloc_sysmem(512 << 10)
+      self.msg1_addr = self.adev.mm.alloc_vaddr(size=self.msg1_view.nbytes, align=am.PSP_1_MEG)
+      self.adev.mm.map_range(self.msg1_addr, self.msg1_view.nbytes, [(paddrs[0], self.msg1_view.nbytes)], AddrSpace.SYS, uncached=True, boot=True)
+    else:
+      self.msg1_paddr = self.adev.mm.palloc(am.PSP_1_MEG, align=am.PSP_1_MEG, zero=False, boot=True)
+      self.msg1_addr, self.msg1_view = self.adev.paddr2mc(self.msg1_paddr), self.adev.vram.view(self.msg1_paddr, am.PSP_1_MEG, 'B')
+
+    self.cmd_paddr = self.adev.mm.palloc(am.PSP_CMD_BUFFER_SIZE, zero=False, boot=True)
+    self.fence_paddr = self.adev.mm.palloc(am.PSP_FENCE_BUFFER_SIZE, zero=True, boot=True)
+
+    self.ring_size = 0x10000
+    self.ring_paddr = self.adev.mm.palloc(self.ring_size, zero=False, boot=True)
+
+    self.tmr_size, self.tmr_paddr = 0, 0
+    self.boot_time_tmr = self.adev.ip_ver[am.MP0_HWIP] in {(13,0,6), (13,0,14), (14,0,2), (14,0,3)}
+    self.autoload_tmr = self.adev.ip_ver[am.MP0_HWIP] not in {(13,0,6), (13,0,14)}
+
+  def init_hw(self):
+    spl_key = am.PSP_FW_TYPE_PSP_SPL if self.adev.ip_ver[am.MP0_HWIP] >= (14,0,0) else am.PSP_FW_TYPE_PSP_KDB
+    sos_components = [(am.PSP_FW_TYPE_PSP_KDB, am.PSP_BL__LOAD_KEY_DATABASE), (spl_key, am.PSP_BL__LOAD_TOS_SPL_TABLE),
+      (am.PSP_FW_TYPE_PSP_SYS_DRV, am.PSP_BL__LOAD_SYSDRV), (am.PSP_FW_TYPE_PSP_SOC_DRV, am.PSP_BL__LOAD_SOCDRV),
+      (am.PSP_FW_TYPE_PSP_INTF_DRV, am.PSP_BL__LOAD_INTFDRV), (am.PSP_FW_TYPE_PSP_DBG_DRV, am.PSP_BL__LOAD_DBGDRV),
+      (am.PSP_FW_TYPE_PSP_RAS_DRV, am.PSP_BL__LOAD_RASDRV), (am.PSP_FW_TYPE_PSP_SOS, am.PSP_BL__LOAD_SOSDRV)]
+
+    if not self.is_sos_alive():
+      for fw, compid in sos_components: self._bootloader_load_component(fw, compid)
+      wait_cond(self.is_sos_alive, value=True, msg="sOS failed to start")
+
+    self._ring_create()
+    if am.PSP_FW_TYPE_PSP_TOC in self.adev.fw.sos_fw: self._tmr_init()
+
+    # SMU fw should be loaded before TMR.
+    if hasattr(self.adev.fw, 'smu_psp_desc'): self._load_ip_fw_cmd(*self.adev.fw.smu_psp_desc)
+    if not self.boot_time_tmr or not self.autoload_tmr: self._tmr_load_cmd()
+
+    for psp_desc in self.adev.fw.descs: self._load_ip_fw_cmd(*psp_desc)
+
+    if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0): self._rlc_autoload_cmd()
+    else: self._load_ip_fw_cmd([am.GFX_FW_TYPE_REG_LIST], self.adev.fw.sos_fw[am.PSP_FW_TYPE_PSP_RL])
+
+  def is_sos_alive(self): return self.adev.reg(f"{self.reg_pref}_81").read() != 0x0
+
+  def _wait_for_bootloader(self): wait_cond(lambda: self.adev.reg(f"{self.reg_pref}_35").read() & 0x80000000, value=0x80000000, msg="BL not ready")
+
+  def _prep_msg1(self, data:memoryview):
+    assert len(data) <= self.msg1_view.nbytes, f"msg1 buffer is too small {len(data):#x} > {self.msg1_view.nbytes:#x}"
+    padded_data = pad_bytes(bytes(data) + b'\x00' * 4, 16) # HACK: apple's memcpy requires 16-bytes alignment
+    self.msg1_view[:len(padded_data)] = padded_data
+    self.adev.gmc.flush_hdp()
+
+  def _bootloader_load_component(self, fw:int, compid:int):
+    if fw not in self.adev.fw.sos_fw: return 0
+
+    self._wait_for_bootloader()
+
+    if DEBUG >= 2: print(f"am {self.adev.devfmt}: loading sos component: {am.enum_psp_fw_type.get(fw)}")
+
+    self._prep_msg1(self.adev.fw.sos_fw[fw])
+    self.adev.reg(f"{self.reg_pref}_36").write(self.msg1_addr >> 20)
+    self.adev.reg(f"{self.reg_pref}_35").write(compid)
+
+    return self._wait_for_bootloader() if compid != am.PSP_BL__LOAD_SOSDRV else 0
+
+  def _tmr_init(self):
+    if self.adev.partial_boot: self.tmr_size = self.adev.reg("regSCRATCH_REG5").read()
+    else:
+      # Load TOC and calculate TMR size
+      self._prep_msg1(fwm:=self.adev.fw.sos_fw[am.PSP_FW_TYPE_PSP_TOC])
+      self.tmr_size = self._load_toc_cmd(len(fwm)).resp.tmr_size
+    # First runtime allocation on both full and partial boots, so the resident TMR keeps the same address.
+    if not self.boot_time_tmr: self.tmr_paddr = self.adev.mm.pa_allocator.alloc(self.tmr_size, am.PSP_TMR_ALIGNMENT)
+
+  def _ring_create(self):
+    # If the ring is already created, destroy it
+    if self.adev.reg(f"{self.reg_pref}_71").read() != 0:
+      self.adev.reg(f"{self.reg_pref}_64").write(am.GFX_CTRL_CMD_ID_DESTROY_RINGS)
+
+      # There might be handshake issue with hardware which needs delay
+      time.sleep(0.02)
+
+    # Wait until the sOS is ready
+    wait_cond(lambda: self.adev.reg(f"{self.reg_pref}_64").read() & 0x80000000, value=0x80000000, msg="sOS not ready")
+
+    self.adev.wreg_pair(self.reg_pref, "_69", "_70", self.adev.paddr2mc(self.ring_paddr))
+    self.adev.reg(f"{self.reg_pref}_71").write(self.ring_size)
+    self.adev.reg(f"{self.reg_pref}_64").write(am.PSP_RING_TYPE__KM << 16)
+
+    # There might be handshake issue with hardware which needs delay
+    time.sleep(0.02)
+
+    wait_cond(lambda: self.adev.reg(f"{self.reg_pref}_64").read() & 0x8000FFFF, value=0x80000000, msg="sOS ring not created")
+
+  def _ring_submit(self, cmd:am.struct_psp_gfx_cmd_resp) -> am.struct_psp_gfx_cmd_resp:
+    msg = am.struct_psp_gfx_rb_frame(fence_value=(prev_wptr:=self.adev.reg(f"{self.reg_pref}_67").read()) + 1,
+      cmd_buf_addr_lo=lo32(self.adev.paddr2mc(self.cmd_paddr)), cmd_buf_addr_hi=hi32(self.adev.paddr2mc(self.cmd_paddr)),
+      fence_addr_lo=lo32(self.adev.paddr2mc(self.fence_paddr)), fence_addr_hi=hi32(self.adev.paddr2mc(self.fence_paddr)))
+
+    self.adev.vram.view(self.cmd_paddr, ctypes.sizeof(cmd))[:] = memoryview(cmd).cast('B')
+    self.adev.vram.view(self.ring_paddr + prev_wptr * 4, ctypes.sizeof(msg))[:] = memoryview(msg).cast('B')
+
+    # Move the wptr
+    self.adev.reg(f"{self.reg_pref}_67").write(prev_wptr + ctypes.sizeof(am.struct_psp_gfx_rb_frame) // 4)
+
+    wait_cond(lambda: self.adev.vram.view(self.fence_paddr, 4, 'I')[0], value=msg.fence_value, msg="sOS ring not responding")
+
+    resp = type(cmd).from_buffer(bytearray(self.adev.vram.view(self.cmd_paddr, ctypes.sizeof(cmd))[:]))
+    if resp.resp.status != 0: raise RuntimeError(f"PSP command failed {resp.cmd_id} {resp.resp.status}")
+
+    return resp
+
+  def _load_ip_fw_cmd(self, fw_types:list[int], fw_bytes:memoryview):
+    self._prep_msg1(fw_bytes)
+    for fw_type in fw_types:
+      if DEBUG >= 2: print(f"am {self.adev.devfmt}: loading fw: {am.enum_psp_gfx_fw_type.get(fw_type)}")
+      cmd = am.struct_psp_gfx_cmd_resp(cmd_id=am.GFX_CMD_ID_LOAD_IP_FW)
+      cmd.cmd.cmd_load_ip_fw.fw_phy_addr_hi, cmd.cmd.cmd_load_ip_fw.fw_phy_addr_lo = data64(self.msg1_addr)
+      cmd.cmd.cmd_load_ip_fw.fw_size = len(fw_bytes)
+      cmd.cmd.cmd_load_ip_fw.fw_type = fw_type
+      self._ring_submit(cmd)
+
+  def _tmr_load_cmd(self) -> am.struct_psp_gfx_cmd_resp:
+    tmr_paddr = self.adev.paddr2xgmi(self.tmr_paddr) if self.tmr_paddr else 0
+
+    cmd = am.struct_psp_gfx_cmd_resp(cmd_id=am.GFX_CMD_ID_SETUP_TMR)
+    cmd.cmd.cmd_setup_tmr.buf_phy_addr_hi, cmd.cmd.cmd_setup_tmr.buf_phy_addr_lo = data64(self.adev.paddr2mc(self.tmr_paddr) if self.tmr_paddr else 0)
+    cmd.cmd.cmd_setup_tmr.system_phy_addr_hi, cmd.cmd.cmd_setup_tmr.system_phy_addr_lo = data64(tmr_paddr)
+    cmd.cmd.cmd_setup_tmr.bitfield.virt_phy_addr = 1
+    cmd.cmd.cmd_setup_tmr.buf_size = self.tmr_size if self.tmr_paddr else 0
+    return self._ring_submit(cmd)
+
+  def _load_toc_cmd(self, toc_size:int) -> am.struct_psp_gfx_cmd_resp:
+    cmd = am.struct_psp_gfx_cmd_resp(cmd_id=am.GFX_CMD_ID_LOAD_TOC)
+    cmd.cmd.cmd_load_toc.toc_phy_addr_hi, cmd.cmd.cmd_load_toc.toc_phy_addr_lo = data64(self.msg1_addr)
+    cmd.cmd.cmd_load_toc.toc_size = toc_size
+    return self._ring_submit(cmd)
+
+  def _spatial_partition_cmd(self, mode):
+    cmd = am.struct_psp_gfx_cmd_resp(cmd_id=am.GFX_CMD_ID_SRIOV_SPATIAL_PART)
+    cmd.cmd.cmd_spatial_part.mode = mode
+    return self._ring_submit(cmd)
+
+  def _rlc_autoload_cmd(self): return self._ring_submit(am.struct_psp_gfx_cmd_resp(cmd_id=am.GFX_CMD_ID_AUTOLOAD_RLC))
+
+import functools, tinygrad.runtime.autogen.am
+from dataclasses import dataclass
+from tinygrad.helpers import getbits
+
+@dataclass
+class AMDReg:
+  name:str; offset:int; segment:int; fields:dict[str, tuple[int, int]]; bases:dict[int, tuple[int, ...]] # noqa: E702
+  def __post_init__(self): self.addr:dict[int, int] = { inst: bases[self.segment] + self.offset for inst, bases in self.bases.items() }
+
+  def encode(self, **kwargs) -> int: return functools.reduce(int.__or__, (value << self.fields[name][0] for name,value in kwargs.items()), 0)
+  def decode(self, val: int) -> dict: return {name:getbits(val, start, end) for name,(start,end) in self.fields.items()}
+
+  def fields_mask(self, *names) -> int:
+    return functools.reduce(int.__or__, ((((1 << (self.fields[nm][1]-self.fields[nm][0]+1

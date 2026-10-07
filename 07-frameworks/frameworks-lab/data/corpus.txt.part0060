@@ -1,0 +1,3191 @@
+at.var("gate", dtype=dtypes.bool)), validate_index),
+
+  # STORE: the target must be storage or a STAGE realization point (or an AFTER/BITCAST/view of one);
+  # STAGE targets are written into the buffer the STAGE creates. INDEX stores are checked above
+  (UPat(Ops.STORE, dtypes.void, (UPat(name="x"), UPat())), lambda x:
+   True if (b:=x.storage_base).op in {Ops.BUFFER, Ops.ALLOC, Ops.PARAM, Ops.STAGE} else None if b.op is Ops.INDEX else False),
+
+  # WMMA has a <a, b, acc>
+  (UPat(Ops.WMMA, src=(UPat(), UPat(), UPat()), name="x"), lambda x: isinstance(x.arg, tuple) and len(x.arg) == 4),
+])
+
+def is_device(d): return isinstance(d, str) or (isinstance(d, tuple) and all(isinstance(s, str) for s in d))
+
+# these ops can exist in tensor but not programs. example: movement
+spec_tensor = PatternMatcher([
+  (UPat((Ops.SIN, Ops.LOG2, Ops.EXP2, Ops.SQRT, Ops.RECIPROCAL), src=(UPat(),), name="u"),
+   lambda u: dtypes.is_float(u.dtype) or u.src[0].base.is_invalid),
+
+  # BUFFER has bound storage; ALLOC declares storage without a runtime buffer
+  (UPat(Ops.BUFFER, name="buf"), lambda buf:
+   isinstance(buf.dtype, DType) and isinstance(buf.arg.size, int) and is_device(buf.arg.device) and buf.arg.buffer is not None
+   and valid_device_range(buf.arg.device, buf.src) if isinstance(buf.arg, ParamArg) and buf.addrspace is AddrSpace.GLOBAL else None),
+  (UPat(Ops.ALLOC, name="buf"), lambda buf: isinstance(buf.arg, ParamArg)
+   and buf.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL, AddrSpace.REG)
+   and buf.arg.buffer is None and (buf.arg.size is None or isinstance(buf.arg.size, int))
+   and (buf.arg.device is None or (buf.addrspace is AddrSpace.GLOBAL and is_device(buf.arg.device)))
+   and valid_device_range(buf.arg.device, buf.src)),
+
+  # a Variable is a scalar ALU PARAM with a value range and no device
+  (UPat(Ops.PARAM, src=(), name="buf"), lambda buf: buf.arg.device is None if buf.is_variable else None),
+
+  # SPECIAL is index before index lowering. custom_kernel currently has this
+  (UPat(Ops.SPECIAL, src=(UPat(dtype=dtypes.weakint),), name="s"), lambda s: isinstance(s.arg, str)),
+
+  # movement ops
+  (UPat((Ops.RESHAPE, Ops.EXPAND), src=(UPat(), UPat())), lambda: True),
+  (UPat((Ops.PAD, Ops.SHRINK), src=(UPat(), UPat(), UPat()), name="x"), lambda x: x.src[1].shape == x.src[2].shape),
+  (UPat((Ops.PERMUTE, Ops.FLIP), name="mv", src=(UPat(),)), lambda mv: isinstance(mv.arg, tuple)),
+
+  # REDUCE has arg=(op, num_axes), src[1:] are ranges after lowering
+  (UPat(Ops.REDUCE, src=(UPat(),), allow_any_len=True, name="x"),
+   lambda x: isinstance(x.arg, tuple) and len(x.arg) == 2 and x.arg[0] in GroupOp.Reduce
+   and isinstance(x.arg[1], int) and all(y.dtype in (dtypes.weakint, dtypes.int) for y in x.src[1:])),
+
+  # COPY carries the DEVICE range as src[1] when the target is multi-device
+  (UPat(Ops.COPY, name="copy", src=(UPat(),), allow_any_len=True), lambda copy:
+   is_device(copy.arg) and not is_disk_device(copy.arg) and valid_device_range(copy.arg, copy.src[1:])),
+  (UPat(Ops.ALLREDUCE, name="red", src=(UPat(),)),
+   lambda red: isinstance(red.arg, tuple) and len(red.arg) == 2 and red.arg[0] in GroupOp.Reduce and is_device(red.arg[1])),
+
+  # UNSHARD/MSELECT/MSTACK
+  # an UNSHARD carries the value and one sharding range per sharded axis (usually a DEVICE RANGE, but can be a derived expression)
+  (UPat(Ops.UNSHARD, name="multi"), lambda multi: len(multi.src) == 1+len(multi.arg)
+    and all(isinstance(a, int) for a in multi.arg) and all(r.dtype in dtypes.weaks for r in multi.src[1:])),
+  (UPat(Ops.MSELECT, name="x"), lambda x: isinstance(x.src[0].device, tuple) and x.arg < len(x.src[0].device)),
+  (UPat(Ops.MSTACK, name="x"), lambda x: all(isinstance(s.device, str) for s in x.src) or (all_same(x.src) and x.src[0].device is None)),
+
+  # CONTIGUOUS ensures the source UOp realizes
+  (UPat((Ops.DETACH, Ops.CONTIGUOUS_BACKWARD), src=(UPat(),), arg=None), lambda: True),
+
+  # TODO: this should not be here. STAGE is transformed to BUFFER later
+  (UPat(Ops.STAGE, src=(UPat(),), allow_any_len=True), lambda: True),
+
+  # codegen: PROGRAM with progressive sources through the pipeline (SINK, LINEAR?, SOURCE?, BINARY?)
+  (UPat(Ops.LINEAR, dtypes.void), lambda: True),
+  (UPat(Ops.SOURCE, dtypes.void, src=()), lambda: True),
+  (UPat(Ops.PROGRAM, dtypes.void, src=(UPat(Ops.SINK),)), lambda: True),
+  (UPat(Ops.PROGRAM, dtypes.void, src=(UPat(Ops.SINK), UPat(Ops.LINEAR))), lambda: True),
+  (UPat(Ops.PROGRAM, dtypes.void, src=(UPat(Ops.SINK), UPat(Ops.LINEAR), UPat(Ops.SOURCE))), lambda: True),
+  (UPat(Ops.PROGRAM, dtypes.void, src=(UPat(Ops.SINK), UPat(Ops.LINEAR), UPat(Ops.SOURCE), UPat(Ops.BINARY))), lambda: True),
+])+spec_shared
+
+# these ops can exist in programs but not the tensor spec. example: LOAD
+spec_program = PatternMatcher([
+  # every width in a program is stated: a CONST appears only under the CAST stating its width, and is the only weak node
+  (UPat(GroupOp.All, name="x"), lambda x: False if x.op is not Ops.CAST and any(s.op is Ops.CONST for s in x.src) else None),
+  (UPat(GroupOp.All-{Ops.CONST}, dtypes.weaks), lambda: False),
+
+  # allow special SHRINK of a buffer or its bitcast
+  (UPat(Ops.SHRINK, src=(UPat((Ops.PARAM, Ops.BUFFER, Ops.ALLOC, Ops.AFTER)).or_bitcasted(), UPat(), UPat.cvar().or_casted())), lambda: True),
+
+  # movement ops are not allowed in programs
+  (UPat(GroupOp.Movement), lambda: False),
+
+  # REG/LOCAL buffer
+  (UPat((Ops.BUFFER, Ops.ALLOC), name="x"), lambda x: isinstance(x.arg, ParamArg) and x.addrspace in (AddrSpace.REG, AddrSpace.LOCAL)),
+
+  # Invalid is not allowed in program
+  (UPat(Ops.CONST, arg=Invalid), lambda: False),
+
+  # if has a <gate, index_for_dedup>
+  (UPat(Ops.IF, dtype=dtypes.void, src=(UPat(dtype=dtypes.bool), UPat((Ops.CAST, Ops.INDEX, Ops.SHRINK)))), lambda: True),
+  (UPat(Ops.ENDIF, dtype=dtypes.void, src=(UPat(Ops.IF),)), lambda: True),
+
+  # SPECIAL is int32 after index lowering
+  (UPat(Ops.SPECIAL, src=(UPat(dtype=dtypes.int32),), name="s"), lambda s: isinstance(s.arg, str)),
+])+spec_shared
+
+spec_hcq = PatternMatcher([
+  (UPat(Ops.GETADDR, dtypes.uint64, name="x",
+        src=(UPat((Ops.BUFFER, Ops.ALLOC, Ops.PARAM, Ops.SHRINK, Ops.BITCAST, Ops.MSTACK, Ops.MSELECT, Ops.LINEAR)).or_after(),)),
+   lambda x: is_device(x.arg)),
+  (UPat(Ops.PROGRAM, dtypes.void, src=(UPat((Ops.BUFFER, Ops.PARAM)).or_after(),)), lambda: True),
+])+spec_shared
+
+# these are intermediate ops. everything should be deleted from here
+spec_full = PatternMatcher([
+  (UPat(Ops.REWRITE_ERROR, dtypes.void, name="x"), lambda x: isinstance(x.arg, str)),
+
+  # codegen may end ranges after gpudims has replaced RANGE with SPECIAL.
+  (UPat(Ops.END, src=(UPat(dtype=dtypes.void), UPat()), allow_any_len=True, name="x"),
+   lambda x: x.arg is None and all(dtypes.is_int(u.dtype) for u in x.src[1:])),
+
+  # allow any AFTER
+  (UPat(Ops.AFTER, src=(UPat(),), allow_any_len=True), lambda: True),
+
+  # all loads/stores
+  (UPat((Ops.LOAD, Ops.STORE)), lambda: True),
+])+spec_tensor+spec_program+spec_hcq
+
+# ***** kernel graph spec *****
+
+spec_kernel_graph = PatternMatcher([
+  # sink
+  (UPat(Ops.SINK, dtypes.void), lambda: True),
+  # const + stack to make vconsts and shape args. a 0-size/bound reduce keeps its const casted
+  (UPat(Ops.CONST, src=()), lambda: True),
+  (UPat(Ops.CAST, src=(UPat(Ops.CONST, src=()),)), lambda: True),
+  (UPat(Ops.STACK, name="s"), lambda s: all(x.op in (Ops.CONST, Ops.PARAM) for x in s.src) or None),
+  # linear for more kernels (TODO: we should enter non sink calls)
+  #(UPat(Ops.LINEAR), lambda: True),
+  # PARAM is caller-provided storage (or a Variable in the ALU addrspace), ALLOC is call-local storage; size is in the arg, no shape input
+  (UPat(Ops.PARAM, src=(), name="x"), lambda x: isinstance(x.arg, ParamArg)),
+  (UPat(Ops.BUFFER, name="x"), lambda x: isinstance(x.arg, ParamArg) and valid_device_range(x.arg.device, x.src) and
+   (x.arg.buffer is not None if x.addrspace is AddrSpace.GLOBAL else x.addrspace in (AddrSpace.LOCAL, AddrSpace.REG))),
+  (UPat(Ops.ALLOC, name="x"), lambda x:
+   isinstance(x.arg, ParamArg) and x.addrspace is AddrSpace.GLOBAL and x.arg.buffer is None and valid_device_range(x.arg.device, x.src)),
+  (UPat(Ops.BITCAST), lambda: True),
+  # mstack/mselect
+  (UPat(Ops.MSTACK, name="x"), lambda x: all(isinstance(s.device, str) for s in x.src) or (all_same(x.src) and x.src[0].device is None)),
+  (UPat(Ops.MSELECT, name="x"), lambda x: isinstance(x.src[0].device, tuple) and x.arg < len(x.src[0].device)),
+  # open DEVICE ranges are bound per device at launch (e.g. the range on a multi-device BUFFER/ALLOC)
+  (UPat(Ops.RANGE, name="r"), lambda r: r.axis_type is AxisType.DEVICE),
+  # all calls are on opaque bodies
+  (UPat(Ops.CALL, src=(UPat(tuple(OPAQUE_CALL_BODIES)),), allow_any_len=True), lambda: True),
+  # after on PARAM or AFTER
+  (UPat(Ops.AFTER, src=(UPat(GroupOp.Movement.union({Ops.PARAM, Ops.AFTER, Ops.BUFFER, Ops.ALLOC,
+                                                  Ops.MSTACK, Ops.MSELECT, Ops.BITCAST, Ops.RESHAPE})),), allow_any_len=True), lambda: True),
+])
+
+# **** pyrender (move this) ****
+
+# circular-import-safe eval globals for pyrender round-tripping (lazy: codegen/schedule/renderer are heavy)
+@functools.cache
+def pyrender_globals() -> dict[str, Any]:
+  from tinygrad.codegen.opt import Opt, OptOps
+  from tinygrad.schedule.rangeify import BufferizeOpts
+  from tinygrad.renderer import Estimates
+  return {"inf": math.inf, "nan": math.nan, "KernelInfo": KernelInfo, "Metadata": Metadata,
+          "UOp": UOp, "dtypes": dtypes, "Ops": Ops, "AxisType": AxisType, "Invalid": Invalid,
+          "Opt": Opt, "OptOps": OptOps, "BufferizeOpts": BufferizeOpts, "AddrSpace": AddrSpace, "panic": panic,
+          "ConstFloat": ConstFloat, "ParamArg": ParamArg, "Estimates": Estimates, "CallInfo": CallInfo, "CustomFunction": CustomFunction}
+def eval_pyrender(code:str) -> UOp:
+  lcls:dict[str, Any] = {}
+  exec(code, pyrender_globals(), lcls)
+  return lcls['ast']
+
+def test_pyrender(test_ast:UOp, assert_parents=True):
+  try: code = pyrender(test_ast)
+  except NotImplementedError: return None  # this is okay, not all ops can be pyrendered
+  ast:UOp = eval_pyrender(code)
+  if ast is not test_ast:
+    if assert_parents:
+      for u in test_ast.toposort(): test_pyrender(u, assert_parents=False)
+    raise RuntimeError(f"PYRENDER ISSUE:\nSTR MATCH: {str(test_ast) == str(ast)}\nUOP:\n{test_ast}\nPRODUCED:\n{ast}\nCODE:\n{code}")
+  return code
+
+# all of symbolic lives here now
+import math
+from collections import defaultdict
+from tinygrad.uop.ops import Ops, PatternMatcher, UPat, UOp, GroupOp, exec_alu, promo_dtype
+from tinygrad.dtype import PyConst, dtypes, can_lossless_cast, Invalid, bitcast, truncate
+from tinygrad.helpers import partition, all_same, prod, flatten, unwrap, IMAGE, dedup
+from tinygrad.uop.divandmod import div_and_mod_symbolic
+from tinygrad.uop.movement import mop_cleanup
+from tinygrad.uop.weak import pm_uncast_const
+
+# TODO: symbolic shouldn't be importing from codegen
+from tinygrad.codegen.decomp.transcendental import xpow
+
+# ******** phase 1 of symbolic used to live in ops, it's the most generic folding rules ********
+
+def simplify_pow(x:UOp, c:UOp) -> UOp|None:
+  if c.val < 0: return x.reciprocal().pow(-c.val)
+  if c.val == 0: return x.const_like(1)
+  if (h := c.val-0.5) < c.val and int(h)+0.5 == c.val: return x.pow(h) * x.sqrt()
+  if int(c.val) == c.val: return (y := x.pow(c.val//2)) * y * (x if c.val%2 == 1 else 1)
+  return None
+
+def fold_bitcast(root:UOp, c:UOp) -> UOp|None:
+  if c.dtype.itemsize != root.dtype.itemsize: return None
+  # the value is mathematical and may not fit: reading it as bits is the emission that pins it to the stated width
+  return root.const_like(bitcast(truncate[c.dtype](c.val), c.dtype, root.dtype))
+
+# no truncate: ints stay mathematical past the fold (emission truncates); floats re-round in the mint
+def fold_const_alu(a:UOp) -> UOp: return a.const_like(exec_alu(a.op, a.dtype, [const_arg(s) for s in a.src], False))
+
+def _quotient_base(q:UOp, base:UOp, div:int) -> UOp|None:
+  # the B with q == B//div and B%div == base%div, or None. only such congruence is needed to recombine, and canonicalization
+  # moves consts freely: the quotient may be merged ((x//c + a)//div -> (x + a*c)//(c*div) for div>0) and shifted ((y + k*D)//D == y//D + k)
+  (q, s), (num, a) = q.pop_const(), base.pop_const()
+  if q.op is not Ops.FLOORDIV or q.src[1].op is not Ops.CONST: return None
+  if div > 0 and num.op is Ops.FLOORDIV and num.src[1].op is Ops.CONST and q.src[1].val == (c:=num.src[1].val)*div: num, a, D = num.src[0], a*c, c*div
+  elif q.src[1].val == div: D = div
+  else: return None
+  (x, xa), (p, pa) = num.pop_const(), q.src[0].pop_const()
+  if p is not x or (t:=xa + a - pa) % D: return None
+  return base - k*div if (k:=t//D - s) else base
+
+def fold_add_divmod_recombine(x:UOp) -> UOp|None:
+  # a scaled mod (base%div)*mul recombines with a partner q*(div*mul) carrying the quotient of a b == base (mod div):
+  #   q == b//div     -> b*mul              (full recombine)
+  #   q == (b//div)%d -> (b%(div*d))*mul    (partial recombine into a wider mod, needs d>0)
+  terms = list(x.split_uop(Ops.ADD))
+  for i,u in enumerate(terms):
+    mod, mul = u.pop_const(Ops.MUL)
+    if mod.op is not Ops.FLOORMOD or mod.src[1].op is not Ops.CONST: continue
+    base, div = mod.src[0], mod.src[1].val
+    for j,v in enumerate(terms):
+      q, scale = v.pop_const(Ops.MUL)
+      if i == j or scale != div*mul: continue
+      rest = [t for k,t in enumerate(terms) if k not in (i,j)]
+      if (b:=_quotient_base(q, base, div)) is not None: return (b*mul).usum(*rest)
+      if q.op is Ops.FLOORMOD and q.src[1].op is Ops.CONST and (d:=q.src[1].val) > 0 and (b:=_quotient_base(q.src[0], base, div)) is not None:
+        return ((b % (div*d))*mul).usum(*rest)
+  return None
+
+# Invalid poisons the value: ops move inside the gate so the Invalid reaches the LOAD/STORE and folds there.
+# this needs to be before symbolic so that 0*something_that_might_be_invalid doesnt become 0
+invalid_pat = UPat(Ops.CONST, arg=Invalid, name="i")
+invalid_gate = UPat.var("cond").where(UPat.var("x"), invalid_pat)
+
+# the two const spellings: Invalid carries no width, so it rides bare inside either
+bare_const = UPat.any(UPat(Ops.CONST), UPat(Ops.STACK, src=UPat(Ops.CONST)))
+casted_const = UPat.any(p:=UPat(Ops.CAST, src=(UPat(Ops.CONST),)), UPat(Ops.STACK, src=UPat.any(p, UPat(Ops.CONST, arg=Invalid))))
+def const_arg(u:UOp):
+  return tuple(const_arg(s) for s in u.src) if u.op is Ops.STACK else u.val
+
+def lift_reduce_gate(red:UOp, cond:UOp, x:UOp, i:UOp) -> UOp|None:
+  # a REDUCE moves inside the gate clauses without its ranges: they invalidate every lane at once, so that gate lifts out
+  if red.arg[1] != 0: return None
+  keep, lift = partition(cond.split_uop(Ops.AND), lambda c: any(rr in c.ranges for r in red.src[1:] for rr in r.ranges))
+  inner = keep[0].uprod(*keep[1:]).where(x, i) if keep else x
+  return lift[0].uprod(*lift[1:]).where(red.replace(src=(inner,)+red.src[1:]), i) if lift else None
+
+pm_data_invalid = PatternMatcher([
+  (invalid_pat.broadcast(), lambda i: i),
+  (UPat(GroupOp.Unary|{Ops.CAST, Ops.BITCAST}, src=(invalid_pat,)), lambda i: i),
+  (UPat(GroupOp.Unary|{Ops.CAST, Ops.BITCAST}, src=(invalid_gate,), name="op"),
+   lambda cond,x,op,i: cond.where(op.replace(src=(x,)), i)),
+  # binary ops move inside the gate, with Invalid in the false branch
+  (UPat(GroupOp.Binary, src=(invalid_gate, UPat.var("y")), name="alu"), lambda cond,x,y,alu,i: cond.where(x.alu(alu.op,y), i)),
+  (UPat(GroupOp.Binary, src=(UPat.var("y"), invalid_gate), name="alu"), lambda cond,x,y,alu,i: cond.where(y.alu(alu.op,x), i)),
+  (UPat(GroupOp.Binary-GroupOp.Comparison, src=[invalid_pat, UPat()]), lambda i: i),
+  (invalid_gate.reduce(allow_any_len=True, name="red"), lift_reduce_gate),
+  # an Invalid condition poisons the whole where; a gated Invalid condition lifts the gate out
+  (invalid_pat.where(UPat(), UPat()), lambda i: i),
+  (invalid_gate.where(UPat.var("a"), UPat.var("b")), lambda cond,x,i,a,b: cond.where(x.where(a,b), i)),
+  # normalize where(cond, Invalid, val) -> where(~cond, val, Invalid)
+  (UPat.var("cond").where(invalid_pat, UPat.var("val")), lambda cond, i, val: cond.logical_not().where(val, i) if not val.is_invalid else i),
+  # lift Invalid out: a.where(cond.where(x, Invalid), c) -> (~a|cond).where(a.where(x, c), Invalid)
+  (UPat.var("a").where(invalid_gate, UPat.var("c")), lambda cond,i,x,a,c:
+   (a.logical_not()|cond).where(a.where(x,c), i) if not c.is_invalid else None),
+  (UPat.var("a").where(UPat.var("b"), invalid_gate), lambda cond,i,x,a,b: (a|cond).where(a.where(b, x), i) if not b.is_invalid else None),
+  # fold gated LOAD/STORE
+  (UPat(Ops.STORE, src=(UPat(Ops.INDEX, src=(UPat(), invalid_pat), allow_any_len=True).or_casted(), UPat())), lambda i: UOp(Ops.NOOP)),
+  (UPat(Ops.LOAD, src=(UPat(Ops.INDEX, src=(UPat(), invalid_pat), allow_any_len=True).or_casted(),), allow_any_len=True, name="x"),
+    lambda x,i: x.src[1] if len(x.src) > 1 else x.const_like(0)),
+])
+
+pm_remove_invalid = PatternMatcher([
+  (invalid_gate.named("w"), lambda cond,x,i,w: w.replace(src=(cond,x,w.const_like(0)))),
+  (UPat(Ops.STACK, name="s"), lambda s: s.replace(src=tuple(UOp.const(0, s.dtype) if x.is_invalid else x for x in s.src))
+   if any(x.is_invalid for x in s.src) else None),
+])
+
+def fold_const_where(gate:UOp, c0:UOp, c1:UOp, w:UOp) -> UOp:
+  # folding a strong dtype WHERE to a weak const branch keeps the strong dtype
+  ret = c0 if gate.val else c1
+  return ret.ccast(w.dtype) if ret.op is Ops.CONST and ret.dtype in dtypes.weaks and w.dtype not in dtypes.weaks else ret
+
+symbolic_simple = pm_data_invalid + PatternMatcher([
+  # ** self folding **
+  (UPat({Ops.ADD, Ops.XOR, Ops.OR}, src=[UPat.var("x"), UPat.const(0)]), lambda x: x),  # x+0 / x^0 / x|0 -> x
+  (UPat({Ops.SHL, Ops.SHR}, src=(UPat.var("x"), UPat.const(0))), lambda x: x),          # x<<0 / x>>0 -> x
+  (UPat.var("x") * 1, lambda x: x),    # x*1 -> x
+  (UPat.var("x") // UPat.var("x"), lambda x: x.const_like(1)), # x//x -> 1
+  (UPat.var("x") // 1, lambda x: x),   # x//1 -> x
+  (UPat.var("x") // -1, lambda x: -x), # x//-1 -> -x
+  ((UPat.var("x") ^ UPat.var("y")) ^ UPat.var("y"), lambda x,y: x), # (x^y)^y -> x
+  ((UPat.var() % UPat.var("y")).named("base") % UPat.var("y"), lambda base,y: base),  # (x%y)%y = -> x%y (rewritten with base for speed)
+  # variations of (x%c)+(x//c)*c = x
+  (UPat(Ops.ADD, dtype=dtypes.weakint, name="x"), fold_add_divmod_recombine),
+  (UPat.var("x", dtype=dtypes.bool) & UPat.cvar("c"), lambda x,c: x if c.val else c),
+  (UPat.var("x", dtype=dtypes.bool) | UPat.cvar("c"), lambda x,c: c if c.val else x),
+  (UPat.var("x", dtype=dtypes.bool) != UPat.const(False, dtypes.bool), lambda x: x),  # x != False -> x
+  (UPat(GroupOp.Idempotent, src=(UPat.var("x"), UPat.var("x"))), lambda x: x),
+  (UPat.var("x", dtype=dtypes.bool).logical_not().logical_not(), lambda x: x),
+  (UPat.var("x", dtype=dtypes.bool).where(UPat.const(True, dtypes.bool), UPat.const(False, dtypes.bool)), lambda x: x),
+  (UPat.var("x", dtype=dtypes.bool).where(UPat.const(False, dtypes.bool), UPat.const(True, dtypes.bool)), lambda x: x.logical_not()),
+  # CAST(bool -> int) != const — CAST(True)=1, CAST(False)=0, so fold based on const value
+  (UPat.var("x", dtype=dtypes.bool).cast(dtypes.ints+(dtypes.weakint,)) != UPat.cvar("c"),
+   lambda x,c: x if c.val == 0 else x.logical_not() if c.val == 1 else x.const_like(True)),
+  (UPat.var("x", dtype=dtypes.ints+(dtypes.bool, dtypes.weakint)).trunc(), lambda x: x),
+  # ** zero folding **
+  (UPat.var("x") < UPat.var("x"), lambda x: x.const_like(False, dtypes.bool)), # x < x -> False
+  (UPat.var("x") % UPat.var("x"), lambda x: x.const_like(0)), # x%x -> 0
+  (UPat.var("x") ^ UPat.var("x"), lambda x: x.const_like(0)), # x^x -> 0
+  (UPat.var("x") & 0, lambda x: x.const_like(0)), # x&0 -> 0
+  # (x&mask)>>k -> x>>k when mask only clears bits below k
+  ((UPat.var("x") & UPat.cvar("mask")) >> UPat.cvar("k"),
+   lambda x,mask,k: x >> k.val if mask.val | ((1 << k.val) - 1) == -1 else None),
+  ((UPat.var("x") & UPat.cvar("mask")) // UPat.cvar("c"),
+   lambda x,mask,c: x // c.val if c.val > 0 and c.val & (c.val-1) == 0 and mask.val | (c.val-1) == -1 else None),
+  (UPat.var("x", dtype=dtypes.ints+(dtypes.bool, dtypes.weakint)) != UPat.var("x"),
+   lambda x: x.const_like(False, dtypes.bool)), # x != x -> False (only ints)
+  # ** constant folding **
+  # canonicalize casted CONST
+  (UPat(Ops.CAST, dtypes.all, name="root", src=(UPat.cvar("c"),)), lambda root, c: root.const_like(c.val)),
+  # collapse committed const conversions
+  (UPat(Ops.CAST, dtypes.all, name="root", src=(UPat(Ops.CAST, dtypes.all, src=(UPat(Ops.CONST, name="c"),)),)),
+   lambda root,c: root.const_like(c.val)),
+  # one rule per spelling: bare has no width, a pair evaluates at its stated width, mixed commits to the promotion
+  # NOTE: THREEFRY(const,const) folds via its decomposition
+  (UPat(GroupOp.ALU-{Ops.THREEFRY}, src=bare_const, name="a"), fold_const_alu),
+  (UPat(GroupOp.ALU-{Ops.THREEFRY}, src=casted_const, name="a"), fold_const_alu),
+  (UPat(GroupOp.Binary-{Ops.THREEFRY}, src=[casted_const, bare_const], name="a"), lambda a:
+   a.replace(src=tuple(s.ccast(dt) if s.dtype in dtypes.weaks else s for s in a.src))
+   if (dt:=promo_dtype(a.src)) not in dtypes.weaks else None),
+  # bool MUL is AND, ADD/MAX is OR. prevents other rules to rewrite bool ADD/MUL incorrectly
+  (UPat.var('x', dtype=dtypes.bool) * UPat.var('y', dtype=dtypes.bool), lambda x,y: x&y),
+  (UPat.var('x', dtype=dtypes.bool) + UPat.var('y', dtype=dtypes.bool), lambda x,y: x|y),
+  (UPat.var('x', dtype=dtypes.bool).maximum(UPat.var('y', dtype=dtypes.bool)), lambda x,y: x|y),
+  # *** div rules ***
+  (UPat.cvar('x', arg=0) / 0, lambda x: x.const_like(float('nan'))),   # 0/0 -> nan
+  # can be wrong if x or x2 is 0
+  (UPat.var("x") / UPat.var("x"), lambda x: x.const_like(1)),          # x/x -> 1
+  ((UPat.var("x") * UPat.var("x2")) / UPat.var("x2"), lambda x,x2: x), # (x*x2)/x2 -> x
+  # x*0 -> 0 or 0*x -> 0
+  # if x is nan or inf it should render the nan value.
+  # NOTE: this can be wrong for loaded NaN
+  (UPat.var("x") * 0, lambda x: x.const_like(float("nan") if x.op is Ops.CONST
+                                             and isinstance(x.val, float) and (math.isnan(x.val) or math.isinf(x.val)) else 0)),
+  # *** cast/bitcast ***
+  (UPat((Ops.CAST, Ops.BITCAST), name="root"), lambda root: root.src[0] if root.dtype == root.src[0].dtype else None),
+  # a BITCAST reads its operand at the width it states, so a weak const is nonsense here: the bare arm is bool only
+  (UPat(Ops.BITCAST, name="root", src=(UPat.any(UPat(Ops.CONST, dtypes.bool, name="c"), UPat(Ops.CAST, src=(UPat(Ops.CONST),), name="c")),)),
+   fold_bitcast),
+  # b.cast(a).cast(b) -> b if a preserves all values in b
+  (UPat.var('x').cast(name="a").cast(name="b"), lambda x,a,b: x if x.dtype == b.dtype and can_lossless_cast(b.dtype, a.dtype) else None),
+  # bitcast twice
+  (UPat(Ops.BITCAST, name="b", src=(UPat.var('x').bitcast(),)), lambda x,b: x.bitcast(b.dtype)),
+  (UPat.var("x").cast(dtypes.bool), lambda x: x != 0),
+  # ** pow **
+  (UPat.var("x").alu(Ops.POW, UPat.cvar("c")), simplify_pow),
+  # positive const ** x
+  (UPat.cvar("c").alu(Ops.POW, UPat.var("x")), lambda c,x: c if c.val == 1 else (x*math.log2(c.val)).exp2() if c.val > 0 else None),
+  # unpack a uint64 packed from two uint32 (threefry)
+  (((UPat.var(None, dtypes.uint64)<<32) | UPat.var('y', dtypes.uint32).cast(dtypes.uint64)).cast(dtypes.uint32), lambda y: y),
+  (((UPat.var('x', dtypes.uint32).cast(dtypes.uint64)<<32) | UPat.var(None, dtypes.uint32).cast(dtypes.uint64))>>32,
+   lambda x: x.cast(dtypes.uint64)),
+  # ** simple where folding **
+  # a conditional with the same results either way is a noop, also fold const conditionals
+  (UPat.var().where(UPat.var("val"), UPat.var("val")), lambda val: val),
+  (UPat.cvar("gate").where(UPat.var("c0"), UPat.var("c1")).named("w"), fold_const_where),
+])+mop_cleanup
+
+# ******** phase 2 builds on phase 1, it includes the old "symbolic", rules that match deeper ********
+
+def lt_folding(x:UOp, c:int) -> UOp|None:
+  p, np = partition(x.split_uop(Ops.ADD), lambda u: u.const_factor() == 1)
+  if np and (d:=math.gcd(*[u.const_factor() for u in np], c)) > 1 and 0 <= sum(u.vmin for u in p) and sum(u.vmax for u in p) < d:
+    return unwrap(UOp.usum(*np).divides(d))<(c//d)
+  return None
+
+def canonicalize_simplex(X:UOp) -> UOp|None:
+  # (X := a0*x0 + a1*x1 + ...) > 0 is equivalent to x0 + x1 + ... > 0 if xi >= 0 and ai > 0 for ints.
+  # returns x0 + x1 + ... in such case, or None if not
+  changed, ret = False, []
+  for u in X.split_uop(Ops.ADD):
+    # assumed the const is the last src of MUL
+    if u.op is Ops.MUL and u.src[1].op is Ops.CONST and u.src[1].val > 0:
+      changed = True
+      u = u.src[0]
+    if not (u.op in GroupOp.Irreducible and u.vmin >= 0): return None
+    ret.append(u)
+  return UOp.usum(*ret) if changed else None
+
+commutative = PatternMatcher([
+  # ** COMMUTATIVE flipping (only for index) **
+  # NOTE: this can break merging vector math by only flipping some of them
+  (UPat(GroupOp.Commutative, dtype=dtypes.weakint, name='x'), lambda x: x.replace(src=x.src[::-1]) if x.src[1].tuplize < x.src[0].tuplize else None),
+])
+
+def fold_where_closure(cond:UOp, t:UOp, f:UOp) -> UOp|None:
+  """in cond.where(t, f), cond is True within t and False within f"""
+  if cond not in t.bool_slice and cond not in f.bool_slice: return None
+  # INDEX gates are owned by the valid/store-coalescing machinery, leave them alone
+  if any(u.op_in_backward_slice_with_self(Ops.INDEX) for u in (cond, t, f)): return None
+  return cond.where(t.substitute({cond: cond.const_like(True)}), f.substitute({cond: cond.const_like(False)}))
+
+symbolic = symbolic_simple+commutative+PatternMatcher([
+  # ** boolean algebra **
+  # TODO: make a more general or folder like simplify_valid
+  (UPat.var("x", dtype=dtypes.bool) | UPat.var("x", dtype=dtypes.bool).logical_not(), lambda x: x.const_like(True)),  # x|!x -> True
+  # ** combine terms **
+  (UPat.var("x") * UPat.cvar("c0") + UPat.var("x") * UPat.cvar("c1"), lambda x,c0,c1: x*(c0+c1)), # (x*c0)+(x*c1) -> x*(c0+c1)
+  ((UPat.var("y") + UPat.var("x") * UPat.cvar("c0")) + UPat.var("x") * UPat.cvar("c1"), lambda x,y,c0,c1: y+x*(c0+c1)),
+  (UPat.var("x") + UPat.var("x") * UPat.cvar("c"), lambda x,c: x*(c+1)), # (x+x*c)-> x*(c+1)
+  ((UPat.var("y") + UPat.var("x")) + UPat.var("x") * UPat.cvar("c"), lambda x,y,c: y+x*(c+1)),
+  ((UPat.var("y") + UPat.var("x") * UPat.cvar("c")) + UPat.var("x"), lambda x,y,c: y+x*(c+1)),
+  (UPat.var("x") + UPat.var("x"), lambda x: x*2), # (x+x)-> x*2
+  ((UPat.var("y") + UPat.var("x")) + UPat.var("x"), lambda y,x: y+x*2),
+  ((UPat.var("x") / UPat.var("x2")) / UPat.var("x3"), lambda x,x2,x3: x/(x2*x3) if x2 is not x3 else None), # (x/x2)/x3 -> x/(x2*x3)
+  (-1 * (UPat.var("x") + UPat.cvar("c")), lambda x,c: (-x)+(-c)),  # -(x+c) -> -x + -c
+  (UPat.cvar("y") * (UPat.var("x", dtype=dtypes.weakint) + UPat.cvar("c")), lambda x,y,c: (y*x)+(y*c)),  # y*(x+c) -> y*x + y*c
+  # ** where folding **
+  (UPat.var("cond", dtype=dtypes.bool).logical_not().where(UPat.var("t"), UPat.var("f")),
+   lambda cond, t, f: cond.where(f,t) if not f.is_invalid else None),
+  # in cond.where(t, f), uses of cond fold to True within t and False within f
+  (UPat.var("cond").where(UPat.var("t"), UPat.var("f")), fold_where_closure),
+  (UPat.var("gate").where(UPat.var("x"), 0) != 0, lambda gate,x: gate & (x != 0)),
+  # a.where(b.where(c, d), d) -> (a & b).where(c, d)
+  (UPat.var("a").where(UPat.var("b").where(UPat.var("c"), UPat.var("d")), UPat.var("d")), lambda a,b,c,d: (a&b).where(c,d)),
+  # a.where(c, b.where(c, d)) -> (a | b).where(c, d)
+  (UPat.var("a").where(UPat.var("c"), UPat.var("b").where(UPat.var("c"), UPat.var("d"))), lambda a,b,c,d: (a|b).where(c,d)),
+  # alu of two where with same conds can combine, only do if true branch or false branch is const
+  (UPat(GroupOp.Binary, name="alu", src=(UPat.var("c").where(UPat.var("t"), UPat.var("f")), UPat.var("c").where(UPat.var("tt"), UPat.var("ff")))), \
+   lambda alu,c,t,tt,f,ff: c.where(t.alu(alu.op, tt), f.alu(alu.op, ff)) if t.op == tt.op == Ops.CONST or f.op == ff.op == Ops.CONST else None),
+  # if its a plus we add the associative variation too
+  ((UPat.var("y")+UPat.var("c").where(UPat.var("t"), UPat.var("f"))) + UPat.var("c").where(UPat.var("tt"), UPat.var("ff")), \
+   lambda y,c,t,tt,f,ff: y+c.where(t+tt, f+ff) if t.op == tt.op == Ops.CONST or f.op == ff.op == Ops.CONST else None),
+  # complementary zero branches under the same condition select directly
+  (UPat.var("c").where(UPat.var("t"), 0) + UPat.var("c").where(0, UPat.var("f")), lambda c,t,f: c.where(t, f)),
+  # ALU/variable min==max -> CONST
+  (UPat({Ops.CMPLT, Ops.CMPNE, Ops.FLOORDIV, Ops.FLOORMOD, Ops.PARAM, Ops.AFTER, Ops.SPECIAL}, name="x"),
+   lambda x: x.const_like(x.vmin) if x.vmin == x.vmax else None),
+  (UPat(Ops.RANGE, src=(UPat.cvar().or_casted(),), name="x"), lambda x: x.const_like(x.vmin) if x.vmin == x.vmax else None),
+  # max folding
+  ((UPat.cvar("a") < UPat.var("b")).where(UPat.var("b"), UPat.cvar("c")), lambda a,b,c: UOp.maximum(a,b) if a.val == c.val else None),
+  ((UPat.var("a") < UPat.cvar("b")).where(UPat.cvar("c"), UPat.var("a")), lambda a,b,c: UOp.maximum(a,b) if b.val == c.val else None),
+  (UPat.maximum(UPat.var("x"), UPat.var("y")), lambda x,y: x if x.vmin >= y.vmax else y if x.vmax <= y.vmin else None),
+  # TODO: why does this rule break beautiful_mnist?
+  #((UPat.var("x")+UPat.var("z")).maximum(UPat.var("y")+UPat.var("z")), lambda x,y,z: x.maximum(y) + z),
+  # ** two stage ALU folding **
+  *((UPat.var("x").alu(op, UPat.cvar("c1")).alu(op, UPat.cvar("c2")).named("f"),
+     lambda f,x,c1,c2: x.alu(f.op,c1.alu(f.op,c2))) for op in GroupOp.Associative),
+  # (x//c1)//c2 -> x//(c1*c2) for c2>0
+  ((UPat.var("x") // UPat.cvar("c1")) // UPat.cvar("c2"), lambda x,c1,c2: x//(c1*c2) if c2.vmin>0 else None),
+  # ** lt **
+  # c0+x<c1 -> x < c1-c0
+  ((UPat.cvar("c0") + UPat.var("x", dtype=dtypes.ints+(dtypes.weakint,))) < UPat.cvar("c1"), lambda x,c0,c1: x<(c1-c0)),
+  # c0*x<c1 -> sign(c0)*x < ceil(c1/abs(c0))
+  ((UPat.cvar("c0")*UPat.var("x", dtype=dtypes.weakint))<UPat.cvar("c1"),
+   lambda x,c0,c1: (x if c0.val > 0 else -x)<-(-c1.val//abs(c0.val)) if abs(c0.val) > 1 else None),
+  # x//d<c -> x<c*d for d>0, and -> c*d<x for d<0
+  ((UPat.var("x", dtype=dtypes.weakint)//UPat.cvar("d"))<UPat.cvar("c"),
+   lambda x,d,c: (x<c.val*d.val) if d.val > 0 else (x>c.val*d.val) if d.val < 0 else None),
+  # ** move add/mul consts to end (NOTE: this is still happening before constant folding) **
+  ((UPat.var("x") + UPat.cvar("c1")) + UPat.var("y"), lambda x,c1,y: (x+y)+c1 if y.op is not Ops.CONST else None),
+  ((UPat.var("x") * UPat.cvar("c1")) * UPat.var("y"), lambda x,c1,y: (x*y)*c1 if y.op is not Ops.CONST else None),
+  # *** rules from symbolic ***
+  # generic lt folding
+  (UPat.var("x", dtypes.weakint)<UPat.cvar("c"), lambda x,c: lt_folding(x, c.val) if 0 < c.val else None),
+  (UPat.var("x", dtypes.weakint)*-1 < UPat.var("y")*-1, lambda x,y: y<x),
+  # canonicalize a simplex with positive coefficients > 0. NOTE: not x < 1 means x > 0
+  ((UPat.var("x", dtypes.weakint)<1).ne(True), lambda x: (newx<1).ne(True) if (newx:=canonicalize_simplex(x)) is not None else None),
+  # a range mod its own upper bound is just the range
+  (UPat(Ops.RANGE, src=UPat.var("end"), name="r")%UPat.var("end"), lambda r,end: r),
+  (UPat(Ops.RANGE, src=UPat.var("end"), name="r")//UPat.var("end"), lambda r,end: r.const_like(0)),
+  # cast/long folding
+  # if the intermediate cast doesnt narrow we can do it in one cast
+  (UPat.var('x').cast(name="a").cast(name="b"), lambda x,a,b: x.cast(b.dtype) if can_lossless_cast(x.dtype, a.dtype) else None),
+  (UPat.var('x', dtypes.ints+(dtypes.weakint,)).cast(dtypes.ints+(dtypes.weakint,), name="a").cast(name="b"),
+    lambda x,a,b: x.ccast(b.dtype) if not x.overflows(a.dtype) else None),
+  # try to do math in int instead of long, keep weak const weak
+  (UPat(GroupOp.Binary, src=(UPat.var("x", (dtypes.long, dtypes.weakint)), UPat.var("y", (dtypes.long, dtypes.weakint))), name="u"), lambda u,x,y:
+    (UOp.const(x.val) if x.op is Ops.CONST else x.cast(dtypes.int)).alu(u.op,
+     UOp.const(y.val) if y.op is Ops.CONST else y.cast(dtypes.int)).cast(u.dtype)
+    if dtypes.long in (x.dtype, y.dtype) and not any(v.overflows(dtypes.int) for v in (u,x,y)) else None),
+  ((UPat.var("x", dtypes.weakint) + UPat.cvar("c")).cast(dtypes.sints, name="cast"), lambda x,c,cast:x.cast(cast.dtype)+cast.const_like(c.val)),
+  # an AFTER waits only on the effect ops listed here, any other dep is replaced by its srcs
+  (UPat(Ops.AFTER, name="x"), lambda x: x.replace(src=(x.src[0],)+
+    tuple(dedup(flatten([(y,) if y.op in {Ops.RANGE, Ops.STORE, Ops.CALL, Ops.BARRIER, Ops.END, Ops.BACKEDGE, Ops.LINEAR, Ops.STAGE}
+                        else y.src for y in x.src[1:]]))))),
+  # after/end with 1 src is just src[0]
+  (UPat((Ops.AFTER, Ops.END), src=(UPat.var("s"),)), lambda s: s),
+  # ranges can be subbed for CONSTs, remove them from ENDs. BACKEDGE conditions are never range selectors.
+  (UPat(Ops.END, name="x"), lambda x: x.replace(src=(x.src[0],)+tuple(r for r in x.src[1:] if r.op is not Ops.CONST))),
+  # the rules above key on bare CONSTs, so a redundantly committed const has to be uncast in the same fixpoint
+])+div_and_mod_symbolic+pm_uncast_const
+
+# ******** we take a small aside to "simplify_valid" to rewrite valids ********
+
+def parse_valid(v:UOp) -> tuple[UOp, bool, int]|None:
+  # if it's X <= c, returns X, True, c
+  # if it's X >= c, returns X, False, c
+
+  if v.op is Ops.CMPNE and v.src[1].op is Ops.CONST and v.src[1].val == 1 and (s0:=v.src[0]).op is Ops.CMPLT and dtypes.is_int(s0.src[0].dtype):
+    # (X < c).ne(True) -> X >= c
+    return s0.src[0], False, int(s0.src[1].vmin)
+  if v.op is Ops.CMPLT and dtypes.is_int(v.src[0].dtype):
+    # c < X -> X >= c+1 (a const on the left is a lower bound on the right)
+    if v.src[0].op is Ops.CONST: return v.src[1], False, int(v.src[0].val)+1
+    # X < c -> X <= c-1
+    return v.src[0], True, int((v.src[1]).vmax)-1
+  return None
+
+def uop_given_valid(valid:UOp, uop:UOp, try_simplex=True) -> UOp:
+  # return simplified uop (might be the same as input)
+
+  # first, parse valid into {expr: (lower_bound, upper_bound)}
+  bounds:defaultdict[UOp, list[PyConst|None]] = defaultdict(lambda: [None, None])
+  for stmt in valid.split_uop(Ops.AND):
+    if (res:=parse_valid(stmt)) is None: continue
+    expr, is_upper, c = res
+    bounds[expr][int(is_upper)] = c
+
+  # simplify uop given that valid is True
+  all_candidates = []
+  for i,(expr,v) in enumerate(bounds.items()):
+    v0, v1 = (expr.vmin if v[0] is None else v[0], expr.vmax if v[1] is None else v[1])
+    all_candidates.append((expr, UOp.variable(f"fake{i}", v0, v1, expr.dtype)))
+
+    if try_simplex and expr.op is Ops.ADD and v0 == 1 and all(u.op in GroupOp.Irreducible for u in expr.split_uop(Ops.ADD)):
+      # For X0 + X1 + ... > 0, check whether every Xi > 0 gives the same simplified output.
+      candidate = [(Xi, UOp.variable(f"fake{i}", 1, Xi.vmax, Xi.dtype)) for Xi in expr.split_uop(Ops.ADD)]
+      if any(X not in uop.backward_slice_with_self for X,_ in candidate): continue
+      newuops = [uop.substitute({X:newX}).simplify().substitute({newX:X}).simplify() for X,newX in candidate]
+      if all_same(newuops): uop = newuops[0]
+      elif uop.op is Ops.STACK and len(uop.src) == 2:
+        if all_same([uops.src[0] for uops in newuops]): uop = uop.replace(src=(newuops[0].src[0], uop.src[1]))
+        if all_same([uops.src[1] for uops in newuops]): uop = uop.replace(src=(uop.src[0], newuops[0].src[1]))
+
+  # try all the valids together (but only the whole expressions)
+  if (s_uop:=uop.substitute(sub_dict:=dict(all_candidates))) is not uop:
+    uop = s_uop.simplify().substitute({newX:X for X,newX in sub_dict.items()}).simplify()
+  return uop
+
+def _valid_priority(v: UOp, valids:list[UOp]) -> tuple[int, int]:
+  # prioritize dependencies, then tighter bounds, so weaker clauses don't hide useful simplifications
+  return (0, 0) if (res:=parse_valid(v)) is None else (
+    sum(-1 for other in valids if res[0] is other or res[0] in other.backward_slice), res[2] if res[1] else -res[2])
+
+def simplify_valid(valid:UOp) -> UOp|None:
+  if valid.op_in_backward_slice_with_self(Ops.INDEX): return None  # this should only be for indexing, skip if there's a INDEX
+  ret:list[UOp] = []
+  valids = list(valid.split_uop(Ops.AND))
+  valids = sorted(valids, key=lambda v: _valid_priority(v, valids))
+  for stmt in dedup(valids):
+    if ret: stmt = uop_given_valid(UOp.uprod(*ret), stmt)
+    ret.append(stmt)
+  return UOp.uprod(*ret) if ret != valids else None
+
+# ******** phase 3 is the complete symbolic ********
+
+def reduce_mul_chain(r:UOp) -> UOp|None:
+  if r.arg[0] not in {Ops.ADD, Ops.MAX}: return None
+  inside, outside = [], []
+  for m in r.src[0].split_uop(Ops.MUL):
+    m_parents = m.backward_slice
+    if m not in r.src[1:] and all(r not in m_parents for r in r.src[1:]) and (r.arg[0] != Ops.MAX or m.vmin >= 0): outside.append(m)
+    else: inside.append(m)
+  if len(outside) == 0: return None
+  return r.replace(src=(prod(inside) if len(inside) else r.src[0].const_like(1),)+r.src[1:])*prod(outside)
+
+def drop_and_clauses(cond:UOp, x:UOp, i:UOp) -> UOp|None:
+  keep, drop = partition(cond.split_uop(Ops.AND), lambda c: any(r in x.ranges for r in c.ranges))
+  return UOp.const(True).uprod(*keep).where(x, i) if drop else None
+pm_drop_and_clauses = PatternMatcher([(invalid_gate, drop_and_clauses)])
+
+# move conditions from where to load's valid, drop clauses already in load
+def where_on_load(cond:UOp, buf:UOp, idx:UOp, or_cast:UOp) -> UOp|None:
+  where_clauses, load_valid = list(cond.split_uop(Ops.AND)), idx.get_valid()
+  in_load = set(load_valid.split_uop(Ops.AND))
+  idx_index = {u for u in idx.backward_slice_with_self if u.op is Ops.INDEX}
+  # can move if: not a const, condition's ranges are subset of idx's ranges, and no data dependent INDEX (only idx's INDEX allowed)
+  def can_move(c:UOp) -> bool:
+    return c.op is not Ops.CONST and c.ranges.keys() <= idx.ranges.keys() and \
+      all(u in idx_index for u in c.backward_slice_with_self if u.op is Ops.INDEX)
+  moved, keep = partition([c for c in where_clauses if c not in in_load], can_move)
+  if len(keep) == len(where_clauses): return None
+  idx = buf.index(idx.get_idx().valid(load_valid.uprod(*moved)))
+  ret_idx = idx.cast(or_cast.dtype) if or_cast.op is Ops.CAST else idx
+  return UOp.const(True).uprod(*keep).where(ret_idx, ret_idx.const_like(0))
+
+# where after gated load becomes alt value, TODO: this is sort of duplicated with rules in devectorizer
+pm_move_where_on_load = PatternMatcher([
+  (UPat.var("cond").where(UPat.var("buf").index(UPat.var("idx")).or_casted("or_cast"), 0), where_on_load),
+  (UPat.var("cond").where(0, UPat.var("buf").index(UPat.var("idx")).or_casted("or_cast")),
+   lambda cond,buf,idx,or_cast: where_on_load(cond.logical_not(),buf,idx,or_cast)),
+])
+
+def gated_given_valid(cond:UOp, x:UOp, i:UOp) -> UOp|None:
+  # pure index math only: a LOAD in x executes even where cond is false, so its INDEX valid must survive the assumption
+  if x.dtype is not dtypes.weakint or x.op_in_backward_slice_with_self(Ops.INDEX): return None
+  # Skip if x contains DIV/MOD AND IMAGE mode is enabled -> image index e.g. openpilot
+  if IMAGE.value > 0 and x.op_in_backward_slice_with_self(Ops.CDIV, Ops.CMOD, Ops.FLOORDIV, Ops.FLOORMOD): return None
+  return cond.where(uop_given_valid(cond, x, try_simplex=False), i)
+
+pm_simplify_valid = PatternMatcher([
+  # simplify valid
+  (UPat(Ops.AND, dtypes.bool, name="valid"), simplify_valid),
+  (invalid_gate, gated_given_valid),
+])
+
+# this is symbolic 2.0
+REMOVE_FROM_SINK_LIKE = {Ops.NOOP, Ops.STACK, Ops.SINK, Ops.GROUP}
+pm_clean_up_group_sink = PatternMatcher([
+  # clean up GROUP/SINK
+  (UPat(Ops.GROUP, src=(UPat.var("x"),)), lambda x: x),
+  (UPat((Ops.SINK, Ops.GROUP), name="root"),
+    lambda root: UOp(root.op, src=tuple(flatten(x.src if x.op in REMOVE_FROM_SINK_LIKE else (x,) for x in root.src)), arg=root.arg)
+      if any(x.op in REMOVE_FROM_SINK_LIKE for x in root.src) else None),
+])
+
+sym = symbolic+pm_simplify_valid+PatternMatcher([
+  # ** pow **
+  ((UPat(Ops.POW, name="p"), lambda p: xpow(*p.src))),
+  # ** load/store folding **
+  (UPat.store(UPat(Ops.INDEX, name="index"), UPat.load(UPat(Ops.INDEX, name="index"))), lambda index: UOp(Ops.NOOP)),
+  (UPat.store(UPat(Ops.INDEX, name="index"), UPat.var("gate").where(UPat.var("alt"),
+                                                                    UPat.load(UPat(Ops.INDEX, name="index")))),
+   lambda index, gate, alt: UOp.store(index.src[0].index(index.src[1].valid(gate)), alt)),
+  # fold gated LOAD/STORE
+  (UPat(Ops.STORE, src=(UPat(), invalid_pat)), lambda i: UOp(Ops.NOOP)),
+  # store of where with invalid -> gated store
+  (UPat(Ops.STORE, src=(UPat(Ops.INDEX, name="index"), UPat.var("cond").where(UPat.var("val"), invalid_pat))),
+   lambda index, cond, val, i: UOp.store(index.src[0].index(index.src[1].valid(cond)), val)),
+  ((UPat.var("x") * UPat.var("x")).reciprocal(), lambda x: x.reciprocal()*x.reciprocal()),  # 1/(x^c) -> (1/x)^c
+  ((UPat.var("x") * UPat.var("x") * UPat.var("x")).reciprocal(), lambda x: x.reciprocal()*x.reciprocal()*x.reciprocal()),
+  ((UPat.var("x") * UPat.cvar("c")).reciprocal(), lambda x,c: x.reciprocal()*c.reciprocal()), # 1/(x*c) -> (1/c)*(1/x)
+  (UPat.var("x") * ((1+UPat.var("x")).reciprocal().named("d")), lambda x,d: 1-d), # x*/(1+x) -> 1-1/(1+x)
+  (UPat.var("x") * ((1+UPat.var("x")).reciprocal().named("d")*UPat.var("y")), lambda x,y,d: y*(1-d)),
+  (UPat.var("x") * ((1+UPat.var("x")).reciprocal().named("d")+UPat.var("y")), lambda x,y,d: (1-d)+x*y),
+  # reduce mul chain, move muls after the reduce
+  (UPat(Ops.MUL).reduce(name="r", allow_any_len=True), reduce_mul_chain),
+  # ** combine terms (opinionated) **
+  (-1 * (UPat.var("x") + UPat.var("y")), lambda x,y: (-x)+(-y)),  # -(x+y) -> -x + -y
+  # (x+y)*c -> x*c+y*c. only for int, float has inf*0=nan issue
+  ((UPat.var("x", dtypes.weakint) + UPat.var("y")) * UPat.cvar("c"), lambda x,y,c: x*c+y*c),
+])+pm_clean_up_group_sink
+
+from typing import Any, Callable
+import itertools, inspect, functools, types
+from tinygrad.helpers import partition, dedup, Context
+from tinygrad.uop.ops import UPat, UOp, Ops, PatternMatcher, graph_rewrite, deconstruct_function
+from tinygrad.dtype import dtypes
+
+class UPatCompileError(Exception): pass
+
+def flatands(x:UOp) -> list[UOp]: return [x] if x.op is not Ops.AND else [y for s in x.src for y in flatands(s)]
+
+# **** UPat compiled ****
+# This file builds an IR of match predicates and compiles them to Python source.
+# Ops used: CUSTOM (format-string predicate over operands), CUSTOMI (inline string fragment),
+#           STORE (bind a matched UOp to a name), PYLITERAL (Python literal for CUSTOM operands),
+#           AND/OR (clause combininers).
+
+def _get_clause(self:UPat, base:UOp, depth=0) -> UOp:
+  if self.is_any:
+    assert len(self.src) == 1
+    return UOp(Ops.AND, src=(UOp(Ops.OR, src=tuple(_get_clause(s, base, depth) for s in self.src[0])),))
+  # build the and_clause for acceptance
+  and_clause:list[UOp] = []
+  if self.op is not None:
+    if len(self.op) > 1:
+      and_clause.append(UOp(Ops.CUSTOM, src=(base, UOp(Ops.PYLITERAL, arg=frozenset(self.op))), arg=("{0}.op in {1}", dtypes.void)))
+    else: and_clause.append(UOp(Ops.CUSTOM, src=(base, UOp(Ops.PYLITERAL, arg=self.op[0])), arg=("{0}.op is {1}", dtypes.void)))
+  if self.arg is not None:
+    if isinstance(self.arg, int): and_clause.append(UOp(Ops.CUSTOM, src=(base,), arg=("{0}.arg == "+str(int(self.arg)), dtypes.void)))
+    else: and_clause.append(UOp(Ops.CUSTOM, src=(base, UOp(Ops.PYLITERAL, arg=self.arg)), arg=("{0}.arg == {1}", dtypes.void)))
+  if self.strict_length or self.required_len > 0:
+    and_clause.append(UOp(Ops.CUSTOM, src=(base,),
+      arg=("len({0}.src)"+(" == " if self.strict_length else " >= ")+str(self.required_len), dtypes.void)))
+  if self.name is not None: and_clause.append(UOp(Ops.STORE, src=(UOp(Ops.CUSTOMI, arg=(self.name, dtypes.void)), base)))
+  if self.match_dtype is not None:
+    if len(self.match_dtype) > 1:
+      and_clause.append(UOp(Ops.CUSTOM, src=(base, UOp(Ops.PYLITERAL, arg=frozenset(self.match_dtype))),
+                            arg=("{0}.dtype in {1}", dtypes.void)))
+    else:
+      and_clause.append(UOp(Ops.CUSTOM, src=(base, UOp(Ops.PYLITERAL, arg=self.match_dtype[0])),
+                            arg=("{0}.dtype is {1}", dtypes.void)))
+  if self.match_tag is not None:
+    if len(self.match_tag) > 1:
+      and_clause.append(UOp(Ops.CUSTOM, src=(base, UOp(Ops.PYLITERAL, arg=frozenset(self.match_tag))), arg=("{0}.tag in {1}", dtypes.void)))
+    else: and_clause.append(UOp(Ops.CUSTOM, src=(base, UOp(Ops.PYLITERAL, arg=self.match_tag[0])), arg=("{0}.tag == {1}", dtypes.void)))
+  if self.src is not None:
+    # single match
+    if len(self.src) == 1 and isinstance(self.src[0], tuple):
+      and_clause += [_get_clause(s, base.index(i), depth) for i,s in enumerate(self.src[0])]
+    # repeat match
+    elif len(self.src) == 1 and isinstance(self.src[0], itertools.repeat):
+      it = UOp(Ops.CUSTOMI, arg=(f"ituop{depth}", dtypes.void))
+      match = _get_clause(next(self.src[0]), it, depth+1)
+      # lift named binds out of the repeat: they bind the first src, and every element must be identical to it
+      stores, pred = partition(flatands(match), lambda x: x.op is Ops.STORE)
+      for st in stores:
+        first = st.src[1].substitute({it: base.index(0)})
+        pred.append(UOp(Ops.CUSTOM, src=(st.src[1], first), arg=("{0} is {1}", dtypes.void)))
+        and_clause.append(UOp(Ops.STORE, src=(st.src[0], first)))
+      if len(stores): and_clause.append(UOp(Ops.CUSTOM, src=(base,), arg=("len({0}.src) != 0", dtypes.void)))
+      and_clause.append(UOp(Ops.CUSTOM, src=(UOp(Ops.AND, src=tuple(pred)), it, base), arg=("all([{0} for {1} in {2}.src])", dtypes.void)))
+    # multi match (fork)
+    elif len(self.src) > 1 and all(isinstance(x, tuple) for x in self.src):
+      fork_cond = [UOp(Ops.AND, src=tuple([_get_clause(s, base.index(i), depth) for i,s in enumerate(ss)])) for ss in self.src]
+      and_clause.append(UOp(Ops.OR, src=tuple(fork_cond)))
+    else: raise RuntimeError("broken")
+  return UOp(Ops.AND, src=tuple(and_clause)) if and_clause else UOp(Ops.CUSTOMI, arg=("True", dtypes.void))
+
+# *** pattern matcher ***
+
+def do_process_and(a:UOp) -> UOp|None:
+  found = False
+  new_src:list[UOp] = []
+  or_clause:list[UOp] = []
+
+  # remove any nested ANDs, extract or clauses
+  for x in a.src:
+    if x.op is Ops.AND:
+      new_src.extend(x.src)
+      found = True
+    elif x.op is Ops.OR: or_clause.append(x)
+    else: new_src.append(x)
+
+  # too big to compile
+  if len(or_clause) >= 4: raise UPatCompileError("too big to compile")
+
+  # one or clause max
+  if len(or_clause) > 1:
+    # need the product of the or clauses
+    or_clause = [UOp(Ops.OR, src=tuple([UOp(Ops.AND, src=x) for x in itertools.product(*[x.src for x in or_clause])]))]
+    found = True
+
+  # handle stores
+  stores, new_src = partition(new_src, lambda x: x.op is Ops.STORE)
+  if len(stores):
+    if len(or_clause):
+      # push stores to the top if we have an or_clause
+      assert len(or_clause) == 1 and all(x.op is Ops.AND for x in or_clause[0].src)
+      or_clause = [UOp(Ops.OR, src=tuple([x.replace(src=x.src+tuple(stores)) for x in or_clause[0].src]))]
+      found = True
+    else:
+      # check for duplicate stores
+      dict_stores: dict[UOp, UOp] = {}
+      for store in stores:
+        if store.src[0] in dict_stores:
+          # duplicate store is an identity compare
+          new_src.append(UOp(Ops.CUSTOM, src=(dict_stores[store.src[0]], store.src[1]), arg=("{0} is {1}", dtypes.void)))
+          found = True
+        else:
+          dict_stores[store.src[0]] = store.src[1]
+      # put the stores back
+      for k,v in dict_stores.items(): new_src.append(UOp(Ops.STORE, src=(k,v)))
+
+  # reassemble, if there's any deduping to do, do it
+  if len(dretand:=dedup(new_src+or_clause)) != len(new_src)+len(or_clause): found = True
+  return UOp(Ops.AND, src=tuple(dretand)) if found else None
+
+# processor
+pm_proc = PatternMatcher([(UPat(Ops.AND, name="a"), do_process_and)], compiled=False)
+
+# renderer
+def wrap(ctx, x) -> UOp:
+  ctx[ret:=f"a{len(ctx)}"] = x.arg
+  return UOp(Ops.CUSTOMI, arg=(ret, dtypes.void))
+
+pm_renderer = PatternMatcher([
+  (UPat(Ops.PYLITERAL, name="x"), wrap),
+
+  # AND/OR of CUSTOMI fragments becomes a single CUSTOMI
+  (UPat(Ops.AND, src=UPat(Ops.CUSTOMI), name="x"), lambda x: UOp(Ops.CUSTOMI, arg=("(" + ' and '.join(y.arg[0] for y in x.src) + ")", dtypes.void))),
+  (UPat(Ops.OR, src=UPat(Ops.CUSTOMI), name="x"), lambda x: UOp(Ops.CUSTOMI, arg=("(" + ' or '.join(y.arg[0] for y in x.src) + ")", dtypes.void))),
+
+  (UPat(Ops.CUSTOM, src=UPat(Ops.CUSTOMI), name="x"), lambda x: UOp(Ops.CUSTOMI, arg=(x.arg[0].format(*[y.arg[0] for y in x.src]), dtypes.void))),
+  (UPat(Ops.INDEX, src=(UPat(Ops.CUSTOMI, name="x"), UPat(Ops.CONST, name="c"))),
+   lambda x,c: x.replace(arg=(x.arg[0]+f".src[{c.val}]", dtypes.void)))
+], compiled=False)
+
+def _final_render(x:UOp, has_ctx:bool, depth=1) -> list[str]:
+  # if the whole clause collapsed to a single predicate (no binds), rewrap it
+  if x.op is Ops.CUSTOMI: x = UOp(Ops.AND, (x,))
+  assert x.op is Ops.AND
+  and_pieces, store_pieces = [], []
+  or_pieces: list[str] = []
+  for s in x.src:
+    if s.op is Ops.OR:
+      assert len(or_pieces) == 0 and len(s.src) >= 1
+      for ss in s.src: or_pieces.extend(_final_render(ss, has_ctx, depth+1))
+    elif s.op is Ops.STORE:
+      assert s.src[0].op is Ops.CUSTOMI and s.src[1].op is Ops.CUSTOMI
+      store_pieces.append(f"{s.src[0].arg[0]}={s.src[1].arg[0]}")
+    elif s.op is Ops.CUSTOMI: and_pieces.append(s.arg[0])
+    else: raise UPatCompileError(f"can't compile this {s}")
+  # if we have an or, render it
+  if len(or_pieces):
+    assert len(store_pieces) == 0
+    and_clause = ' and '.join(and_pieces)
+    return [f"{'  '*depth}if {and_clause if len(and_clause) else 'True'}:"] + or_pieces
+  # if we don't, this is a final return
+  store_clause = ', '.join((["ctx=ctx"] if has_ctx else [])+store_pieces)
+  and_clause = ' and '.join(and_pieces + [f"(_ret:=_fxn({store_clause})) is not None"])
+  return [f"{'  '*depth}if {and_clause}: return _ret"]
+
+def _get_code(self:UPat, has_ctx:bool):
+  ret = _get_clause(self, UOp(Ops.CUSTOMI, arg=("uop", dtypes.void)))
+  try:
+    # TODO: this should be tracked in a "system" rewrite, not untracked or tracked with kernel
+    with Context(TRACK_MATCH_STATS=0):
+      ret = graph_rewrite(ret, pm_proc, name="process UPat")
+      dyn_lookup: dict[str, Any] = {}
+      out = graph_rewrite(ret, pm_renderer, ctx=dyn_lookup, name="compile UPat")
+      rendered = _final_render(out, has_ctx)
+  except UPatCompileError:
+    #print("FAILED", self, self.location)
+    return None
+  return '\n'.join([f"# match for {self.location}", "def compiled_match(uop, ctx):"] + rendered + ["  return None"]), dyn_lookup
+
+@functools.cache
+def upat_compile(self:UPat, fxn) -> Callable:
+  real_fxn = types.FunctionType(*deconstruct_function(fxn))
+  code = _get_code(self, 'ctx' in inspect.signature(real_fxn).parameters)
+  if code is None: raise UPatCompileError(f"can't compile pattern defined at {self.location[0]}:{self.location[1]}")
+  code_str, dyn_lookup = code
+  globs = dyn_lookup.copy()
+  globs["_fxn"] = real_fxn
+  namespace: dict = {}
+  exec(code_str, globs, namespace)  # pylint: disable=W0122
+  return namespace["compiled_match"]
+
+from typing import Callable
+from tinygrad.uop.ops import PatternMatcher, UPat, GroupOp, Ops, UOp, python_alu, range_str
+from tinygrad.dtype import dtypes, Invalid
+from tinygrad.helpers import cpu_profile
+import z3
+
+# older versions of z3 dont have some operators like & overloaded
+if z3.get_version() < (4, 12, 4, 0):
+  raise ImportError("bounds checking requires z3 >= 4.12.4, use CHECK_OOB=0 to disable, or \"pip install 'z3-solver>=4.12.4\"")
+
+# IDIV is truncated division but z3 does euclidian division (floor if b>0 ceil otherwise); mod by power of two sometimes uses Ops.AND
+def z3_cdiv(a:z3.ArithRef, b:z3.ArithRef) -> z3.ArithRef:return z3.If((a<0), z3.If(0<b, (a+(b-1))/b, (a-(b+1))/b), a/b)
+def z3_floordiv(a:z3.ArithRef, b:z3.ArithRef) -> z3.ArithRef: return z3.If(b > 0, a/b, (-a)/(-b))
+# general int bitops are bit-blasted through the narrowest BV that fits both sides in two's complement (BV ops get exponentially slower with width)
+def z3_bv(x:UOp, op:Callable[[z3.ExprRef, z3.ExprRef], z3.ExprRef], a:z3.ExprRef, b:z3.ExprRef) -> z3.ExprRef:
+  w = 1 + max(int(x.src[0].vmax).bit_length(), int(x.src[1].vmax).bit_length(), int(-x.src[0].vmin).bit_length(), int(-x.src[1].vmin).bit_length())
+  return z3.BV2Int(op(z3.Int2BV(a, w), z3.Int2BV(b, w)), is_signed=True)
+def z3_xor(x:UOp, a:z3.ExprRef, b:z3.ExprRef) -> z3.ExprRef:
+  if isinstance(a, z3.BoolRef): return a^b
+  # x ^ -1 = -(x+1), i.e. bitwise NOT
+  if isinstance(b, z3.IntNumRef) and b.as_long() == -1: return -(a+1)
+  if isinstance(a, z3.IntNumRef) and a.as_long() == -1: return -(b+1)
+  return z3_bv(x, lambda u,v: u^v, a, b)
+def z3_and(x:UOp, a:z3.ExprRef, b:z3.ExprRef) -> z3.ExprRef:
+  if isinstance(a, z3.BoolRef): return a&b
+  if isinstance(a, z3.IntNumRef): a, b = b, a
+  if isinstance(b, z3.IntNumRef):
+    # x & (2^k-1) = x % 2^k and x & -(2^k) = x - x % 2^k for any x in two's complement
+    if (m:=b.as_long()+1) > 0 and m&(m-1) == 0: return a%m
+    if (m:=-b.as_long()) > 0 and m&(m-1) == 0: return a - a%m
+  return z3_bv(x, lambda u,v: u&v, a, b)
+def z3_or(x:UOp, a:z3.ExprRef, b:z3.ExprRef) -> z3.ExprRef:
+  return a|b if isinstance(a, z3.BoolRef) else z3_bv(x, lambda u,v: u|v, a, b)
+
+# Factor out the minimum count, then shift by its varying bits. Constant counts need no stages.
+def z3_shift(x:UOp, a:z3.ExprRef, b:z3.ExprRef) -> z3.ExprRef:
+  lo = max(0, int(x.src[1].vmin))
+  a = a / (1 << lo) if x.op is Ops.SHR else a * (1 << lo)
+  for i in range(max(0, int(x.src[1].vmax)-lo).bit_length()):
+    factor = 1 << (1 << i)
+    a = z3.If(((b-lo) / (1 << i)) % 2 == 1, a / factor if x.op is Ops.SHR else a * factor, a)
+  return z3.If(b < 0, z3.FreshInt("invalid_shift", ctx=a.ctx), a)
+
+# handlers take (x, *src exprs): x provides vmin/vmax for the bounds-aware ops; anything not here falls back to python_alu
+z3_alu: dict[Ops, Callable[..., z3.ExprRef]] = {Ops.CMOD: lambda _,a,b: a-z3_cdiv(a,b)*b, Ops.CDIV: lambda _,a,b: z3_cdiv(a,b),
+  Ops.FLOORDIV: lambda _,a,b: z3_floordiv(a,b), Ops.FLOORMOD: lambda _,a,b: a-z3_floordiv(a,b)*b,
+  Ops.WHERE: lambda _,c,a,b: z3.If(c,a,b), Ops.MAX: lambda _,a,b: z3.If(a<b, b, a),
+  Ops.AND: z3_and, Ops.OR: z3_or, Ops.XOR: z3_xor, Ops.SHL: z3_shift, Ops.SHR: z3_shift}
+
+def create_bounded(name:str, vmin:int|z3.ArithRef, vmax:int|z3.ArithRef, solver:z3.Solver) -> z3.ArithRef:
+  solver.add((vmin <= (s:=z3.Int(name, ctx=solver.ctx)))&(s <= vmax))
+  return s
+def create_var(x:UOp, ctx:tuple[z3.Solver, dict[UOp, z3.ExprRef]]) -> z3.ExprRef:
+  name = x.arg.name if x.op is Ops.PARAM else f"{x.op.name.lower()}{len(ctx[1])}"
+  return z3.Bool(name, ctx=ctx[0].ctx) if x.dtype == dtypes.bool else create_bounded(name, x.vmin, x.vmax, ctx[0])
+# z3 does not model widths: a cast only converts between bool and int
+def z3_cast(c:UOp, x:z3.ExprRef) -> z3.ExprRef:
+  if (c.src[0].dtype == dtypes.bool) == (c.dtype == dtypes.bool): return x
+  return x != 0 if c.dtype == dtypes.bool else z3.If(x, 1, 0)
+
+z3_renderer = PatternMatcher([
+  # the valid condition is a constraint
+  (UPat.var("cond").where(UPat.var("x"), UPat(Ops.CONST, arg=Invalid)), lambda x,cond,ctx: ctx[0].add(ctx[1][cond]) or ctx[1][x]),
+  # variables
+  (UPat((Ops.SPECIAL, Ops.RANGE), name="x"), lambda x,ctx:
+   create_bounded(x.arg if x.op is Ops.SPECIAL else f"r{range_str(x)}", 0, ctx[1][x.src[0]]-1, ctx[0])),
+  # unknown values are variables bounded by their vmin/vmax: params, loads (non-pointer INDEX is a LOAD) and anything from floats
+  (UPat((Ops.PARAM, Ops.LOAD, Ops.INDEX), name="x"), create_var),
+  (UPat((Ops.CAST, Ops.BITCAST)+tuple(GroupOp.Comparison), src=UPat(dtype=dtypes.floats), name="x"), create_var),
+  # a bitcast between ints wraps into the target range, z3 ints are unbounded
+  (UPat(Ops.BITCAST, dtypes.ints, src=(UPat.var("x", dtypes.ints),), name="c"),
+   lambda c,x,ctx: (ctx[1][x]-c.dtype.min) % 2**(8*c.dtype.itemsize) + c.dtype.min),
+  # constants
+  (UPat(Ops.CONST, arg=Invalid), lambda ctx: z3.Int("Invalid", ctx=ctx[0].ctx)),
+  (UPat(Ops.CONST, name="x"), lambda x,ctx: z3.BoolVal(x.val, ctx=ctx[0].ctx) if x.dtype == dtypes.bool else z3.IntVal(x.val, ctx=ctx[0].ctx)),
+  (UPat(Ops.CAST, src=(UPat.var("x"),), name="c"), lambda c,x,ctx: z3_cast(c, ctx[1][x])),
+  (UPat(tuple(z3_alu), name="x"), lambda x,ctx: z3_alu[x.op](x, *(ctx[1][s] for s in x.src))),
+  (UPat(GroupOp.ALU, name="x"), lambda x,ctx: python_alu[x.op](*(ctx[1][s] for s in x.src))),
+])
+
+def uops_to_z3(solver:z3.Solver, *uops: UOp) -> list[z3.ExprRef]:
+  # gate on upstream memory addressing, but keep INDEX as an unknown LOAD
+  lst = list(UOp.sink(*uops).toposort(gate=lambda x: x.op not in {Ops.AFTER, Ops.SHRINK, Ops.ALLOC, Ops.BUFFER}
+                                      and (x.dtype in dtypes.ints+(dtypes.bool, dtypes.weakint) or x.op is Ops.SINK)))[:-1]
+  z3map: dict[UOp, z3.ExprRef] = {}
+  for u in lst:
+    if (z3_rewritten:=z3_renderer.rewrite(u, ctx=(solver, z3map))) is None: raise NotImplementedError(f"{u.op} is not supported by z3")
+    z3map[u] = z3_rewritten
+  assert all(u in z3map for u in uops), "UOp failed to rewrite to z3!"
+  return [z3map[u] for u in uops]
+
+def validate_index_with_z3(sz:int, idx:UOp, gate:UOp) -> bool:
+  solver = z3.Solver(ctx=z3.Context())
+  z3_idx, z3_mask = uops_to_z3(solver, idx, gate)
+  solver.add(z3_mask)
+  with cpu_profile("validate index with z3", "TINY"):
+    match solver.check((z3_idx<0)|(sz<=z3_idx)):
+      case z3.unsat: return True
+      case z3.sat: print(f"# OUT OF BOUNDS ACCESS: at {solver.model()} INDEX not in 0 - {sz}\nconstraints = {solver}")
+      case z3.unknown: print(f"# UNKNOWN RESULT FROM Z3: {solver.reason_unknown()}\nconstraints = {solver}")
+  print(f"idx={idx.render(simplify=False)}")
+  print(f"mask={gate.render(simplify=False)}")
+  return False
+
+from dataclasses import replace
+from tinygrad.dtype import dtypes, DType, AddrSpace, Invalid, least_upper_dtype, strong_dtype, weak_dtype
+
+from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, GroupOp, dtype_from_uop, promo_dtype
+
+# the decomps and float emulation commit bare consts at a dtype another src already states
+def commit_weak_consts(u:UOp, dt:DType|None) -> UOp:
+  return u if dt is None else u.replace(src=tuple(s.ccast(dt) if s.op is Ops.CONST and s.dtype in dtypes.weaks else s for s in u.src))
+
+# the concrete dtypes u commits its srcs at: the operands' meet and u's own derived dtype, None if either is weak
+def derived_dtypes(u:UOp, src:tuple[UOp, ...]) -> tuple[DType, DType]|None:
+  if u.op not in GroupOp.Broadcastable or (meet:=promo_dtype(src)) in dtypes.weaks \
+     or (result:=dtype_from_uop(u.op, src, u.arg)) in dtypes.weaks: return None
+  return meet, result
+
+def commit_srcs_at(u:UOp, dt:DType) -> UOp|None:
+  # the root re-derives: a shift's dtype is its lhs's, so committing the lhs commits the node too
+  bare = derived_dtypes(u, u.src) is not None
+  src = tuple(s if s.dtype not in dtypes.weaks else UOp.const(dt.const(s.val)) if bare and s.op is Ops.CONST else s.ccast(dt) for s in u.src)
+  return None if (ret := u.replace(src=src)) is u else ret
+
+def commit_weak_srcs(u:UOp) -> UOp|None:
+  if not any(s.dtype in dtypes.weaks for s in u.src) or (dt:=least_upper_dtype(*(s.dtype for s in u.src))) in dtypes.weaks: return None
+  return commit_srcs_at(u, dt)
+
+# a concrete CAST over a weak node states the width the value will live at. that width is a floor, never a narrowing
+def cast_weak_srcs(c:UOp, u:UOp) -> UOp|None:
+  # only within the kind: an int cast of a weakfloat node is a value conversion, not a statement about the node's width
+  if c.dtype in dtypes.weaks or weak_dtype(c.dtype) is not u.dtype: return None
+  # every weak src commits at the one width: the node's own bounds and each src's, none of them narrowed
+  dt = least_upper_dtype(c.dtype, u.commit_dtype(dtypes.int), *(s.commit_dtype(dtypes.int) for s in u.src if s.dtype in dtypes.weaks))
+  return None if (ret:=commit_srcs_at(u, dt)) is None else ret.cast(c.dtype)
+
+# rides every round that can mint a weak const, and must reach fixpoint before pm_lower_weak below defaults one
+pm_commit_weak = PatternMatcher([
+  (UPat(GroupOp.Broadcastable, name="u"), commit_weak_srcs),
+  (UPat(Ops.STORE, src=(UPat(), UPat(dtype=dtypes.weaks)), allow_any_len=True, name="u"),
+   lambda u: u.replace(src=(u.src[0], u.src[1].ccast(u.src[0].dtype), *u.src[2:]))),
+  # no CONST arm: a concrete CAST over a weak CONST is already committed, minted that way by UOp.const
+  (UPat(Ops.CAST, name="c", src=(UPat(GroupOp.ALU, dtype=dtypes.weaks, name="u"),)), cast_weak_srcs),
+])
+
+# consumers absorb the weak CAST off their srcs and default underivable consts; dtype-producing ops settle here.
+# a weakfloat Unary (sin/exp2/...) must resolve before the transcendental decomposition.
+_lower_weak_ops = GroupOp.Binary|GroupOp.Unary|{Ops.WHERE, Ops.RANGE, Ops.STACK, Ops.SPECIAL}
+
+# a weak CAST states a width, which the consumer restates. a weakint over a bool or float is a conversion, it commits here
+def absorb_weak_src(s:UOp) -> UOp:
+  if s.op is not Ops.CAST or s.dtype not in dtypes.weaks: return s
+  if s.dtype is dtypes.weakint and not dtypes.is_int(s.src[0].dtype): return s.src[0].cast(s.commit_dtype(dtypes.int))
+  return s.src[0]
+
+def lower_weak_node(u:UOp) -> UOp|None:
+  if u.op is Ops.CAST and u.src[0].op is Ops.CONST: return None  # a committed const, not a consumer
+  src = tuple(absorb_weak_src(s) for s in u.src)
+  if derived_dtypes(u, src) is None:
+    src = tuple(s.ccast(s.commit_dtype(dtypes.int)) if s.op is Ops.CONST and s.dtype in dtypes.weaks else s for s in src)
+  if src == u.src: return None
+  start = 1 if u.op is Ops.WHERE else 0  # WHERE's cond is bool, never part of the width unification
+  if u.op not in _lower_weak_ops or any(s.dtype in dtypes.weaks and s.op is not Ops.CONST for s in src[start:]): return u.replace(src=src)
+  # resolve whole once every weak expression lowered: a Binary widens from its own bounds too, derivable consts wait
+  dt = strong_dtype(least_upper_dtype(u.commit_dtype(dtypes.int), *(s.dtype for s in src)) if u.op in GroupOp.Binary else
+                    dtype_from_uop(u.op, src, u.arg))
+  src = src[:start]+tuple(s if s.base.is_invalid or s.dtype in dtypes.weaks else s.ccast(dt) for s in src[start:])
+  return u.replace(src=src).cast(u.dtype)
+
+pm_lower_weak = PatternMatcher([
+  # a gated long index into a small buffer narrows; its out-of-gate value is discarded
+  (UPat((Ops.INDEX, Ops.SHRINK), src=(UPat.var("buf"), UPat.var("gate").where(UPat.var("idx", dtypes.long), UPat(Ops.CONST, arg=Invalid))),
+        allow_any_len=True, name="u"),
+   lambda u,buf,gate,idx: u.replace(src=(buf, idx.cast(dtypes.int).valid(gate))+u.src[2:]) if buf.max_numel()-1 <= dtypes.int32.max else None),
+  # two stacked weak casts are two kind conversions: each resolves at its own kind's default
+  (UPat(Ops.CAST, dtype=dtypes.weaks, src=(UPat(Ops.CAST, dtype=dtypes.weaks, src=(UPat.var("x"),)),), name="u"),
+   lambda u,x: x.cast(u.src[0].commit_dtype(dtypes.int)).cast(u.commit_dtype(dtypes.int)).cast(u.dtype) if x.dtype not in dtypes.weaks else None),
+  (UPat(Ops.PARAM, dtype=dtypes.weakint, name="u"),
+    lambda u: u.replace(arg=replace(u.arg, dtype=u.commit_dtype(dtypes.int))).cast(dtypes.weakint) if u.addrspace == AddrSpace.ALU else None),
+  (UPat(GroupOp.All, name="u"), lower_weak_node),
+])
+
+# drop the CAST off a committed const where the consumer re-derives it anyway, so bare-CONST rules keep matching.
+# the drop must change nothing the consumer derives: neither the operands' meet nor the node's own dtype
+def uncast_const(u:UOp) -> UOp|None:
+  # a weak CAST over a const is not a commit, it is still resolving
+  src = tuple(s.src[0] if s.op is Ops.CAST and s.dtype not in dtypes.weaks and s.src[0].op is Ops.CONST
+              and s.src[0].dtype in dtypes.weaks else s for s in u.src)
+  if src == u.src or (dts:=derived_dtypes(u, src)) is None or dts[0] != promo_dtype(u.src) or dts[1] is not u.dtype: return None
+  return u.replace(src=src)
+
+pm_uncast_const = PatternMatcher([(UPat(GroupOp.Broadcastable, name="u"), uncast_const)])
+
+# commit every remaining bare const, keyed on the consumer: "bare" is a property of the edge
+def cast_consts(u:UOp) -> UOp|None:
+  if u.op is Ops.CAST and u.src[0].op is Ops.CONST: return None  # a committed const's CONST is its value, not an edge
+  if (dts:=derived_dtypes(u, u.src)) is not None: u = commit_weak_consts(u, dts[0])
+  # .cast folds at the dtypes a bare CONST derives, so the width is forced. Invalid never commits.
+  return u.replace(src=tuple(UOp.cconst(s.val, s.commit_dtype(dtypes.int)) if s.op is Ops.CONST and not s.is_invalid else s for s in u.src))
+
+pm_cast_const = PatternMatcher([(UPat(GroupOp.All, name="u", custom_early_reject={Ops.CONST}), cast_consts)])
+
+
+#!/usr/bin/env python3
+import argparse, pathlib, signal, struct, json, os, itertools, heapq
+os.environ["VIZ"] = "0"
+if hasattr(signal, "SIGPIPE"): signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+from typing import Iterator
+from tinygrad.viz import serve as viz
+from tinygrad.viz.serve import fmt_colored
+from tinygrad.uop.ops import RewriteTrace
+from tinygrad.helpers import temp, ansistrip, colored, time_to_str, ansilen, ProfilePointEvent, ProfileRangeEvent, TracingKey, unwrap, NO_COLOR, DEBUG
+from tinygrad.helpers import Context
+
+# profile decoder used in CLI and tests
+def decode_profile(data:bytes) -> dict:
+  ret, off = data, 0
+  def u(fmt:str) -> tuple:
+    nonlocal off
+    vals = struct.unpack_from(fmt, ret, off)
+    off += struct.calcsize(fmt)
+    return vals
+  total_dur, global_peak, index_len, layout_len = u("<IQII")
+  strings, dtypes, markers = json.loads(ret[off:off+index_len]).values()
+  off += index_len
+  layout:dict[str, dict] = {}
+  # 0 means None, otherwise it's an enum value
+  def option(i:int) -> int|None: return None if i == 0 else i-1
+  for _ in range(layout_len):
+    klen = u("<B")[0]
+    k = ret[off:off+klen].decode()
+    off += klen
+    event_type, event_count = u("<BI")
+    layout[k] = v = {"event_type":event_type, "events":[]}
+    if event_type == 0:
+      for _ in range(event_count):
+        name, ref, key, st, dur, fmt = u("<IIIIfI")
+        v["events"].append({"name":strings[name], "ref":option(ref), "key":option(key), "st":st, "dur":dur, "fmt":json.loads(strings[fmt])})
+    else:
+      v["linear"] = u("<B")[0]
+      v["peak"] = u("<Q")[0]
+      for _ in range(event_count):
+        if v["linear"]:
+          ts, value = u("<IQ")
+          v["events"].append({"event":"freq", "ts":ts, "value":value})
+        else:
+          alloc, ts, key = u("<BII")
+          if alloc: v["events"].append({"event":"alloc", "ts":ts, "key":key, "arg": {"dtype":strings[u("<I")[0]], "sz":u("<Q")[0]}})
+          else: v["events"].append({"event":"free", "ts":ts, "key":key, "arg": {"users":[(k, strings[rep], num, mode) \
+              for k,rep,num,mode in [u("<IIIB") for _ in range(u("<I")[0])]]}})
+  return {"dur":total_dur, "peak":global_peak, "layout":layout, "markers":markers}
+
+def to_str(k:str, v) -> str:
+  if isinstance(v, str): return f"{k} {v}"
+  if k == "FLOPS" or k.startswith("B/s"): return f"{v*1e-9:.0f} G{k}" if v < 1e13 else f"{v*1e-12:.0f} T{k}"
+  if k == "B": return next((f"{v/s:.0f} {u}" for s,u in ((1e9,"GB"),(1e6,"MB"),(1e3,"KB")) if v>=s), f"{v:.0f} B")
+  return f"{k}={v}"
+def fmt_data(data:dict) -> str: return "  ".join((p:=to_str(k, v))+" "*max(0, 14-ansilen(p)) for k,v in data.items())
+
+def marker_st(markers:list[dict], name:str) -> int:
+  try: return next(e["ts"] for e in markers if e["name"] == name)
+  except StopIteration: raise RuntimeError(f"marker not found: {name}") from None
+
+def get(data:dict, key:str):
+  for k,v in data.items():
+    if ansistrip(k) == key: return v
+  import difflib
+  match = difflib.get_close_matches(key, [ansistrip(k) for k in data], n=1, cutoff=0.6)
+  raise RuntimeError(f'item "{key}" not found in list'+(f", did you mean {match[0]!r}?" if match else ''))
+
+def fmt_top(k:dict) -> str:
+  return f"{fmt_colored(k['name'])}{' ' * max(0, 38-ansilen(k['name']))} {time_to_str(k['dur_ms']*1e-3, w=9)} {k['count']:7d} {k['pct']:6.2f}%"+\
+      (" "*4+fmt_data(k['fmt']) if k['fmt'] else "")
+
+def fmt_all(k:dict) -> str:
+  if k["device"] in {"MARKER", "SOURCE"}: return f"--- {k['device']} {k['name']}"+(f"/{k['st_ms']:9.2f}ms" if k['st_ms'] else "")
+  ptm = colored(time_to_str(k["dur_ms"]*1e-3, w=9), "yellow" if k["dur_ms"] > 10 else None)
+  name = f"*** {k['device'][:7]:7s} "+k["name"]+" "*(46-ansilen(k["name"]))
+  return f"{name} tm {ptm}/{k['st_ms']:9.2f}ms"+(f" ({fmt_data(k['fmt'])})" if k["fmt"] else "")
+
+@Context(ALLOW_DEVICE_USAGE=0)
+def main(args) -> None:
+  viz.load_rewrites(viz_data:=viz.VizData(viz.load_pickle(args.rewrites_path, default=RewriteTrace([], [], {}))))
+
+  def emit(val, to_str=str) -> str: return json.dumps(val if isinstance(val, dict) else {"value":val}) if args.json else to_str(val)
+
+  def print_step(step:dict, print_graph=False, reconstruct_matches=False) -> None:
+    data = viz.get_render(viz_data, step["query"], update_sink=False)
+    if isinstance(data.get("value"), Iterator):
+      for m in data["value"]:
+        if print_graph and "graph" in m and not args.json:
+          for k,v in m["graph"].items():
+            print(f"[{k}] {' '.join((lines:=v['label'].splitlines())[:5])}{'...' if len(lines) > 5 else ''}"+(f" tag={v['tag']}" if v['tag'] else ''))
+            if v["src"]:
+              print("  src: "+", ".join([f"{i}->[{x}]" for i,x in v["src"]]))
+        elif "uop" in m: print(emit(m["graph"] if print_graph else m["uop"]))
+        if not reconstruct_matches: return None
+        if m.get("diff"):
+          loc = pathlib.Path(m["upat"][0][0])
+          print(emit(f"{loc.parent.name}/{loc.name}:{m['upat'][0][1]}\n{m['upat'][1]}"))
+          for line in m["diff"]: print(emit(colored(line, "red" if line.startswith("-") else "green" if line.startswith("+") else None)))
+    if data.get("src") is not None: print(emit(data["src"]))
+
+  profile_bytes = viz.get_profile(viz_data, viz.load_pickle(args.profile_path, default=[]))
+  if profile_bytes is None: raise RuntimeError(f"empty profile in {args.profile_path}")
+  profile = decode_profile(profile_bytes)
+  profile["layout"].update([(f'{c["name"][5:]}{" SQTT" if s["name"].endswith("PKTS") else ""} {s["name"]}', s["_data"]) for c in viz_data.ctxs
+                            if c["name"].startswith("SQTT") for s in c["steps"] if s["name"].endswith(("PMC", "PKTS"))])
+  if args.list and not args.src: return print("\n".join(emit(fmt_colored(k)) for k in ["ALL"]+list(profile["layout"])))
+
+  # ** SQTT printer
+  data = None if not args.src else get(profile["layout"], args.src[0])
+  if args.src and "SQTT" in args.src[0]:
+    # modern terminals support 24-bit color
+    def hex_colored(st:str, color:str) -> str: return f"\x1b[38;2;{int(color[1:3],16)};{int(color[3:5],16)};{int(color[5:7],16)}m{st}\x1b[0m"
+    print(emit(f"{'Clk':<12} {'Unit':<20} {'Op':<22} {'Dur':<4} {'Delay':<4} {'Info'}"))
+    print(emit("-" * 100))
+    pc_map:dict[int, str] = {}
+    pkt_idxs:dict[str, itertools.count] = {}
+    dispatch_to_inst:dict[str, tuple[str, int]] = {}
+    inst_st:int|None = None
+    for e in viz.sqtt_timeline(*unwrap(data)):
+      if isinstance(e, ProfilePointEvent) and e.key == 'pcMap': pc_map = e.arg
+      if not isinstance(e, ProfileRangeEvent): continue
+      if inst_st is None: inst_st = int(e.st)
+      assert isinstance(e.name, TracingKey)
+      op_name, ret, info = e.name.display_name, json.loads(e.name.ret[4:]) if e.name.ret else {}, ""
+      color = next((v for k,v in viz.wave_colors.items() if k in op_name), None)
+      op_str = hex_colored(op_name, color) if color and not NO_COLOR else op_name
+      inst, phase, delay = None, None, 0
+      idx = next(pkt_idxs.setdefault(e.device, itertools.count()))
+      if e.device.startswith("WAVE"):
+        inst = f"0x{pc:05x} {pc_map[pc]}" if (pc:=ret.get("pc")) is not None else f"{'':7} {op_name}"
+        dispatch_to_inst[f"{e.device}-{idx}"] = (inst, int(e.st))
+        phase = "DISPATCH"
+      if (link:=ret.get("link")) is not None:
+        inst, dispatch_st = dispatch_to_inst[link]
+        phase, delay = "EXEC", int(e.st) - dispatch_st
+      if inst and phase: info = f"{phase:<8} {inst}"
+      unit = e.device.replace(" ", "-")
+      row = {"clk":int(e.st)-inst_st, "cycle":int(e.st), "unit":unit, "op":op_name, "dur":int(unwrap(e.en)-e.st), "delay":delay or "", "info":info}
+      print(emit(row, lambda _: f"{row['clk']:<12} {unit:<20} {op_str}{' '*(22-ansilen(op_str))} {row['dur']:<4} {str(row['delay']):<4} {info}"))
+
+  # ** PMC printer
+  elif args.src and "PMC" in args.src[0]:
+    pmc = viz.unpack_pmc(unwrap(data))
+    pmc_fmt:list[str] = []
+    for name,val,*detail in pmc["rows"]:
+      pmc_fmt += [f"{name} {val}"]+([" ".join(f"{k}={v}" for k,v in zip(detail[0]["cols"], r)) for r in detail[0]["rows"]] if detail else [])
+    print(emit(pmc, lambda _: "\n".join(pmc_fmt)))
+
+  # ** Memory printer
+  elif data is not None and data["event_type"] == 1:
+    print(emit({"peak":data["peak"]}, lambda _: f"Peak: {data['peak']}"+"\n"+f"{'TS':<10}  {'Event':<6}  {'Key':>8}  Info"))
+    for e in data["events"]:
+      info = str(arg:=e.pop("arg", {}))
+      if e["event"] == "free": info = ', '.join([f"{fmt_colored(k)} {['read','write','write+read'][m]}@data{n}" for _,k,n,m in arg["users"]])
+      print(emit({**e, "info":info}, lambda _: f"{e['ts']:<10}  {e['event']:<6}  {e.get('key', ''):>8}  {info}"))
+
+  # ** Profiler printer
+  else:
+    timelines = [(n,l) for n,l in profile["layout"].items() if isinstance(l, dict) and l.get("event_type") == 0]
+    markers = profile.get("markers", [])
+    interval:tuple[int, int]|None = None
+    if (rng:=args.interval): interval = (marker_st(markers, rng[0]), marker_st(markers, rng[1]) if len(rng) > 1 else profile["dur"])
+    def produce_top_kernels() -> Iterator[dict]:
+      tagged = ((n,e) for n,l in timelines for e in l["events"]) if not args.src else ((args.src[0],e) for e in unwrap(data)["events"])
+      agg:dict[tuple[str,str], tuple[float, int, int|None, dict[str, float]]] = {} # map (device, kernel name) to (total time, count, ref, est)
+      est_keys = ("FLOPS", "B/s mem", "B/s lds")
+      total = 0
+      for dev,e in tagged:
+        if interval and not interval[0] <= e["st"] <= interval[1]: continue
+        et = e["dur"] * 1e-3
+        t, c, ref, est = agg.get((dev,e["name"]), (0.0, 0, None, {}))
+        est.update({k:est.get(k, 0.0)+e["fmt"][k]*e["dur"]*1e-6 for k in est_keys if k in e["fmt"]})
+        agg[(dev,e["name"])] = (t+et, c+1, e["ref"], est)
+        total += et
+      items = sorted(agg.items(), key=lambda kv:kv[1][0], reverse=True)
+      num_rows = len(items) if args.t < 0 else args.t
+      for (dev,name),(t,c,ref,est) in items[:num_rows]:
+        display = f"{dev[:7]:7s} {fmt_colored(name)}" if not args.src else fmt_colored(name)
+        yield {"name":display, "dur_ms":t, "count":c, "pct":t/total*100.0, "ref":ref, "fmt":{k:int(est[k]/(t*1e-3)) for k in est_keys if k in est}}
+      if num_rows > 0 and items[num_rows:]:
+        other_t = sum(t for _,(t,_,_,_) in items[num_rows:])
+        other_c = sum(c for _,(_,c,_,_) in items[num_rows:])
+        yield {"name":"Other", "dur_ms":other_t, "count":other_c, "pct":other_t/total*100.0, "ref":None, "fmt":None}
+    def produce_all_kernels() -> Iterator[dict]:
+      event_streams = [[(e["st"], n, e) for e in l["events"]] for n,l in timelines] if not args.src \
+                      else [[(e["st"], args.src[0], e) for e in unwrap(data)["events"]]]
+      if not args.src:
+        for n,l in profile["layout"].items():
+          if not isinstance(l, dict) or l.get("event_type") != 0: yield {"device":"SOURCE", "name":n, "st_ms":0, "ref":None, "ext":None}
+      marker_stream = sorted([(m["ts"], "MARKER", m) for m in markers], key=lambda t:t[0])
+      for ts,dev,e in heapq.merge(*event_streams, marker_stream, key=lambda t:t[0]):
+        if interval is not None and not interval[0] <= ts <= interval[1]: continue
+        if dev == "MARKER":
+          yield {"device":dev, "name":fmt_colored(e["name"]), "st_ms":ts*1e-3, "ref":None, "ext":None}
+          continue
+        ext, fmt = [], e["fmt"]
+        if (tb:=fmt.pop("tb", [])):
+          while tb:
+            file, lineno, fxn, code = tb.pop()
+            line = f"{file.split('/')[-1]}:{lineno} {fxn}"
+            if fmt: ext.append(f"{line} {code}")
+            elif not file.startswith("<") and not fxn.startswith("<"): fmt["loc"] = line
+        yield {"device":dev, "name":fmt_colored(e["name"]), "dur_ms":e["dur"]*1e-3, "st_ms":e["st"]*1e-3, "fmt":fmt, "ref":e["ref"],
+               "ext":"\n".join(ext)}
+    fmt_row = fmt_top if args.t else fmt_all
+    seen_refs:set[int] = set()
+    def render_event(k:dict, ls=args.list) -> None:
+      if len(args.src) > 1 and ansistrip(k["name"]) not in args.src: return None
+      print(emit(k, to_str=fmt_row))
+      if k["ref"] is not None and k["ref"] not in seen_refs:
+        seen_refs.add(k["ref"])
+        for i,s in enumerate(viz_data.ctxs[k["ref"]]["steps"]):
+          if DEBUG >= 3 and s["name"] == "View Base AST": print_step(s)
+          if DEBUG >= 4 and s["name"] == "View Source": print_step(s)
+          if DEBUG >= 5 or ls: print(emit(" "*s["depth"]+s["name"]+(f" - {s['match_count']}" if s.get('match_count', 0) else '')))
+          if DEBUG >= 6 or (DEBUG >= 5 and s["name"] == "View Kernel Graph") or (s["name"] in args.src):
+            print_step(s, print_graph=True, reconstruct_matches=s["name"] in args.src)
+          if DEBUG >= 7: print_step(s, reconstruct_matches=True)
+      elif DEBUG >= 3 and k.get("ext"): print(emit(k["ext"]))
+    for k in (produce_top_kernels if args.t else produce_all_kernels)(): render_event(k)
+
+def get_arg_parser() -> argparse.ArgumentParser:
+  parser = argparse.ArgumentParser(prog="python -m tinygrad.viz.cli")
+  parser.add_argument("-s", "--src", nargs="+", default=[], metavar="NAME", help="Select a data source (default: all)")
+  parser.add_argument("--list", "--ls", dest="list", action="store_true", help="List sources")
+  parser.add_argument("--interval", nargs="+", metavar=("START", "END"), help="Optional start and end marker")
+  parser.add_argument("-t", nargs="?", type=int, const=20, metavar="COUNT", help="Aggregate top kernels (optional count, default 20)")
+  parser.add_argument("--profile-path", type=str, metavar="PATH", help="Optional path to profile.pkl (default: latest profile)",
+                      default=temp("profile.pkl", append_user=True))
+  parser.add_argument("--rewrites-path", type=str, metavar="PATH", help="Optional path to rewrites.pkl (default: latest rewrites)",
+                      default=temp("rewrites.pkl", append_user=True))
+  parser.add_argument("--json", action="store_true", help="Emit profiler output as JSON")
+  return parser
+
+if __name__ == "__main__":
+  try: main(get_arg_parser().parse_args())
+  except KeyboardInterrupt: pass
+
+#!/usr/bin/env python3
+import multiprocessing, pickle, difflib, os, threading, json, time, sys, socket, argparse, codecs, io, struct, re, traceback, itertools, socketserver
+from contextlib import redirect_stdout, redirect_stderr, contextmanager
+from decimal import Decimal
+from dataclasses import dataclass, field, replace
+from urllib.parse import parse_qs, urlparse
+from http.server import BaseHTTPRequestHandler
+from typing import Any, TypedDict, TypeVar, Generator, Callable
+from tinygrad.helpers import colored, getenv, unwrap, word_wrap, TRACEMETA, ProfileEvent, ProfileRangeEvent, TracingKey, ProfilePointEvent, temp
+from tinygrad.helpers import printable, Context, START_TIME, NO_COLOR, ansistrip
+from tinygrad.renderer.amd.dsl import Inst, Reg
+from tinygrad.renderer.amd import detect_format
+from tinygrad.runtime.autogen.amd.common import OpType
+
+# NOTE: using HTTPServer forces a potentially slow socket.getfqdn
+class TCPServerWithReuse(socketserver.TCPServer):
+  allow_reuse_address = True
+  def __init__(self, server_address, RequestHandlerClass):
+    print(f"*** started server on http://127.0.0.1:{server_address[1]} at {time.perf_counter()-START_TIME:.2f} s")
+    super().__init__(server_address, RequestHandlerClass)
+
+class HTTPRequestHandler(BaseHTTPRequestHandler):
+  def send_data(self, data:bytes, content_type:str="application/json", status_code:int=200):
+    self.send_response(status_code)
+    self.send_header("Content-Type", content_type)
+    self.send_header("Content-Length", str(len(data)))
+    self.end_headers()
+    return self.wfile.write(data)
+  def stream_json(self, source:Generator):
+    try:
+      self.send_response(200)
+      self.send_header("Content-Type", "text/event-stream")
+      self.send_header("Cache-Control", "no-cache")
+      self.end_headers()
+      for r in source:
+        self.wfile.write(f"data: {json.dumps(filter_keys(r))}\n\n".encode("utf-8"))
+        self.wfile.flush()
+      self.wfile.write("data: [DONE]\n\n".encode("utf-8"))
+    # pass if client closed connection
+    except (BrokenPipeError, ConnectionResetError): source.close()
+
+from tinygrad.uop.ops import TrackedGraphRewrite, RewriteTrace, UOp, Ops, GroupOp, srender, sint, sym_infer, range_str, range_start, multirange_str
+from tinygrad.uop.ops import KernelInfo, CallInfo
+from tinygrad.uop.render import render_ssa, pyrender, uops_colors
+from tinygrad.device import ProfileDeviceEvent, ProfileGraphEvent, ProfileGraphEntry, ProfileProgramEvent
+from tinygrad.dtype import dtypes, AddrSpace
+
+
+addrspace_colors = {AddrSpace.ALU: "#AAAAAA", AddrSpace.REG:"#e68181", AddrSpace.LOCAL:"#e7c86a", AddrSpace.GLOBAL:"#75bd7b"}
+
+# VIZ API
+
+# A step is a lightweight descriptor for a trace entry
+# Includes a name, metadata and a URL path for fetching the full data
+
+def create_step(name:str, query:tuple[str, int, int], data=None, depth:int=0, **kwargs) -> dict:
+  return {"name":name, "query":f"{query[0]}?ctx={query[1]}&step={query[2]}", "_data":data, "depth":depth, **kwargs}
+
+@dataclass(frozen=True)
+class VizData:
+  trace:RewriteTrace = field(default_factory=lambda: RewriteTrace([], [], {}))
+  ctxs:list[dict] = field(default_factory=list)
+  ref_map:dict[Any, int] = field(default_factory=dict)
+  all_uops:dict[int, UOp] = field(default_factory=dict)
+
+# ** load all saved rewrites
+
+def load_rewrites(data:VizData) -> None:
+  assert not data.ctxs and not data.ref_map, "load_rewrites called multiple times"
+  for i,k in enumerate(data.trace.keys):
+    steps:list[dict] = []
+    ki:KernelInfo|None = None
+    lin_idx:int|None = None
+    for j,s in enumerate(rewrites:=data.trace.rewrites[i]):
+      steps.append(create_step(s.name, ("/graph-rewrites", i, j), loc=s.loc, match_count=len(s.matches), code_line=printable(s.loc),
+                               trace=k.tb if j==0 else None, depth=s.depth))
+      # get source and binary from Ops.PROGRAM
+      if s.name == "linearize/render": lin_idx = j
+      if lin_idx is not None and (j+1 == len(rewrites) or rewrites[j+1].depth <= rewrites[lin_idx].depth):
+        steps.append(create_step("View UOp List", ("/uops", i, len(steps)), lin_idx, depth=0))
+        steps.append(create_step("View Source", ("/code", i, len(steps)), lin_idx, depth=0))
+        steps.append(create_step("View Disassembly", ("/asm", i, len(steps)), (k.ret, lin_idx), depth=0))
+        lin_idx = None
+      if s.name == "View Program": ki = _reconstruct(data, s.sink, depth=1).src[0].arg
+      if s.name == "View Tensor Graph": steps.append(create_step("View Input UOps", ("/input-uops", i, len(steps)), j, depth=0))
+    for key in k.keys: data.ref_map[canonicalize_ast(key) if isinstance(key, UOp) else key] = i
+    data.ctxs.append({"name":k.display_name, "steps":steps, "ki":ki})
+
+# ** get the complete UOp graphs for one rewrite
+
+class GraphRewriteDetails(TypedDict):
+  graph: dict                            # JSON serialized UOp for this rewrite step
+  uop: str                               # strigified UOp for this rewrite step
+  diff: list[str]|None                   # diff of the single UOp that changed
+  change: list[int]|None                 # the new UOp id + all its parents ids
+  upat: tuple[tuple[str, int], str]|None # [loc, source_code] of the matched UPat
+  _sink: UOp
+
+def shape_to_str(s:tuple[sint, ...]): return "(" + ','.join(srender(x) for x in s) + ")"
+def mask_to_str(s:tuple[tuple[sint, sint], ...]): return "(" + ','.join(shape_to_str(x) for x in s) + ")"
+def pystr(u:UOp) -> str:
+   # pyrender may check for shape mismatch
+  try: return pyrender(u)
+  except Exception: return str(u)
+
+def fmt_colored(s:str) -> str: return ansistrip(s) if NO_COLOR else s
+
+def canonicalize_ast(u:UOp) -> UOp: return u.replace(arg=KernelInfo()) if u.op is Ops.SINK and isinstance(u.arg, KernelInfo) else u
+
+def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
+  assert isinstance(x, UOp)
+  graph: dict[int, dict] = {}
+  excluded: set[UOp] = set()
+  for u in (toposort:=x.toposort()):
+    # always exclude CONST
+    if u.op is Ops.CONST and u is not x: excluded.add(u)
+    if u.op is Ops.STACK and len(u.src) == 0: excluded.add(u)
+    # exclude RESHAPE/EXPAND that only serve to broadcast a CONST
+    if u.op in {Ops.RESHAPE, Ops.EXPAND} and len(u.src) >= 1 and u.src[0] in excluded and u is not x: excluded.add(u)
+    if u.op in {*GroupOp.Movement, Ops.PARAM}: excluded.update(s for s in u.src if s.op is Ops.STACK and all(x.op is Ops.CONST for x in s.src))
+  for u in toposort:
+    argst = codecs.decode(str(u.arg), "unicode_escape")
+    with soft_err():
+      if u.op in GroupOp.Movement and u.marg: argst = (mask_to_str if u.op in {Ops.SHRINK, Ops.PAD} else shape_to_str)(u.marg)
+    if u.op is Ops.BINARY: argst = f"<{len(u.arg)} bytes>"
+    if u.op is Ops.CONST and dtypes.is_float(u.dtype): argst = f"{u.val:g}"
+    if u.op is not Ops.SOURCE: argst = word_wrap(argst.replace(':', ''))
+    label = f"{str(u.op).split('.')[1]}{(chr(10)+argst) if u.arg is not None else ''}"
+    if u.dtype != dtypes.void: label += f"\n{u.dtype}"
+    for idx,x in enumerate(u.src[:1] if u.op in {Ops.STAGE, Ops.INDEX} else (u.src if u.op is not Ops.END else [])):
+      if x in excluded:
+        # walk through excluded movement ops to find the underlying CONST
+        cx = x
+        while cx.op in GroupOp.Movement and len(cx.src) >= 1 and cx.src[0] in excluded: cx = cx.src[0]
+        arg = f"{cx.val:g}" if cx.op is Ops.CONST and dtypes.is_float(cx.dtype) else cx.render() if cx.op is Ops.STACK else f"{cx.arg}"
+        label += f"\n{cx.op.name}{idx} {arg}" + (f" {cx.src[0].op}" if len(cx.src) else "")
+    try:
+      if len(rngs:=u.ranges):
+        label += f"\n({multirange_str(rngs, color=True)})"
+      if u._shape is not None:
+        label += f"\n{shape_to_str(u.shape)}"
+      if u.op is Ops.CALL:
+        label += f"\n{u.src[0].key.hex()[:8]}\n{u.src[0].op}"
+      if u.op in {Ops.INDEX, Ops.STAGE}:
+        if len(u.src) > 1: label += f"\n{u.render()}" if sum(len(s.toposort()) for s in u.src[1:]) < 50 else "\nINDEX TOO LARGE"
+        ranges: list[UOp] = []
+        for us in u.src[1:]: ranges += [s for s in us.toposort() if s.op in {Ops.RANGE, Ops.SPECIAL}]
+        if ranges: label += "\n"+' '.join([f"{s.render()}={s.vmax+1}" for s in ranges])
+      if u.op in {Ops.END, Ops.REDUCE, Ops.BACKEDGE} and len(trngs:=list(u.ended_ranges if u.op is Ops.BACKEDGE else
+                                                                 UOp.sink(*u.src[range_start[u.op]:]).ranges)):
+        label += "\n"+' '.join([f"{range_str(s, color=True)}({s.vmax+1})" for s in trngs])
+    except Exception:
+      label += "\n<ISSUE GETTING LABEL>"
+    ref = data.ref_map.get(canonicalize_ast(u.body)) if u.op is Ops.CALL else None
+    if ref is not None: label += f"\ncodegen@{fmt_colored(data.ctxs[ref]['name'])}"
+    if TRACEMETA >= 2 and u.metadata is not None: label += "\n"+str(u.metadata)
+    addrspace_color:str|None = None
+    with soft_err(): addrspace_color = addrspace_colors.get(u.addrspace, None) if u.addrspace is not None else None
+    color = uops_colors.get(u.op, "#ffffff")
+    graph[id(u)] = {"label":label, "src":[(i,id(x)) for i,x in enumerate(u.src)], "exclude":u in excluded, "color":color,
+                    "ref":ref, "tag":repr(u.tag) if u.tag is not None else None, "addrspace":addrspace_color}
+  return graph
+
+def _reconstruct(data:VizData, a:int, depth:int|None=None):
+  if depth is None and a in data.all_uops: return data.all_uops[a]
+  op, src, arg, *rest = data.trace.uop_fields[a]
+  # mirror of the trace_num encoding, viz must not save buffers
+  if op is Ops.CALL and isinstance(arg, CallInfo) and hasattr(aux:=arg.aux, "written_bufs"):
+    arg = replace(arg, aux=replace(aux, written_bufs=tuple(_reconstruct(data, b, depth) for b in aux.written_bufs)))
+  if depth is not None and depth <= 0: return UOp(op, (), arg, *rest)
+  ret = UOp(op, tuple(_reconstruct(data, s, None if depth is None else depth-1) for s in src), arg, *rest)
+  if depth is None: data.all_uops[a] = ret
+  return ret
+
+def get_full_rewrite(data:VizData, ctx:TrackedGraphRewrite, depth:int|None=None, update_sink=True) -> Generator[GraphRewriteDetails, None, None]:
+  next_sink, err = _reconstruct(data, ctx.sink, depth=depth), False
+  yield {"graph":uop_to_json(data, next_sink), "uop":pystr(next_sink), "change":None, "diff":None, "upat":None, "_sink":next_sink}
+  replaces: dict[UOp, UOp] = {}
+  for u0_num,u1_num,upat_loc,dur in ctx.matches:
+    if err: break
+    replaces[u0:=_reconstruct(data, u0_num, depth=depth)] = u1 = _reconstruct(data, u1_num, depth=depth)
+    try: new_sink = next_sink.substitute(replaces, walk=ctx.walk, enter_calls=ctx.enter_calls) if update_sink else next_sink
+    except RuntimeError: new_sink, err = UOp(Ops.REWRITE_ERROR, arg=traceback.format_exc()), True
+    match_repr = f"# {dur*1e6:.2f} us\n"+printable(upat_loc)
+    yield {"graph":(sink_json:=uop_to_json(data, new_sink)), "uop":pystr(new_sink), "change":[id(x) for x in u1.toposort() if id(x) in sink_json],
+           "diff":list(difflib.unified_diff(pystr(u0).splitlines(), pystr(u1).splitlines())), "upat":(upat_loc, match_repr), "_sink":new_sink}
+    if not ctx.bottom_up: next_sink = new_sink
+
+def get_sink_at(upats:tuple[str, ...], viz_data:VizData, kernel_idx:int, lin_idx:int, depth:int|None=None, alt:str|None=None) -> UOp|None:
+  for i in range(lin_idx+1, len(rewrites:=viz_data.trace.rewrites[kernel_idx])):
+    if (r:=rewrites[i]).name == alt: return _reconstruct(viz_data, r.sink, depth=depth)
+  for s in get_full_rewrite(viz_data, rewrites[lin_idx], depth=depth):
+    if (s["upat"] is not None and any(n in s["upat"][1] for n in upats)): return s["_sink"]
+  return None
+
+# encoder helpers
+
+def enum_str(s, cache:dict[str, int]) -> int:
+  if (cret:=cache.get(s)) is not None: return cret
+  cache[s] = ret = len(cache)
+  return ret
+
+def option(s:int|None) -> int: return 0 if s is None else s+1
+
+def rel_ts(ts:int|Decimal, start_ts:int, ctx:str="") -> int:
+  val = int(ts) - start_ts
+  if val < 0 or val > 0xFFFFFFFF: raise ValueError(f"timestamp out of range: {ctx} diff={val} (ts={ts} start={start_ts})")
+  return val
+
+# Profiler API
+
+def cpu_ts_diff(device_ts_diffs:dict[str, Decimal], device:str) -> Decimal: return device_ts_diffs.get(device, Decimal(0))
+
+DevEvent = ProfileRangeEvent|ProfileGraphEntry|ProfilePointEvent
+def flatten_events(profile:list[ProfileEvent], device_ts_diffs:dict[str, Decimal]) -> Generator[tuple[Decimal, Decimal, DevEvent], None, None]:
+  for e in profile:
+    if isinstance(e, ProfileRangeEvent): yield (e.st+(diff:=cpu_ts_diff(device_ts_diffs, e.device)), (e.en if e.en is not None else e.st)+diff, e)
+    elif isinstance(e, ProfilePointEvent): yield (e.ts, e.ts, e)
+    elif isinstance(e, ProfileGraphEvent):
+      cpu_ts = []
+      for ent in e.ents: cpu_ts += [e.sigs[ent.st_id]+(diff:=cpu_ts_diff(device_ts_diffs, ent.device)), e.sigs[ent.en_id]+diff]
+      yield (st:=min(cpu_ts)), (et:=max(cpu_ts)), ProfileRangeEvent(f"{e.ents[0].device.split(':')[0]} Graph", f"batched {len(e.ents)}", st, et)
+      for i,ent in enumerate(e.ents): yield (cpu_ts[i*2], cpu_ts[i*2+1], ent)
+
+# normalize event timestamps and attach kernel metadata
+def timeline_layout(data:VizData, dev_events:list[tuple[int, int, float, DevEvent]], start_ts:int, scache:dict[str, int]) -> bytes|None:
+  events:list[bytes] = []
+  ei:ProfilePointEvent|None = None
+  for st,et,dur,e in dev_events:
+    if isinstance(e, ProfilePointEvent) and e.name == "exec": ei = e
+    # only visualize range events with an end timestamp
+    if dur == 0 or isinstance(e, ProfilePointEvent): continue
+    name, key = e.name, None
+    fmt:dict = {}
+    if (ref:=data.ref_map.get(e.profile_key)) is not None and ref < len(data.ctxs):
+      name = data.ctxs[ref]["name"]
+      if (ki:=data.ctxs[ref].get("ki")) is not None and ki.estimates is not None and ei is not None:
+        for est_key,est_val in (("FLOPS", ki.estimates.ops), ("B/s mem", ki.estimates.mem), ("B/s lds", ki.estimates.lds)):
+          with soft_err(lambda _: fmt.update({est_key:"ERR"})): fmt[est_key] = int(sym_infer(est_val, ei.arg['var_vals'])/(dur*1e-6))
+        key = ei.key
+    elif isinstance(e.name, TracingKey):
+      name = e.name.display_name
+      ref = next((v for k in e.name.keys if (v:=data.ref_map.get(k)) is not None), None)
+      if isinstance(e.name.ret, str): fmt.update(json.loads(e.name.ret[4:]) if e.name.ret.startswith("JSON") else {"metadata":e.name.ret})
+      elif isinstance(e.name.ret, int): fmt["B/s"], fmt["B"] = int(e.name.ret/(dur*1e-6)), e.name.ret
+      elif e.name.tb: fmt["tb"] = e.name.tb
+    events.append(struct.pack("<IIIIfI", enum_str(name, scache), option(ref), option(key), rel_ts(st,start_ts, f"'{name}' on {e.device}"),
+                              dur, enum_str(json.dumps(fmt),scache)))
+  return struct.pack("<BI", 0, len(events))+b"".join(events) if events else None
+
+def encode_mem_free(key:int, ts:int, execs:list[ProfilePointEvent], scache:dict) -> bytes:
+  ei_encoding:list[tuple[int, int, int, int]] = [] # <[u32, u32, u32, u8] [run id, display name, buffer number and mode (2 = r/w, 1 = w, 0 = r)]
+  for e in execs:
+    num = next(i for i,k in enumerate(e.arg["bufs"]) if k == key)
+    mode = 2 if (num in e.arg["inputs"] and num in e.arg["outputs"]) else 1 if (num in e.arg["outputs"]) else 0
+    ei_encoding.append((e.key, enum_str(e.arg["name"], scache), num, mode))
+  return struct.pack("<BIII", 0, ts, key, len(ei_encoding))+b"".join(struct.pack("<IIIB", *t) for t in ei_encoding)
+
+def graph_layout(k:str, dev_events:list[tuple[int, int, float, DevEvent]], start_ts:int, end_ts:int, peaks:list[int], dtype_size:dict[str, int],
+                 scache:dict[str, int]) -> tuple[str, bytes|None]:
+  if k.startswith("LINE:"):
+    xy = [(rel_ts(e.ts, start_ts, f"line '{k}' on {e.device}"), e.key) for st,_,_,e in dev_events if isinstance(e, ProfilePointEvent)]
+    peaks.append(peak:=max([y for _,y in xy]))
+    return k.replace("LINE:", ""), struct.pack("<BIBQ", 1, len(xy), 1, peak)+b"".join(struct.pack("<IQ", x, y) for x,y in xy)
+  peak, mem = 0, 0
+  temp:dict[int, int] = {}
+  events:list[bytes] = []
+  buf_ei:dict[int, list[ProfilePointEvent]] = {}
+  for st,_,_,e in dev_events:
+    if not isinstance(e, ProfilePointEvent): continue
+    if e.name == "alloc":
+      safe_sz = min(1_000_000_000_000, e.arg["sz"])
+      events.append(struct.pack("<BIIIQ", 1, rel_ts(e.ts, start_ts, f"alloc on {e.device}"), e.key, enum_str(e.arg["dtype"].name, scache), safe_sz))
+      dtype_size.setdefault(e.arg["dtype"].name, e.arg["dtype"].itemsize)
+      temp[e.key] = nbytes = safe_sz*e.arg["dtype"].itemsize
+      mem += nbytes
+      if mem > peak: peak = mem
+    if e.name == "exec" and e.arg["bufs"]:
+      for b in e.arg["bufs"]: buf_ei.setdefault(b, []).append(e)
+    if e.name == "free":
+      events.append(encode_mem_free(e.key, rel_ts(e.ts, start_ts, f"free on {e.device}"), buf_ei.pop(e.key, []), scache))
+      mem -= temp.pop(e.key)
+  for t in temp: events.append(encode_mem_free(t, rel_ts(end_ts, start_ts, f"end_ts for {k}"), buf_ei.pop(t, []), scache))
+  peaks.append(peak)
+  return f"{k} Memory", struct.pack("<BIBQ", 1, len(events), 0, peak)+b"".join(events) if events else None
+
+# by default, VIZ does not start when there is an error
+# use this to instead display the traceback to the user
+@contextmanager
+def soft_err(fn:Callable|None=None):
+  try: yield
+  except Exception:
+    if fn is not None: fn({"src":traceback.format_exc()})
+
+def row_tuple(row:str) -> tuple[tuple[int, int], ...]:
+  return ((0, 0),) if "Clock" in row else tuple((ord(ss[0][0]), int(ss[1])) if len(ss:=x.split(":"))>1 else (999,999) for x in row.split())
+
+# *** Performance counters
+
+metrics:dict[str, Callable[[dict[str, tuple[int, int, int]]], str]] = {
+  "VALU utilization": lambda s: f"{100 * (s['SQ_INSTS_VALU'][0] / s['SQ_INSTS_VALU'][2]) / (s['GRBM_GUI_ACTIVE'][1] * 4):.1f}%",
+  "SALU utilization": lambda s: f"{100 * (s['SQ_INSTS_SALU'][0] / s['SQ_INSTS_SALU'][2]) / (s['GRBM_GUI_ACTIVE'][1] * 4):.1f}%",
+}
+
+def unpack_pmc(e) -> dict:
+  agg_cols = ["Name", "Sum"]
+  rows:list[list] = []
+  stats:dict[str, tuple[int, int, int]] = {}  # name -> (sum, max, count)
+  view, ptr = memoryview(e.blob).cast('Q'), 0
+  for s in e.sched:
+    sample_cols = ["XCC", "INST", "SE", "SA"] + [f"WGP:{i}" for i in range(s.wgp)]
+    row:list = [s.name, 0, {"cols":sample_cols, "rows":[]}]
+    max_val, cnt = 0, 0
+    for sample in itertools.product(range(s.xcc), range(s.inst), range(s.se), range(s.sa)):
+      vals:list[int] = []
+      # pack work group processors on the same se
+      for _ in range(s.wgp):
+        row[1] += (val:=int(view[ptr]))
+        max_val, cnt = max(max_val, val), cnt + 1
+        vals.append(val)
+        ptr += 1
+      row[2]["rows"].append(sample+tuple(vals))
+    stats[s.name] = (row[1], max_val, cnt)
+    rows.append(row)
+  for name, fn in metrics.items():
+    try: rows.append([name, fn(stats)])
+    except KeyError: pass
+  return {"rows":rows, "cols":agg_cols}
+
+# ** on startup, list all the performance counter traces
+
+def load_amd_counters(data:VizData, profile:list) -> None:
+  counter_events:dict[tuple[int, int], dict] = {}
+  durations:dict[bytes|str, list[float]] = {}
+  prg_events:dict[int, ProfileProgramEvent] = {}
+  arch = ""
+  for e in profile:
+    if type(e).__name__ in {"ProfilePMCEvent", "ProfileSQTTEvent"}:
+      counter_events.setdefault((e.kern, e.exec_tag), {}).setdefault(type(e).__name__, []).append(e)
+    if isinstance(e, ProfileRangeEvent) and e.device.startswith("AMD") and e.en is not None and e.profile_key is not None:
+      durations.setdefault(e.profile_key, []).append(float(e.en-e.st))
+    if isinstance(e, ProfileProgramEvent) and e.device.startswith("AMD") and e.tag is not None: prg_events[e.tag] = e
+    if isinstance(e, ProfileDeviceEvent) and e.device.startswith("AMD"): arch = f"gfx{unwrap(e.props)['gfx_target_version']//1000}"
+  if len(counter_events) == 0: return None
+  data.ctxs.append({"name":"All Counters", "steps":[create_step("PMC", ("/all-pmc", len(data.ctxs), 0), (durations, all_counters:={}))]})
+  run_number = {n:0 for n,_ in counter_events}
+  for (k, tag),v in counter_events.items():
+    # use the colored name if it exists
+    name = data.ctxs[r]["ki"].name if (r:=data.ref_map.get(unwrap(prg_events[k].profile_key))) is not None else prg_events[k].name
+    run_number[k] += 1
+    steps:list[dict] = []
+    if (pmc:=v.get("ProfilePMCEvent")):
+      steps.append(create_step("PMC", ("/prg-pmc", len(data.ctxs), len(steps)), pmc[0]))
+      all_counters[(name, run_number[k], unwrap(prg_events[k].profile_key))] = pmc[0]
+    # to decode a SQTT trace, we need the raw stream, program binary and device properties
+    if (sqtt:=v.get("ProfileSQTTEvent")):
+      for e in sqtt:
+        if e.itrace: steps.append(create_step(f"SE:{e.se} PKTS", (f"/sqtt-{e.se}",len(data.ctxs),len(steps)), data=(e.blob,prg_events[k].lib,arch)))
+    data.ctxs.append({"name":f"SQTT {name}"+(f" n{run_number[k]}" if run_number[k] > 1 else ""), "steps":steps})
+
+wave_colors = {**{x:"#1F7857" for x in ["WMMA", "MFMA"]}, **{x:"#ffffc0" for x in ["VALU", "VINTERP"]}, "SALU": "#cef263", "SMEM": "#ffc0c0",
+               "STORE": "#4fa3cc", **{x:"#b2b7c9" for x in ["VMEM", "SGMEM"]}, "LDS": "#9fb4a6", "IMMEDIATE": "#f3b44a", "BARRIER": "#d00000",
+               "JUMP_NO": "#fb8500", "JUMP": "#ffb703", "WAVERDY": "#1a2a2a"}
+
+def sqtt_timeline(data:bytes, lib:bytes, target:str) -> Generator[ProfileEvent, None, None]:
+  from tinygrad.renderer.amd.sqtt import (map_insts, InstructionInfo, PacketType, INST, InstOp, VALUINST, IMMEDIATE, IMMEDIATE_MASK, VMEMEXEC,
+                                          ALUEXEC, INST_RDNA4, InstOpRDNA4, TS_DELTA_OR_MARK, TS_DELTA_OR_MARK_RDNA4, CDNA_INST, InstOpCDNA,
+                                          CDNA_ISSUE, WAVEEND, WAVEEND_RDNA4, CDNA_WAVEEND, WAVERDY)
+  decoded = amd_decode((text:=get_elf_section(lib, ".text")).content, get_arch(target), text.header.sh_addr)
+  pc_map = {addr:str(inst) for addr,inst in decoded.items()}
+  row_ends:dict[str, Decimal] = {}
+  row_counts:dict[str, itertools.count] = {}
+  curr_barrier:dict[tuple[int, int], ProfileRangeEvent] = {}
+  exec_pending:dict[str, list[tuple[str, str]]] = {}
+  dispatch_to_exec = {"WMMA":"VALU", "VALU":"VALU", "VALU1":"VALU", "VALUT":"VALU", "VALUB":"VALU", "VALUINST":"VALU", "VINTERP":"VALU",
+                      "SGMEM":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU", "SMEM":"SALU", "VMEM":"VMEM"}
+  def add(name:str, p:PacketType, wave:int|None=None, info:InstructionInfo|None=None) -> Generator[ProfileEvent, None, None]:
+    row = f"WAVE:{wave}" if (wave:=getattr(p, "wave", wave)) is not None else f"{p.__class__.__name__}:0 {name.replace('_ALT', '')}"
+    if (simd:=getattr(p, "simd", None)) is not None: row += f" SIMD:{simd}"
+    # extend packets to the architectural instruction issue interval
+    start_time, end_time = p._time, p._time+(4 if target.startswith("gfx9") else 1)
+    if isinstance(p, CDNA_WAVEEND): start_time, end_time = start_time+4, end_time+4
+    # exec links to dispatch, dispatch links to PC
+    link:dict|None = {"pc":info.pc} if info else None
+    if isinstance(p, (ALUEXEC, VMEMEXEC)):
+      dispatch_id, op_type = exec_pending[name].pop(0)
+      # wmma exec gets its own color and its own row on rdna4
+      if op_type.startswith("WMMA"):
+        name = name+"_WMMA"
+        if not op_type.startswith("WMMA_VALU"): row = "ALUEXEC:0 WMMA"
+      # transcendental valu gets its own row
+      if op_type.startswith("VALUT"): row = "ALUEXEC:0 TFU"
+      # extend execs by the op type's known duration, p._time marks the first or last cycle based on the op type
+      duration = int(dur_match.group(1)) if (dur_match:=re.match(r".*_(\d+)$", op_type)) else 1
+      if any(ss in row for ss in ("SALU", "TFU", "VMEM", "LDS")): start_time, end_time = p._time, p._time+duration
+      else: start_time, end_time = p._time-duration, p._time
+      link = {"link":dispatch_id}
+    # queue inst dispatches
+    idx = next(row_counts.setdefault(row, itertools.count(0)))
+    if isinstance(p, (VALUINST, INST, INST_RDNA4)) and (exec_type:=dispatch_to_exec.get(name.replace("OTHER_", "").split("_")[0])) is not None:
+      if name.startswith("OTHER_"): exec_type = f"{exec_type}_ALT"
+      # detect rdna3 wmma from the asm, only rdna4 has an op type for it
+      if isinstance(p, VALUINST) and (asm:=getattr(unwrap(info).inst, "op_name", "")).startswith("V_WMMA"):
+        name = f"WMMA_VALU_{16 if 'IU4' in asm else 32}"
+      exec_pending.setdefault(exec_type, []).append((f"{row}-{idx}", name))
+    # construct and yield the event for this packet
+    if row not in row_ends: yield ProfilePointEvent(row, "JSON", "pcMap", pc_map, ts=Decimal(0))
+    yield (e:=ProfileRangeEvent(row, TracingKey(name, ret="JSON"+json.dumps(link) if link else None), Decimal(start_time), Decimal(end_time)))
+    row_ends[row] = unwrap(e.en)
+    if name == "VALU_MAI_MFMA" and info is not None and info.inst.op_name.startswith("V_MFMA_"):
+      from tinygrad.runtime.autogen.amd.cdna.ins import VOP3PX2, VOP3P_MFMA
+      # derive exec from dispatch and inst, CDNA doesn't have ALUEXEC packets
+      ss = info.inst.op_name.removeprefix("V_MFMA_").removeprefix("SCALE_").split("_")
+      duration = max(8, m:=int(ss[1].split("X", 1)[0]))
+      if (m != 4 and (ss[2].endswith("B") or ss[-1] == "F32")) or \
+         (ss[-1] == "F8F6F4" and isinstance(info.inst, (VOP3P_MFMA, VOP3PX2)) and (info.inst.cbsz < 2 or info.inst.blgp < 2)): duration *= 2
+      yield ProfileRangeEvent(f"ALUEXEC:0 MFMA SIMD:{simd}", TracingKey("MFMA", ret="JSON"+json.dumps({"link":f"{row}-{idx}"})),
+                              Decimal(p._time+(mfma_delay:=4)), Decimal(p._time+mfma_delay+duration))
+    # barrier on this wave extends to fill the time it was waiting
+    if wave is not None:
+      if (barrier:=curr_barrier.pop((simd or 0, wave), None)) is not None: barrier.en = Decimal(p._time)
+      if name in {"BARRIER", "BARRIER_SIGNAL"}: curr_barrier[(simd or 0, wave)] = e
+  NS_PER_TICK = 10  # 100MHz
+  prev_pair:tuple[int, int]|None = None # (shader, realtime)
+  yield ProfilePointEvent("", "JSON", "waveColors", list(wave_colors.items()), ts=Decimal(0))
+  for p, info in map_insts(data, lib, target):
+    if isinstance(p, (TS_DELTA_OR_MARK, TS_DELTA_OR_MARK_RDNA4)) and p.is_marker:
+      pair = (p._time, p.delta)
+      if prev_pair is None: prev_pair = pair
+      else:
+        (s0, r0), (s1, r1) = prev_pair, pair
+        freq_hz = (s1 - s0) * 1_000_000_000 // ((r1 - r0) * NS_PER_TICK)
+        yield ProfilePointEvent("LINE:Shader Clock", "freq_hz", freq_hz, ts=Decimal(p._time))
+        prev_pair = pair
+    if isinstance(p, (INST, INST_RDNA4, CDNA_INST)):
+      name = p.op.name if isinstance(p.op, (InstOp, InstOpRDNA4, InstOpCDNA)) else f"0x{p.op:02x}"
+      if name == "VALU_MAI" and unwrap(info).inst.op_name.startswith(("V_MFMA_F", "V_MFMA_I", "V_MFMA_SCALE_")): name += "_MFMA"
+      if isinstance(p, CDNA_INST) and unwrap(info).inst.op_name == "S_BARRIER": name = "BARRIER"
+      yield from add(name, p, info=info)
+    if isinstance(p, (VALUINST, IMMEDIATE, WAVEEND, WAVEEND_RDNA4, CDNA_WAVEEND)): yield from add(p.__class__.__name__, p, info=info)
+    if isinstance(p, (IMMEDIATE_MASK, CDNA_ISSUE)): yield from add("IMMEDIATE", p, wave=unwrap(info).wave, info=info)
+    if isinstance(p, WAVERDY):
+      for wave in range(16):
+        if p.mask & (1 << wave):
+          if (0, wave) in curr_barrier: yield from add("WAVERDY", p, wave=wave)
+    if isinstance(p, (VMEMEXEC, ALUEXEC)):
+      name = str(p.src).split('.')[1]
+      if name == "VALU_SALU":
+        yield from add("VALU", p)
+        yield from add("SALU", p)
+      else:
+        yield from add(name, p)
+
+def device_sort_fn(k:str) -> tuple:
+  special = {"GC": 0, "USER": 1, "TINY": 2, "ALLDEVS":100, "DISK": 999}
+  is_memory = k.endswith(" Memory")
+  p = k.split(" ")[0].split(":")
+  dev_base = p[0] if len(p) < 2 or not p[1].isdigit() else f"{p[0]}:{p[1]}"
+  return (is_memory, special.get(p[0], special['ALLDEVS']), dev_base, k)
+
+def get_profile(data:VizData, profile:list[ProfileEvent], sort_fn:Callable[[str], Any]=device_sort_fn) -> bytes|None:
+  # start by getting the time diffs
+  device_ts_diffs:dict[str, Decimal] = {}
+  device_decoders:dict[str, Callable[[VizData, list[ProfileEvent]], None]] = {}
+  for ev in profile:
+    if isinstance(ev, ProfileDeviceEvent):
+      device_ts_diffs[ev.device] = ev.tdiff
+      if (d:=ev.device.split(":")[0]) == "AMD": device_decoders[d] = load_amd_counters
+      if d == "NV": device_decoders[d] = load_nv_counters
+  # load device specific counters
+  for fxn in device_decoders.values(): fxn(data, profile)
+  # map events per device
+  dev_events:dict[str, list[tuple[int, int, float, DevEvent]]] = {}
+  markers:list[ProfilePointEvent] = []
+  ext_data:dict[str, Any] = {}
+  start_ts:int|None = None
+  end_ts:int|None = None
+  for ts,en,e in flatten_events(profile, device_ts_diffs):
+    if isinstance(e, ProfilePointEvent) and e.name == "JSON": ext_data[e.key] = e.arg
+    else:
+      dev_events.setdefault(e.device,[]).append((st:=int(ts), et:=int(en), float(en-ts), e))
+      if start_ts is None or st < start_ts: start_ts = st
+      if end_ts is None or et > end_ts: end_ts = et
+      if isinstance(e, ProfilePointEvent) and e.name == "marker": markers.append(e)
+  if start_ts is None: return None
+  # return layout of per device events
+  layout:dict[str, bytes|None] = {}
+  scache:dict[str, int] = {}
+  peaks:list[int] = []
+  dtype_size:dict[str, int] = {}
+  with soft_err():
+    for k,v in dev_events.items():
+      v.sort(key=lambda e:e[0])
+      layout[k] = timeline_layout(data, v, start_ts, scache)
+      layout.update([graph_layout(k, v, start_ts, unwrap(end_ts), peaks, dtype_size, scache)])
+  sorted_layout = sorted([k for k,v in layout.items() if v is not None], key=sort_fn)
+  ret = [b"".join([struct.pack("<B", len(k)), k.encode(), unwrap(layout[k])]) for k in sorted_layout]
+  index = json.dumps({"strings":list(scache), "dtypeSize":dtype_size,
+                      "markers":[{"ts":rel_ts(e.ts, start_ts, f"marker '{e.arg.get('name','?')}'"), **e.arg} for e in markers],
+                      **ext_data}).encode()
+  return struct.pack("<IQII", rel_ts(unwrap(end_ts), start_ts, "end_ts"), max(peaks,default=0), len(index), len(ret))+index+b"".join(ret)
+
+# ** PMA counters
+
+def load_nv_counters(data:VizData, profile:list) -> None:
+  steps:list[dict] = []
+  sm_version = {e.device:e.props.get("sm_version", 0x800) for e in profile if isinstance(e, ProfileDeviceEvent) and e.props is not None}
+  run_number:dict[bytes, int] = {}
+  for e in profile:
+    if type(e).__name__ == "ProfilePMAEvent":
+      run_number[profile_key] = run_num = run_number.get(profile_key:=unwrap(e.profile_key), 0)+1
+      steps.append(create_step(f"PMA {e.kern}"+(f"n{run_num}" if run_num>1 else ""), ("/prg-pma-pkts", len(data.ctxs), len(steps)),
+                               data=(e.blob, sm_version[e.device])))
+  if steps: data.ctxs.append({"name":"All Counters", "steps":steps})
+
+def pma_timeline(blob:bytes, sm_version:int) -> list[ProfileEvent]:
+  from extra.nv_pma.decode import decode, decode_tpc_id
+  ret:list[ProfileEvent] = []
+  rows:dict[str, None] = {}
+  tpc_count:dict[int, int] = {}
+  # assume every sample is 32 cycles
+  cycles_per_sample = 32
+  for s, tpc_id in decode(blob, sm_version):
+    if len(ret) > getenv("MAX_SQTT_PKTS", 50_000): break
+    gpc, tpc, sm = decode_tpc_id(tpc_id)
+    tpc_count[tpc_id] = (n:=tpc_count.get(tpc_id,0)) + 1
+    rows.setdefault(row:=f"GPC:{gpc} TPC:{tpc} SM:{sm} WAVE:{s.wave_id}")
+    ret.append(ProfileRangeEvent(row, TracingKey(s.stall_reason.name, ret=f"pc=0x{s.pc_offset:06x} active={s.active}"),
+                                 Decimal(n*cycles_per_sample), Decimal((n+1)*cycles_per_sample)))
+  return [ProfilePointEvent(r, "start", r, ts=Decimal(0)) for r in rows]+ret
+
+# ** Assembly static analyzers
+
+def get_stdout(f: Callable) -> str:
+  buf = io.StringIO()
+  try:
+    with redirect_stdout(buf), redirect_stderr(buf): f()
+  except Exception: traceback.print_exc(file=buf)
+  return buf.getvalue()
+
+def get_elf_section(lib:bytes, name:str):
+  from tinygrad.runtime.support.elf import elf_loader
+  return next((sh for sh in elf_loader(lib)[1] if sh.name == name))
+
+def get_arch(target:str) -> str: return "rdna3" if target.startswith("gfx11") else "rdna4" if target.startswith("gfx12") else "cdna"
+
+def amd_decode(buf:bytes, arch:str, off:int=0) -> dict[int, Inst]:
+  from tinygrad.runtime.autogen.amd.rdna3.ins import s_code_end
+  code_end = s_code_end().to_bytes()*5 if arch.startswith("rdna") else None
+  addr_table:dict[int, Inst] = {}
+  offset = 0
+  while offset < len(buf):
+    remaining = buf[offset:]
+    if code_end is not None and remaining.startswith(code_end): break
+    fmt = detect_format(remaining, arch)
+    decoded = fmt.from_bytes(remaining)
+    addr_table[off+offset] = decoded
+    offset += decoded.size()
+  return addr_table
+
+def parse_branch(inst) -> int|None:
+  if "branch" in getattr(inst, "op_name", "").lower():
+    x = inst.simm16 & 0xffff
+    return (x - 0x10000 if x & 0x8000 else x)*4
+  return None
+
+def is_acc_operand(inst, name:str) -> bool:
+  if not isinstance(val:=getattr(inst, name), Reg) or not 256 <= val.offset < 512: return False
+  if (opr:=inst.operands.get(name)) and opr[2] in {OpType.OPR_ACCVGPR, OpType.OPR_SRC_ACCVGPR}: return True
+  if not hasattr(inst, 'acc'): return False
+  if hasattr(inst, 'acc_cd'):
+    if name in ('src0', 'src1'): return bool(inst.acc & (1 << int(name[-1])))
+    return bool(inst.acc_cd) and (name == 'vdst' or (name == 'src2' and 'SMFMAC' not in inst.op_name))
+  return bool(inst.acc) and name in ('vdst', 'vdata', 'data')
+
+COND_TAKEN, COND_NOT_TAKEN, UNCOND = range(3)
+def get_cfg(pc_table:dict[int, Inst]) -> dict:
+  # get leaders
+  leaders:set[int] = {next(iter(pc_table))}
+  for pc, inst in pc_table.items():
+    if (offset:=parse_branch(inst)) is not None: leaders.update((pc+inst.size()+offset, pc+inst.size()))
+  # build the cfg
+  curr:int|None = None
+  blocks:dict[int, list[int]] = {}
+  paths:dict[int, dict[int, int]] = {}
+  for pc, inst in pc_table.items():
+    if pc in leaders:
+      paths[curr:=pc] = {}
+      blocks[pc] = []
+    else: assert curr is not None, f"no basic block found for {pc}"
+    blocks[curr].append(pc)
+    # otherwise a basic block can have exactly one or two paths
+    nx = pc+inst.size()
+    if (offset:=parse_branch(inst)) is not None:
+      if inst.op_name == "S_BRANCH": paths[curr][nx+offset] = UNCOND
+      else: paths[curr].update([(nx+offset, COND_TAKEN), (nx, COND_NOT_TAKEN)])
+    elif nx in leaders: paths[curr][nx] = UNCOND
+  pc_tokens:dict[int, list[dict]] = {}
+  for pc, inst in pc_table.items():
+    pc_tokens[pc] = tokens = []
+    for name, f in inst._fields:
+      if isinstance(val:=getattr(inst, name), Reg):
+        if inst.operands and name not in inst.operands: continue
+        reg_str = val.fmt().replace("v", "a", 1) if (is_acc:=is_acc_operand(inst, name)) else val.fmt()
+        tokens.append({"st":reg_str, "keys":[f"{'a' if is_acc else 'r'}{val.offset+i}" for i in range(val.sz)], "kind":1})
+      elif name in {"op","opx","opy"}: tokens.append({"st":(op_name:=val.name.lower()), "keys":[op_name], "kind":0})
+      elif name != "encoding" and val != f.default:
+        tokens.append({"st":repr(val - (1 << 32) if name == "literal" and val >= (1 << 31) else val), "keys":[repr(val)], "kind":1})
+  lines:list[str] = []
+  disasm = {pc:str(inst) for pc,inst in pc_table.items()}
+  asm_width = max(len(asm) for asm in disasm.values())
+  for pcs in blocks.values():
+    for pc in pcs: lines.append(f"{disasm[pc]:<{asm_width}}  # {pc:012X}")
+  return {"data":{"blocks":blocks, "paths":paths, "pc_tokens":pc_tokens}, "src":"\n".join(lines), "lang":"python"}
+
+# ** Main render function to get the complete details about a trace event
+
+def get_render(viz_data:VizData, query:str, **kwargs) -> dict:
+  url = urlparse(query)
+  i, j, fmt = get_int(qs:=parse_qs(url.query), "ctx"), get_int(qs, "step"), url.path.lstrip("/")
+  data = viz_data.ctxs[i]["steps"][j]["_data"]
+  if fmt == "graph-rewrites": return {"value":get_full_rewrite(viz_data, viz_data.trace.rewrites[i][j], **kwargs), "content_type":"text/event-stream"}
+  if fmt == "input-uops":
+    sink = unwrap(_reconstruct(viz_data, viz_data.trace.rewrites[i][data].sink))
+    return {"src":render_ssa(list(sink.toposort()))}
+  if fmt == "uops":
+    if (sink:=get_sink_at(("do_linearize",), viz_data, i, data, alt="View Program")) is None: return {"src":"No linear found"}
+    return {"src":sink.arg} if sink.op is Ops.REWRITE_ERROR else {"src":render_ssa(list(unwrap(sink).src[1].src))}
+  if fmt == "code":
+    if (sink:=get_sink_at(("do_render",), viz_data, i, data, depth=1, alt="View Program")) is None: return {"src":"No source found"}
+    return {"src":sink.arg} if sink.op is Ops.REWRITE_ERROR else {"src":sink.src[2].arg, "lang":"cpp"}
+  if fmt == "asm":
+    ret:dict = {}
+    renderer, idx = data
+    if (sink:=get_sink_at(("do_compile","do_assemble"), viz_data, i, idx, depth=1, alt="View Program")) is None: return {"src":"No binary found"}
+    if sink.op is Ops.REWRITE_ERROR: return {"src":sink.arg}
+    lib:bytes = sink.src[3].arg
+    if (target:=renderer.target.arch).startswith("gfx"):
+      with soft_err(lambda err: ret.update(err)):
+        ret.update(get_cfg(amd_decode((text:=get_elf_section(lib, ".text")).content, get_arch(target), text.header.sh_addr)))
+      with soft_err(lambda err: ret.update(err)):
+        from tinygrad.runtime.autogen import amdgpu_kd
+        kd = amdgpu_kd.llvm_amdhsa_kernel_descriptor_t.from_buffer_copy(bytearray(get_elf_section(lib, ".rodata").content))
+        vgpr_gran = kd.compute_pgm_rsrc1 & amdgpu_kd.COMPUTE_PGM_RSRC1_GRANULATED_WORKITEM_VGPR_COUNT
+        ret["metadata"] = [[{"label":f"{r} Alloc", "value":v} for r,v in [("VGPR", (vgpr_gran+1)*8-7), ("LDS", kd.group_segment_fixed_size),
+                                                                          ("Scratch", kd.private_segment_fixed_size)] if v>0]]
+    else: ret["src"] = get_stdout(lambda: renderer.compiler.disassemble(lib))
+    return ret
+  if fmt == "all-pmc":
+    durations, pmc = data
+    ret = {"cols":{}, "rows":[]}
+    for (name, n, k),events in pmc.items():
+      pmc_table = unpack_pmc(events)
+      ret["cols"].update([(r[0], None) for r in pmc_table["rows"]])
+      ret["rows"].append((name, durations[k][n-1], *[r[1] for r in pmc_table["rows"]]))
+    ret["cols"] = ["Kernel", "Duration", *ret["cols"]]
+    return ret
+  if fmt == "prg-pmc": return unpack_pmc(data)
+  if fmt.startswith("sqtt"):
+    ret = {}
+    with soft_err(lambda err:ret.update(err)):
+      if (events:=get_profile(viz_data, list(itertools.islice(sqtt_timeline(*data), None if (max_pkts:=getenv("MAX_SQTT_PKTS", 50_000)) == -1
+                                                              else max_pkts)), sort_fn=row_tuple)):
+        ret = {"value":events, "content_type":"application/octet-stream"}
+      else: ret = {"src":"No SQTT trace on this SE."}
+    return ret
+  if fmt == "prg-pma-pkts":
+    ret = {}
+    with soft_err(lambda err:ret.update(err)):
+      if (events:=get_profile(viz_data, pma_timeline(*data), sort_fn=row_tuple)): ret = {"value":events, "content_type":"application/octet-stream"}
+      else: ret = {"src":"No PMA samples found."}
+    return ret
+  return data
+
+# ** HTTP server
+
+def get_int(query:dict[str, list[str]], k:str) -> int: return int(query.get(k,["0"])[0])
+
+def filter_keys(data:dict) -> dict: return {k:v for k,v in data.items() if not k.startswith("_")}
+
+class Handler(HTTPRequestHandler):
+  def do_GET(self):
+    ret, status_code, content_type = b"", 200, "text/html"
+
+    if (url:=urlparse(self.path)).path == "/":
+      with open(os.path.join(os.path.dirname(__file__), "index.html"), "rb") as f: ret = f.read()
+    elif self.path.startswith(("/assets/", "/js/")) and '/..' not in self.path:
+      try:
+        with open(os.path.join(os.path.dirname(__file__), self.path.strip('/')), "rb") as f: ret = f.read()
+        if url.path.endswith(".js"): content_type = "application/javascript"
+        if url.path.endswith(".css"): content_type = "text/css"
+      except FileNotFoundError: status_code = 404
+
+    elif url.path == "/ctxs":
+      lst = [{"name":c["name"], "steps":[filter_keys(s) for s in c["steps"]]} for c in data.ctxs]
+      ret, content_type = json.dumps(lst).encode(), "application/json"
+    elif url.path == "/get_profile" and profile_ret: ret, content_type = profile_ret, "application/octet-stream"
+    else:
+      if not (render_src:=get_render(data, self.path)): status_code = 404
+      else:
+        if "content_type" in render_src: ret, content_type = render_src["value"], render_src["content_type"]
+        else: ret, content_type = json.dumps(render_src).encode(), "application/json"
+        if content_type == "text/event-stream": return self.stream_json(render_src["value"])
+
+    return self.send_data(ret, content_type, status_code)
+
+# ** main loop
+
+def reloader():
+  mtime = os.stat(__file__).st_mtime
+  while not stop_reloader.is_set():
+    if mtime != os.stat(__file__).st_mtime:
+      print("reloading server...")
+      os.execv(sys.executable, [sys.executable] + sys.argv)
+    time.sleep(0.1)
+
+T = TypeVar("T")
+# unpickling may load libraries, turn off DEBUG=3 output
+@Context(DEBUG=0)
+def load_pickle(path:str, default:T) -> T:
+  if not os.path.exists(path): return default
+  with open(path, "rb") as f: return pickle.load(f)
+
+if __name__ == "__main__":
+  parser = argparse.ArgumentParser()
+  parser.add_argument('--rewrites-path', type=str, help='Path to rewrites', default=temp("rewrites.pkl", append_user=True))
+  parser.add_argument('--profile-path', type=str, help='Path to profile', default=temp("profile.pkl", append_user=True))
+  args = parser.parse_args()
+
+  with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    if s.connect_ex(((HOST:="http://127.0.0.1").replace("http://", ""), PORT:=getenv("PORT", 8000))) == 0:
+      raise RuntimeError(f"{HOST}:{PORT} is occupied! use PORT= to change.")
+  stop_reloader = threading.Event()
+  multiprocessing.current_process().name = "VizProcess"
+  Context(ALLOW_DEVICE_USAGE=0).__enter__()                # disallow opening of devices
+  st = time.perf_counter()
+  print("*** viz is starting")
+
+  data = VizData(load_pickle(args.rewrites_path, default=RewriteTrace([], [], {})))
+  load_rewrites(data)
+  profile_ret = get_profile(data, load_pickle(args.profile_path, default=[]))
+
+  server = TCPServerWithReuse(('', PORT), Handler)
+  reloader_thread = threading.Thread(target=reloader)
+  reloader_thread.start()
+  print(colored(f"*** ready in {(time.perf_counter()-st)*1e3:4.2f}ms", "green"), flush=True)
+  try: server.serve_forever()
+  except KeyboardInterrupt:
+    print("*** viz is shutting down...")
+    stop_reloader.set()
+
+"""
+A much shorter version of train.py for benchmarking
+"""
+import os
+from contextlib import nullcontext
+import numpy as np
+import time
+import torch
+from model import GPTConfig, GPT
+
+# -----------------------------------------------------------------------------
+batch_size = 12
+block_size = 1024
+bias = False
+real_data = True
+seed = 1337
+device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
+compile = True # use PyTorch 2.0 to compile the model to be faster
+profile = False # use pytorch profiler, or just simple benchmarking?
+exec(open('configurator.py').read()) # overrides from command line or config file
+# -----------------------------------------------------------------------------
+
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+# data loading init
+if real_data:
+    dataset = 'openwebtext'
+    data_dir = os.path.join('data', dataset)
+    train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    def get_batch(split):
+        data = train_data # note ignore split in benchmarking script
+        ix = torch.randint(len(data) - block_size, (batch_size,))
+        x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        return x, y
+else:
+    # alternatively, if fixed data is desired to not care about data loading
+    x = torch.randint(50304, (batch_size, block_size), device=device)
+    y = torch.randint(50304, (batch_size, block_size), device=device)
+    get_batch = lambda split: (x, y)
+
+# model init
+gptconf = GPTConfig(
+    block_size = block_size, # how far back does the model look? i.e. context size
+    n_layer = 12, n_head = 12, n_embd = 768, # size of the model
+    dropout = 0, # for determinism
+    bias = bias,
+)
+model = GPT(gptconf)
+model.to(device)
+
+optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
+
+if compile:
+    print("Compiling model...")
+    model = torch.compile(model) # pytorch 2.0
+
+if profile:
+    # useful docs on pytorch profiler:
+    # - tutorial https://pytorch.org/tutorials/intermediate/tensorboard_profiler_tutorial.html
+    # - api https://pytorch.org/docs/stable/profiler.html#torch.profiler.profile
+    wait, warmup, active = 5, 5, 5
+    num_steps = wait + warmup + active
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./bench_log'),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False, # incurs an additional overhead, disable if not needed
+        with_flops=True,
+        with_modules=False, # only for torchscript models atm
+    ) as prof:
+
+        X, Y = get_batch('train')
+        for k in range(num_steps):
+            with ctx:
+                logits, loss = model(X, Y)
+            X, Y = get_batch('train')
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            lossf = loss.item()
+            print(f"{k}/{num_steps} loss: {lossf:.4f}")
+
+            prof.step() # notify the profiler at end of each step
+
+else:
+
+    # simple benchmarking
+    torch.cuda.synchronize()
+    for stage, num_steps in enumerate([10, 20]): # burnin, then benchmark
+        t0 = time.time()
+        X, Y = get_batch('train')
+        for k in range(num_steps):
+            with ctx:
+                logits, loss = model(X, Y)
+            X, Y = get_batch('train')
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            lossf = loss.item()
+            print(f"{k}/{num_steps} loss: {lossf:.4f}")
+        torch.cuda.synchronize()
+        t1 = time.time()
+        dt = t1-t0
+        mfu = model.estimate_mfu(batch_size * 1 * num_steps, dt)
+        if stage == 1:
+            print(f"time per iteration: {dt/num_steps*1000:.4f}ms, MFU: {mfu*100:.2f}%")
+
+"""
+Poor Man's Configurator. Probably a terrible idea. Example usage:
+$ python train.py config/override_file.py --batch_size=32
+this will first run config/override_file.py, then override batch_size to 32
+
+The code in this file will be run as follows from e.g. train.py:
+>>> exec(open('configurator.py').read())
+
+So it's not a Python module, it's just shuttling this code away from train.py
+The code in this script then overrides the globals()
+
+I know people are not going to love this, I just really dislike configuration
+complexity and having to prepend config. to every single variable. If someone
+comes up with a better simple Python solution I am all ears.
+"""
+
+import sys
+from ast import literal_eval
+
+for arg in sys.argv[1:]:
+    if '=' not in arg:
+        # assume it's the name of a config file
+        assert not arg.startswith('--')
+        config_file = arg
+        print(f"Overriding config with {config_file}:")
+        with open(config_file) as f:
+            print(f.read())
+        exec(open(config_file).read())
+    else:
+        # assume it's a --key=value argument
+        assert arg.startswith('--')
+        key, val = arg.split('=')
+        key = key[2:]
+        if key in globals():
+            try:
+                # attempt to eval it it (e.g. if bool, number, or etc)
+                attempt = literal_eval(val)
+            except (SyntaxError, ValueError):
+                # if that goes wrong, just use the string
+                attempt = val
+            # ensure the types match ok
+            assert type(attempt) == type(globals()[key])
+            # cross fingers
+            print(f"Overriding: {key} = {attempt}")
+            globals()[key] = attempt
+        else:
+            raise ValueError(f"Unknown config key: {key}")
+
+"""
+Full definition of a GPT Language Model, all of it in this single file.
+References:
+1) the official GPT-2 TensorFlow implementation released by OpenAI:
+https://github.com/openai/gpt-2/blob/master/src/model.py
+2) huggingface/transformers PyTorch implementation:
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+"""
+
+import math
+import inspect
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+class LayerNorm(nn.Module):
+    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+
+    def __init__(self, ndim, bias):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+
+    def forward(self, input):
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu    = nn.GELU()
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
+class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+class GPT(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # with weight tying when using torch.compile() some warnings get generated:
+        # "UserWarning: functional_call was passed multiple values for tied weights.
+        # This behavior is deprecated and will be an error in future versions"
+        # not 100% sure what this is, so far seems to be harmless. TODO investigate
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+
+        # report number of parameters
+        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def get_num_params(self, non_embedding=True):
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
+        return n_params
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            loss = None
+
+        return logits, loss
+
+    def crop_block_size(self, block_size):
+        # model surgery to decrease the block size if necessary
+        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+        # but want to use a smaller block size for some smaller, simpler model
+        assert block_size <= self.config.block_size
+        self.config.block_size = block_size
+        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        for block in self.transformer.h:
+            if hasattr(block.attn, 'bias'):
+                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+
+    @classmethod
+    def from_pretrained(cls, model_type, override_args=None):
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        override_args = override_args or {} # default to empty dict
+        # only dropout can be overridden see more notes below
+        assert all(k == 'dropout' for k in override_args)
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained gpt: %s" % model_type)
+
+        # n_layer, n_head and n_embd are determined from model_type
+        config_args = {
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+        }[model_type]
+        print("forcing vocab_size=50257, block_size=1024, bias=True")
+        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        config_args['bias'] = True # always True for GPT model checkpoints
+        # we can override the dropout rate, if desired
+        if 'dropout' in override_args:
+            print(f"overriding dropout rate to {override_args['dropout']}")
+            config_args['dropout'] = override_args['dropout']
+        # create a from-scratch initialized minGPT model
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+
+        # init a huggingface/transformers model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
+        return model
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
+        # first estimate the number of flops we do per iteration.
+        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+        N = self.get_num_params()
+        cfg = self.config
+        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
+        flops_per_token = 6*N + 12*L*H*Q*T
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        # express our flops throughput as ratio of A100 bfloat16 peak flops
+        flops_achieved = flops_per_iter * (1.0/dt) # per second
+        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        mfu = flops_achieved / flops_promised
+        return mfu
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
+
+# nanoGPT
+
+![nanoGPT](assets/nanogpt.jpg)
+
+
+---
+
+**Update Nov 2025** nanoGPT has a new and improved cousin called [nanochat](https://github.com/karpathy/nanochat). It is very likely you meant to use/find nanochat instead. nanoGPT (this repo) is now very old and deprecated but I will leave it up for posterity.
+
+---
+
+The simplest, fastest repository for training/finetuning medium-sized GPTs. It is a rewrite of [minGPT](https://github.com/karpathy/minGPT) that prioritizes teeth over education. Still under active development, but currently the file `train.py` reproduces GPT-2 (124M) on OpenWebText, running on a single 8XA100 40GB node in about 4 days of training. The code itself is plain and readable: `train.py` is a ~300-line boilerplate training loop and `model.py` a ~300-line GPT model definition, which can optionally load the GPT-2 weights from OpenAI. That's it.
+
+![repro124m](assets/gpt2_124M_loss.png)
+
+Because the code is so simple, it is very easy to hack to your needs, train new models from scratch, or finetune pretrained checkpoints (e.g. biggest one currently available as a starting point would be the GPT-2 1.3B model from OpenAI).
+
+## install
+
+```
+pip install torch numpy transformers datasets tiktoken wandb tqdm
+```
+
+Dependencies:
+
+- [pytorch](https://pytorch.org) <3
+- [numpy](https://numpy.org/install/) <3
+-  `transformers` for huggingface transformers <3 (to load GPT-2 checkpoints)
+-  `datasets` for huggingface datasets <3 (if you want to download + preprocess OpenWebText)
+-  `tiktoken` for OpenAI's fast BPE code <3
+-  `wandb` for optional logging <3
+-  `tqdm` for progress bars <3
+
+## quick start
+
+If you are not a deep learning professional and you just want to feel the magic and get your feet wet, the fastest way to get started is to train a character-level GPT on the works of Shakespeare. First, we download it as a single (1MB) file and turn it from raw text into one large stream of integers:
+
+```sh
+python data/shakespeare_char/prepare.py
+```
+
+This creates a `train.bin` and `val.bin` in that data directory. Now it is time to train your GPT. The size of it very much depends on the computational resources of your system:
+
+**I have a GPU**. Great, we can quickly train a baby GPT with the settings provided in the [config/train_shakespeare_char.py](config/train_shakespeare_char.py) config file:
+
+```sh
+python train.py config/train_shakespeare_char.py
+```
+
+If you peek inside it, you'll see that we're training a GPT with a context size of up to 256 characters, 384 feature channels, and it is a 6-layer Transformer with 6 heads in each layer. On one A100 GPU this training run takes about 3 minutes and the best validation loss is 1.4697. Based on the configuration, the model checkpoints are being written into the `--out_dir` directory `out-shakespeare-char`. So once the training finishes we can sample from the best model by pointing the sampling script at this directory:
+
+```sh
+python sample.py --out_dir=out-shakespeare-char
+```
+
+This generates a few samples, for example:
+
+```
+ANGELO:
+And cowards it be strawn to my bed,
+And thrust the gates of my threats,
+Because he that ale away, and hang'd
+An one with him.
+
+DUKE VINCENTIO:
+I thank your eyes against it.
+
+DUKE VINCENTIO:
+Then will answer him to save the malm:
+And what have you tyrannous shall do this?
+
+DUKE VINCENTIO:
+If you have done evils of all disposition
+To end his power, the day of thrust for a common men
+That I leave, to fight with over-liking
+Hasting in a roseman.
+```
+
+lol  `¯\_(ツ)_/¯`. Not bad for a character-level model after 3 minutes of training on a GPU. Better results are quite likely obtainable by instead finetuning a pretrained GPT-2 model on this dataset (see finetuning section later).
+
+**I only have a macbook** (or other cheap computer). No worries, we can still train a GPT but we want to dial things down a notch. I recommend getting the bleeding edge PyTorch nightly ([select it here](https://pytorch.org/get-started/locally/) when installing) as it is currently quite likely to make your code more efficient. But even without it, a simple train run could look as follows:
+
+```sh
+python train.py config/train_shakespeare_char.py --device=cpu --compile=False --eval_iters=20 --log_interval=1 --block_size=64 --batch_size=12 --n_layer=4 --n_head=4 --n_embd=128 --max_iters=2000 --lr_decay_iters=2000 --dropout=0.0
+```
+
+Here, since we are running on CPU instead of GPU we must set both `--device=cpu` and also turn off PyTorch 2.0 compile with `--compile=False`. Then when we evaluate we get a bit more noisy but faster estimate (`--eval_iters=20`, down from 200), our context size is only 64 characters instead of 256, and the batch size only 12 examples per iteration, not 64. We'll also use a much smaller Transformer (4 layers, 4 heads, 128 embedding size), and decrease the number of iterations to 2000 (and correspondingly usually decay the learning rate to around max_iters with `--lr_decay_iters`). Because our network is so small we also ease down on regularization (`--dropout=0.0`). This still runs in about ~3 minutes, but gets us a loss of only 1.88 and therefore also worse samples, but it's still good fun:
+
+```sh
+python sample.py --out_dir=out-shakespeare-char --device=cpu
+```
+Generates samples like this:
+
+```
+GLEORKEN VINGHARD III:
+Whell's the couse, the came light gacks,
+And the for mought you in Aut fries the not high shee
+bot thou the sought bechive in that to doth groan you,
+No relving thee post mose the wear
+```
+
+Not bad for ~3 minutes on a CPU, for a hint of the right character gestalt. If you're willing to wait longer, feel free to tune the hyperparameters, increase the size of the network, the context length (`--block_size`), the length of training, etc.
+
+Finally, on Apple Silicon Macbooks and with a recent PyTorch version make sure to add `--device=mps` (short for "Metal Performance Shaders"); PyTorch then uses the on-chip GPU that can *significantly* accelerate training (2-3X) and allow you to use larger networks. See [Issue 28](https://github.com/karpathy/nanoGPT/issues/28) for more.
+
+## reproducing GPT-2
+
+A more serious deep learning professional may be more interested in reproducing GPT-2 results. So here we go - we first tokenize the dataset, in this case the [OpenWebText](https://openwebtext2.readthedocs.io/en/latest/), an open reproduction of OpenAI's (private) WebText:
+
+```sh
+python data/openwebtext/prepare.py
+```
+
+This downloads and tokenizes the [OpenWebText](https://huggingface.co/datasets/openwebtext) dataset. It will create a `train.bin` and `val.bin` which holds the GPT2 BPE token ids in one sequence, stored as raw uint16 bytes. Then we're ready to kick off training. To reproduce GPT-2 (124M) you'll want at least an 8X A100 40GB node and run:
+
+```sh
+torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py
+```
+
+This will run for about 4 days using PyTorch Distributed Data Parallel (DDP) and go down to loss of ~2.85. Now, a GPT-2 model just evaluated on OWT gets a val loss of about 3.11, but if you finetune it it will come down to ~2.85 territory (due to an apparent domain gap), making the two models ~match.
+
+If you're in a cluster environment and you are blessed with multiple GPU nodes you can make GPU go brrrr e.g. across 2 nodes like:
+
+```sh
+# Run on the first (master) node with example IP 123.456.123.456:
+torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
+# Run on the worker node:
+torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
+```
+
+It is a good idea to benchmark your interconnect (e.g. iperf3). In particular, if you don't have Infiniband then also prepend `NCCL_IB_DISABLE=1` to the above launches. Your multinode training will work, but most likely _crawl_. By default checkpoints are periodically written to the `--out_dir`. We can sample from the model by simply `python sample.py`.
+
+Finally, to train on a single GPU simply run the `python train.py` script. Have a look at all of its args, the script tries to be very readable, hackable and transparent. You'll most likely want to tune a number of those variables depending on your needs.
+
+## baselines
+
+OpenAI GPT-2 checkpoints allow us to get some baselines in place for openwebtext. We can get the numbers as follows:
+
+```sh
+$ python train.py config/eval_gpt2.py
+$ python train.py config/eval_gpt2_medium.py
+$ python train.py config/eval_gpt2_large.py
+$ python train.py config/eval_gpt2_xl.py
+```
+
+and observe the following losses on train and val:
+
+| model | params | train loss | val loss |
+| ------| ------ | ---------- | -------- |
+| gpt2 | 124M         | 3.11  | 3.12     |
+| gpt2-medium | 350M  | 2.85  | 2.84     |
+| gpt2-large | 774M   | 2.66  | 2.67     |
+| gpt2-xl | 1558M     | 2.56  | 2.54     |
+
+However, we have to note that GPT-2 was trained on (closed, never released) WebText, while OpenWebText is just a best-effort open reproduction of this dataset. This means there is a dataset domain gap. Indeed, taking the GPT-2 (124M) checkpoint and finetuning on OWT directly for a while reaches loss down to ~2.85. This then becomes the more appropriate baseline w.r.t. reproduction.
+
+## finetuning
+
+Finetuning is no different than training, we just make sure to initialize from a pretrained model and train with a smaller learning rate. For an example of how to finetune a GPT on new text go to `data/shakespeare` and run `prepare.py` to download the tiny shakespeare dataset and render it into a `train.bin` and `val.bin`, using the OpenAI BPE tokenizer from GPT-2. Unlike OpenWebText this will run in seconds. Finetuning can take very little time, e.g. on a single GPU just a few minutes. Run an example finetuning like:
+
+```sh
+python train.py config/finetune_shakespeare.py
+```
+
+This will load the config parameter overrides in `config/finetune_shakespeare.py` (I didn't tune them much though). Basically, we initialize from a GPT2 checkpoint with `init_from` and train as normal, except shorter and with a small learning rate. If you're running out of memory try decreasing the model size (they are `{'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}`) or possibly decreasing the `block_size` (context length). The best checkpoint (lowest validation loss) will be in the `out_dir` directory, e.g. in `out-shakespeare` by default, per the config file. You can then run the code in `sample.py --out_dir=out-shakespeare`:
+
+```
+THEODORE:
+Thou shalt sell me to the highest bidder: if I die,
+I sell thee to the first; if I go mad,
+I sell thee to the second; if I
+lie, I sell thee to the third; if I slay,
+I sell thee to the fourth: so buy or sell,
+I tell thee again, thou shalt not sell my
+possession.
+
+JULIET:
+And if thou steal, thou shalt not sell thyself.
+
+THEODORE:
+I do not steal; I sell the stolen goods.
+
+THEODORE:
+Thou know'st not what thou sell'st; thou, a woman,
+Thou art ever a victim, a thing of no worth:
+Thou hast no right, no right, but to be sold.
+```
+
+Whoa there, GPT, entering some dark place over there. I didn't really tune the hyperparameters in the config too much, feel free to try!
+
+## sampling / inference
+
+Use the script `sample.py` to sample either from pre-trained GPT-2 models released by OpenAI, or from a model you trained yourself. For example, here is a way to sample from the largest available `gpt2-xl` model:
+
+```sh
+python sample.py \
+    --init_from=gpt2-xl \
+    --start="What is the answer to life, the universe, and everything?" \
+    --num_samples=5 --max_new_tokens=100
+```
+
+If you'd like to sample from a model you trained, use the `--out_dir` to point the code appropriately. You can also prompt the model with some text from a file, e.g. ```python sample.py --start=FILE:prompt.txt```.
+
+## efficiency notes
+
+For simple model benchmarking and profiling, `bench.py` might be useful. It's identical to what happens in the meat of the training loop of `train.py`, but omits much of the other complexities.
+
+Note that the code by default uses [PyTorch 2.0](https://pytorch.org/get-started/pytorch-2.0/). At the time of writing (Dec 29, 2022) this makes `torch.compile()` available in the nightly release. The improvement from the one line of code is noticeable, e.g. cutting down iteration time from ~250ms / iter to 135ms / iter. Nice work PyTorch team!
+
+## todos
+
+- Investigate and add FSDP instead of DDP
+- Eval zero-shot perplexities on standard evals (e.g. LAMBADA? HELM? etc.)
+- Finetune the finetuning script, I think the hyperparams are not great
+- Schedule for linear batch size increase during training
+- Incorporate other embeddings (rotary, alibi)
+- Separate out the optim buffers from model params in checkpoints I think
+- Additional logging around network health (e.g. gradient clip events, magnitudes)
+- Few more investigations around better init etc.
+
+## troubleshooting
+
+Note that by default this repo uses PyTorch 2.0 (i.e. `torch.compile`). This is fairly new and experimental, and not yet available on all platforms (e.g. Windows). If you're running into related error messages try to disable this by adding `--compile=False` flag. This will slow down the code but at least it will run.
+
+For some context on this repository, GPT, and language modeling it might be helpful to watch my [Zero To Hero series](https://karpathy.ai/zero-to-hero.html). Specifically, the [GPT video](https://www.youtube.com/watch?v=kCc8FmEb1nY) is popular if you have some prior language modeling context.
+
+For more questions/discussions feel free to stop by **#nanoGPT** on Discord:
+
+[![](https://dcbadge.vercel.app/api/server/3zy8kqD9Cp?compact=true&style=flat)](https://discord.gg/3zy8kqD9Cp)
+
+## acknowledgements
+
+All nanoGPT experiments are powered by GPUs on [Lambda labs](https://lambdalabs.com), my favorite Cloud GPU provider. Thank you Lambda labs for sponsoring nanoGPT!
+
+"""
+Sample from a trained model
+"""
+import os
+import pickle
+from contextlib import nullcontext
+import torch
+import tiktoken
+from model import GPTConfig, GPT
+
+# -----------------------------------------------------------------------------
+init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
+out_dir = 'out' # ignored if init_from is not 'resume'
+start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+num_samples = 10 # number of samples to draw
+max_new_tokens = 500 # number of tokens generated in each sample
+temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
+top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
+seed = 1337
+device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
+compile = False # use PyTorch 2.0 to compile the model to be faster
+exec(open('configurator.py').read()) # overrides from command line or config file
+# -----------------------------------------------------------------------------
+
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+# model
+if init_from == 'resume':
+    # init from a model saved in a specific directory
+    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    gptconf = GPTConfig(**checkpoint['model_args'])
+    model = GPT(gptconf)
+    state_dict = checkpoint['model']
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+elif init_from.startswith('gpt2'):
+    # init from a given GPT-2 model
+    model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+
+model.eval()
+model.to(device)
+if compile:
+    model = torch.compile(model) # requires PyTorch 2.0 (optional)
+
+# look for the meta pickle in case it is available in the dataset folder
+load_meta = False
+if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
+    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
+    load_meta = os.path.exists(meta_path)
+if load_meta:
+    print(f"Loading meta from {meta_path}...")
+    with open(meta_path, 'rb') as f:
+        meta = pickle.load(f)
+    # TODO want to make this more general to arbitrary encoder/decoder schemes
+    stoi, itos = meta['stoi'], meta['itos']
+    encode = lambda s: [stoi[c] for c in s]
+    decode = lambda l: ''.join([itos[i] for i in l])
+else:
+    # ok let's assume gpt-2 encodings by default
+    print("No meta.pkl found, assuming GPT-2 encodings...")
+    enc = tiktoken.get_encoding("gpt2")
+    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+    decode = lambda l: enc.decode(l)
+
+# encode the beginning of the prompt
+if start.startswith('FILE:'):
+    with open(start[5:], 'r', encoding='utf-8') as f:
+        start = f.read()
+start_ids = encode(start)
+x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+
+# run generation
+with torch.no_grad():
+    with ctx:
+        for k in range(num_samples):
+            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            print(decode(y[0].tolist()))
+            print('---------------')
+
+"""
+This training script can be run both on a single gpu in debug mode,
+and also in a larger training run with distributed data parallel (ddp).
+
+To run on a single GPU, example:
+$ python train.py --batch_size=32 --compile=False
+
+To run with DDP on 4 gpus on 1 node, example:
+$ torchrun --standalone --nproc_per_node=4 train.py
+
+To run with DDP on 4 gpus across 2 nodes, example:
+- Run on the first (master) node with example IP 123.456.123.456:
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
+- Run on the worker node:
+$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
+(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
+"""
+
+import os
+import time
+import math
+import pickle
+from contextlib import nullcontext
+
+import numpy as np
+import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+
+from model import GPTConfig, GPT
+
+# -----------------------------------------------------------------------------
+# default config values designed to train a gpt2 (124M) on OpenWebText
+# I/O
+out_dir = 'out'
+eval_interval = 2000
+log_interval = 1
+eval_iters = 200
+eval_only = False # if True, script exits right after the first eval
+always_save_checkpoint = True # if True, always save a checkpoint after each eval
+init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+# wandb logging
+wandb_log = False # disabled by default
+wandb_project = 'owt'
+wandb_run_name = 'gpt2' # 'run' + str(time.time())
+# data
+dataset = 'openwebtext'
+gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 1024
+# model
+n_layer = 12
+n_head = 12
+n_embd = 768
+dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
+bias = False # do we use bias inside LayerNorm and Linear layers?
+# adamw optimizer
+learning_rate = 6e-4 # max learning rate
+max_iters = 600000 # total number of training iterations
+weight_decay = 1e-1
+beta1 = 0.9
+beta2 = 0.95
+grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+# learning rate decay settings
+decay_lr = True # whether to decay the learning rate
+warmup_iters = 2000 # how many steps to warm up for
+lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+# DDP settings
+backend = 'nccl' # 'nccl', 'gloo', etc.
+# system
+device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+compile = True # use PyTorch 2.0 to compile the model to be faster
+# -----------------------------------------------------------------------------
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+exec(open('configurator.py').read()) # overrides from command line or config file
+config = {k: globals()[k] for k in config_keys} # will be useful for logging
+# -----------------------------------------------------------------------------
+
+# various inits, derived attributes, I/O setup
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    init_process_group(backend=backend)
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+    seed_offset = ddp_rank # each process gets a different seed
+    # world_size number of processes will be training simultaneously, so we can scale
+    # down the desired gradient accumulation iterations per process proportionally
+    assert gradient_accumulation_steps % ddp_world_size == 0
+    gradient_accumulation_steps //= ddp_world_size
+else:
+    # if not ddp, we are running on a single gpu, and one process
+    master_process = True
+    seed_offset = 0
+    ddp_world_size = 1
+tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+print(f"tokens per iteration will be: {tokens_per_iter:,}")
+
+if master_process:
+    os.makedirs(out_dir, exist_ok=True)
+torch.manual_seed(1337 + seed_offset)
+torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+# note: float16 data type will automatically use a GradScaler
+ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+# poor man's data loader
+data_dir = os.path.join('data', dataset)
+def get_batch(split):
+    # We recreate np.memmap every batch to avoid a memory leak, as per
+    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    if split == 'train':
+        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    else:
+        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    if device_type == 'cuda':
+        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
+    return x, y
+
+# init these up here, can override if init_from='resume' (i.e. from a checkpoint)
+iter_num = 0
+best_val_loss = 1e9
+
+# attempt to derive vocab_size from the dataset
+meta_path = os.path.join(data_dir, 'meta.pkl')
+meta_vocab_size = None
+if os.path.exists(meta_path):
+    with open(meta_path, 'rb') as f:
+        meta = pickle.load(f)
+    meta_vocab_size = meta['vocab_size']
+    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+
+# model init
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+if init_from == 'scratch':
+    # init a new model from scratch
+    print("Initializing a new model from scratch")
+    # determine the vocab size we'll use for from-scratch training
+    if meta_vocab_size is None:
+        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+elif init_from == 'resume':
+    print(f"Resuming training from {out_dir}")
+    # resume training from a checkpoint.
+    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint_model_args = checkpoint['model_args']
+    # force these config attributes to be equal otherwise we can't even resume training
+    # the rest of the attributes (e.g. dropout) can stay as desired from command line
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = checkpoint_model_args[k]
+    # create the model
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+    state_dict = checkpoint['model']
+    # fix the keys of the state dictionary :(
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+    iter_num = checkpoint['iter_num']
+    best_val_loss = checkpoint['best_val_loss']
+elif init_from.startswith('gpt2'):
+    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
+    # initialize from OpenAI GPT-2 weights
+    override_args = dict(dropout=dropout)
+    model = GPT.from_pretrained(init_from, override_args)
+    # read off the created config params, so we can store them into checkpoint correctly
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = getattr(model.config, k)
+# crop down the model block size if desired, using model surgery
+if block_size < model.config.block_size:
+    model.crop_block_size(block_size)
+    model_args['block_size'] = block_size # so that the checkpoint will have the right value
+model.to(device)
+
+# initialize a GradScaler. If enabled=False scaler is a no-op
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+
+# optimizer
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+if init_from == 'resume':
+    optimizer.load_state_dict(checkpoint['optimizer'])
+checkpoint = None # free up memory
+
+# compile the model
+if compile:
+    print("compiling the model... (takes a ~minute)")
+    unoptimized_model = model
+    model = torch.compile(model) # requires PyTorch 2.0
+
+# wrap model into DDP container
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+# helps estimate an arbitrarily accurate loss over either split using many batches
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            with ctx:
+                logits, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+# learning rate decay scheduler (cosine with warmup)
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_iters:
+        return learning_rate * (it + 1) / (warmup_iters + 1)
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > lr_decay_iters:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    return min_lr + coeff * (learning_rate - min_lr)
+
+# logging
+if wandb_log and master_process:
+    import wandb
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+
+# training loop
+X, Y = get_batch('train') # fetch the very first batch
+t0 = time.time()
+local_iter_num = 0 # number of iterations in the lifetime of this process
+raw_model = model.module if ddp else model # unwrap DDP container if needed
+running_mfu = -1.0
+while True:
+
+    # determine and set the learning rate for this iteration
+    lr = get_lr(iter_num) if decay_lr else learning_rate
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+    # evaluate the loss on train/val sets and write checkpoints
+    if iter_num % eval_interval == 0 and master_process:
+        losses = estimate_loss()
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "train/loss": losses['train'],
+                "val/loss": losses['val'],
+                "lr": lr,
+                "mfu": running_mfu*100, # convert to percentage
+            })
+        if losses['val'] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses['val']
+            if iter_num > 0:
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'model_args': model_args,
+                    'iter_num': iter_num,
+                    'best_val_loss': best_val_loss,
+                    'config': config,
+                }
+                print(f"saving checkpoint to {out_dir}")
+                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+    if iter_num == 0 and eval_only:
+        break
+
+    # forward backward update, with optional gradient accumulation to simulate larger batch size
+    # and using the GradScaler if data type is float16
+    for micro_step in range(gradient_accumulation_steps):
+        if ddp:
+            # in DDP training we only need to sync gradients at the last micro step.
+            # the official way to do this is with model.no_sync() context manager, but
+            # I really dislike that this bloats the code and forces us to repeat code
+            # looking at the source of that context manager, it just toggles this variable
+            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        with ctx:
+            logits, loss = model(X, Y)
+            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+        X, Y = get_batch('train')
+        # backward pass, with gradient scaling if training in fp16
+        scaler.scale(loss).backward()
+    # clip the gradient
+    if grad_clip != 0.0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    # step the optimizer and scaler if training in fp16
+    scaler.step(optimizer)
+    scaler.update()
+    # flush the gradients as soon as we can, no need for this memory anymore
+    optimizer.zero_grad(set_to_none=True)
+
+    # timing and logging
+    t1 = time.time()
+    dt = t1 - t0
+    t0 = t1
+    if iter_num % log_interval == 0 and master_process:
+        # get loss as float. note: this is a CPU-GPU sync point
+        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+        lossf = loss.item() * gradient_accumulation_steps
+        if local_iter_num >= 5: # let the training loop settle a bit
+            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+    iter_num += 1
+    local_iter_num += 1
+
+    # termination conditions
+    if iter_num > max_iters:
+        break
+
+if ddp:
+    destroy_process_group()
