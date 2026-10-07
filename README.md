@@ -126,11 +126,10 @@ GGUF 量化推理、nanoGPT 训练，到 bitsandbytes / tinygrad 框架拆解与
 每个 lab 目录内：`README.md`（复现步骤）、`results.md`（逐图中文分析）、
 `results/*.json`（原始数据）、`verify_numbers.py`（文档-JSON 断言）。
 
-> **产物再生成**：`figs/`（56 张 300 DPI 图）、`data/`（语料与 token）、
-> `*.pt` / `*.gguf`（训练 checkpoint 与导出模型）均为**可再生产物，不入库**
-> （见各 lab README 的一键命令：`plot_results.py` / `corpus_prep.py` /
-> `charlm.py`）——入库的是全部代码、JSON 原始数据、笔记与断言脚本，
-> 任何一张图都能从 `results/*.json` 一条命令复原。
+> **实验产物全部入库**：`figs/`（56 张 300 DPI 图）、`data/`（语料与 token）、
+> `*.pt` / `*.gguf`（训练 checkpoint 与导出模型）均随仓库分发，克隆即得完整结果。
+> 同时它们也是可再生产物（`plot_results.py` / `corpus_prep.py` / `charlm.py`
+> 一键复原），可与 `results/*.json` 原始数据互相印证。
 
 ## 快速复现
 
