@@ -1,0 +1,4171 @@
+ store and load 8-bit weights directly from the HuggingFace Hub. Thank you @myrab
+- New bug report features `python -m bitsandbytes` now gives extensive debugging details to debug CUDA setup failures.
+
+Bug fixes:
+
+- Fixed a bug where some bitsandbytes methods failed in a model-parallel setup on multiple GPUs. Thank you @tonylins
+- Fixed a bug where cudart.so libraries could not be found in newer PyTorch releases.
+
+Improvements:
+
+- Improved the CUDA Setup procedure by doing a more extensive search for CUDA libraries
+
+Deprecated:
+
+- Devices with compute capability 3.0 (GTX 700s, K10) and 3.2 (Tegra K1, Jetson TK1) are now deprecated and support will be removed in 0.39.0.
+- Support for CUDA 10.0 and 10.2 will be removed in bitsandbytes 0.39.0
+
+### 0.37.0
+
+#### Int8 Matmul + backward support for all GPUs
+
+Features:
+
+- Int8 MatmulLt now supports backward through inversion of the ColTuring/ColAmpere format. Slow, but memory efficient. Big thanks to @borzunov
+- Int8 now supported on all GPUs. On devices with compute capability \< 7.5, the Int weights are cast to 16/32-bit for the matrix multiplication. Contributed by @borzunov
+
+Improvements:
+
+- Improved logging for the CUDA detection mechanism.
+
+### 0.36.0
+
+#### Improvements, Ada/Hopper support, fake k-bit quantization.
+
+Features:
+
+- CUDA 11.8 and 12.0 support added
+- support for Ada and Hopper GPUs added (compute capability 8.9 and 9.0)
+- support for fake k-bit block-wise quantization for Int, Float, quantile quantization, and dynamic exponent data types added
+- Added CUDA instruction generator to fix some installations.
+- Added additional block sizes for quantization {64, 128, 256, 512, 1024}
+- Added SRAM Quantile algorithm to quickly estimate less than 256 quantiles
+- Added option to suppress the bitsandbytes welcome message (@Cyberes)
+
+Regression:
+
+- Compute capability 3.0 removed: GTX 600s and 700s series is no longer supported (except GTX 780 and GTX 780 Ti)
+
+Bug fixes:
+
+- fixed a bug where too long directory names would crash the CUDA SETUP #35 (@tomaarsen)
+- fixed a bug where CPU installations on Colab would run into an error  #34 (@tomaarsen)
+- fixed an issue where the default CUDA version with fast-DreamBooth was not supported #52
+- fixed a bug where the CUDA setup failed due to a wrong function call.
+- fixed a bug in the CUDA Setup which led to an incomprehensible error if no GPU was detected.
+- fixed a bug in the CUDA Setup failed with the cuda runtime was found, but not the cuda library.
+- fixed a bug where not finding the cuda runtime led to an incomprehensible error.
+- fixed a bug where with missing CUDA the default was an error instead of the loading the CPU library
+- fixed a bug where the CC version of the GPU was not detected appropriately (@BlackHC)
+- fixed a bug in CPU quantization which lead to errors when the input buffer exceeded 2^31 elements
+
+Improvements:
+
+- multiple improvements in formatting, removal of unused imports, and slight performance improvements (@tomaarsen)
+- StableEmbedding layer now has device and dtype parameters to make it 1:1 replaceable with regular Embedding layers (@lostmsu)
+- runtime performance of block-wise quantization slightly improved
+- added error message for the case multiple libcudart.so are installed and bitsandbytes picks the wrong one
+
+### 0.35.4
+
+Bug fixes:
+
+- Fixed a bug in the CUDA Setup failed with the cuda runtime was found, but not the cuda library.
+- Fixed a bug where not finding the cuda runtime led to an incomprehensible error.
+
+### 0.35.3
+
+Bug fixes:
+
+- Fixed a bug in the CUDA Setup which led to an incomprehensible error if no GPU was detected.
+
+### 0.35.2
+
+Bug fixes:
+
+- Fixed a bug where the CUDA setup failed due to a wrong function call.
+
+### 0.35.1
+
+Features:
+
+- Added CUDA instruction generator to fix some installations.
+
+Bug fixes:
+
+- Fixed a problem where warning messages would be displayed even though everything worked correctly.
+
+### 0.35.0
+
+#### CUDA 11.8 support and bug fixes
+
+Features:
+
+- CUDA 11.8 support added and binaries added to the PyPI release.
+
+Bug fixes:
+
+- fixed a bug where too long directory names would crash the CUDA SETUP #35 (thank you @tomaarsen)
+- fixed a bug where CPU installations on Colab would run into an error  #34 (thank you @tomaarsen)
+- fixed an issue where the default CUDA version with fast-DreamBooth was not supported #52
+
+### 0.34.0
+
+#### Bug fixes and memory efficient backprop
+
+Features:
+
+- Linear8bitLt layer now supports `memory_efficient_backward=True` which enables backprop of gradients through frozen weights.
+
+Bug fixes:
+
+- fixed an issue where too many threads were created in blockwise quantization on the CPU for large tensors
+
+### 0.33.0
+
+#### Various bug fixes
+
+Features:
+
+- CPU quantization now supports a variable `blocksize` variable to enhance quantization speed or precision.
+
+Bug fixes:
+
+- fixed an issue in CPU quantization where tensors with more than 2^31 elements would fail 19a7adca7a6c9bf7061a384d7e9d9b13676a1a88
+- fixed a bug where cpu binaries would fail if no GPU would be detected eab4d8232d558f2e6bd7f7cc3d00e2e6e94f4e80
+- fixed an issue where cpu binaries cause additional stdout messages 92a3363096e10ad6a5c4e944af898bd1186d806a
+- fixed an import of bnb.utils 2e630b55f51d454f3bd723dffda68a07ef93190c
+
+We thank @mryab, @mbrukman, @chessgecko, @dbaranchuk for pull request with bug fixes and new features.
+
+### 0.32.0
+
+#### 8-bit Inference Performance Enhancements
+
+We added performance enhancements for small models. This makes small models about 2x faster for LLM.int8() inference.
+
+Features:
+
+- Int32 dequantization now supports fused biases.
+- Linear8bitLt now uses a fused bias implementation.
+- Change `.data.storage().data_ptr()` to `.data.data_ptr()` to enhance inference performance.
+
+Bug fixes:
+
+- Now throws and error if LLM.int8() is used on a GPU that is not supported.
+- Enhances error messaging if CUDA SETUP fails.
+
+### 0.31.0
+
+#### 8-bit Inference and Packaging Update
+
+Features:
+
+- added direct outlier extraction. This enables outlier extraction without fp16 weights without performance degradation.
+- Added automatic CUDA SETUP procedure and packaging all binaries into a single bitsandbytes package.
+
+### 0.30.0
+
+#### 8-bit Inference Update
+
+Features:
+
+- Added 8-bit matrix multiplication form cuBLAS,  and cuBLASLt as well as multiple GEMM kernels (GEMM, GEMMEx, GEMMLt)
+- Added 8-bit Linear layers with 8-bit Params that perform memory efficient inference with an option for 8-bit mixed precision matrix decomposition for inference without performance degradation
+- Added quantization methods for "fake" quantization as well as optimized kernels vector-wise quantization and equalization as well as optimized cuBLASLt transformations
+- CPU only build now available (Thank you, @mryab)
+
+Deprecated:
+
+- Pre-compiled release for CUDA 9.2, 10.0, 10.2 no longer available
+
+### 0.26.0:
+
+Features:
+
+- Added Adagrad (without grad clipping) as 32-bit and 8-bit block-wise optimizer.
+- Added AdamW (copy of Adam with weight decay init 1e-2). #10
+- Introduced ModuleConfig overrides which can be seamlessly be used at initialization time of a module.
+- Added `bnb.nn.Embedding` layer which runs at 32-bit but without the layernorm. This works well if you need to fine-tune pretrained models that do not have a embedding layer norm. #19
+
+Bug fixes:
+
+- Fixed a bug where weight decay was incorrectly applied to 32-bit Adam. #13
+- Fixed an unsafe use of eval. #8
+- Fixed a bug where the StableEmbedding layer 32-bit optimizer override would not work without registering the whole model first (`bnb.optim.GlobalOptimManager.get_instance().register_parameters(model.parameters())`).  #13 #15
+
+Docs:
+
+- Added instructions how to solve "\_\_fatbinwrap\_" errors.
+
+### 0.0.25:
+
+Features:
+
+- Added `skip_zeros` for block-wise and 32-bit optimizers. This ensures correct updates for sparse gradients and sparse models.
+- Added support for Kepler GPUs. (#4)
+- Added Analysis Adam to track 8-bit vs 32-bit quantization errors over time.
+- Make compilation more user friendly.
+
+Bug fixes:
+
+- fixed "undefined symbol: \_\_fatbinwrap_38" error for P100 GPUs on CUDA 10.1 (#5)
+
+Docs:
+
+- Added docs with instructions to compile from source.
+
+### 0.0.24:
+
+- Fixed a bug where a float/half conversion led to a compilation error for CUDA 11.1 on Turning GPUs.
+- removed Apex dependency for bnb LAMB
+
+### 0.0.23:
+
+Bugs:
+
+- Unified quantization API: each quantization function now returns `Q, S` where `Q` is the quantized tensor and `S` the quantization state which may hold absolute max values, a quantization map or more. For dequantization all functions now accept the inputs `Q, S` so that `Q` is dequantized with the quantization state `S`.
+- Fixed an issue where the CUDA 11.1 binary was not compiled with the right headers
+
+API changes:
+
+- Block-wise quantization for optimizers now enabled by default
+
+Features:
+
+- Block-wise quantization routines now support CPU Tensors.
+
+### 0.0.22:
+
+- Fixed an error where a `reset_parameters()` call on the `StableEmbedding` would lead to an error in older PyTorch versions (from 1.7.0).
+
+### 0.0.21
+
+- Ampere, RTX 30 series GPUs now compatible with the library.
+
+# MANDATORY: Use git worktrees for all branch work
+
+NEVER work on a fix or feature branch inside the main `~/git/bitsandbytes` checkout. Always create a worktree first:
+
+```bash
+cd ~/git/bitsandbytes
+git worktree add ~/git/bnb-fix-<NUMBER> -b fix/issue-<NUMBER>
+cd ~/git/bnb-fix-<NUMBER>
+```
+
+This keeps the main checkout clean and allows parallel sessions. If you are already inside a worktree directory, you do not need to create another one.
+
+**Before creating a worktree**, check the worktree registry for existing ones — see the Git Worktrees section in `~/.claude/CLAUDE.md`. Bitsandbytes-specific naming conventions: `agents/worktree_guide.md`. General worktree guide: `~/git/lab_tools/worktree_guide.md`.
+
+# MANDATORY: Check for existing PRs before starting work
+
+Before working on any issue, check whether a PR already exists:
+
+```bash
+gh pr list --search "issue-number OR keyword" --state open
+```
+
+If a PR exists, review and build on it instead of starting from scratch. Do not create duplicate work.
+
+# MANDATORY: Run linting before every pull request
+
+Before pushing a PR branch, you MUST run the full pre-commit suite. CI will reject PRs that fail any check:
+
+```bash
+pre-commit run --all-files
+```
+
+This runs ruff, ruff format, typos, trailing-whitespace, clang-format, and all other CI lint hooks. Review and commit any changes it makes. Do NOT run only `ruff check` and `ruff format` — those are just 2 of 10 hooks. Full details: `agents/linting_guide.md`
+
+# Testing: only run relevant tests
+
+Do NOT run the full test suite — it takes 10+ minutes. Instead, run only the tests that cover the code you changed:
+
+```bash
+pytest tests/test_relevant_file.py -v --tb=short -k "relevant_test_name"
+```
+
+The full suite will be run separately. Best practices and known issues: `agents/testing_guide.md`
+
+# Agent Dispatch (the "Dispatcher" role)
+
+To triage open GitHub issues, generate prompt files, and launch parallel worker agents, read `agents/dispatch_guide.md`. If told "you're the Dispatcher" or "please read the Dispatch Guide," that's what this refers to. The dispatch workflow uses the GitHub issue tools in `agents/` — see `agents/github_tools_guide.md` for the bitsandbytes-specific reference.
+
+# Issue maintenance and triage
+
+To identify and close stale, duplicate, or resolved issues: `agents/issue_maintenance_guide.md`. Common closeable patterns (old CUDA setup, Windows pre-support, third-party app issues, etc.) are cataloged in `agents/issue_patterns.md`.
+
+# Pull request review
+
+When tasked with reviewing a pull request, you MUST read these guides before starting the review:
+
+1. `agents/pr_review_guide.md` — The complete review workflow (classification, checklists, verdict format, and posting instructions). This is the primary guide; follow its steps sequentially.
+2. `agents/architecture_guide.md` — Codebase architecture and patterns
+3. `agents/code_standards.md` — Code quality expectations
+4. `agents/api_surface.md` — Public API catalog (for detecting breaking changes)
+5. `agents/downstream_integrations.md` — How Transformers, PEFT, Accelerate, TGI, and vLLM depend on bitsandbytes (for assessing downstream impact)
+6. `agents/security_guide.md` — Trust model and security checklist (especially for external contributor PRs)
+
+For CUDA kernel changes, also read `agents/kbit_gemm_context.md`. The PR review guide references all of these at the appropriate steps.
+
+# Code of Conduct
+
+## Our Pledge
+
+In the interest of fostering an open and welcoming environment, we as
+contributors and maintainers pledge to make participation in our project and
+our community a harassment-free experience for everyone, regardless of age, body
+size, disability, ethnicity, sex characteristics, gender identity and expression,
+level of experience, education, socio-economic status, nationality, personal
+appearance, race, religion, or sexual identity and orientation.
+
+## Our Standards
+
+Examples of behavior that contributes to creating a positive environment
+include:
+
+* Using welcoming and inclusive language
+* Being respectful of differing viewpoints and experiences
+* Gracefully accepting constructive criticism
+* Focusing on what is best for the community
+* Showing empathy towards other community members
+
+Examples of unacceptable behavior by participants include:
+
+* The use of sexualized language or imagery and unwelcome sexual attention or
+  advances
+* Trolling, insulting/derogatory comments, and personal or political attacks
+* Public or private harassment
+* Publishing others' private information, such as a physical or electronic
+  address, without explicit permission
+* Other conduct which could reasonably be considered inappropriate in a
+  professional setting
+
+## Our Responsibilities
+
+Project maintainers are responsible for clarifying the standards of acceptable
+behavior and are expected to take appropriate and fair corrective action in
+response to any instances of unacceptable behavior.
+
+Project maintainers have the right and responsibility to remove, edit, or
+reject comments, commits, code, wiki edits, issues, and other contributions
+that are not aligned to this Code of Conduct, or to ban temporarily or
+permanently any contributor for other behaviors that they deem inappropriate,
+threatening, offensive, or harmful.
+
+## Scope
+
+This Code of Conduct applies within all project spaces, and it also applies when
+an individual is representing the project or its community in public spaces.
+Examples of representing a project or community include using an official
+project e-mail address, posting via an official social media account, or acting
+as an appointed representative at an online or offline event. Representation of
+a project may be further defined and clarified by project maintainers.
+
+This Code of Conduct also applies outside the project spaces when there is a
+reasonable belief that an individual's behavior may have a negative impact on
+the project or its community.
+
+## Enforcement
+
+Instances of abusive, harassing, or otherwise unacceptable behavior may be
+reported by contacting the project team at <opensource-conduct@fb.com>. All
+complaints will be reviewed and investigated and will result in a response that
+is deemed necessary and appropriate to the circumstances. The project team is
+obligated to maintain confidentiality with regard to the reporter of an incident.
+Further details of specific enforcement policies may be posted separately.
+
+Project maintainers who do not follow or enforce the Code of Conduct in good
+faith may face temporary or permanent repercussions as determined by other
+members of the project's leadership.
+
+## Attribution
+
+This Code of Conduct is adapted from the [Contributor Covenant][homepage], version 1.4,
+available at https://www.contributor-covenant.org/version/1/4/code-of-conduct.html
+
+[homepage]: https://www.contributor-covenant.org
+
+For answers to common questions about this code of conduct, see
+https://www.contributor-covenant.org/faq
+
+# Compiling bitsandbytes for H100 and L40 GPUs
+
+This guide shows how to compile bitsandbytes from source specifically optimized for NVIDIA H100 and L40 GPUs.
+
+## Prerequisites
+
+- CMake >= 3.22.1
+- Python >= 3.9
+- GCC (version 9+ recommended)
+- CUDA Toolkit (11.8+)
+- PyTorch with CUDA support
+
+Verify your system:
+```bash
+cmake --version
+python3 --version
+gcc --version
+nvcc --version
+```
+
+## GPU Compute Capabilities
+
+- **L40**: Compute Capability 8.9 (sm_89)
+- **H100**: Compute Capability 9.0 (sm_90)
+
+## Compilation Steps
+
+### 1. Clean any previous build configuration
+
+```bash
+cd /path/to/bitsandbytes
+rm -rf CMakeCache.txt CMakeFiles/ build/
+```
+
+### 2. Configure CMake for H100 and L40
+
+```bash
+cmake -DCOMPUTE_BACKEND=cuda -DCOMPUTE_CAPABILITY="89;90" -S .
+```
+
+This configures the build to target only compute capabilities 89 (L40) and 90 (H100), significantly reducing compilation time compared to building for all architectures.
+
+### 3. Compile the library
+
+```bash
+make -j$(nproc)
+```
+
+This will create `bitsandbytes/libbitsandbytes_cuda<VERSION>.so` where `<VERSION>` matches your CUDA Toolkit version (e.g., `cuda124` for CUDA 12.4).
+
+### 4. Install the package
+
+```bash
+pip install -e .
+```
+
+Use `-e` flag for editable/development install, or omit it for regular installation.
+
+### 5. Handle PyTorch CUDA version mismatch (if needed)
+
+If your PyTorch was compiled with a different CUDA version than your Toolkit, you may need to create a symlink:
+
+```bash
+# Example: PyTorch uses CUDA 12.8, but you compiled with CUDA 12.4
+ln -sf libbitsandbytes_cuda124.so bitsandbytes/libbitsandbytes_cuda128.so
+```
+
+Alternatively, set the environment variable:
+```bash
+export BNB_CUDA_VERSION=124  # Use your compiled CUDA version
+```
+
+### 6. Verify installation
+
+```bash
+python3 -c "import bitsandbytes as bnb; print(f'bitsandbytes version: {bnb.__version__}'); print('Success!')"
+```
+
+## Expected Output
+
+After compilation, you should see:
+- Binary file: `bitsandbytes/libbitsandbytes_cuda<VERSION>.so` (approximately 7MB when targeting only sm_89 and sm_90)
+- Successful import in Python with no errors
+
+## Compilation Time
+
+Building for only H100/L40 (2 architectures) takes approximately **1-2 minutes** compared to **5+ minutes** when building for all 14+ compute capabilities.
+
+## Troubleshooting
+
+### Warning messages during compilation
+Warnings like "variable declared but never referenced" are harmless and can be ignored.
+
+### Wrong CUDA binary error
+If you see `Configured CUDA binary not found`, check:
+1. The compiled `.so` file exists in `bitsandbytes/` directory
+2. The CUDA version matches or create a symlink as shown in step 5
+3. Use `BNB_CUDA_VERSION` environment variable to override
+
+### CUDA version check
+```bash
+# Check your CUDA Toolkit version
+nvcc --version
+
+# Check PyTorch CUDA version
+python3 -c "import torch; print(torch.version.cuda)"
+```
+
+## Notes
+
+- The compiled library will **only work on GPUs with compute capability 8.9 or 9.0** (L40 and H100)
+- For other GPUs, you'll need to recompile with appropriate compute capabilities
+- The `-DCOMPUTE_CAPABILITY` flag accepts a semicolon-separated list: e.g., `"75;80;89;90"` for T4, A100, L40, and H100
+
+# Contributing to bitsandbytes
+We want to make contributing to this project as easy and transparent as
+possible.
+
+## Pull Requests
+We actively welcome your pull requests.
+
+1. Fork the repo and create your branch from `main`.
+2. If you've added code that should be tested, add tests.
+3. If you've changed APIs, update the documentation.
+4. Ensure the test suite passes.
+5. Make sure your code lints, install the [pre-commit hooks as documented here](https://huggingface.co/docs/bitsandbytes/main/en/contributing#setup-pre-commit-hooks).
+
+## Issues
+We use GitHub issues to track public bugs. Please ensure your description is
+clear and has sufficient instructions to be able to reproduce the issue.
+
+## License
+By contributing to bitsandbytes, you agree that your contributions will be licensed
+under the LICENSE file in the root directory of this source tree.
+
+The majority of bitsandbytes is licensed under MIT, however portions of the project are available under separate license terms: PyTorch is licensed under the BSD license.
+
+<p align="center"><img src="https://avatars.githubusercontent.com/u/175231607?s=200&v=4" alt=""></p>
+<h1 align="center">bitsandbytes</h1>
+<p align="center">
+    <a href="https://github.com/bitsandbytes-foundation/bitsandbytes/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/bitsandbytes-foundation/bitsandbytes.svg?color=blue"></a>
+    <a href="https://pepy.tech/project/bitsandbytes"><img alt="Downloads" src="https://static.pepy.tech/badge/bitsandbytes/month"></a>
+    <a href="https://github.com/bitsandbytes-foundation/bitsandbytes/actions/workflows/tests-nightly.yml"><img alt="Nightly Unit Tests" src="https://img.shields.io/github/actions/workflow/status/bitsandbytes-foundation/bitsandbytes/tests-nightly.yml?logo=github&label=Nightly%20Tests"></a>
+    <a href="https://github.com/bitsandbytes-foundation/bitsandbytes/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/bitsandbytes-foundation/bitsandbytes"></a>
+    <a href="https://pypi.org/project/bitsandbytes/"><img alt="PyPI - Python Version" src="https://img.shields.io/pypi/pyversions/bitsandbytes"></a>
+</p>
+
+`bitsandbytes` enables accessible large language models via k-bit quantization for PyTorch. We provide three main features for dramatically reducing memory consumption for inference and training:
+
+* 8-bit optimizers uses block-wise quantization to maintain 32-bit performance at a small fraction of the memory cost.
+* LLM.int8() or 8-bit quantization enables large language model inference with only half the required memory and without any performance degradation. This method is based on vector-wise quantization to quantize most features to 8-bits and separately treating outliers with 16-bit matrix multiplication.
+* QLoRA or 4-bit quantization enables large language model training with several memory-saving techniques that don't compromise performance. This method quantizes a model to 4-bits and inserts a small set of trainable low-rank adaptation (LoRA) weights to allow training.
+
+The library includes quantization primitives for 8-bit & 4-bit operations, through `bitsandbytes.nn.Linear8bitLt` and `bitsandbytes.nn.Linear4bit` and 8-bit optimizers through `bitsandbytes.optim` module.
+
+## System Requirements
+bitsandbytes has the following minimum requirements for all platforms:
+
+* Python 3.10+
+* [PyTorch](https://pytorch.org/get-started/locally/) 2.4+
+  * _Note: While we aim to provide wide backwards compatibility, we recommend using the latest version of PyTorch for the best experience._
+
+#### Accelerator support:
+
+<small>Note: this table reflects the status of the current development branch. For the latest stable release, see the
+[document in the 0.50.0 tag](https://github.com/bitsandbytes-foundation/bitsandbytes/blob/0.50.0/README.md#accelerator-support).
+</small>
+
+##### Legend:
+🚧 = Planned |
+〰️ = Partially Supported |
+✅ = Supported |
+❌ = Not Supported
+
+<table>
+  <thead>
+    <tr>
+      <th>Platform</th>
+      <th>Accelerator</th>
+      <th>Hardware Requirements</th>
+      <th>LLM.int8()</th>
+      <th>QLoRA 4-bit</th>
+      <th>8-bit Optimizers</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td colspan="6">🐧 <strong>Linux, glibc >= 2.24</strong></td>
+    </tr>
+    <tr>
+      <td align="right">x86-64</td>
+      <td>◻️ CPU</td>
+      <td>Minimum: AVX2<br>Optimized: AVX512F, AVX512BF16</td>
+      <td>✅</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>🟩 NVIDIA GPU <br><code>cuda</code></td>
+      <td>SM60+ minimum<br>SM75+ recommended</td>
+      <td>✅</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>🟥 AMD GPU <br><code>cuda</code></td>
+      <td>
+        CDNA: gfx908, gfx90a, gfx942, gfx950, gfx1250<br>
+        RDNA: gfx101X, gfx103X, gfx110X, gfx115X, gfx120X
+      </td>
+      <td>✅</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>🟦 Intel GPU <br><code>xpu</code></td>
+      <td>
+        Data Center GPU Max Series<br>
+        Arc A-Series (Alchemist)<br>
+        Arc B-Series (Battlemage)
+      </td>
+      <td>✅</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>🟪 Intel Gaudi <br><code>hpu</code></td>
+      <td>Gaudi2, Gaudi3</td>
+      <td>✅</td>
+      <td>〰️</td>
+      <td>❌</td>
+    </tr>
+    <tr>
+      <td align="right">aarch64</td>
+      <td>◻️ CPU</td>
+      <td></td>
+      <td>✅ *</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>🟩 NVIDIA GPU <br><code>cuda</code></td>
+      <td>SM75+</td>
+      <td>✅</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td colspan="6">🪟 <strong>Windows 11 / Windows Server 2022+</strong></td>
+    </tr>
+    <tr>
+      <td align="right">x86-64</td>
+      <td>◻️ CPU</td>
+      <td>AVX2</td>
+      <td>✅</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>🟩 NVIDIA GPU <br><code>cuda</code></td>
+      <td>SM60+ minimum<br>SM75+ recommended</td>
+      <td>✅</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>🟥 AMD GPU <br><code>cuda</code></td>
+      <td>
+        CDNA: gfx908, gfx90a<br>
+        RDNA: gfx101X, gfx103X, gfx110X, gfx115X, gfx120X
+      </td>
+      <td>✅</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>🟦 Intel GPU <br><code>xpu</code></td>
+      <td>
+        Arc A-Series (Alchemist) <br>
+        Arc B-Series (Battlemage)
+      </td>
+      <td>✅</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td align="right">arm64</td>
+      <td>◻️ CPU</td>
+      <td></td>
+      <td>✅</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>🟩 NVIDIA GPU <br><code>cuda</code></td>
+      <td>SM121</td>
+      <td>✅</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td colspan="6">🍎 <strong>macOS 14+</strong></td>
+    </tr>
+    <tr>
+      <td align="right">arm64</td>
+      <td>◻️ CPU</td>
+      <td>Apple M1+</td>
+      <td>✅ *</td>
+      <td>✅</td>
+      <td>✅</td>
+    </tr>
+    <tr>
+      <td></td>
+      <td>⬜ Metal <br><code>mps</code></td>
+      <td>Apple M1+</td>
+      <td>✅ *</td>
+      <td>✅</td>
+      <td>🚧</td>
+  </tbody>
+</table>
+<sup>* While supported, these marked features may lack in performance optimizations.</sup>
+
+## :book: Documentation
+* [Official Documentation](https://huggingface.co/docs/bitsandbytes/main)
+* 🤗 [Transformers](https://huggingface.co/docs/transformers/quantization/bitsandbytes)
+* 🤗 [Diffusers](https://huggingface.co/docs/diffusers/quantization/bitsandbytes)
+* 🤗 [PEFT](https://huggingface.co/docs/peft/developer_guides/quantization#quantize-a-model)
+
+## :heart: Sponsors
+The continued maintenance and development of `bitsandbytes` is made possible thanks to the generous support of our sponsors. Their contributions help ensure that we can keep improving the project and delivering valuable updates to the community.
+
+<kbd><a href="https://hf.co" target="_blank"><img width="100" src="https://huggingface.co/datasets/huggingface/brand-assets/resolve/main/hf-logo.svg" alt="Hugging Face"></a></kbd>
+
+## License
+`bitsandbytes` is MIT licensed.
+
+## How to cite us
+If you found this library useful, please consider citing our work:
+
+### QLoRA
+
+```bibtex
+@article{dettmers2023qlora,
+  title={Qlora: Efficient finetuning of quantized llms},
+  author={Dettmers, Tim and Pagnoni, Artidoro and Holtzman, Ari and Zettlemoyer, Luke},
+  journal={arXiv preprint arXiv:2305.14314},
+  year={2023}
+}
+```
+
+### LLM.int8()
+
+```bibtex
+@article{dettmers2022llmint8,
+  title={LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale},
+  author={Dettmers, Tim and Lewis, Mike and Belkada, Younes and Zettlemoyer, Luke},
+  journal={arXiv preprint arXiv:2208.07339},
+  year={2022}
+}
+```
+
+### 8-bit Optimizers
+
+```bibtex
+@article{dettmers2022optimizers,
+  title={8-bit Optimizers via Block-wise Quantization},
+  author={Dettmers, Tim and Lewis, Mike and Shleifer, Sam and Zettlemoyer, Luke},
+  journal={9th International Conference on Learning Representations, ICLR},
+  year={2022}
+}
+```
+
+# Security Policy
+
+## Supported Versions
+
+We provide security updates for the latest stable minor release line.
+
+| Version  | Supported |
+| -------- | --------- |
+| 0.49.x   | ✅        |
+| < 0.49.x | ❌        |
+
+> Note: Pre-releases, development builds, and commits on `main` are not considered supported release versions. If you believe you have found a vulnerability in unreleased code, please still report it following the process below.
+
+## Reporting a Vulnerability
+
+Please report security issues **privately** using the GitHub Security Advisory tool to create a new draft advisory:
+
+- https://github.com/bitsandbytes-foundation/bitsandbytes/security/advisories/new
+
+Do not open a public GitHub issue for security-sensitive reports.
+
+### What to include
+
+To help us triage and respond quickly, please include:
+
+- A clear description of the issue and potential impact
+- Affected version(s) and environment details (OS, GPU type, CUDA version, Python version, PyTorch version, etc)
+- Steps to reproduce (ideally a minimal proof of concept)
+- Any relevant logs, crash traces, or screenshots
+- Any known mitigations or workarounds
+
+## Response process
+
+We will review reports filed via GitHub Security Advisories and collaborate with the reporter in the advisory thread to:
+
+- Confirm and reproduce the report
+- Assess severity and affected versions
+- Identify mitigations and/or prepare a fix
+- Coordinate any follow-up needed prior to broader communication
+
+#pragma once
+
+typedef enum DataType_t {
+    General8bit = 0,
+    FP4 = 1,
+    NF4 = 2,
+} DataType_t;
+
+#include "cpu_ops.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#ifdef HAS_OPENMP
+#include <omp.h>
+#define BNB_OMP_PARALLEL_FOR _Pragma("omp parallel for")
+#else
+#define BNB_OMP_PARALLEL_FOR
+#endif
+
+namespace {
+
+constexpr int kCodebookSize = 256;
+
+inline unsigned char lookup_code_index(const float* codebook, float value) {
+    value = std::clamp(value, -1.0f, 1.0f);
+    const float* begin = codebook;
+    const float* end = codebook + kCodebookSize;
+    const float* right = std::lower_bound(begin, end, value);
+    if (right == begin) {
+        return 0;
+    }
+    if (right == end) {
+        return static_cast<unsigned char>(kCodebookSize - 1);
+    }
+    const float* left = right - 1;
+    const float dist_left = std::fabs(value - *left);
+    const float dist_right = std::fabs(*right - value);
+    const unsigned char idx = static_cast<unsigned char>(right - begin);
+    return dist_right < dist_left ? idx : idx - 1;
+}
+
+} // namespace
+
+#if defined(_M_ARM64) || defined(__aarch64__)
+#include <arm_neon.h>
+
+// ARM NEON NF4 lookup table (16 float values indexed by 4-bit code)
+static inline void neon_nf4_lut(float32x4_t lut[4]) {
+    // Indices 0-15 map to NF4 dequantized values
+    // Order: index 0 = -1.0, index 1 = -0.6962, ..., index 7 = 0.0, ..., index 15 = 1.0
+    static const float nf4_values[16] = {
+        -1.0f,
+        -0.6961928009986877f,
+        -0.5250730514526367f,
+        -0.39491748809814453f,
+        -0.28444138169288635f,
+        -0.18477343022823334f,
+        -0.09105003625154495f,
+        0.0f,
+        0.07958029955625534f,
+        0.16093020141124725f,
+        0.24611230194568634f,
+        0.33791524171829224f,
+        0.44070982933044434f,
+        0.5626170039176941f,
+        0.7229568362236023f,
+        1.0f
+    };
+    lut[0] = vld1q_f32(nf4_values);
+    lut[1] = vld1q_f32(nf4_values + 4);
+    lut[2] = vld1q_f32(nf4_values + 8);
+    lut[3] = vld1q_f32(nf4_values + 12);
+}
+
+// ARM NEON FP4 lookup table
+static inline void neon_fp4_lut(float32x4_t lut[4]) {
+    static const float fp4_values[16] = {
+        0.0f, 5.208333333e-03f,  0.66666667f,  1.0f,  0.33333333f,  0.5f,  0.16666667f,  0.25f,
+        0.0f, -5.208333333e-03f, -0.66666667f, -1.0f, -0.33333333f, -0.5f, -0.16666667f, -0.25f
+    };
+    lut[0] = vld1q_f32(fp4_values);
+    lut[1] = vld1q_f32(fp4_values + 4);
+    lut[2] = vld1q_f32(fp4_values + 8);
+    lut[3] = vld1q_f32(fp4_values + 12);
+}
+
+// Efficient NEON float LUT lookup using indexed lane extraction
+// The LUT has 16 float entries stored as a flat array for direct indexing
+static inline float neon_lut_lookup_flat(const float* flat_lut, uint8_t idx) { return flat_lut[idx]; }
+
+// Vectorized 4-bit dequantization: process 8 packed bytes = 16 output values
+// Each byte contains two 4-bit values: high nibble first, low nibble second
+static inline void
+    neon_dequant_4bit_16values(const uint8_t* packed, float scale, const float32x4_t lut[4], float* out) {
+    // Load 8 bytes = 16 x 4-bit values
+    uint8x8_t raw = vld1_u8(packed);
+
+    // Extract high and low nibbles
+    uint8x8_t mask4 = vdup_n_u8(0x0F);
+    uint8x8_t lo_nibbles = vand_u8(raw, mask4); // low nibble (second value)
+    uint8x8_t hi_nibbles = vshr_n_u8(raw, 4);   // high nibble (first value)
+
+    // Interleave hi/lo into 16-element index array for output ordering
+    // output[2*i] = hi_nibble[i], output[2*i+1] = lo_nibble[i]
+    uint8x8x2_t interleaved = vzip_u8(hi_nibbles, lo_nibbles);
+    // interleaved.val[0] has elements 0-7, interleaved.val[1] has elements 8-15
+    uint8x16_t indices = vcombine_u8(interleaved.val[0], interleaved.val[1]);
+
+    // Reinterpret float LUT as 64-byte table for vqtbl4q_u8 lookup.
+    // Each 4-bit index i maps to bytes [i*4 .. i*4+3] in the table.
+    uint8x16x4_t lut_bytes = {
+        vreinterpretq_u8_f32(lut[0]), vreinterpretq_u8_f32(lut[1]), vreinterpretq_u8_f32(lut[2]),
+        vreinterpretq_u8_f32(lut[3])
+    };
+    // Multiply each index by 4 to get byte offset (max 15*4=60 < 64, safe)
+    uint8x16_t base = vshlq_n_u8(indices, 2);
+    // Expand each base offset to 4 consecutive bytes via zip
+    const uint8x16_t off = vreinterpretq_u8_u32(vdupq_n_u32(0x03020100));
+    uint8x8_t lo = vget_low_u8(base), hi = vget_high_u8(base);
+    uint8x8x2_t z0 = vzip_u8(lo, lo);
+    uint8x8x2_t z1 = vzip_u8(hi, hi);
+    uint8x8x2_t zlo = vzip_u8(z0.val[0], z0.val[0]);
+    uint8x8x2_t zhi = vzip_u8(z0.val[1], z0.val[1]);
+    uint8x8x2_t zlo2 = vzip_u8(z1.val[0], z1.val[0]);
+    uint8x8x2_t zhi2 = vzip_u8(z1.val[1], z1.val[1]);
+    float32x4_t vscale = vdupq_n_f32(scale);
+    float32x4_t v0 = vreinterpretq_f32_u8(vqtbl4q_u8(lut_bytes, vaddq_u8(vcombine_u8(zlo.val[0], zlo.val[1]), off)));
+    float32x4_t v1 = vreinterpretq_f32_u8(vqtbl4q_u8(lut_bytes, vaddq_u8(vcombine_u8(zhi.val[0], zhi.val[1]), off)));
+    float32x4_t v2 = vreinterpretq_f32_u8(vqtbl4q_u8(lut_bytes, vaddq_u8(vcombine_u8(zlo2.val[0], zlo2.val[1]), off)));
+    float32x4_t v3 = vreinterpretq_f32_u8(vqtbl4q_u8(lut_bytes, vaddq_u8(vcombine_u8(zhi2.val[0], zhi2.val[1]), off)));
+
+    vst1q_f32(out, vmulq_f32(v0, vscale));
+    vst1q_f32(out + 4, vmulq_f32(v1, vscale));
+    vst1q_f32(out + 8, vmulq_f32(v2, vscale));
+    vst1q_f32(out + 12, vmulq_f32(v3, vscale));
+}
+
+// NEON-optimized BF16 to float conversion (4 values at a time)
+static inline float32x4_t neon_bf16x4_to_f32(const bf16_t* src) {
+    // BF16 is upper 16 bits of float32, so shift left by 16
+    uint16x4_t raw = vld1_u16(reinterpret_cast<const uint16_t*>(src));
+    uint32x4_t wide = vshll_n_u16(raw, 16);
+    return vreinterpretq_f32_u32(wide);
+}
+
+// NEON-optimized float to BF16 conversion (4 values at a time, with rounding)
+static inline void neon_f32_to_bf16x4(const float32x4_t src, bf16_t* dst) {
+    uint32x4_t bits = vreinterpretq_u32_f32(src);
+    // Round to nearest even: add 0x7FFF + ((bits >> 16) & 1)
+    uint32x4_t lsb = vshrq_n_u32(bits, 16);
+    lsb = vandq_u32(lsb, vdupq_n_u32(1));
+    uint32x4_t rounding = vaddq_u32(vdupq_n_u32(0x7FFF), lsb);
+    bits = vaddq_u32(bits, rounding);
+    // Extract upper 16 bits
+    uint16x4_t result = vshrn_n_u32(bits, 16);
+    vst1_u16(reinterpret_cast<uint16_t*>(dst), result);
+}
+
+// NEON-optimized float to FP16 conversion (4 values at a time)
+static inline void neon_f32_to_fp16x4(const float32x4_t src, fp16_t* dst) {
+    // ARM64 has native FP16 conversion
+    float16x4_t half = vcvt_f16_f32(src);
+    vst1_u16(reinterpret_cast<uint16_t*>(dst), vreinterpret_u16_f16(half));
+}
+
+// NEON-optimized FP16 to float conversion (4 values at a time)
+static inline float32x4_t neon_fp16x4_to_f32(const fp16_t* src) {
+    uint16x4_t raw = vld1_u16(reinterpret_cast<const uint16_t*>(src));
+    return vcvt_f32_f16(vreinterpret_f16_u16(raw));
+}
+
+// NEON-optimized absmax computation for a block of float32, bf16, or fp16.
+template <typename T> static inline float neon_absmax(const T* data, long long n) {
+    float32x4_t vmax = vdupq_n_f32(0.0f);
+    long long i = 0;
+    for (; i + 16 <= n; i += 16) {
+        float32x4_t v0, v1, v2, v3;
+        if constexpr (std::is_same<T, float>::value) {
+            const float* p = reinterpret_cast<const float*>(data + i);
+            v0 = vld1q_f32(p);
+            v1 = vld1q_f32(p + 4);
+            v2 = vld1q_f32(p + 8);
+            v3 = vld1q_f32(p + 12);
+        } else if constexpr (std::is_same<T, bf16_t>::value) {
+            v0 = neon_bf16x4_to_f32(data + i);
+            v1 = neon_bf16x4_to_f32(data + i + 4);
+            v2 = neon_bf16x4_to_f32(data + i + 8);
+            v3 = neon_bf16x4_to_f32(data + i + 12);
+        } else {
+            v0 = neon_fp16x4_to_f32(data + i);
+            v1 = neon_fp16x4_to_f32(data + i + 4);
+            v2 = neon_fp16x4_to_f32(data + i + 8);
+            v3 = neon_fp16x4_to_f32(data + i + 12);
+        }
+        vmax = vmaxq_f32(
+            vmax, vmaxq_f32(vmaxq_f32(vabsq_f32(v0), vabsq_f32(v1)), vmaxq_f32(vabsq_f32(v2), vabsq_f32(v3)))
+        );
+    }
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t v;
+        if constexpr (std::is_same<T, float>::value)
+            v = vld1q_f32(reinterpret_cast<const float*>(data + i));
+        else if constexpr (std::is_same<T, bf16_t>::value)
+            v = neon_bf16x4_to_f32(data + i);
+        else
+            v = neon_fp16x4_to_f32(data + i);
+        vmax = vmaxq_f32(vmax, vabsq_f32(v));
+    }
+    float result = vmaxvq_f32(vmax);
+    for (; i < n; ++i) {
+        float val;
+        if constexpr (std::is_same<T, float>::value)
+            val = data[i];
+        else if constexpr (std::is_same<T, bf16_t>::value)
+            val = bf16_to_float(data[i].v);
+        else
+            val = fp16_to_float(data[i].v);
+        result = std::max(result, std::fabs(val));
+    }
+    return result;
+}
+
+// NEON-optimized norm_to_lut_index for 4 float values at a time
+// Maps [-1, 1] → [0, 65535]
+static inline uint16x4_t neon_norm_to_lut_index_x4(float32x4_t vals) {
+    // clamp to [-1, 1]
+    vals = vmaxq_f32(vals, vdupq_n_f32(-1.0f));
+    vals = vminq_f32(vals, vdupq_n_f32(1.0f));
+    // (val + 1.0) * 0.5 * 65535 + 0.5
+    float32x4_t result = vmlaq_f32(vdupq_n_f32(0.5f), vaddq_f32(vals, vdupq_n_f32(1.0f)), vdupq_n_f32(0.5f * 65535.0f));
+    uint32x4_t u32 = vcvtq_u32_f32(result);
+    return vmovn_u32(u32);
+}
+
+#endif // _M_ARM64 || __aarch64__
+
+#if defined(__AVX512F__)
+
+inline __m256i cvt_fp32_to_fp16(const __m512 src) {
+    return _mm512_cvtps_ph(src, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+}
+
+inline __m256i cvt_fp32_to_bf16(const __m512 src) {
+#if defined(__AVX512BF16__)
+    if (has_avx512bf16()) {
+        return reinterpret_cast<__m256i>(_mm512_cvtneps_pbh(src));
+    }
+#endif
+    __m512i value = _mm512_castps_si512(src);
+    __m512i nan = _mm512_set1_epi32(0xffff);
+    auto mask_value = _mm512_cmp_ps_mask(src, src, _CMP_ORD_Q);
+    __m512i ones = _mm512_set1_epi32(0x1);
+    __m512i vec_bias = _mm512_set1_epi32(0x7fff);
+    // uint32_t lsb = (input >> 16) & 1;
+    auto t_value = _mm512_and_si512(_mm512_srli_epi32(value, 16), ones);
+    // uint32_t rounding_bias = 0x7fff + lsb;
+    t_value = _mm512_add_epi32(t_value, vec_bias);
+    // input += rounding_bias;
+    t_value = _mm512_add_epi32(t_value, value);
+    // input = input >> 16;
+    t_value = _mm512_srli_epi32(t_value, 16);
+    // Check NaN before converting back to bf16
+    t_value = _mm512_mask_blend_epi32(mask_value, nan, t_value);
+    return _mm512_cvtusepi32_epi16(t_value);
+}
+
+static inline __m512 set_nf4_lut() {
+    return _mm512_set_ps(
+        1.0f, 0.7229568362236023, 0.5626170039176941, 0.44070982933044434, 0.33791524171829224, 0.24611230194568634,
+        0.16093020141124725, 0.07958029955625534, 0.0f, -0.09105003625154495, -0.18477343022823334,
+        -0.28444138169288635, -0.39491748809814453, -0.5250730514526367, -0.6961928009986877, -1.0f
+    );
+}
+
+static inline __m512 set_fp4_lut() {
+    return _mm512_set_ps(
+        -0.2500f, -0.16666667f, -0.5000f, -0.33333333f, -1.0000f, -0.66666667f, -5.208333333e-03f, 0.0000f, 0.2500f,
+        0.16666667f, 0.5000f, 0.33333333f, 1.0000f, 0.66666667f, 5.208333333e-03f, 0.0000f
+    );
+}
+#endif
+
+static constexpr float fp4_lut[16] = {
+    0.0f,  0.005208333333f,  0.66666667f,  1.0f,  0.33333333f,  0.5f,  0.16666667f,  0.25f,
+    -0.0f, -0.005208333333f, -0.66666667f, -1.0f, -0.33333333f, -0.5f, -0.16666667f, -0.25f,
+};
+static constexpr float nf4_lut[16] = {
+    -1.0f,
+    -0.6961928009986877f,
+    -0.5250730514526367f,
+    -0.39491748809814453f,
+    -0.28444138169288635f,
+    -0.18477343022823334f,
+    -0.09105003625154495f,
+    0.0f,
+    0.07958029955625534f,
+    0.16093020141124725f,
+    0.24611230194568634f,
+    0.33791524171829224f,
+    0.44070982933044434f,
+    0.5626170039176941f,
+    0.7229568362236023f,
+    1.0f,
+};
+
+// 4-bit (FP4 / NF4) dequantization helper extracted from the original else branch.
+// DATA_TYPE: 1 = FP4, 2 = NF4
+template <typename T, int DATA_TYPE>
+void dequantizeBlockwise4bitCpu(
+    unsigned char* A, const float* absmax, T* out, long long blocksize, long long m, long long n
+) {
+    static_assert(DATA_TYPE == 1 || DATA_TYPE == 2, "dequantizeBlockwise4bitCpu called with non 4-bit DATA_TYPE");
+    if (blocksize <= 0 || m < 0 || n <= 0)
+        return;
+
+#if defined(_M_ARM64) || defined(__aarch64__)
+    // n % blocksize == 0: absmax is organized by flat element blocks; row and block
+    // boundaries must align or the 2D absmax indexing gives wrong scale values.
+    if (n % blocksize == 0) {
+        long long dim_0 = m;
+        long long dim_1 = n;
+        long long input_dim_1 = dim_1 >> 1;
+        long long absmax_dim_1 = dim_1 / blocksize;
+        float32x4_t neon_lut[4];
+        if constexpr (DATA_TYPE == 1) {
+            neon_fp4_lut(neon_lut);
+        } else {
+            neon_nf4_lut(neon_lut);
+        }
+        constexpr long long k_step = 8; // 8 packed bytes = 16 output values
+        BNB_OMP_PARALLEL_FOR
+        for (long long block_idx = 0; block_idx < dim_0; ++block_idx) {
+            for (long long k = 0; k < input_dim_1; k += k_step) {
+                long long scale_idx = k * 2 / blocksize;
+                float scale = absmax[block_idx * absmax_dim_1 + scale_idx];
+                const uint8_t* p = &A[block_idx * input_dim_1 + k];
+                float tmp_f32[16];
+                neon_dequant_4bit_16values(p, scale, neon_lut, tmp_f32);
+                T* pout = &out[block_idx * dim_1 + k * 2];
+                if constexpr (std::is_same<T, float>()) {
+                    std::memcpy(pout, tmp_f32, 16 * sizeof(float));
+                } else if constexpr (std::is_same<T, bf16_t>()) {
+                    neon_f32_to_bf16x4(vld1q_f32(tmp_f32), pout);
+                    neon_f32_to_bf16x4(vld1q_f32(tmp_f32 + 4), pout + 4);
+                    neon_f32_to_bf16x4(vld1q_f32(tmp_f32 + 8), pout + 8);
+                    neon_f32_to_bf16x4(vld1q_f32(tmp_f32 + 12), pout + 12);
+                } else {
+                    neon_f32_to_fp16x4(vld1q_f32(tmp_f32), pout);
+                    neon_f32_to_fp16x4(vld1q_f32(tmp_f32 + 4), pout + 4);
+                    neon_f32_to_fp16x4(vld1q_f32(tmp_f32 + 8), pout + 8);
+                    neon_f32_to_fp16x4(vld1q_f32(tmp_f32 + 12), pout + 12);
+                }
+            }
+        }
+        return;
+    }
+#endif // _M_ARM64 || __aarch64__
+
+#if defined(__AVX512F__)
+    if (has_avx512f()) {
+        long long dim_0 = m;
+        long long dim_1 = n;
+        long long input_dim_1 = dim_1 >> 1;
+        long long absmax_dim_1 = dim_1 / blocksize;
+        using Tcomp = float;
+        constexpr auto VEC_LEN = sizeof(__m512i) / sizeof(Tcomp); // 16
+        if (dim_1 % VEC_LEN == 0 && blocksize >= VEC_LEN) {
+            __m512 lut = DATA_TYPE == 1 ? set_fp4_lut() : set_nf4_lut();
+            constexpr auto k_step = VEC_LEN / 2; // 8
+            BNB_OMP_PARALLEL_FOR
+            for (int block_idx = 0; block_idx < dim_0; ++block_idx) {
+                for (int k = 0; k < input_dim_1; k += k_step) {
+                    const uint8_t* p = &A[block_idx * input_dim_1 + k];
+                    auto scale_idx = k * 2 / blocksize;
+                    auto vscales = _mm512_set1_ps((float)absmax[block_idx * absmax_dim_1 + scale_idx]);
+                    // Unpack 8 packed bytes into 16 nibble indices using SSE.
+                    // Each byte holds two 4-bit values; high nibble is the first output element.
+                    __m128i raw = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+                    __m128i mask4 = _mm_set1_epi8(0x0f);
+                    __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask4);
+                    __m128i lo = _mm_and_si128(raw, mask4);
+                    __m128i packed_128 = _mm_unpacklo_epi8(hi, lo);
+                    __m512i vint32 = _mm512_cvtepu8_epi32(packed_128);
+                    // Table look-up
+                    __m512 vout = _mm512_permutexvar_ps(vint32, lut);
+                    // Apply scale
+                    vout = _mm512_mul_ps(vout, vscales);
+                    // Store results
+                    T* pout = &out[block_idx * dim_1 + k * 2];
+                    if constexpr (std::is_same<T, float>()) {
+                        _mm512_storeu_ps(pout, vout);
+                    } else if constexpr (std::is_same<T, bf16_t>()) {
+                        _mm256_storeu_si256((__m256i*)pout, cvt_fp32_to_bf16(vout));
+                    } else if constexpr (std::is_same<T, fp16_t>()) {
+                        _mm256_storeu_si256((__m256i*)pout, cvt_fp32_to_fp16(vout));
+                    }
+                }
+            }
+            return;
+        }
+    }
+#endif
+    // Scalar fallback branch
+    const float* lut = DATA_TYPE == 1 ? fp4_lut : nf4_lut;
+    long long total = m * n;
+    BNB_OMP_PARALLEL_FOR
+    for (long long block_idx = 0; block_idx < total; block_idx += blocksize) {
+        long long valid_items = (total - block_idx >= blocksize ? blocksize : total - block_idx);
+        float scale = absmax[block_idx / blocksize];
+        for (long long i = 0; i < valid_items; i += 2) {
+            long long byte_index = (block_idx + i) >> 1;
+            unsigned char byte = A[byte_index];
+
+            // High nibble first (matches previous code logic)
+            float v0 = lut[byte >> 4] * scale;
+            // Low nibble second
+            float v1 = lut[byte & 0x0F] * scale;
+
+            if constexpr (std::is_same<T, bf16_t>::value) {
+                out[block_idx + i] = float_to_bf16(v0);
+            } else if constexpr (std::is_same<T, fp16_t>::value) {
+                out[block_idx + i] = float_to_fp16(v0);
+            } else {
+                out[block_idx + i] = static_cast<T>(v0);
+            }
+
+            if (i + 1 < valid_items) {
+                if constexpr (std::is_same<T, bf16_t>::value) {
+                    out[block_idx + i + 1] = float_to_bf16(v1);
+                } else if constexpr (std::is_same<T, fp16_t>::value) {
+                    out[block_idx + i + 1] = float_to_fp16(v1);
+                } else {
+                    out[block_idx + i + 1] = static_cast<T>(v1);
+                }
+            }
+        }
+    }
+}
+
+template <typename T>
+void dequantizeBlockwise8bitCpu(
+    float* code, unsigned char* A, const float* absmax, T* out, long long blocksize, long long n
+) {
+    if (blocksize <= 0 || n <= 0)
+        return;
+    // 8-bit path
+    BNB_OMP_PARALLEL_FOR
+    for (long long block_idx = 0; block_idx < n; block_idx += blocksize) {
+        long long valid_items = (n - block_idx >= blocksize ? blocksize : n - block_idx);
+        long long block_end = block_idx + valid_items;
+        float scale = absmax[block_idx / blocksize];
+#if defined(_M_ARM64) || defined(__aarch64__)
+        {
+            float32x4_t vscale = vdupq_n_f32(scale);
+            long long i = block_idx;
+            for (; i + 4 <= block_end; i += 4) {
+                float tmp[4] = {code[A[i]], code[A[i + 1]], code[A[i + 2]], code[A[i + 3]]};
+                float32x4_t v = vmulq_f32(vld1q_f32(tmp), vscale);
+                if constexpr (std::is_same<T, float>::value)
+                    vst1q_f32(reinterpret_cast<float*>(out + i), v);
+                else if constexpr (std::is_same<T, bf16_t>::value)
+                    neon_f32_to_bf16x4(v, out + i);
+                else
+                    neon_f32_to_fp16x4(v, out + i);
+            }
+            for (; i < block_end; ++i) {
+                float v = code[A[i]] * scale;
+                if constexpr (std::is_same<T, bf16_t>::value)
+                    out[i] = float_to_bf16(v);
+                else if constexpr (std::is_same<T, fp16_t>::value)
+                    out[i] = float_to_fp16(v);
+                else
+                    out[i] = static_cast<T>(v);
+            }
+        }
+#else
+#pragma omp simd
+        for (long long i = block_idx; i < block_end; ++i) {
+            float v = code[A[i]] * scale;
+            if constexpr (std::is_same<T, bf16_t>::value) {
+                out[i] = float_to_bf16(v);
+            } else if constexpr (std::is_same<T, fp16_t>::value) {
+                out[i] = float_to_fp16(v);
+            } else {
+                out[i] = static_cast<T>(v);
+            }
+        }
+#endif
+    }
+}
+
+// Prevent GCC/Clang from emitting EVEX-encoded AVX512 instructions in plain scalar code.
+// The global -mavx512vl flag can cause GCC to fold broadcasts into EVEX encoding (e.g. vmulps {1to4})
+// which would SIGILL on non-AVX512 CPUs like Zen3. These functions are scalar C++ and don't need AVX512.
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#pragma GCC push_options
+#pragma GCC target("avx2,fma,no-avx512f")
+#endif
+
+// Precomputed direct lookup table: maps quantized uint16 index [0..65535] to codebook index.
+// Replaces binary search per element with a single array access.
+static constexpr int kLUTSize = 65536;
+static constexpr int kLUTCacheSlots = 4;
+
+static void build_quantize_lut(const float* codebook, unsigned char* lut) {
+    // codebook has 256 sorted entries in [-1, 1].
+    // We discretize the [-1, 1] range into 65536 bins and find the nearest codebook entry for each.
+    // Precompute midpoints between consecutive codebook entries for nearest-neighbor lookup.
+    float midpoints[kCodebookSize - 1];
+    for (int i = 0; i < kCodebookSize - 1; ++i) {
+        midpoints[i] = 0.5f * (codebook[i] + codebook[i + 1]);
+    }
+
+    int code_idx = 0;
+    for (int i = 0; i < kLUTSize; ++i) {
+        // Map LUT index to normalized value in [-1, 1]
+        float val = -1.0f + (2.0f * i) / (kLUTSize - 1);
+        // Advance code_idx while the next midpoint is still below val
+        while (code_idx < kCodebookSize - 1 && midpoints[code_idx] < val) {
+            ++code_idx;
+        }
+        lut[i] = static_cast<unsigned char>(code_idx);
+    }
+}
+
+// Per-thread LUT cache with multiple slots to avoid rebuilding when alternating codebooks
+struct LUTCache {
+    unsigned char luts[kLUTCacheSlots][kLUTSize];
+    const float* cached_codes[kLUTCacheSlots] = {};
+    // Store fingerprint to detect pointer reuse (ABA problem):
+    // when a tensor is freed and a new one reuses the same address,
+    // the pointer matches but the codebook content may differ.
+    float cached_fingerprints[kLUTCacheSlots][4] = {};
+    int next_slot = 0;
+
+    static void compute_fingerprint(const float* code, float* fp) {
+        fp[0] = code[0];
+        fp[1] = code[1];
+        fp[2] = code[127];
+        fp[3] = code[255];
+    }
+
+    const unsigned char* get_lut(const float* code) {
+        float fp[4];
+        compute_fingerprint(code, fp);
+        for (int i = 0; i < kLUTCacheSlots; ++i) {
+            if (cached_codes[i] == code && cached_fingerprints[i][0] == fp[0] && cached_fingerprints[i][1] == fp[1] &&
+                cached_fingerprints[i][2] == fp[2] && cached_fingerprints[i][3] == fp[3]) {
+                return luts[i];
+            }
+        }
+        // Cache miss: build and store in next slot (round-robin)
+        int slot = next_slot;
+        next_slot = (next_slot + 1) % kLUTCacheSlots;
+        build_quantize_lut(code, luts[slot]);
+        cached_codes[slot] = code;
+        for (int j = 0; j < 4; ++j)
+            cached_fingerprints[slot][j] = fp[j];
+        return luts[slot];
+    }
+};
+
+// Single global LUT cache (protected by mutex for thread safety during build)
+static LUTCache g_lut_cache;
+static std::mutex g_lut_mutex;
+
+static const unsigned char* get_global_lut(const float* code) {
+    std::lock_guard<std::mutex> lock(g_lut_mutex);
+    return g_lut_cache.get_lut(code);
+}
+
+// Convert a normalized value in [-1, 1] to LUT index [0, 65535]
+static inline uint16_t norm_to_lut_index(float val) {
+    val = std::clamp(val, -1.0f, 1.0f);
+    return static_cast<uint16_t>((val + 1.0f) * 0.5f * (kLUTSize - 1) + 0.5f);
+}
+
+template <typename T>
+void quantize_cpu_impl(float* code, const T* A, float* absmax, unsigned char* out, long long blocksize, long long n) {
+    if (blocksize <= 0 || n <= 0)
+        return;
+
+    // Get LUT from global cache (built once per codebook, shared by all OMP threads)
+    const unsigned char* lut = get_global_lut(code);
+
+    const long long num_blocks = (n + blocksize - 1) / blocksize;
+
+    BNB_OMP_PARALLEL_FOR
+    for (long long b = 0; b < num_blocks; ++b) {
+        const long long block_start = b * blocksize;
+        const long long block_end = std::min(block_start + blocksize, n);
+        const long long block_len = block_end - block_start;
+
+        // Compute absmax for this block
+        float absmax_block = 0.0f;
+
+#if defined(_M_ARM64) || defined(__aarch64__)
+        absmax_block = neon_absmax<T>(A + block_start, block_len);
+#else
+#pragma omp simd reduction(max : absmax_block)
+        for (long long i = block_start; i < block_end; ++i) {
+            float val;
+            if constexpr (std::is_same<T, float>::value)
+                val = A[i];
+            else if constexpr (std::is_same<T, bf16_t>::value)
+                val = bf16_to_float(A[i].v);
+            else
+                val = fp16_to_float(A[i].v);
+            absmax_block = std::max(absmax_block, std::fabs(val));
+        }
+#endif
+
+        absmax[b] = absmax_block;
+
+        if (absmax_block == 0.0f) {
+            for (long long i = block_start; i < block_end; ++i) {
+                out[i] = 0;
+            }
+            continue;
+        }
+
+        const float inv_absmax = 1.0f / absmax_block;
+
+#if defined(_M_ARM64) || defined(__aarch64__)
+        {
+            long long i = 0;
+            float32x4_t vinv = vdupq_n_f32(inv_absmax);
+            for (; i + 4 <= block_len; i += 4) {
+                float32x4_t v;
+                if constexpr (std::is_same<T, float>::value)
+                    v = vld1q_f32(reinterpret_cast<const float*>(A + block_start + i));
+                else if constexpr (std::is_same<T, bf16_t>::value)
+                    v = neon_bf16x4_to_f32(A + block_start + i);
+                else
+                    v = neon_fp16x4_to_f32(A + block_start + i);
+                v = vmulq_f32(v, vinv);
+                uint16x4_t indices = neon_norm_to_lut_index_x4(v);
+                uint16_t idx_arr[4];
+                vst1_u16(idx_arr, indices);
+                out[block_start + i] = lut[idx_arr[0]];
+                out[block_start + i + 1] = lut[idx_arr[1]];
+                out[block_start + i + 2] = lut[idx_arr[2]];
+                out[block_start + i + 3] = lut[idx_arr[3]];
+            }
+            for (; i < block_len; ++i) {
+                float val;
+                if constexpr (std::is_same<T, float>::value)
+                    val = A[block_start + i];
+                else if constexpr (std::is_same<T, bf16_t>::value)
+                    val = bf16_to_float(A[block_start + i].v);
+                else
+                    val = fp16_to_float(A[block_start + i].v);
+                out[block_start + i] = lut[norm_to_lut_index(val * inv_absmax)];
+            }
+        }
+#else
+        for (long long i = block_start; i < block_end; ++i) {
+            float val;
+            if constexpr (std::is_same<T, float>::value)
+                val = A[i];
+            else if constexpr (std::is_same<T, bf16_t>::value)
+                val = bf16_to_float(A[i].v);
+            else
+                val = fp16_to_float(A[i].v);
+            out[i] = lut[norm_to_lut_index(val * inv_absmax)];
+        }
+#endif
+    }
+}
+
+void quantize_cpu(float* code, float* A, float* absmax, unsigned char* out, long long blocksize, long long n) {
+    quantize_cpu_impl<float>(code, A, absmax, out, blocksize, n);
+}
+
+void quantize_cpu_bf16(float* code, bf16_t* A, float* absmax, unsigned char* out, long long blocksize, long long n) {
+    quantize_cpu_impl<bf16_t>(code, A, absmax, out, blocksize, n);
+}
+
+void quantize_cpu_fp16(float* code, fp16_t* A, float* absmax, unsigned char* out, long long blocksize, long long n) {
+    quantize_cpu_impl<fp16_t>(code, A, absmax, out, blocksize, n);
+}
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#pragma GCC pop_options
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BF16__)
+
+#define CVT_BF16_TO_FP32(a) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
+
+template <typename scalar_t, int BLOCK_M, int BLOCK_N, int DATA_TYPE> struct tinygemm_kernel_nn {
+    static inline void apply(
+        const scalar_t*, const unsigned char*, scalar_t*, const scalar_t*, int64_t, int, int64_t, int64_t, int64_t,
+        int64_t, int64_t
+    ) {
+        static_assert(sizeof(scalar_t) == 0, "tinygemm_kernel_nn primary template should never be instantiated");
+    }
+};
+
+template <int BLOCK_M, int BLOCK_N, int DATA_TYPE> struct tinygemm_kernel_nn<bf16_t, BLOCK_M, BLOCK_N, DATA_TYPE> {
+    static inline void apply(
+        const bf16_t* __restrict__ A, const unsigned char* __restrict__ B, bf16_t* __restrict__ C,
+        const bf16_t* __restrict__ Bs, int64_t K, int group_size, int64_t lda, int64_t ldb, int64_t ldc,
+        int64_t strideBz, int64_t strideBs
+    ) {
+        static_assert(BLOCK_N % 32 == 0);
+        constexpr int ROWS = BLOCK_M;      // 32
+        constexpr int COLS = BLOCK_N / 16; // 2
+
+        // prefetch distance
+        constexpr int PREFETCH_SIZE_K = 16 * 4;
+
+        __m512bh va;
+        __m512bh vb[COLS];
+        __m512 vc[ROWS * COLS];
+        __m512 vc_master[ROWS * COLS];
+
+        __m256i mask = _mm256_set1_epi8(0xF); // lower 4 bit
+        __m256i fifteen = _mm256_set1_epi8(15);
+        __m512i lut = DATA_TYPE == 1
+                          ? _mm512_set_epi16(
+                                0x0000, -0x4180, -0x41D5, -0x4100, -0x4155, -0x4080, -0x40D5, -0x4455, 0x0000, 0x3E80,
+                                0x3E2B, 0x3F00, 0x3EAB, 0x3F80, 0x3F2B, 0x3BAB, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+                                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
+                            )
+                          : _mm512_set_epi16(
+                                0x0000, 0x3F80, 0x3F39, 0x3F10, 0x3EE2, 0x3EAD, 0x3E7C, 0x3E25, 0x3DA3, 0x0000, -0x4246,
+                                -0x41C3, -0x416E, -0x4136, -0x40FA, -0x40CE, -0x4080, 0x0000, 0x0000, 0x0000, 0x0000,
+                                0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
+                            );
+        __m512 scales[COLS];
+        const int64_t K2 = K >> 1;
+        const int64_t lda2 = lda >> 1;
+        const int64_t ldb2 = ldb;            // ldb * 2 >> 1;
+        const int64_t gs2 = group_size >> 1; // 64 / 2 = 32
+        const float* a_ptr = reinterpret_cast<const float*>(A);
+
+        auto loadc = [&](auto i) {
+            constexpr int col = i % COLS;
+            vc_master[i] = _mm512_set1_ps(0.f);
+        };
+        Unroll<ROWS * COLS>{}(loadc);
+
+        auto pre_compute = [&](auto i, int64_t kgs) {
+            constexpr int row = i / COLS;
+            constexpr int col = i % COLS;
+            vc[i] = _mm512_set1_ps(0.f); // reset accumulator
+
+            // load scales
+            if constexpr (row == 0 && col % 2 == 0) {
+                // Bs layout: [K/gs, BLOCK_N] : [strideBs, 1], dtype=bf16
+                __m512i tmp = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(Bs + kgs * strideBs + col * 16));
+                scales[col] = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(tmp, 0));
+                scales[col + 1] = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(tmp, 1));
+            }
+        };
+        auto compute = [&](auto i, int64_t k) {
+            constexpr int row = i / COLS;
+            constexpr int col = i % COLS;
+
+            if constexpr (col == 0) {
+                va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
+            }
+            if constexpr (row == 0 && col % 2 == 0) {
+                __m256i vb_u4 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(B + k * ldb + col * 16));
+
+                // deinterleave and lookup to BF16
+                __m256i vb_i8_lo = vb_u4 & mask;
+                __m256i vb_i8_hi = _mm256_srli_epi16(vb_u4, 4) & mask;
+                vb_i8_lo = _mm256_add_epi8(vb_i8_lo, fifteen);
+                vb_i8_hi = _mm256_add_epi8(vb_i8_hi, fifteen);
+                vb[col] = (__m512bh)_mm512_permutexvar_epi16(_mm512_cvtepi8_epi16(vb_i8_lo), lut);
+                vb[col + 1] = (__m512bh)_mm512_permutexvar_epi16(_mm512_cvtepi8_epi16(vb_i8_hi), lut);
+
+                if constexpr (PREFETCH_SIZE_K > 0) {
+                    _mm_prefetch(B + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
+                }
+            }
+            vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
+        };
+        auto post_compute = [&](auto i, int64_t kgs) {
+            vc_master[i] = _mm512_fmadd_ps(vc[i], scales[i % COLS], vc_master[i]);
+        };
+        for (int64_t k = 0; k < K2; k += gs2) {
+            Unroll<ROWS * COLS>{}(pre_compute, k / gs2);
+            for (int64_t k_offset = 0; k_offset < gs2; ++k_offset) {
+                Unroll<ROWS * COLS>{}(compute, k + k_offset);
+            }
+            Unroll<ROWS * COLS>{}(post_compute, k / gs2);
+        }
+
+        auto storec = [&](auto i) {
+            constexpr int row = i / COLS;
+            constexpr int col = i % COLS;
+            if constexpr (col % 2 == 0) {
+                _mm512_storeu_si512(
+                    reinterpret_cast<__m512i*>(C + row * ldc + col * 16),
+                    (__m512i)(_mm512_cvtne2ps_pbh(vc_master[i + 1], vc_master[i]))
+                );
+            }
+        };
+        Unroll<ROWS * COLS>{}(storec);
+    }
+};
+
+#define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE, DATA_TYPE)                                                         \
+    tinygemm_kernel_nn<scalar_t, MB_SIZE, NB_SIZE, DATA_TYPE>::apply(                                                  \
+        A + mb_start * lda, B + nb_start, C + mb_start * ldc + nb_start, Bs + nb_start, K, group_size, lda, ldb, ldc,  \
+        strideBz, strideBs                                                                                             \
+    );
+
+template <typename scalar_t, int DATA_TYPE>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A, const unsigned char* __restrict__ B, scalar_t* __restrict__ C,
+    const scalar_t* __restrict__ Bs, scalar_t* __restrict__ Btmp, float* __restrict__ Ctmp, int64_t M, int64_t N,
+    int64_t K, int group_size, int64_t lda, int64_t ldb, int64_t ldc, int64_t strideBz, int64_t strideBs
+) {
+    constexpr int64_t BLOCK_M = 4;
+    constexpr int64_t BLOCK_N = 64;
+    const int64_t MB = div_up(M, BLOCK_M);
+    const int64_t NB = div_up(N, BLOCK_N);
+    for (int mb = 0; mb < MB; ++mb) {
+        int64_t mb_start = mb * BLOCK_M;
+        int64_t mb_size = std::min(BLOCK_M, M - mb_start);
+        for (int64_t nb = 0; nb < NB; ++nb) {
+            int64_t nb_start = nb * BLOCK_N;
+            int64_t nb_size = std::min(BLOCK_N, N - nb_start);
+
+            switch (mb_size << 4 | nb_size >> 4) {
+            // mb_size = 1
+            case 0x12:
+                LAUNCH_TINYGEMM_KERNEL_NN(1, 32, DATA_TYPE);
+                break;
+            case 0x14:
+                LAUNCH_TINYGEMM_KERNEL_NN(1, 64, DATA_TYPE);
+                break;
+            // mb_size = 2
+            case 0x22:
+                LAUNCH_TINYGEMM_KERNEL_NN(2, 32, DATA_TYPE);
+                break;
+            case 0x24:
+                LAUNCH_TINYGEMM_KERNEL_NN(2, 64, DATA_TYPE);
+                break;
+            // mb_size = 3
+            case 0x32:
+                LAUNCH_TINYGEMM_KERNEL_NN(3, 32, DATA_TYPE);
+                break;
+            case 0x34:
+                LAUNCH_TINYGEMM_KERNEL_NN(3, 64, DATA_TYPE);
+                break;
+            // mb_size = 4
+            case 0x42:
+                LAUNCH_TINYGEMM_KERNEL_NN(4, 32, DATA_TYPE);
+                break;
+            case 0x44:
+                LAUNCH_TINYGEMM_KERNEL_NN(4, 64, DATA_TYPE);
+                break;
+            default: {
+                std::fprintf(
+                    stderr, "[bitsandbytes] Unexpected block size %lldx%lld\n", (long long)mb_size, (long long)nb_size
+                );
+                std::abort(); // or return; if you prefer silent exit
+            }
+            }
+        }
+    }
+}
+
+template <typename T, int DATA_TYPE>
+void gemv_4bit_inference(
+    int64_t M, int64_t N, int64_t K, const T* __restrict__ x, const unsigned char* __restrict__ w,
+    const T* __restrict__ absmax, T* __restrict__ out, int64_t blocksize, int64_t x_stride, int64_t out_stride
+) {
+    constexpr int64_t BLOCK_M = block_size_m(); // 32
+    constexpr int64_t BLOCK_N = block_size_n(); // 32
+    const int64_t MB = div_up(M, BLOCK_M);      // （x + y -1）/ y, res = 1 when M <= 32
+    const int64_t NB = div_up(N, BLOCK_N);
+    // TODO: enable brgemm in the future.
+    // const bool use_brgemm = M > 4;
+    // const bool use_brgemm_dequant_out = M > 512;
+    // T* Btmp_start = nullptr;
+    // l2 cache block for n
+    int64_t cache_blocks_nb = get_cache_blocks<T>(BLOCK_N * K);
+    parallel_2d(MB, NB, [&](int64_t begin_mb, int64_t end_mb, int64_t begin_nb, int64_t end_nb) {
+        // for brgemm, use float32 for accumulate
+        alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
+        alignas(64) T Btmp_inner[BLOCK_N * BLOCK_K]; // BLOCK_K = 128
+        for (int64_t nbb = begin_nb; nbb < end_nb; nbb += cache_blocks_nb) {
+            for (int64_t mb = begin_mb; mb < end_mb; ++mb) { // 0-1
+                for (int64_t nb = nbb; nb < std::min(nbb + cache_blocks_nb, end_nb); ++nb) {
+                    int64_t mb_start = mb * BLOCK_M; // 0
+                    int64_t mb_size = std::min(M - mb_start, BLOCK_M);
+                    int64_t nb_start = nb * BLOCK_N;
+                    int64_t nb_size = std::min(N - nb_start, BLOCK_N);
+                    tinygemm_kernel<T, DATA_TYPE>(
+                        /*   A  */ x + mb_start * x_stride,
+                        /*   B  */ w + nb_start * K / 2, // divide by 2 since w is u4 packed in u8, K is w.size(1) * 2
+                        /*   C  */ out + mb_start * out_stride + nb_start,
+                        /*  Bs  */ absmax + nb_start,
+                        /* Btmp */ Btmp_inner,
+                        /* Ctmp */ Ctmp,
+                        /*   M  */ mb_size,
+                        /*   N  */ nb_size,
+                        /*   K  */ K,
+                        /*  gs  */ blocksize, // group_size
+                        /* lda  */ x_stride,
+                        /* ldb  */ nb_size,
+                        /* ldc  */ out_stride,
+                        /* sBz  */ N,
+                        /* sBs  */ N
+                    );
+                }
+            }
+        }
+        // if (use_brgemm) {
+        //     at::native::cpublas::brgemm_release();
+        // }
+    });
+}
+#endif
+
+//==============================================================
+//                   TEMPLATE DEFINITIONS
+//==============================================================
+
+template void dequantizeBlockwise8bitCpu<float>(
+    float* code, unsigned char* A, const float* absmax, float* out, long long blocksize, long long n
+);
+template void dequantizeBlockwise8bitCpu<fp16_t>(
+    float* code, unsigned char* A, const float* absmax, fp16_t* out, long long blocksize, long long n
+);
+template void dequantizeBlockwise8bitCpu<bf16_t>(
+    float* code, unsigned char* A, const float* absmax, bf16_t* out, long long blocksize, long long n
+);
+
+template void dequantizeBlockwise4bitCpu<float, FP4>(
+    unsigned char* A, const float* absmax, float* out, long long blocksize, long long m, long long n
+);
+template void dequantizeBlockwise4bitCpu<float, NF4>(
+    unsigned char* A, const float* absmax, float* out, long long blocksize, long long m, long long n
+);
+
+template void dequantizeBlockwise4bitCpu<fp16_t, FP4>(
+    unsigned char* A, const float* absmax, fp16_t* out, long long blocksize, long long m, long long n
+);
+template void dequantizeBlockwise4bitCpu<fp16_t, NF4>(
+    unsigned char* A, const float* absmax, fp16_t* out, long long blocksize, long long m, long long n
+);
+
+template void dequantizeBlockwise4bitCpu<bf16_t, FP4>(
+    unsigned char* A, const float* absmax, bf16_t* out, long long blocksize, long long m, long long n
+);
+template void dequantizeBlockwise4bitCpu<bf16_t, NF4>(
+    unsigned char* A, const float* absmax, bf16_t* out, long long blocksize, long long m, long long n
+);
+
+#if defined(__AVX512F__) && defined(__AVX512BF16__)
+template void gemv_4bit_inference<bf16_t, FP4>(
+    int64_t M, int64_t N, int64_t K, const bf16_t* __restrict__ x, const unsigned char* __restrict__ w,
+    const bf16_t* __restrict__ absmax, bf16_t* __restrict__ out, int64_t blocksize, int64_t x_stride, int64_t out_stride
+);
+template void gemv_4bit_inference<bf16_t, NF4>(
+    int64_t M, int64_t N, int64_t K, const bf16_t* __restrict__ x, const unsigned char* __restrict__ w,
+    const bf16_t* __restrict__ absmax, bf16_t* __restrict__ out, int64_t blocksize, int64_t x_stride, int64_t out_stride
+);
+#endif
+
+#ifndef BITSANDBYTES_CPU_OPS_H
+#define BITSANDBYTES_CPU_OPS_H
+
+#include "common.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <thread>
+#include <type_traits>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
+// amx-bf16
+#define TILE_M 16
+#define TILE_N 16
+#define TILE_K 32
+// work around compiler internal error
+#define BLOCK_K 128 // 4 * TILE_K
+
+// block size for AMX gemm
+constexpr int block_size_m() { return 2 * TILE_M; }
+
+constexpr int block_size_n() { return 2 * TILE_N; }
+
+template <typename T> inline int get_cache_blocks(int chunk_size) {
+    // L2 2MB and ratio of 50%
+    const int L2_size = 2048 * 1024 >> 1;
+    return std::max(1, int(L2_size / (chunk_size * sizeof(T))));
+}
+
+// forced unroll for perf critical path
+#if defined(__has_attribute) && __has_attribute(always_inline)
+#define ALWAYS_INLINE __attribute__((__always_inline__)) inline
+#else
+#define ALWAYS_INLINE inline
+#endif
+
+template <int n> struct Unroll {
+    template <typename Func, typename... Args> ALWAYS_INLINE void operator()(const Func& f, Args... args) const {
+        Unroll<n - 1>{}(f, args...);
+        f(std::integral_constant<int, n - 1>{}, args...);
+    }
+};
+
+template <> struct Unroll<1> {
+    template <typename Func, typename... Args> ALWAYS_INLINE void operator()(const Func& f, Args... args) const {
+        f(std::integral_constant<int, 0>{}, args...);
+    }
+};
+
+template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0> inline T div_up(T x, T y) {
+    return (x + y - 1) / y;
+}
+
+inline int get_max_threads() {
+#if defined(_OPENMP)
+    return omp_get_max_threads();
+#else
+    unsigned hc = std::thread::hardware_concurrency();
+    return hc == 0 ? 1 : int(hc);
+#endif
+}
+
+inline int adjust_num_threads(int m) {
+    int actual_nth = get_max_threads();
+    if (m == 1)
+        return actual_nth;
+    return std::max(1, (actual_nth >> 1) * 2);
+}
+
+template <typename func_t> inline void parallel_2d(int m, int n, const func_t& f) {
+    // make sure we have even num_threads
+    int nth = adjust_num_threads(m);
+
+    // [NOTE] thread blocking:
+    //
+    //   1) prefer square block per thread
+    //   2) use even number of CPU cores
+    //   3) use all `num_threads` cores
+    //
+    //   we have:
+    //     TM * TN = T
+    //     BM / TM = BN / TN
+    //   then:
+    //     TM = ((BM / BN) * T) ^ 0.5
+    //
+    float r = float(m) / n;
+    int nth_m = std::ceil(std::sqrt(r * nth));
+    int nth_n = 1;
+    for (; nth_m > 0; --nth_m) {
+        nth_n = nth / nth_m;
+        if (nth_m * nth_n == nth) {
+            break;
+        }
+    }
+
+#if defined(_OPENMP)
+#pragma omp parallel num_threads(nth)
+    {
+        int ith = omp_get_thread_num();
+        int ith_m = ith / nth_n;
+        int ith_n = ith % nth_n;
+
+        int thread_block_m = div_up(m, nth_m);
+        int thread_block_n = div_up(n, nth_n);
+
+        int begin_m = ith_m * thread_block_m;
+        int end_m = std::min(m, begin_m + thread_block_m);
+        int begin_n = ith_n * thread_block_n;
+        int end_n = std::min(n, begin_n + thread_block_n);
+
+        f(begin_m, end_m, begin_n, end_n);
+    }
+#else
+    f(0, m, 0, n);
+#endif
+}
+
+void quantize_cpu(float* code, float* A, float* absmax, unsigned char* out, long long blocksize, long long n);
+
+struct fp16_t {
+    uint16_t v;
+};
+
+struct bf16_t {
+    uint16_t v;
+};
+
+void quantize_cpu_bf16(float* code, bf16_t* A, float* absmax, unsigned char* out, long long blocksize, long long n);
+void quantize_cpu_fp16(float* code, fp16_t* A, float* absmax, unsigned char* out, long long blocksize, long long n);
+
+static inline bf16_t float_to_bf16(float x) {
+    uint32_t bits;
+    std::memcpy(&bits, &x, 4);
+    uint32_t r = bits + 0x7FFF + ((bits >> 16) & 1);
+    return bf16_t{static_cast<uint16_t>(r >> 16)};
+}
+
+static float bf16_to_float(uint16_t bf16) {
+    uint32_t bits = (uint32_t)bf16 << 16;
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+static inline fp16_t float_to_fp16(float x) {
+#if defined(__AVX2__)
+    // F16C is guaranteed on all AVX2 CPUs; matches CUDA round-to-nearest-even behavior
+    return fp16_t{
+        (uint16_t)_mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(x), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC), 0)
+    };
+#else
+    uint32_t bits;
+    std::memcpy(&bits, &x, 4);
+    uint32_t sign = (bits >> 31) & 0x1;
+    uint32_t exp = (bits >> 23) & 0xFF;
+    uint32_t mant = bits & 0x7FFFFF;
+
+    uint16_t h;
+    if (exp == 0xFF) {                      // Inf / NaN
+        uint16_t mant16 = mant ? 0x200 : 0; // quiet NaN: set MSB of mantissa
+        h = (sign << 15) | (0x1F << 10) | mant16;
+    } else if (exp > 0x70 + 0x1E) {      // overflow: exp_f -127 +15 > 30  (exp_f > 142)
+        h = (sign << 15) | (0x1F << 10); // Inf
+    } else if (exp < 0x71) {             // subnormal or zero (exp_f < 113)
+        if (exp < 0x67) {                // too small -> zero (exp_f < 103)
+            h = (sign << 15);
+        } else {
+            // subnormal: implicit leading 1
+            uint32_t shift = 0x71 - exp;
+            uint32_t mant_with_hidden = mant | 0x800000;
+            // add rounding bias before shifting (23-10 =13 bits to drop + shift)
+            uint32_t rounded = (mant_with_hidden + (1u << (shift + 12))) >> (shift + 13);
+            h = (sign << 15) | (uint16_t)rounded;
+        }
+    } else {
+        // normalized
+        uint32_t exp_h = exp - 127 + 15;
+        // round mantissa: add 2^(23-10-1) = 0x1000
+        uint32_t mant_rounded = mant + 0x00001000;
+        if (mant_rounded & 0x00800000) { // mantissa overflow after rounding
+            mant_rounded = 0;
+            ++exp_h;
+            if (exp_h >= 0x1F) { // overflow to Inf
+                h = (sign << 15) | (0x1F << 10);
+                return fp16_t{h};
+            }
+        }
+        h = (sign << 15) | ((uint16_t)exp_h << 10) | ((uint16_t)(mant_rounded >> 13));
+    }
+    return fp16_t{h};
+#endif
+}
+
+static inline float fp16_to_float(uint16_t h) {
+#if defined(__AVX2__)
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h)));
+#else
+    uint32_t sign = (h >> 15) & 0x1;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t bits;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign << 31; // zero
+        } else {
+            // subnormal fp16 -> normal fp32
+            exp = 1;
+            while (!(mant & 0x400)) {
+                mant <<= 1;
+                exp--;
+            }
+            mant &= 0x3FF;
+            bits = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {
+        bits = (sign << 31) | (0xFF << 23) | (mant ? (mant << 13) : 0); // Inf or NaN
+    } else {
+        bits = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+#endif
+}
+
+inline float dDequantizeFP4(unsigned char val) {
+    if ((val & 0b1000) == 8)
+        if ((val & 0b0100) == 4)
+            if ((val & 0b0010) == 2)
+                if ((val & 0b0001) == 1)
+                    return -0.25000000f;
+                else
+                    return -0.16666667f;
+            else if ((val & 0b0001) == 1)
+                return -0.50000000f;
+            else
+                return -0.33333333f;
+        else if ((val & 0b0010) == 2)
+            if ((val & 0b0001) == 1)
+                return -1.00000000f;
+            else
+                return -0.66666667f;
+        else if ((val & 0b0001) == 1)
+            return -5.208333333e-03f;
+        else
+            return 0.00000000f;
+    else if ((val & 0b0100) == 4)
+        if ((val & 0b0010) == 2)
+            if ((val & 0b0001) == 1)
+                return 0.25000000f;
+            else
+                return 0.16666667f;
+        else if ((val & 0b0001) == 1)
+            return 0.50000000f;
+        else
+            return 0.33333333f;
+    else if ((val & 0b0010) == 2)
+        if ((val & 0b0001) == 1)
+            return 1.00000000f;
+        else
+            return 0.66666667f;
+    else if ((val & 0b0001) == 1)
+        return 5.208333333e-03f;
+    else
+        return 0.00000000f;
+}
+
+inline float dDequantizeNF4(unsigned char val) {
+
+    // the values for this tree was generated by test_normal_map_tree
+    // in the file tests/test_functional.py
+    if ((val & 0b1000) == 8)
+        if ((val & 0b0100) == 4)         // 1
+            if ((val & 0b0010) == 2)     // 11
+                if ((val & 0b0001) == 1) // 111
+                    return 1.0f;         //*1111
+                else
+                    return 0.7229568362236023f; //*1110
+            else if ((val & 0b0001) == 1)       // 110
+                return 0.5626170039176941f;     //*1101
+            else
+                return 0.44070982933044434f; //*1100
+        else if ((val & 0b0010) == 2)        // 10
+            if ((val & 0b0001) == 1)         // 101
+                return 0.33791524171829224f; //*1011
+            else
+                return 0.24611230194568634f; //*1010
+        else if ((val & 0b0001) == 1)        // 100
+            return 0.16093020141124725f;     //*1001
+        else
+            return 0.07958029955625534f; //*1000
+
+    else if ((val & 0b0100) == 4)    // 0
+        if ((val & 0b0010) == 2)     // 01
+            if ((val & 0b0001) == 1) // 011
+                return 0.0f;         //*0111
+            else
+                return -0.09105003625154495f; //*0110
+        else if ((val & 0b0001) == 1)         // 010
+            return -0.18477343022823334f;     //*0101
+        else
+            return -0.28444138169288635f; //*0100
+    else if ((val & 0b0010) == 2)         // 00
+        if ((val & 0b0001) == 1)          // 001
+            return -0.39491748809814453f; //*0011
+        else
+            return -0.5250730514526367f; //*0010
+    else if ((val & 0b0001) == 1)        // 000
+        return -0.6961928009986877f;     //*0001
+    else
+        return -1.0f; //*0000
+}
+
+template <typename T>
+void dequantizeBlockwise8bitCpu(
+    float* code, unsigned char* A, const float* absmax, T* out, long long blocksize, long long n
+);
+
+template <typename T, int DATA_TYPE>
+void dequantizeBlockwise4bitCpu(
+    unsigned char* A, const float* absmax, T* out, long long blocksize, long long m, long long n
+);
+
+#if defined(__AVX512F__)
+#include <immintrin.h>
+
+#ifdef _MSC_VER
+#include <intrin.h>
+
+static inline bool has_avx512f() {
+    static bool v = [] {
+        int info[4];
+        __cpuidex(info, 7, 0);
+        return (info[1] & (1 << 16)) != 0; // EBX bit16 AVX512F
+    }();
+    return v;
+}
+
+#if defined(__AVX512BF16__)
+static inline bool has_avx512bf16() {
+    static bool v = [] {
+        int info[4];
+        __cpuidex(info, 7, 1);
+        return (info[0] & (1 << 5)) != 0; // EAX bit5 AVX512_BF16
+    }();
+    return v;
+}
+#endif
+#else
+static inline bool has_avx512f() {
+    static const bool supported_avx512f = __builtin_cpu_supports("avx512f");
+    return supported_avx512f;
+}
+
+#if defined(__AVX512BF16__)
+static inline bool has_avx512bf16() {
+    static const bool supported_avx512bf16 = __builtin_cpu_supports("avx512bf16");
+    return supported_avx512bf16;
+}
+#endif
+#endif
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BF16__)
+template <typename T, int DATA_TYPE>
+void gemv_4bit_inference(
+    int64_t M, int64_t N, int64_t K, const T* __restrict__ x, const unsigned char* __restrict__ w,
+    const T* __restrict__ absmax, T* __restrict__ out, int64_t blocksize, int64_t x_stride, int64_t out_stride
+);
+#endif
+
+#endif
+
+// C API for the custom 4-bit GEMM.
+// Dispatches to SIMT or MMA kernels based on GPU architecture and shape.
+// Computes out[M, N] = A[M, K] @ B[N, K]^T. All pointers are device memory.
+
+#include <cstdint>
+#include <type_traits>
+
+#include "compat.cuh"
+#include "gemm_4bit_simt.cuh"
+#if defined(BNB_HAS_GEMM4BIT_SM75) || defined(BNB_HAS_GEMM4BIT_SM80)
+// Included only when an MMA-capable arch (sm75/sm80+) is in the build.
+#include "gemm_4bit_common.cuh" // GpuProps, used only by the MMA dispatch below
+#include "gemm_4bit_sm75.cuh"
+#include "gemm_4bit_sm80.cuh"
+
+// 16-entry cache indexed by device ID. num_sms==0 means not yet populated.
+// Static storage is zero-initialized, so all entries start unpopulated (num_sms==0).
+GpuProps get_gpu_props() {
+    static GpuProps cache[16] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+
+    if (dev < 16 && cache[dev].num_sms != 0)
+        return cache[dev];
+
+    GpuProps props = {};
+    props.device_index = dev;
+    cudaDeviceGetAttribute(&props.num_sms, cudaDevAttrMultiProcessorCount, dev);
+    cudaDeviceGetAttribute(&props.cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&props.cc_minor, cudaDevAttrComputeCapabilityMinor, dev);
+
+    if (dev < 16)
+        cache[dev] = props;
+
+    return props;
+}
+#endif
+
+/// @brief Fused 4-bit dequantize + GEMM. Computes out[M,N] = A[M,K] @ B[N,K]^T + bias.
+///
+/// Dispatches to SIMT (sm60+) or MMA (sm75 fp16, sm80+ bf16/fp16) based on GPU arch and shape.
+/// fp32 always uses SIMT. Supports single-level and double-quantized (nested) absmax.
+///
+/// @tparam T Input/output dtype (`bnb_bfloat16`, `half`, or `float`)
+template <typename T>
+static void gemm_4bit(
+    // clang-format off
+    const T*       A,             // inputs [M, K]
+    const uint8_t* B,             // packed 4-bit weights [N, K/2]
+    const float*   absmax,        // fp32 absmax [N*K/blocksize] or [ceil(N*K/(blocksize*256))] when nested
+    const uint8_t* absmax_8bit,   // [N*K/blocksize] uint8 compressed absmax; nullptr = non-nested
+    const float*   absmax_code,   // [256] codebook for 8bit absmax
+    const float*   absmax_offset, // scalar; nullptr = non-nested
+    T*             out,           // [M, N]
+    const T*       bias,          // [N] optional, nullptr = no bias
+    int M, int N, int K,          // problem shape
+    int blocksize,                // elements per quantization block
+    int quant_type,               // 1 = FP4, 2 = NF4
+    bnb_stream_t stream           // CUDA/HIP stream
+    // clang-format on
+) {
+    constexpr bool is_fp32 = std::is_same_v<T, float>;
+
+    // fp32 and M<=3 are always SIMT regardless of GPU -- skip the props lookup.
+    if (is_fp32 || M <= 3) {
+        launch_gemm_4bit_simt<T>(
+            A, B, absmax, absmax_8bit, absmax_code, absmax_offset, out, bias, M, N, K, blocksize, quant_type, stream
+        );
+        return;
+    }
+
+#if defined(BNB_HAS_GEMM4BIT_SM75) || defined(BNB_HAS_GEMM4BIT_SM80)
+    const GpuProps gpu = get_gpu_props();
+    const int num_sms = gpu.num_sms;
+    const int cc_maj = gpu.cc_major;
+    const int cc_min = gpu.cc_minor;
+
+    const bool hbm_arch = (cc_maj == 8 && cc_min == 0) || cc_maj == 9 || cc_maj == 10;
+    const bool gddr_arch = !hbm_arch && cc_maj >= 8;
+    const int mma_blocks = ((M + 31) / 32) * ((N + 63) / 64);
+
+    // sm86/sm89/sm120 with >= 48 SMs: high GDDR bandwidth means SIMT wins at M=4.
+    const bool highbw_gddr = (cc_maj == 8 && (cc_min == 6 || cc_min == 9) && num_sms >= 48) ||
+                             (cc_maj == 12 && cc_min == 0 && num_sms >= 48);
+
+    // Below 2/3-wave at M<=8: SIMT keeps more warps in flight.
+    const bool undersubscribed =
+        (M <= 8 && mma_blocks * 3 <= num_sms * 2) || (hbm_arch && M == 4 && mma_blocks <= num_sms);
+
+    // sm89 (>=60 SMs) and sm120/sm121 (>=48 SMs): at M<=6 with wide N, SIMT saturates
+    // bandwidth more efficiently than blocked MMA.
+    const bool wide_n_simt =
+        M <= 6 && mma_blocks >= num_sms &&
+        ((cc_maj == 8 && cc_min == 9 && num_sms >= 60) || (cc_maj == 12 && cc_min == 0 && num_sms >= 48) ||
+         (cc_maj == 12 && cc_min == 1 && num_sms >= 48));
+
+    // GDDR tall-K (K>N): K-loop too long relative to output tile at small M.
+    const bool tall_k_simt = gddr_arch && K > N && M <= 17 && mma_blocks * 3 < num_sms;
+
+    const bool use_simt = (M == 4 && highbw_gddr) || undersubscribed || wide_n_simt || tall_k_simt ||
+                          (M <= 16 && mma_blocks * 4 <= num_sms) || (M <= 32 && mma_blocks * 8 <= num_sms) ||
+                          (K % 64 != 0); // MMA requirement
+
+    if (!use_simt) {
+#if defined(BNB_HAS_GEMM4BIT_SM80)
+        if (cc_maj >= 8) {
+            if constexpr (!is_fp32) {
+                launch_gemm_4bit_sm80_m16n8k16<T>(
+                    A, B, absmax, absmax_8bit, absmax_code, absmax_offset, out, bias, M, N, K, blocksize, quant_type,
+                    gpu, stream
+                );
+                return;
+            }
+        }
+#endif
+#if defined(BNB_HAS_GEMM4BIT_SM75)
+        if (cc_maj == 7 && cc_min >= 5) {
+            // bf16 has no sm75 tensor core support; falls through to SIMT.
+            if constexpr (std::is_same_v<T, half>) {
+                launch_gemm_4bit_sm75_m16n8k8<T>(
+                    A, B, absmax, absmax_8bit, absmax_code, absmax_offset, out, bias, M, N, K, blocksize, quant_type,
+                    gpu, stream
+                );
+                return;
+            }
+        }
+#endif
+    }
+#endif // BNB_HAS_GEMM4BIT_SM75 || BNB_HAS_GEMM4BIT_SM80
+
+    launch_gemm_4bit_simt<T>(
+        A, B, absmax, absmax_8bit, absmax_code, absmax_offset, out, bias, M, N, K, blocksize, quant_type, stream
+    );
+}
+
+extern "C" {
+
+void cgemm_4bit_bf16(
+    const bnb_bfloat16* A, const uint8_t* B, const float* absmax, const uint8_t* absmax_8bit, const float* absmax_code,
+    const float* absmax_offset, bnb_bfloat16* out, const bnb_bfloat16* bias, int M, int N, int K, int blocksize,
+    int quant_type, bnb_stream_t stream
+) {
+    gemm_4bit<bnb_bfloat16>(
+        A, B, absmax, absmax_8bit, absmax_code, absmax_offset, out, bias, M, N, K, blocksize, quant_type, stream
+    );
+}
+
+void cgemm_4bit_fp16(
+    const half* A, const uint8_t* B, const float* absmax, const uint8_t* absmax_8bit, const float* absmax_code,
+    const float* absmax_offset, half* out, const half* bias, int M, int N, int K, int blocksize, int quant_type,
+    bnb_stream_t stream
+) {
+    gemm_4bit<half>(
+        A, B, absmax, absmax_8bit, absmax_code, absmax_offset, out, bias, M, N, K, blocksize, quant_type, stream
+    );
+}
+
+void cgemm_4bit_fp32(
+    const float* A, const uint8_t* B, const float* absmax, const uint8_t* absmax_8bit, const float* absmax_code,
+    const float* absmax_offset, float* out, const float* bias, int M, int N, int K, int blocksize, int quant_type,
+    bnb_stream_t stream
+) {
+    gemm_4bit<float>(
+        A, B, absmax, absmax_8bit, absmax_code, absmax_offset, out, bias, M, N, K, blocksize, quant_type, stream
+    );
+}
+
+} // extern "C"
+
+// SIMT 4-bit GEMM kernel. Compiles for all CUDA architectures (sm60+) and for
+// ROCm/HIP (RDNA wave32 and CDNA wave64).
+
+#include <cstdint>
+#include <type_traits>
+
+#include "common.cuh"
+#include "gemm_4bit_common.cuh"
+#include "gemm_4bit_simt.cuh"
+
+// gfx9/CDNA tuning (CDNA1-4 and CDNA5/gfx1250):
+// - use fmaf for fp32 accumulation
+// - accumulate fp16/bf16 pairs in fp32 via fused multiply-add
+// - keep 16-bit centroids unscaled and fold scale into the fp32 accumulator
+// - use packed fp16 accumulation
+// CDNA5 (gfx1250) is Wave32, but it does NOT implement the SIMT dot instructions
+// (no dot12-insts / v_dot2_f32_* builtins), so it opts into this fp32-FMA path
+// rather than the v_dot2 path below. This improves bf16/fp16 accuracy relative
+// to the generic fallback.
+#if IS_CDNA || IS_CDNA5
+#define BNB_SIMT_F32_FMAF 1
+#define BNB_SIMT_16BIT_FLOAT_FMA 1
+#define BNB_SIMT_BF16_UNSCALED_CENTROID 1
+#define BNB_SIMT_FP16_UNSCALED_CENTROID 1
+#define BNB_SIMT_FP16_PACKED_ACCUM 1
+#else
+#define BNB_SIMT_F32_FMAF 0
+#define BNB_SIMT_16BIT_FLOAT_FMA 0
+#define BNB_SIMT_BF16_UNSCALED_CENTROID 0
+#define BNB_SIMT_FP16_UNSCALED_CENTROID 0
+#define BNB_SIMT_FP16_PACKED_ACCUM 0
+#endif
+
+// RDNA3/RDNA3.5/RDNA4 tuning:
+// - use native packed bf16/fp16 dot2 instructions with fp32 accumulation.
+// Note: CDNA5 (gfx1250) is intentionally excluded here. Despite its gfx12xx
+// target number, it lacks the dot12-insts v_dot2_f32_bf16 / v_dot2_f32_f16
+// builtins (they fail to compile for gfx1250), so it uses the fp32-FMA CDNA path
+// above.
+#if IS_RDNA3 || IS_RDNA3_5 || IS_RDNA4
+#define BNB_HIP_BF16_VDOT2 1
+#define BNB_HIP_FP16_DOT2 1
+#else
+#define BNB_HIP_BF16_VDOT2 0
+#define BNB_HIP_FP16_DOT2 0
+#endif
+
+// Warps per block; each warp owns one N-column. CTA size = WARPS_PER_BLOCK * 32.
+static constexpr int WARPS_PER_BLOCK = 4;
+
+// Element-wise multiply of a half2 vector pair.
+__device__ __forceinline__ half2 vec2_mul(half2 a, half2 b) { return __hmul2(a, b); }
+
+// Element-wise multiply of a bnb_bfloat162 vector pair.
+__device__ __forceinline__ bnb_bfloat162 vec2_mul(bnb_bfloat162 a, bnb_bfloat162 b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800 && __CUDA_VERSION__ < 12020
+    // Falls back to fp32 round-trip on <= sm75 + CUDA < 12.2, which lacks a __hmul2
+    // overload for bf16 on Turing; identical to what CUDA 12.2+ emits for that target.
+    return __floats2bfloat162_rn(
+        __bfloat162float(a.x) * __bfloat162float(b.x), __bfloat162float(a.y) * __bfloat162float(b.y)
+    );
+#else
+    return __hmul2(a, b);
+#endif
+}
+
+__device__ __forceinline__ float simt_fma_f32(float acc, float a, float b) {
+#if BNB_SIMT_F32_FMAF
+    return fmaf(a, b, acc);
+#else
+    return acc + a * b;
+#endif
+}
+
+// Sum a per-lane float across the 32-lane warp; result valid in lane 0.
+// HIP: DPP row-shift reduction + xor-16 exchange (cheaper than shfl on RDNA).
+// CUDA/others: standard __shfl_down_sync tree.
+__device__ __forceinline__ float simt_warp_reduce_sum(float v) {
+#if BNB_HIP
+    v += __builtin_amdgcn_mov_dpp(v, 0x108, 0xf, 0xf, 1); // row_shr:8
+    v += __builtin_amdgcn_mov_dpp(v, 0x104, 0xf, 0xf, 1); // row_shr:4
+    v += __builtin_amdgcn_mov_dpp(v, 0x102, 0xf, 0xf, 1); // row_shr:2
+    v += __builtin_amdgcn_mov_dpp(v, 0x101, 0xf, 0xf, 1); // row_shr:1
+    return v + __shfl_xor(v, 16, 32);
+#else
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(BNB_FULL_WARP_MASK, v, offset, 32);
+    return v;
+#endif
+}
+
+/// @brief Fused 4-bit dequantize + GEMM with optional nested absmax and bias.
+///        Computes C[M,N] = A[M,K] @ B[N,K]^T + bias.
+///
+/// One warp owns one N-column. All 32 lanes split K in parallel, then warp-reduce.
+/// B is dequantized once per outer K step and reused across all M rows.
+/// Supports single-level and double-quantized (nested) absmax.
+///
+/// Dtype paths:
+///   HIP bf16:  LDS bf16 LUT + native v_dot2_f32_bf16 (when enabled)
+///   HIP fp16/fp32: LDS centroid LUT; pair/scalar math
+///   CUDA:      warp-shuffle LUT; pair/scalar math
+///
+/// Grid: (ceil(N/WARPS_PER_BLOCK), ceil(M/M_BLOCK))
+///
+/// @tparam T           Input/output dtype (`bnb_bfloat16`, `half`, or `float`)
+/// @tparam M_BLOCK     M rows per block
+template <typename T, int M_BLOCK = 1>
+__global__ void __launch_bounds__(WARPS_PER_BLOCK * 32) gemm_4bit_simt(
+    // clang-format off
+    const T*       __restrict__ A,             // inputs [M, K]
+    const uint8_t* __restrict__ B,             // packed 4-bit weights [N, K/2]
+    const float*   __restrict__ absmax,        // fp32 absmax [N, K/blocksize] or
+                                               //   [ceil(N*K/(blocksize*256))] when nested
+    const uint8_t* __restrict__ absmax_8bit,   // [N, K/blocksize] uint8 compressed absmax;
+                                               //   nullptr = non-nested
+    const float*   __restrict__ absmax_code,   // [256] codebook for 8bit absmax
+    const float*   __restrict__ absmax_offset, // scalar; nullptr = non-nested
+    T*             __restrict__ C,             // [M, N]
+    const T*       __restrict__ bias,          // [N] optional, nullptr = no bias
+    int M, int N, int K,                       // problem shape
+    int blocksize,                             // elements per quantization block
+    int quant_type                             // 1 = FP4, 2 = NF4
+    // clang-format on
+) {
+    // T2 is the vector-pair type; for float it resolves to float2 but is unused.
+    using T2 = std::conditional_t<
+        std::is_same_v<T, bnb_bfloat16>, bnb_bfloat162, std::conditional_t<std::is_same_v<T, half>, half2, float2>>;
+
+    const float absmax_offset_f = absmax_8bit ? __ldg(absmax_offset) : 0.0f;
+
+    const int blocksize_log2 = __ffs(blocksize) - 1;
+
+    constexpr int NUM_VAL = 32;            // 4-bit elements per lane per outer K step
+    constexpr int K_STRIDE = 32 * NUM_VAL; // = 1024 K elements per outer step
+
+    const int lane_id = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    const int warp_n = blockIdx.x * WARPS_PER_BLOCK + warp_id;
+    const int base_m = blockIdx.y * M_BLOCK;
+
+    // HIP bf16 uses the native v_dot2_f32_bf16 dot product with an LDS centroid
+    // LUT when BNB_HIP_BF16_VDOT2 is set; all other dtype/platform
+    // combinations keep the warp-shuffle + pair-mul path. Compile-time so the
+    // unused paths are dropped.
+    constexpr bool HIP_BF16_VDOT2 = BNB_HIP && BNB_HIP_BF16_VDOT2 && std::is_same_v<T, bnb_bfloat16>;
+    constexpr bool HIP_FP16_DOT2 = BNB_HIP && BNB_HIP_FP16_DOT2 && std::is_same_v<T, half>;
+    constexpr bool BF16_UNSCALED_CENTROID =
+        BNB_HIP && BNB_SIMT_BF16_UNSCALED_CENTROID && !HIP_BF16_VDOT2 && std::is_same_v<T, bnb_bfloat16>;
+    constexpr bool FP16_UNSCALED_CENTROID = BNB_HIP && BNB_SIMT_FP16_UNSCALED_CENTROID && std::is_same_v<T, half>;
+
+    // Stage the fp16/fp32 centroid LUT in LDS on HIP instead of warp shuffle
+    // (ds_bpermute). bf16 uses the VDOT2 LDS LUT above.
+    [[maybe_unused]] constexpr bool HIP_LDS_LUT_SHFL =
+        BNB_HIP && !HIP_BF16_VDOT2 && (std::is_same_v<T, half> || std::is_same_v<T, float>);
+
+    // Each lane loads its LUT entry (lane_id < 16) for warp-shuffle dequant.
+    // bf16/fp16: centroid as uint16-in-uint32 for __shfl_sync over uint32.
+    // fp32: centroid as float for __shfl_sync over float.
+    // (The VDOT2 path uses the shared LDS LUT below instead of my_lut_u32.)
+    [[maybe_unused]] uint32_t my_lut_u32 = 0u;
+    [[maybe_unused]] float my_lut_f32_shfl = 0.0f;
+
+    if (lane_id < 16) {
+        const float* lut = (quant_type == 1) ? FP4_LUT_F32 : NF4_LUT_F32;
+        if constexpr (std::is_same_v<T, float>)
+            my_lut_f32_shfl = lut[lane_id];
+        else if constexpr (!HIP_BF16_VDOT2) {
+            const T centroid = static_cast<T>(lut[lane_id]);
+            my_lut_u32 = (uint32_t)(*reinterpret_cast<const uint16_t*>(&centroid));
+        }
+    }
+
+    // Centroid LUTs in LDS, populated by all warps before the warp_n >= N early-out
+    // so every warp reaches the barrier. bf16 -> quant_map_bf16 (VDOT2 path);
+    // fp16/fp32 -> quant_map_shfl (fp16 = uint16 bits, fp32 = float). The
+    // HIP_BF16_VDOT2 / HIP_LDS_LUT_SHFL gates select which dtype/arch passes use them.
+#if BNB_HIP
+    using shfl_lut_t = std::conditional_t<std::is_same_v<T, float>, float, uint16_t>;
+    __shared__ uint16_t quant_map_bf16[16];
+    __shared__ shfl_lut_t quant_map_shfl[16];
+    if constexpr (HIP_BF16_VDOT2) {
+        if (lane_id < 16) {
+            const float* lut = (quant_type == 1) ? FP4_LUT_F32 : NF4_LUT_F32;
+            const bnb_bfloat16 c = static_cast<bnb_bfloat16>(lut[lane_id]);
+            quant_map_bf16[lane_id] = *reinterpret_cast<const uint16_t*>(&c);
+        }
+        __syncthreads();
+    }
+
+    if constexpr (HIP_LDS_LUT_SHFL) {
+        if (lane_id < 16) {
+            const float* lut = (quant_type == 1) ? FP4_LUT_F32 : NF4_LUT_F32;
+            if constexpr (std::is_same_v<T, float>) {
+                quant_map_shfl[lane_id] = lut[lane_id];
+            } else {
+                const T c = static_cast<T>(lut[lane_id]);
+                quant_map_shfl[lane_id] = *reinterpret_cast<const uint16_t*>(&c);
+            }
+        }
+        __syncthreads();
+    }
+#endif
+    if (warp_n >= N)
+        return;
+
+    const int blk_per_row = K >> blocksize_log2;
+
+    // Per-M accumulators. M_BLOCK is compile-time so the loop fully unrolls.
+    float acc[M_BLOCK];
+#pragma unroll
+    for (int m = 0; m < M_BLOCK; m++)
+        acc[m] = 0.f;
+
+    const int m_valid = min(M_BLOCK, max(0, M - base_m));
+
+    // All 32 lanes run the same number of K iterations for warp-shuffle convergence.
+    // Inactive lanes load b_packed4={0}, which decodes to 0 and contributes nothing.
+    const int num_groups = (K + K_STRIDE - 1) / K_STRIDE;
+
+#if BNB_HIP
+    // Per-lane fp32 scale for the K group at inner_k (single-level or nested absmax).
+    auto compute_scale = [&](int ik) -> float {
+        const int blk_idx = warp_n * blk_per_row + (ik >> blocksize_log2);
+        if (absmax_8bit)
+            return __ldg(&absmax_code[absmax_8bit[blk_idx]]) * __ldg(&absmax[blk_idx >> 8]) + absmax_offset_f;
+        return __ldg(&absmax[blk_idx]);
+    };
+
+    // Register prefetch of the packed B + scale for the next K group, overlapping
+    // the global loads with the current group's decode/accumulate.
+    int pref_inner_k = lane_id * NUM_VAL;
+    bool pref_lane_active = (pref_inner_k < K);
+    float pref_scale_f = 0.0f;
+    uint4 pref_b_packed4 = {0u, 0u, 0u, 0u};
+    if (pref_lane_active) {
+        pref_scale_f = compute_scale(pref_inner_k);
+        pref_b_packed4 =
+            *reinterpret_cast<const uint4*>(reinterpret_cast<const uint32_t*>(B + warp_n * (K / 2) + pref_inner_k / 2));
+    }
+#endif
+
+    for (int g = 0; g < num_groups; g++) {
+        const int inner_k = g * K_STRIDE + lane_id * NUM_VAL;
+
+#if BNB_HIP
+        const bool lane_active = pref_lane_active;
+        const float scale_f = pref_scale_f;
+        const uint4 b_packed4 = pref_b_packed4;
+
+        // Advance the prefetch to the next group.
+        const int next_inner_k = (g + 1) * K_STRIDE + lane_id * NUM_VAL;
+        pref_lane_active = (g + 1 < num_groups) && (next_inner_k < K);
+        pref_scale_f = 0.0f;
+        pref_b_packed4 = {0u, 0u, 0u, 0u};
+        if (pref_lane_active) {
+            pref_scale_f = compute_scale(next_inner_k);
+            pref_b_packed4 = *reinterpret_cast<const uint4*>(
+                reinterpret_cast<const uint32_t*>(B + warp_n * (K / 2) + next_inner_k / 2)
+            );
+        }
+#else
+        const bool lane_active = (inner_k < K);
+
+        // Scale: one absmax per lane per outer K step.
+        float scale_f = 0.0f;
+        if (lane_active) {
+            const int blk_idx = warp_n * blk_per_row + (inner_k >> blocksize_log2);
+            if (absmax_8bit) {
+                // absmax_8bit[blk_idx] is a uint8 index into absmax_code.
+                // absmax[blk_idx >> 8] is the fp32 state2 scale (one per 256 blocks).
+                // absmax_offset is subtracted at quantize time and re-added here.
+                scale_f = __ldg(&absmax_code[absmax_8bit[blk_idx]]) * __ldg(&absmax[blk_idx >> 8]) + absmax_offset_f;
+            } else {
+                scale_f = __ldg(&absmax[blk_idx]);
+            }
+        }
+
+        // Load 16 packed 4-bit bytes (.cs: streaming, bypasses L1).
+        // Inactive lanes keep b_packed4 = {0}.
+        uint4 b_packed4 = {0u, 0u, 0u, 0u};
+        if (lane_active) {
+            const uint32_t* bptr = reinterpret_cast<const uint32_t*>(B + warp_n * (K / 2) + inner_k / 2);
+            // clang-format off
+            asm volatile(
+                "ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                : "=r"(b_packed4.x), "=r"(b_packed4.y),
+                  "=r"(b_packed4.z), "=r"(b_packed4.w)
+                : "l"(bptr)
+            );
+            // clang-format on
+        }
+#endif
+        const uint8_t* b_bytes = reinterpret_cast<const uint8_t*>(&b_packed4);
+
+        // Decode B and accumulate.
+        // HIP bf16:   bf16 LDS-LUT centroids, native v_dot2_f32_bf16, scale once per sub.
+        // bf16/fp16:  uint16-in-uint32 LUT, fp32 FMA accumulate, 1x uint4 A load per sub-iter.
+        // fp32:       float LUT, scalar multiply, 2x uint4 A loads per sub-iter.
+        [[maybe_unused]] T2 scale_x2{};
+        if constexpr (!std::is_same_v<T, float>) {
+            if constexpr (!HIP_BF16_VDOT2 && !BF16_UNSCALED_CENTROID && !FP16_UNSCALED_CENTROID)
+                scale_x2 = broadcast_vec2<T>(scale_f);
+        }
+
+#pragma unroll
+        for (int sub = 0; sub < 4; sub++) {
+            // Decode 4 B bytes (8 nibbles) into 8 dequantized values.
+            // hi nibble (>>4) = lower K index, lo nibble (&0xf) = higher K index.
+            [[maybe_unused]] T2 b_chunk[4];
+            [[maybe_unused]] float b_dq[8];
+#if BNB_HIP && BNB_HIP_BF16_VDOT2
+            // VDOT2 centroid pairs (no scale baked in); scale applied once below.
+            using bf16x2_t = __bf16 __attribute__((ext_vector_type(2)));
+            [[maybe_unused]] bf16x2_t b_chunk_d[4];
+#endif
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const uint8_t byte = b_bytes[sub * 4 + j];
+                if constexpr (std::is_same_v<T, float>) {
+                    if constexpr (HIP_LDS_LUT_SHFL) {
+#if BNB_HIP
+                        b_dq[j * 2] = quant_map_shfl[byte >> 4] * scale_f;
+                        b_dq[j * 2 + 1] = quant_map_shfl[byte & 0x0f] * scale_f;
+#endif
+                    } else {
+                        b_dq[j * 2] = __shfl_sync(BNB_FULL_WARP_MASK, my_lut_f32_shfl, byte >> 4, 32) * scale_f;
+                        b_dq[j * 2 + 1] = __shfl_sync(BNB_FULL_WARP_MASK, my_lut_f32_shfl, byte & 0x0f, 32) * scale_f;
+                    }
+#if BNB_HIP && BNB_HIP_BF16_VDOT2
+                } else if constexpr (HIP_BF16_VDOT2) {
+                    const uint16_t hi16 = quant_map_bf16[byte >> 4];
+                    const uint16_t lo16 = quant_map_bf16[byte & 0x0f];
+                    b_chunk_d[j] =
+                        bf16x2_t{*reinterpret_cast<const __bf16*>(&hi16), *reinterpret_cast<const __bf16*>(&lo16)};
+#endif
+                } else {
+                    // fp16 on HIP uses the LDS LUT; fp16/bf16 on CUDA use the shuffle.
+                    uint32_t hi, lo;
+                    if constexpr (HIP_LDS_LUT_SHFL) {
+#if BNB_HIP
+                        hi = quant_map_shfl[byte >> 4];
+                        lo = quant_map_shfl[byte & 0x0f];
+#endif
+                    } else {
+                        hi = __shfl_sync(BNB_FULL_WARP_MASK, my_lut_u32, byte >> 4, 32);
+                        lo = __shfl_sync(BNB_FULL_WARP_MASK, my_lut_u32, byte & 0x0f, 32);
+                    }
+                    if constexpr (BF16_UNSCALED_CENTROID || FP16_UNSCALED_CENTROID) {
+                        b_chunk[j] = vec2_from_u16bits<T>(hi, lo);
+                    } else {
+                        b_chunk[j] = vec2_mul(vec2_from_u16bits<T>(hi, lo), scale_x2);
+                    }
+                }
+            }
+
+            if (lane_active) {
+#pragma unroll
+                for (int m = 0; m < M_BLOCK; m++) {
+                    if (m >= m_valid)
+                        break;
+                    const int m_global = base_m + m;
+                    const int a_k = inner_k + sub * 8;
+
+                    if constexpr (std::is_same_v<T, float>) {
+                        // 8 floats = 2x uint4 (cached; A rows reused across N-tiles)
+                        const uint4 a4a = *reinterpret_cast<const uint4*>(&A[m_global * K + a_k]);
+                        const uint4 a4b = *reinterpret_cast<const uint4*>(&A[m_global * K + a_k + 4]);
+                        const float* fa = reinterpret_cast<const float*>(&a4a);
+                        const float* fb = reinterpret_cast<const float*>(&a4b);
+#pragma unroll
+                        for (int k = 0; k < 4; k++) {
+                            acc[m] = simt_fma_f32(acc[m], fa[k], b_dq[k]);
+                            acc[m] = simt_fma_f32(acc[m], fb[k], b_dq[k + 4]);
+                        }
+                    } else if constexpr (HIP_BF16_VDOT2) {
+#if BNB_HIP && BNB_HIP_BF16_VDOT2
+                        // Native v_dot2_f32_bf16 over 8 K elements (4 pairs),
+                        // accumulating in fp32; multiply by the scale once. This
+                        // avoids the bf16-multiply round-to-nearest-even emulation on RDNA.
+                        const uint4 a_packed4 = *reinterpret_cast<const uint4*>(&A[m_global * K + a_k]);
+                        const bf16x2_t* a_pairs_d = reinterpret_cast<const bf16x2_t*>(&a_packed4);
+                        float partial = 0.0f;
+#pragma unroll
+                        for (int k = 0; k < 4; k++)
+                            partial = __builtin_amdgcn_fdot2_f32_bf16(a_pairs_d[k], b_chunk_d[k], partial, false);
+                        acc[m] += partial * scale_f;
+#endif
+                    } else if constexpr (HIP_FP16_DOT2) {
+#if BNB_HIP && BNB_HIP_FP16_DOT2
+                        const uint4 a_packed4 = *reinterpret_cast<const uint4*>(&A[m_global * K + a_k]);
+                        const __2f16* a_pairs_d = reinterpret_cast<const __2f16*>(&a_packed4);
+                        const __2f16* b_pairs_d = reinterpret_cast<const __2f16*>(b_chunk);
+                        float partial = 0.0f;
+#pragma unroll
+                        for (int k = 0; k < 4; k++)
+                            partial = __ockl_fdot2(a_pairs_d[k], b_pairs_d[k], partial, false);
+                        acc[m] += partial;
+#endif
+                    } else {
+                        // 8 T elements as uint4 (cached; A rows reused across N-tiles).
+                        // sm90+: asm fence gives better occupancy.
+#if __CUDA_ARCH__ >= 900
+                        uint4 a_packed4;
+                        // clang-format off
+                        asm volatile(
+                            "ld.global.ca.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                            : "=r"(a_packed4.x), "=r"(a_packed4.y),
+                              "=r"(a_packed4.z), "=r"(a_packed4.w)
+                            : "l"(&A[m_global * K + a_k])
+                        );
+                        // clang-format on
+#else
+                        const uint4 a_packed4 = *reinterpret_cast<const uint4*>(&A[m_global * K + a_k]);
+#endif
+                        const T2* a_pairs = reinterpret_cast<const T2*>(&a_packed4);
+#if BNB_SIMT_16BIT_FLOAT_FMA
+                        if constexpr (std::is_same_v<T, half> && BNB_SIMT_FP16_PACKED_ACCUM) {
+                            half2 partial_h2 = __float2half2_rn(0.0f);
+#pragma unroll
+                            for (int k = 0; k < 4; k++)
+                                partial_h2 = __hfma2(a_pairs[k], b_chunk[k], partial_h2);
+                            const float2 partial = __half22float2(partial_h2);
+                            const float sum = partial.x + partial.y;
+                            if constexpr (FP16_UNSCALED_CENTROID) {
+                                acc[m] = simt_fma_f32(acc[m], sum, scale_f);
+                            } else {
+                                acc[m] += sum;
+                            }
+                        } else
+#endif
+                        {
+#pragma unroll
+                            for (int k = 0; k < 4; k++) {
+#if BNB_SIMT_16BIT_FLOAT_FMA
+                                // Accumulate each pair in fp32 with fused multiply-add.
+                                if constexpr (BF16_UNSCALED_CENTROID || FP16_UNSCALED_CENTROID) {
+                                    const float2 af = vec2_to_float2(a_pairs[k]);
+                                    const float2 bf = vec2_to_float2(b_chunk[k]);
+                                    float partial = 0.0f;
+                                    partial = simt_fma_f32(partial, af.x, bf.x);
+                                    partial = simt_fma_f32(partial, af.y, bf.y);
+                                    acc[m] = simt_fma_f32(acc[m], partial, scale_f);
+                                } else {
+                                    const float2 af = vec2_to_float2(a_pairs[k]);
+                                    const float2 bf = vec2_to_float2(b_chunk[k]);
+                                    acc[m] = simt_fma_f32(acc[m], af.x, bf.x);
+                                    acc[m] = simt_fma_f32(acc[m], af.y, bf.y);
+                                }
+#else
+                                const float2 p = vec2_to_float2(vec2_mul(a_pairs[k], b_chunk[k]));
+                                acc[m] += p.x + p.y;
+#endif
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    // Warp reduce: sum acc[m] across all 32 lanes.
+    for (int m = 0; m < M_BLOCK; m++) {
+        if (m >= m_valid)
+            break;
+        acc[m] = simt_warp_reduce_sum(acc[m]);
+    }
+
+    if (lane_id == 0) {
+        const float bias_f = bias ? static_cast<float>(bias[warp_n]) : 0.0f;
+#pragma unroll
+        for (int m = 0; m < M_BLOCK; m++) {
+            if (m >= m_valid)
+                break;
+            C[(base_m + m) * N + warp_n] = static_cast<T>(acc[m] + bias_f);
+        }
+    }
+}
+
+/// @brief Host launcher for the SIMT 4-bit GEMM kernel. Selects M_BLOCK at compile
+///        time based on M (exact for M=1..8, clamped to 8 above).
+/// @tparam T Input/output dtype (`bnb_bfloat16`, `half`, or `float`)
+template <typename T>
+void launch_gemm_4bit_simt(
+    // clang-format off
+    const T*       A,             // inputs [M, K]
+    const uint8_t* B,             // packed 4-bit weights [N, K/2]
+    const float*   absmax,        // fp32 absmax [N*K/blocksize] or [ceil(N*K/(blocksize*256))] when nested
+    const uint8_t* absmax_8bit,   // [N*K/blocksize] uint8 compressed absmax; nullptr = non-nested
+    const float*   absmax_code,   // [256] codebook for 8bit absmax
+    const float*   absmax_offset, // scalar; nullptr = non-nested
+    T*             C,             // output [M, N]
+    const T*       bias,          // [N] optional, nullptr = no bias
+    int M, int N, int K,          // problem shape
+    int blocksize,                // elements per quantization block
+    int quant_type,               // 1 = FP4, 2 = NF4
+    bnb_stream_t stream           // CUDA/HIP stream
+    // clang-format on
+) {
+    int n_blocks = (N + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+#if BNB_HIP
+    // Large HIP SIMT dispatches can underutilize the GPU when the workgroup
+    // count is an exact multiple of 256. One additional bounds-checked block
+    // breaks the scheduler resonance without changing useful work.
+    if (n_blocks >= 512 && n_blocks % 256 == 0)
+        n_blocks++;
+#endif
+
+    // M=1..8: M_BLOCK == M, so the inner m-loop fully unrolls at compile time.
+    // M>8: M_BLOCK=8, ceil(M/8) grid rows.
+    auto launch = [&](auto mb_tag) {
+        constexpr int MB = decltype(mb_tag)::value;
+        const int grid_y = (M + MB - 1) / MB;
+        gemm_4bit_simt<T, MB><<<dim3(n_blocks, grid_y), WARPS_PER_BLOCK * 32, 0, stream>>>(
+            A, B, absmax, absmax_8bit, absmax_code, absmax_offset, C, bias, M, N, K, blocksize, quant_type
+        );
+    };
+
+    // clang-format off
+    switch (min(M, 8)) {
+        case 1: launch(std::integral_constant<int, 1>{}); break;
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 6: launch(std::integral_constant<int, 6>{}); break;
+        case 7: launch(std::integral_constant<int, 7>{}); break;
+        default: launch(std::integral_constant<int, 8>{}); break;
+    }
+    // clang-format on
+}
+
+// Explicit instantiations for supported dtypes.
+template void launch_gemm_4bit_simt<bnb_bfloat16>(
+    const bnb_bfloat16*, const uint8_t*, const float*, const uint8_t*, const float*, const float*, bnb_bfloat16*,
+    const bnb_bfloat16*, int, int, int, int, int, bnb_stream_t
+);
+template void launch_gemm_4bit_simt<half>(
+    const half*, const uint8_t*, const float*, const uint8_t*, const float*, const float*, half*, const half*, int, int,
+    int, int, int, bnb_stream_t
+);
+template void launch_gemm_4bit_simt<float>(
+    const float*, const uint8_t*, const float*, const uint8_t*, const float*, const float*, float*, const float*, int,
+    int, int, int, int, bnb_stream_t
+);
+
+// sm75 MMA (mma.sync.aligned.m16n8k8) 4-bit GEMM kernel. fp16 only.
+
+#include <cstdint>
+#include <cuda_fp16.h>
+#include <type_traits>
+
+#include "gemm_4bit_common.cuh"
+#include "gemm_4bit_mma.cuh"
+#include "gemm_4bit_sm75.cuh"
+
+static constexpr int K_CHUNK = 64;
+[[maybe_unused]] static constexpr int MMA_M = 16;
+[[maybe_unused]] static constexpr int MMA_N = 8;
+[[maybe_unused]] static constexpr int MMA_K = 8;
+
+static constexpr int NUM_WARPS = 8;
+static constexpr int CTA_SIZE = NUM_WARPS * 32;
+
+// K_CHUNK + 8 stride: 16-byte row alignment, limits bank conflicts to 4-way for K_CHUNK=64.
+static constexpr int SMEM_A_STRIDE = K_CHUNK + 8; // 72 half elements
+static constexpr int SMEM_B_STRIDE = K_CHUNK + 8;
+
+/// @brief In-place warp-level MMA: accum += A * B (fp16, m16n8k8).
+///        Called once per K chunk to accumulate the full matrix product.
+///
+/// Executes mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32.
+/// Fragments are distributed across warp lanes per PTX spec.
+///
+/// @param accum In-place f32 accumulator (4 regs per lane)
+/// @param a     A fragment: 16x8 fp16 operand (2 regs per lane)
+/// @param b     B fragment: 8x8 fp16 operand (1 reg per lane)
+__device__ __forceinline__ void mma_m16n8k8(FragC& accum, const uint32_t a[2], const uint32_t b[1]) {
+    // clang-format off
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+        : "+f"(accum.x[0]), "+f"(accum.x[1]), "+f"(accum.x[2]), "+f"(accum.x[3])
+        : "r"(a[0]), "r"(a[1]), "r"(b[0])
+    );
+    // clang-format on
+}
+
+// A: m16 x k8 from row-major smem. ldmatrix.x2 loads two stacked m8xk8 halves.
+// Thread t provides the address for row m_off + (t % 16) at column k_off.
+// Lanes 16-31 mirror 0-15 (both sets address the same 16 rows for .x2).
+__device__ __forceinline__ void load_A_frag(uint32_t frag[2], const half* smem_a, int m_off, int k_off, int lane) {
+    const int m_row = m_off + (lane % 16);
+    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem_a[m_row * SMEM_A_STRIDE + k_off]));
+    // clang-format off
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+        : "=r"(frag[0]), "=r"(frag[1])
+        : "r"(addr)
+    );
+    // clang-format on
+}
+
+// B: k8 x n8 from row-major smem (= col-major [k][n]). ldmatrix.x1 loads one m8xk8.
+// Thread t addresses row n_off + (t % 8) at column k_off.
+__device__ __forceinline__ void load_B_frag(uint32_t frag[1], const half* smem_b, int n_off, int k_off, int lane) {
+    const int n_row = n_off + (lane % 8);
+    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem_b[n_row * SMEM_B_STRIDE + k_off]));
+    // clang-format off
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];\n"
+        : "=r"(frag[0])
+        : "r"(addr)
+    );
+    // clang-format on
+}
+
+template <typename T, int MT, int NT> static constexpr int smem_bytes_for() {
+    return 2 * (MT * SMEM_A_STRIDE + NT * SMEM_B_STRIDE) * static_cast<int>(sizeof(T));
+}
+
+/// @brief Fused 4-bit dequantize + MMA GEMM for sm75 (fp16 only).
+///        Computes C[M,N] = A[M,K] @ B[N,K]^T + bias.
+///
+/// Layout:
+///   A: [M, K] row-major, half (activations)
+///   B: [N, K/2] row-major, packed uint8 (2 nibbles per byte, weights)
+///   C: [M, N] row-major, half (output)
+///
+/// MMA: `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32`
+///   A operand: row-major [M, K]
+///   B operand: col-major [K, N] (B [N, K] row-major reinterpreted)
+///
+/// Double-buffered smem pipeline. Supports optional nested absmax and bias.
+///
+/// Smem per double-buffer (K_CHUNK=64, half=2 bytes):
+///   MT=32, NT=64: 27 KB   MT=32, NT=128: 45 KB
+///   MT=64, NT=64: 36 KB   MT=64, NT=128: 54 KB
+///
+/// @tparam T  Input/output dtype (must be `half`; static_assert enforces)
+/// @tparam MT M tile size (32 or 64)
+/// @tparam NT N tile size (64 or 128)
+template <typename T, int MT = 32, int NT = 64>
+__global__ void __launch_bounds__(CTA_SIZE) gemm_4bit_sm75_m16n8k8(
+    // clang-format off
+    const T*       __restrict__ A,             // inputs [M, K]
+    const uint8_t* __restrict__ B,             // packed 4-bit weights [N, K/2]
+    const float*   __restrict__ absmax,        // fp32 absmax [N, K/blocksize] or
+                                               //   [ceil(N*K/(blocksize*256))] when nested
+    const uint8_t* __restrict__ absmax_8bit,   // [N, K/blocksize] uint8 compressed absmax;
+                                               //   nullptr = non-nested
+    const float*   __restrict__ absmax_code,   // [256] codebook for 8bit absmax
+    const float*   __restrict__ absmax_offset, // scalar; nullptr = non-nested
+    T*             __restrict__ C,             // [M, N]
+    const T*       __restrict__ bias,          // [N] optional, nullptr = no bias
+    int M, int N, int K,                       // problem shape
+    int blocksize,                             // elements per quantization block
+    int quant_type                             // 1 = FP4, 2 = NF4
+    // clang-format on
+) {
+#if __CUDA_ARCH__ == 750
+    static_assert(std::is_same_v<T, half>, "sm75 MMA requires fp16 (half)");
+    static_assert(MT == 32 || MT == 64, "MT must be 32 or 64");
+    static_assert(NT == 64 || NT == 128, "NT must be 64 or 128");
+
+    using WL = MmaWarpLayout<MT, NT, NUM_WARPS, MMA_M, MMA_N>;
+    constexpr int WARPS_M = WL::WARPS_M;
+    constexpr int WARPS_N = WL::WARPS_N;
+    constexpr int WARP_M = WL::WARP_M;
+    constexpr int WARP_MMA_M = WL::WARP_MMA_M;
+    constexpr int WARP_N = WL::WARP_N;
+    constexpr int WARP_MMA_N = WL::WARP_MMA_N;
+
+    static_assert(MT >= WARPS_M * MMA_M, "MT too small for warp layout");
+    static_assert(NT >= WARPS_N * MMA_N, "NT too small for warp layout");
+
+    // Packed bytes of B per thread per K-chunk (NT=64: 8 bytes; NT=128: 16 bytes).
+    constexpr int B_BYTES = NT * (K_CHUNK / 2) / CTA_SIZE;
+    static_assert(B_BYTES == 8 || B_BYTES == 16, "unexpected B bytes per thread");
+
+    extern __shared__ char smem_raw[];
+    constexpr int buf_offset = (MT * SMEM_A_STRIDE + NT * SMEM_B_STRIDE) * sizeof(T);
+    auto smem_a_buf = [&](int buf) -> half* { return reinterpret_cast<half*>(smem_raw + buf * buf_offset); };
+    auto smem_b_buf = [&](int buf) -> half* {
+        return reinterpret_cast<half*>(smem_raw + buf * buf_offset + MT * SMEM_A_STRIDE * sizeof(T));
+    };
+
+    const float absmax_offset_f = absmax_8bit ? __ldg(absmax_offset) : 0.0f;
+
+    const int bm = blockIdx.x * MT;
+    const int bn = blockIdx.y * NT;
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int warp_m = warp_id / WARPS_N;
+    const int warp_n = warp_id % WARPS_N;
+
+    const float* lut = (quant_type == 1) ? FP4_LUT_F32 : NF4_LUT_F32;
+    const float my_lut_f32 = (lane_id < 16) ? lut[lane_id] : 0.0f;
+
+    const int k_iters = K / K_CHUNK;
+    const int blocksize_log2 = __ffs(blocksize) - 1;
+    const int blocks_per_row = K >> blocksize_log2;
+
+    FragC accum[WARP_MMA_M][WARP_MMA_N];
+#pragma unroll
+    for (int wm = 0; wm < WARP_MMA_M; wm++)
+#pragma unroll
+        for (int wn = 0; wn < WARP_MMA_N; wn++) {
+            accum[wm][wn].x[0] = 0.f;
+            accum[wm][wn].x[1] = 0.f;
+            accum[wm][wn].x[2] = 0.f;
+            accum[wm][wn].x[3] = 0.f;
+        }
+
+    // Tile loading: A (direct copy from global) + B (load packed 4-bit + dequant to half2)
+    auto load_tile = [&](int k_iter, int buf) {
+        const int k_base = k_iter * K_CHUNK;
+        half* __restrict__ sa = smem_a_buf(buf);
+        half* __restrict__ sb = smem_b_buf(buf);
+
+        // Load A: (MT/32) x uint4 per thread, .ca
+        constexpr int vecs_per_thread = MT / 32;
+#pragma unroll
+        for (int v = 0; v < vecs_per_thread; v++) {
+            const int vec_idx = threadIdx.x * vecs_per_thread + v;
+            const int row = vec_idx / 8;
+            const int col = (vec_idx % 8) * 8;
+            const int g_row = bm + row;
+            uint4 val = {0u, 0u, 0u, 0u};
+            if (g_row < M) {
+                // clang-format off
+                asm volatile(
+                    "ld.global.ca.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                    : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                    : "l"(&A[g_row * K + k_base + col])
+                );
+                // clang-format on
+            }
+            *reinterpret_cast<uint4*>(&sa[row * SMEM_A_STRIDE + col]) = val;
+        }
+
+        // Load + dequant B
+        {
+            const int byte_start = threadIdx.x * B_BYTES;
+            const int n_local = byte_start / (K_CHUNK / 2);
+            const int k_byte0 = byte_start % (K_CHUNK / 2);
+            const int n_global = bn + n_local;
+            const int k_elem0 = k_byte0 * 2;
+
+            float scale_f = 0.0f;
+            if (n_global < N) {
+                const int blk_idx = n_global * blocks_per_row + ((k_base + k_elem0) >> blocksize_log2);
+                if (absmax_8bit) {
+                    // absmax_8bit[blk_idx] indexes absmax_code (256-entry codebook).
+                    // absmax[blk_idx >> 8] is the fp32 state2 scale (one per 256 blocks).
+                    scale_f = __ldg(&absmax_code[__ldg(&absmax_8bit[blk_idx])]) * __ldg(&absmax[blk_idx >> 8]) +
+                              absmax_offset_f;
+                } else {
+                    scale_f = __ldg(&absmax[blk_idx]);
+                }
+            }
+
+            // Centroid * scale in fp32 avoids double rounding to half.
+            auto dequant_byte = [&](uint8_t byte, int smem_off) {
+                const float hi = __shfl_sync(0xffffffff, my_lut_f32, byte >> 4);
+                const float lo = __shfl_sync(0xffffffff, my_lut_f32, byte & 0x0f);
+                const auto dq = make_vec2<half>(hi * scale_f, lo * scale_f);
+                *reinterpret_cast<uint32_t*>(&sb[n_local * SMEM_B_STRIDE + smem_off]) =
+                    *reinterpret_cast<const uint32_t*>(&dq);
+            };
+
+            if constexpr (B_BYTES == 16) {
+                uint4 packed4 = {0u, 0u, 0u, 0u};
+                if (n_global < N) {
+                    // clang-format off
+                    asm volatile(
+                        "ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                        : "=r"(packed4.x), "=r"(packed4.y),
+                          "=r"(packed4.z), "=r"(packed4.w)
+                        : "l"(&B[n_global * (K / 2) + k_base / 2 + k_byte0])
+                    );
+                    // clang-format on
+                }
+                const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&packed4);
+#pragma unroll
+                for (int j = 0; j < 16; j++)
+                    dequant_byte(bytes[j], k_elem0 + j * 2);
+            } else {
+                uint2 packed2 = {0u, 0u};
+                if (n_global < N) {
+                    // clang-format off
+                    asm volatile(
+                        "ld.global.cs.v2.u32 {%0,%1}, [%2];\n"
+                        : "=r"(packed2.x), "=r"(packed2.y)
+                        : "l"(&B[n_global * (K / 2) + k_base / 2 + k_byte0])
+                    );
+                    // clang-format on
+                }
+                const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&packed2);
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    dequant_byte(bytes[j], k_elem0 + j * 2);
+            }
+        }
+    };
+
+    // Compute MMA on one buffer. K_CHUNK/MMA_K = 8 iterations.
+    auto compute = [&](int buf) {
+        const half* sa = smem_a_buf(buf);
+        const half* sb = smem_b_buf(buf);
+        const int wm_off = warp_m * WARP_M;
+        const int wn_off = warp_n * WARP_N;
+
+        for (int kk = 0; kk < K_CHUNK / MMA_K; kk++) {
+            const int k_off = kk * MMA_K;
+
+            uint32_t a_frag[WARP_MMA_M][2];
+#pragma unroll
+            for (int wm = 0; wm < WARP_MMA_M; wm++)
+                load_A_frag(a_frag[wm], sa, wm_off + wm * MMA_M, k_off, lane_id);
+
+#pragma unroll
+            for (int wn = 0; wn < WARP_MMA_N; wn++) {
+                uint32_t b_frag[1];
+                load_B_frag(b_frag, sb, wn_off + wn * MMA_N, k_off, lane_id);
+#pragma unroll
+                for (int wm = 0; wm < WARP_MMA_M; wm++)
+                    mma_m16n8k8(accum[wm][wn], a_frag[wm], b_frag);
+            }
+        }
+    };
+
+    // Main loop: double buffered
+    load_tile(0, 0);
+    __syncthreads();
+
+    for (int k_iter = 0; k_iter < k_iters; k_iter++) {
+        const int cur_buf = k_iter % 2;
+        const int next_buf = 1 - cur_buf;
+        if (k_iter + 1 < k_iters)
+            load_tile(k_iter + 1, next_buf);
+        compute(cur_buf);
+        __syncthreads();
+    }
+
+    mma_store_accum<T, WARP_MMA_M, WARP_MMA_N, MMA_M, MMA_N>(
+        C, accum, bm, bn, warp_m * WARP_M, warp_n * WARP_N, M, N, lane_id, bias
+    );
+#endif // __CUDA_ARCH__ == 750
+}
+
+template <typename T, int MT, int NT>
+static void launch_tile(
+    // clang-format off
+    const T* A,
+    const uint8_t* B,
+    const float* absmax,
+    const uint8_t* absmax_8bit,
+    const float* absmax_code,
+    const float* absmax_offset,
+    T* C,
+    const T* bias,
+    int M, int N, int K,
+    int blocksize,
+    int quant_type,
+    GpuProps gpu,
+    cudaStream_t stream
+    // clang-format on
+) {
+    constexpr int smem = smem_bytes_for<T, MT, NT>();
+    static bool cfg[16] = {};
+    if (gpu.device_index >= 16 || !cfg[gpu.device_index]) {
+        cudaFuncSetAttribute(gemm_4bit_sm75_m16n8k8<T, MT, NT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        if (gpu.device_index < 16)
+            cfg[gpu.device_index] = true;
+    }
+    dim3 grid((M + MT - 1) / MT, (N + NT - 1) / NT);
+    gemm_4bit_sm75_m16n8k8<T, MT, NT><<<grid, dim3(CTA_SIZE), smem, stream>>>(
+        A, B, absmax, absmax_8bit, absmax_code, absmax_offset, C, bias, M, N, K, blocksize, quant_type
+    );
+}
+
+/// @brief Auto-dispatch launcher for the sm75 MMA kernel. Selects MT/NT tile
+///        based on GPU SM count and shape.
+/// @tparam T Input/output dtype (must be `half`)
+template <typename T>
+void launch_gemm_4bit_sm75_m16n8k8(
+    // clang-format off
+    const T* A,
+    const uint8_t* B,
+    const float* absmax,
+    const uint8_t* absmax_8bit,
+    const float* absmax_code,
+    const float* absmax_offset,
+    T* C,
+    const T* bias,
+    int M, int N, int K,
+    int blocksize,
+    int quant_type,
+    GpuProps gpu,
+    cudaStream_t stream
+    // clang-format on
+) {
+    static_assert(std::is_same_v<T, half>, "sm75 MMA requires fp16 (half)");
+
+    const int num_sms = gpu.num_sms;
+    const int m_blocks_32 = (M + 31) / 32;
+    const int m_blocks_64 = (M + 63) / 64;
+    const int n_blocks_128 = (N + 127) / 128;
+    const int n_blocks_64 = (N + 63) / 64;
+    const int blocks_32x64 = m_blocks_32 * n_blocks_64;
+
+    // Suppress MT=32 when M just crossed a 64-row boundary and the extra
+    // MT=32 block would be nearly empty -- but only once 64x128 reaches 0.25 wave.
+    // Below 0.25 wave, MT=32 still wins by keeping more blocks in flight.
+    const bool mt32_boundary_waste = (m_blocks_32 > m_blocks_64) && (m_blocks_64 * n_blocks_128 >= num_sms / 4);
+
+    const bool use_mt32 = (M < 48 && !mt32_boundary_waste) ||
+                          (M <= 128 && blocks_32x64 >= num_sms * 2 && m_blocks_32 * 32 < m_blocks_64 * 64 &&
+                           m_blocks_64 * n_blocks_128 < num_sms * 3) ||
+                          (m_blocks_64 * n_blocks_128 < num_sms / 4); // 64x128 < 0.25 wave
+
+    int m_blocks = use_mt32 ? m_blocks_32 : m_blocks_64;
+    int mt = use_mt32 ? 32 : 64;
+    int nt;
+
+    if (mt == 32) {
+        // NT=128 only at very high occupancy (>=5 waves); NT=64 otherwise gives
+        // 2x more blocks and wins at normal occupancy on sm75.
+        const bool use_nt64 = (m_blocks * n_blocks_128 < num_sms * 5) && (n_blocks_64 > n_blocks_128);
+        nt = use_nt64 ? 64 : 128;
+    } else {
+        // Fall back to MT=32 when 64x128 is severely undersubscribed (< 0.25 wave).
+        if (m_blocks * n_blocks_128 < num_sms / 4 && n_blocks_64 > n_blocks_128) {
+            m_blocks = m_blocks_32;
+            mt = 32;
+            const bool use_nt64 = (m_blocks * n_blocks_128 < num_sms * 5) && (n_blocks_64 > n_blocks_128);
+            nt = use_nt64 ? 64 : 128;
+        } else {
+            // 64x128 otherwise, except 64x64 when NT=128 is below 0.5 wave.
+            nt = (m_blocks * n_blocks_128 < num_sms / 2) ? 64 : 128;
+        }
+    }
+
+    // clang-format off
+#define LAUNCH_SM75(MT, NT) \
+    launch_tile<T, MT, NT>(A, B, absmax, absmax_8bit, absmax_code, absmax_offset, C, bias, M, N, K, blocksize, quant_type, gpu, stream)
+
+    if      (mt == 32 && nt ==  64) LAUNCH_SM75(32,  64);
+    else if (mt == 32 && nt == 128) LAUNCH_SM75(32, 128);
+    else if (mt == 64 && nt ==  64) LAUNCH_SM75(64,  64);
+    else if (mt == 64 && nt == 128) LAUNCH_SM75(64, 128);
+#undef LAUNCH_SM75
+    // clang-format on
+}
+
+// Explicit instantiation
+template void launch_gemm_4bit_sm75_m16n8k8<half>(
+    const half*, const uint8_t*, const float*, const uint8_t*, const float*, const float*, half*, const half*, int, int,
+    int, int, int, GpuProps, cudaStream_t
+);
+
+// sm80+ MMA (mma.sync.aligned.m16n8k16) 4-bit GEMM kernel (bf16 and fp16).
+
+#include <cstdint>
+#include <cstring>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <type_traits>
+
+#include "gemm_4bit_common.cuh"
+#include "gemm_4bit_mma.cuh"
+#include "gemm_4bit_sm80.cuh"
+
+[[maybe_unused]] static constexpr int MMA_M = 16;
+[[maybe_unused]] static constexpr int MMA_N = 8;
+[[maybe_unused]] static constexpr int MMA_K = 16;
+
+static constexpr int NUM_WARPS = 8;
+static constexpr int CTA_SIZE = NUM_WARPS * 32;
+
+/// @brief In-place warp-level MMA: accum += A * B (bf16 or fp16, m16n8k16).
+///        Called once per K chunk to accumulate the full matrix product.
+///
+/// Executes mma.sync.aligned.m16n8k16.row.col.f32.{bf16,f16}.{bf16,f16}.f32.
+/// Fragments are distributed across warp lanes per PTX spec.
+///
+/// @tparam T    Input dtype; selects bf16 or fp16 PTX instruction
+/// @param accum In-place f32 accumulator (4 regs per lane)
+/// @param a     A fragment: 16x16 operand (4 regs per lane)
+/// @param b     B fragment: 16x8 operand (2 regs per lane)
+template <typename T>
+__device__ __forceinline__ void mma_m16n8k16(FragC& accum, const uint32_t a[4], const uint32_t b[2]) {
+    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        // clang-format off
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : "+f"(accum.x[0]), "+f"(accum.x[1]), "+f"(accum.x[2]), "+f"(accum.x[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+              "r"(b[0]), "r"(b[1])
+        );
+        // clang-format on
+    } else {
+        // clang-format off
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : "+f"(accum.x[0]), "+f"(accum.x[1]), "+f"(accum.x[2]), "+f"(accum.x[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+              "r"(b[0]), "r"(b[1])
+        );
+        // clang-format on
+    }
+}
+
+// Smem stride = K_CHUNK + 8 elements (same for A and B).
+// +8 padding: 16-byte row alignment, limits bank conflicts to 4-way for both
+// K_CHUNK=64 (stride=72, gcd(36,32)=4) and K_CHUNK=128 (stride=136, gcd(68,32)=4).
+
+// A: m16 x k16 from row-major [m][k] smem. ldmatrix.x4.
+template <typename T>
+__device__ __forceinline__ void
+    load_A_frag(uint32_t frag[4], const T* smem_a, int m_off, int k_off, int lane, int stride) {
+    const int mat_idx = lane / 8;
+    const int row_in_mat = lane % 8;
+    const int m_row = m_off + row_in_mat + (mat_idx & 1) * 8;
+    const int k_col = k_off + (mat_idx >> 1) * 8;
+    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem_a[m_row * stride + k_col]));
+    // clang-format off
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(frag[0]), "=r"(frag[1]), "=r"(frag[2]), "=r"(frag[3])
+        : "r"(addr)
+    );
+    // clang-format on
+}
+
+// B: k16 x n8 from row-major [n][k] smem (= col-major [k][n]). ldmatrix.x2.
+template <typename T>
+__device__ __forceinline__ void
+    load_B_frag(uint32_t frag[2], const T* smem_b, int n_off, int k_off, int lane, int stride) {
+    int n_row = lane % 8;
+    int k_col = k_off + (lane / 8) * 8;
+    if (lane >= 16) {
+        n_row = (lane - 16) % 8;
+        k_col = k_off + ((lane - 16) / 8) * 8;
+    }
+    const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem_b[(n_off + n_row) * stride + k_col]));
+    // clang-format off
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+        : "=r"(frag[0]), "=r"(frag[1])
+        : "r"(addr)
+    );
+    // clang-format on
+}
+
+// Smem size per double-buffer in bytes (sizeof(T) == 2 for both bf16 and fp16).
+template <typename T, int MT, int NT, int K_CHUNK = 64> static constexpr int smem_bytes_for() {
+    constexpr int STRIDE = K_CHUNK + 8;
+    return 2 * (MT + NT) * STRIDE * static_cast<int>(sizeof(T));
+}
+
+/// @brief Fused 4-bit dequantize + MMA GEMM for sm80+ (bf16 and fp16).
+///        Computes C[M,N] = A[M,K] @ B[N,K]^T + bias.
+///
+/// Layout:
+///   A: [M, K] row-major, T (activations)
+///   B: [N, K/2] row-major, packed uint8 (2 nibbles per byte, weights)
+///   C: [M, N] row-major, T (output)
+///
+/// MMA: `mma.sync.aligned.m16n8k16.row.col.f32.{bf16,f16}.{bf16,f16}.f32`
+///   A operand: row-major [M, K]
+///   B operand: col-major [K, N] (B [N, K] row-major reinterpreted)
+///
+/// Double-buffered smem pipeline. Supports optional nested absmax and bias.
+///
+/// Smem per double-buffer = 2*(MT+NT)*(K_CHUNK+8)*sizeof(T) bytes:
+///   KC=64:  32x 64  27KB   32x128  45KB   64x 64  36KB
+///           64x128  54KB  128x 64  54KB  128x128  72KB
+///   KC=128: 32x 64  51KB   32x128  85KB   32x256 153KB
+///           64x 32  51KB   64x 64  68KB
+///
+/// @tparam T       Input/output dtype (`__nv_bfloat16` or `half`)
+/// @tparam MT      M tile size (32, 64, or 128)
+/// @tparam NT      N tile size (32, 64, 128, or 256)
+/// @tparam K_CHUNK K elements per outer iteration (64 or 128)
+template <typename T, int MT = 128, int NT = 128, int K_CHUNK = 64>
+__global__ void __launch_bounds__(CTA_SIZE) gemm_4bit_sm80_m16n8k16(
+    // clang-format off
+    const T*       __restrict__ A,             // inputs [M, K]
+    const uint8_t* __restrict__ B,             // packed 4-bit weights [N, K/2]
+    const float*   __restrict__ absmax,        // fp32 absmax [N, K/blocksize] or
+                                               //   [ceil(N*K/(blocksize*256))] when nested
+    const uint8_t* __restrict__ absmax_8bit,   // [N, K/blocksize] uint8 compressed absmax;
+                                               //   nullptr = non-nested
+    const float*   __restrict__ absmax_code,   // [256] codebook for 8bit absmax
+    const float*   __restrict__ absmax_offset, // scalar; nullptr = non-nested
+    T*             __restrict__ C,             // [M, N]
+    const T*       __restrict__ bias,          // [N] optional, nullptr = no bias
+    int M, int N, int K,                       // problem shape
+    int blocksize,                             // elements per quantization block
+    int quant_type                             // 1 = FP4, 2 = NF4
+    // clang-format on
+) {
+#if __CUDA_ARCH__ >= 800
+    static_assert(MT == 32 || MT == 64 || MT == 128, "MT must be 32, 64, or 128");
+    static_assert(NT == 32 || NT == 64 || NT == 128 || NT == 256, "NT must be 32, 64, 128, or 256");
+    static_assert(K_CHUNK == 64 || K_CHUNK == 128, "K_CHUNK must be 64 or 128");
+
+    // Trap on tile+arch combinations that the dispatcher can never reach.
+    // if constexpr prunes the kernel body entirely at compile time; __trap()
+    // provides a visible error if this assumption is ever violated at runtime.
+    // clang-format off
+#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+    // HBM (sm90/sm100/sm103): MT=32 always returns K_CHUNK=128 with NT=64 or NT=256;
+    // MT=64 never uses NT=32 (GDDR-only fallback).
+    // sm80 is intentionally excluded: these four GDDR tiles are unused on sm80 itself
+    // but must remain in the sm80 cubin so it can run correctly on sm86/sm89.
+    if constexpr ((MT==32 && NT== 64 && K_CHUNK== 64) ||
+                  (MT==32 && NT==128 && K_CHUNK== 64) ||
+                  (MT==32 && NT==128 && K_CHUNK==128) ||
+                  (MT==64 && NT== 32 && K_CHUNK==128)) { __trap(); return; }
+#endif
+#if __CUDA_ARCH__ == 900
+    // sm90: only 64x64-64 is dispatched at MT=64 (NT forced to 64, K_CHUNK=128 never selected).
+    if constexpr (MT==64 && !(NT==64 && K_CHUNK==64)) { __trap(); return; }
+#endif
+#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+    // sm100/sm103 (B200/B300): only 64x64-128 is dispatched at MT=64.
+    if constexpr (MT==64 && !(NT==64 && K_CHUNK==128)) { __trap(); return; }
+#endif
+#if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
+    // GDDR (sm86/sm89/sm120/sm121): NT=256 only exists in the HBM MT=32 path.
+    if constexpr (MT==32 && NT==256 && K_CHUNK==128) { __trap(); return; }
+#endif
+    // clang-format on
+
+    const float absmax_offset_f = absmax_8bit ? __ldg(absmax_offset) : 0.0f;
+
+    // K_CHUNK + 8 padding: 16-byte row alignment, limits bank conflicts to 4-way.
+    constexpr int SMEM_A_STRIDE = K_CHUNK + 8;
+    constexpr int SMEM_B_STRIDE = K_CHUNK + 8;
+
+    using WL = MmaWarpLayout<MT, NT, NUM_WARPS, MMA_M, MMA_N>;
+    constexpr int WARPS_M = WL::WARPS_M;
+    constexpr int WARPS_N = WL::WARPS_N;
+    constexpr int WARP_M = WL::WARP_M;
+    constexpr int WARP_MMA_M = WL::WARP_MMA_M;
+    constexpr int WARP_N = WL::WARP_N;
+    constexpr int WARP_MMA_N = WL::WARP_MMA_N;
+
+    static_assert(MT >= WARPS_M * MMA_M, "MT too small for warp layout");
+    static_assert(NT >= WARPS_N * MMA_N, "NT too small for warp layout");
+
+    // Packed bytes of B per thread per K-chunk:
+    //   NT= 64, KC= 64 ->  8 bytes (uint2)
+    //   NT=128, KC= 64 -> 16 bytes (uint4)
+    //   NT= 32, KC=128 ->  8 bytes (uint2)
+    //   NT= 64, KC=128 -> 16 bytes (uint4)
+    //   NT=128, KC=128 -> 32 bytes (2x uint4)
+    //   NT=256, KC=128 -> 64 bytes (4x uint4)
+    constexpr int B_BYTES = NT * (K_CHUNK / 2) / CTA_SIZE;
+    static_assert(B_BYTES == 8 || B_BYTES == 16 || B_BYTES == 32 || B_BYTES == 64, "unexpected B bytes per thread");
+
+    extern __shared__ char smem_raw[];
+    constexpr int buf_offset = (MT * SMEM_A_STRIDE + NT * SMEM_B_STRIDE) * sizeof(T);
+    auto smem_a_buf = [&](int buf) -> T* { return reinterpret_cast<T*>(smem_raw + buf * buf_offset); };
+    auto smem_b_buf = [&](int buf) -> T* {
+        return reinterpret_cast<T*>(smem_raw + buf * buf_offset + MT * SMEM_A_STRIDE * sizeof(T));
+    };
+
+    const int bm = blockIdx.x * MT;
+    const int bn = blockIdx.y * NT;
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int warp_m = warp_id / WARPS_N;
+    const int warp_n = warp_id % WARPS_N;
+
+    // LUT in fp32: centroid * scale in fp32 avoids double rounding to output dtype.
+    const float* lut = (quant_type == 1) ? FP4_LUT_F32 : NF4_LUT_F32;
+    const float my_lut_f32 = (lane_id < 16) ? lut[lane_id] : 0.0f;
+
+    const int k_iters = K / K_CHUNK;
+    const int blocksize_log2 = __ffs(blocksize) - 1;
+    const int blocks_per_row = K >> blocksize_log2;
+
+    FragC accum[WARP_MMA_M][WARP_MMA_N];
+#pragma unroll
+    for (int wm = 0; wm < WARP_MMA_M; wm++)
+#pragma unroll
+        for (int wn = 0; wn < WARP_MMA_N; wn++) {
+            accum[wm][wn].x[0] = 0.f;
+            accum[wm][wn].x[1] = 0.f;
+            accum[wm][wn].x[2] = 0.f;
+            accum[wm][wn].x[3] = 0.f;
+        }
+
+    // Tile loading: A (direct copy from global) + B (load packed 4-bit + dequant)
+    auto load_tile = [&](int k_iter, int buf) {
+        const int k_base = k_iter * K_CHUNK;
+        T* __restrict__ sa = smem_a_buf(buf);
+        T* __restrict__ sb = smem_b_buf(buf);
+
+        // Load A: each thread loads vecs_per_thread uint4 (8 T elements each).
+        constexpr int vecs_per_row = K_CHUNK / 8;
+        constexpr int vecs_per_thread = MT * vecs_per_row / CTA_SIZE;
+#pragma unroll
+        for (int v = 0; v < vecs_per_thread; v++) {
+            const int vec_idx = threadIdx.x * vecs_per_thread + v;
+            const int row = vec_idx / vecs_per_row;
+            const int col = (vec_idx % vecs_per_row) * 8;
+            const int g_row = bm + row;
+            uint4 val = {0u, 0u, 0u, 0u};
+            if (g_row < M) {
+                // clang-format off
+                asm volatile(
+                    "ld.global.ca.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                    : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+                    : "l"(&A[g_row * K + k_base + col])
+                );
+                // clang-format on
+            }
+            *reinterpret_cast<uint4*>(&sa[row * SMEM_A_STRIDE + col]) = val;
+        }
+
+        // Pre-fetch nested_idx_b before scale_f computation; the A-tile loads above
+        // provide enough in-flight latency to hide the absmax_8bit read.
+        const int byte_start_b = threadIdx.x * B_BYTES;
+        const int n_local_b = byte_start_b / (K_CHUNK / 2);
+        const int k_byte0_b = byte_start_b % (K_CHUNK / 2);
+        const int n_global_b = bn + n_local_b;
+        const int k_elem0_b = k_byte0_b * 2;
+        const int blk_idx_b = n_global_b * blocks_per_row + ((k_base + k_elem0_b) >> blocksize_log2);
+        uint8_t nested_idx_b = 0;
+        if (absmax_8bit && n_global_b < N)
+            nested_idx_b = __ldg(&absmax_8bit[blk_idx_b]);
+
+        // Load + dequant B
+        {
+            const int n_local = n_local_b;
+            const int k_byte0 = k_byte0_b;
+            const int n_global = n_global_b;
+            const int k_elem0 = k_elem0_b;
+            // (k_base + k_elem0) selects the correct absmax block for any blocksize:
+            // for blocksize >= K_CHUNK the index collapses to k_iter; for smaller
+            // blocksizes each thread's k_elem0 selects the right sub-chunk block.
+            const int blk_idx = blk_idx_b;
+
+            float scale_f = 0.0f;
+            if (n_global < N) {
+                if (absmax_8bit) {
+                    // nested_idx_b was pre-fetched above; __ldg keeps the 1KB codebook in read-only L1.
+                    scale_f = __ldg(&absmax_code[nested_idx_b]) * __ldg(&absmax[blk_idx >> 8]) + absmax_offset_f;
+                } else {
+                    scale_f = __ldg(&absmax[blk_idx]);
+                }
+            }
+
+            // fp32 centroid * scale avoids double rounding; hi nibble (>>4) = lower K index.
+            auto dequant_byte = [&](uint8_t byte, int smem_off) {
+                const float hi = __shfl_sync(0xffffffff, my_lut_f32, byte >> 4);
+                const float lo = __shfl_sync(0xffffffff, my_lut_f32, byte & 0x0f);
+                const auto dq = make_vec2<T>(hi * scale_f, lo * scale_f);
+                *reinterpret_cast<uint32_t*>(&sb[n_local * SMEM_B_STRIDE + smem_off]) =
+                    *reinterpret_cast<const uint32_t*>(&dq);
+            };
+
+            if constexpr (B_BYTES == 64) {
+                // NT=256, KC=128: each thread covers one N-column x K_CHUNK K-elements.
+                // scale_f for the first block is fetched above. The loop refreshes it at
+                // each absmax block boundary using (j*2 & (blocksize-1)) == 0, which is
+                // a single bitmask AND per unrolled step since blocksize is always a power of 2.
+                uint4 p0 = {0, 0, 0, 0}, p1 = {0, 0, 0, 0}, p2 = {0, 0, 0, 0}, p3 = {0, 0, 0, 0};
+                const uint8_t* bptr = &B[n_global * (K / 2) + k_base / 2 + k_byte0];
+                if (n_global < N) {
+                    // clang-format off
+                    asm volatile(
+                        "ld.global.cs.v4.u32 {%0,%1,%2,%3},   [%16];\n"
+                        "ld.global.cs.v4.u32 {%4,%5,%6,%7},   [%16+16];\n"
+                        "ld.global.cs.v4.u32 {%8,%9,%10,%11}, [%16+32];\n"
+                        "ld.global.cs.v4.u32 {%12,%13,%14,%15},[%16+48];\n"
+                        : "=r"(p0.x), "=r"(p0.y), "=r"(p0.z), "=r"(p0.w),
+                          "=r"(p1.x), "=r"(p1.y), "=r"(p1.z), "=r"(p1.w),
+                          "=r"(p2.x), "=r"(p2.y), "=r"(p2.z), "=r"(p2.w),
+                          "=r"(p3.x), "=r"(p3.y), "=r"(p3.z), "=r"(p3.w)
+                        : "l"(bptr)
+                    );
+                    // clang-format on
+                }
+                uint8_t bytes[64];
+                memcpy(bytes, &p0, 16);
+                memcpy(bytes + 16, &p1, 16);
+                memcpy(bytes + 32, &p2, 16);
+                memcpy(bytes + 48, &p3, 16);
+#pragma unroll
+                for (int j = 0; j < B_BYTES; j++) {
+                    if (j > 0 && ((j * 2) & (blocksize - 1)) == 0 && n_global < N) {
+                        const int blk_idx = n_global * blocks_per_row + ((k_base + k_elem0 + j * 2) >> blocksize_log2);
+                        if (absmax_8bit) {
+                            scale_f = __ldg(&absmax_code[__ldg(&absmax_8bit[blk_idx])]) * __ldg(&absmax[blk_idx >> 8]) +
+                                      absmax_offset_f;
+                        } else {
+                            scale_f = __ldg(&absmax[blk_idx]);
+                        }
+                    }
+                    dequant_byte(bytes[j], k_elem0 + j * 2);
+                }
+            } else if constexpr (B_BYTES == 32) {
+                // NT=128, KC=128: same block boundary refresh as B_BYTES=64.
+                // Needed when blocksize < K_CHUNK (e.g. blocksize=32 with KC=128).
+                uint4 p0 = {0, 0, 0, 0}, p1 = {0, 0, 0, 0};
+                const uint8_t* bptr = &B[n_global * (K / 2) + k_base / 2 + k_byte0];
+                if (n_global < N) {
+                    // clang-format off
+                    asm volatile(
+                        "ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%8];\n"
+                        "ld.global.cs.v4.u32 {%4,%5,%6,%7}, [%8+16];\n"
+                        : "=r"(p0.x), "=r"(p0.y), "=r"(p0.z), "=r"(p0.w),
+                          "=r"(p1.x), "=r"(p1.y), "=r"(p1.z), "=r"(p1.w)
+                        : "l"(bptr)
+                    );
+                    // clang-format on
+                }
+                uint8_t bytes[32];
+                memcpy(bytes, &p0, 16);
+                memcpy(bytes + 16, &p1, 16);
+#pragma unroll
+                for (int j = 0; j < B_BYTES; j++) {
+                    if (j > 0 && ((j * 2) & (blocksize - 1)) == 0 && n_global < N) {
+                        const int blk_idx = n_global * blocks_per_row + ((k_base + k_elem0 + j * 2) >> blocksize_log2);
+                        if (absmax_8bit) {
+                            scale_f = __ldg(&absmax_code[__ldg(&absmax_8bit[blk_idx])]) * __ldg(&absmax[blk_idx >> 8]) +
+                                      absmax_offset_f;
+                        } else {
+                            scale_f = __ldg(&absmax[blk_idx]);
+                        }
+                    }
+                    dequant_byte(bytes[j], k_elem0 + j * 2);
+                }
+            } else if constexpr (B_BYTES == 16) {
+                uint4 packed4 = {0u, 0u, 0u, 0u};
+                if (n_global < N) {
+                    // clang-format off
+                    asm volatile(
+                        "ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                        : "=r"(packed4.x), "=r"(packed4.y),
+                          "=r"(packed4.z), "=r"(packed4.w)
+                        : "l"(&B[n_global * (K / 2) + k_base / 2 + k_byte0])
+                    );
+                    // clang-format on
+                }
+                const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&packed4);
+#pragma unroll
+                for (int j = 0; j < 16; j++)
+                    dequant_byte(bytes[j], k_elem0 + j * 2);
+            } else if constexpr (B_BYTES == 8) {
+                uint2 packed2 = {0u, 0u};
+                if (n_global < N) {
+                    // clang-format off
+                    asm volatile(
+                        "ld.global.cs.v2.u32 {%0,%1}, [%2];\n"
+                        : "=r"(packed2.x), "=r"(packed2.y)
+                        : "l"(&B[n_global * (K / 2) + k_base / 2 + k_byte0])
+                    );
+                    // clang-format on
+                }
+                const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&packed2);
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    dequant_byte(bytes[j], k_elem0 + j * 2);
+            }
+        }
+    };
+
+    // Compute MMA on one buffer
+    auto compute = [&](int buf) {
+        const T* sa = smem_a_buf(buf);
+        const T* sb = smem_b_buf(buf);
+        const int wm_off = warp_m * WARP_M;
+        const int wn_off = warp_n * WARP_N;
+
+        for (int kk = 0; kk < K_CHUNK / MMA_K; kk++) {
+            const int k_off = kk * MMA_K;
+            uint32_t a_frag[WARP_MMA_M][4];
+#pragma unroll
+            for (int wm = 0; wm < WARP_MMA_M; wm++)
+                load_A_frag<T>(a_frag[wm], sa, wm_off + wm * MMA_M, k_off, lane_id, SMEM_A_STRIDE);
+#pragma unroll
+            for (int wn = 0; wn < WARP_MMA_N; wn++) {
+                uint32_t b_frag[2];
+                load_B_frag<T>(b_frag, sb, wn_off + wn * MMA_N, k_off, lane_id, SMEM_B_STRIDE);
+#pragma unroll
+                for (int wm = 0; wm < WARP_MMA_M; wm++)
+                    mma_m16n8k16<T>(accum[wm][wn], a_frag[wm], b_frag);
+            }
+        }
+    };
+
+    // Main loop: double buffered
+    load_tile(0, 0);
+    __syncthreads();
+
+    for (int k_iter = 0; k_iter < k_iters; k_iter++) {
+        const int cur_buf = k_iter % 2;
+        const int next_buf = 1 - cur_buf;
+        if (k_iter + 1 < k_iters)
+            load_tile(k_iter + 1, next_buf);
+        compute(cur_buf);
+        __syncthreads();
+    }
+
+    mma_store_accum<T, WARP_MMA_M, WARP_MMA_N, MMA_M, MMA_N>(
+        C, accum, bm, bn, warp_m * WARP_M, warp_n * WARP_N, M, N, lane_id, bias
+    );
+#endif // __CUDA_ARCH__ >= 800
+}
+
+template <typename T, int MT, int NT, int KC>
+static void launch_tile(
+    // clang-format off
+    const T* A,
+    const uint8_t* B,
+    const float* absmax,
+    const uint8_t* absmax_8bit,
+    const float* absmax_code,
+    const float* absmax_offset,
+    T* C,
+    const T* bias,
+    int M, int N, int K,
+    int blocksize,
+    int quant_type,
+    GpuProps gpu,
+    cudaStream_t stream
+    // clang-format on
+) {
+    constexpr int smem = smem_bytes_for<T, MT, NT, KC>();
+    static bool cfg[16] = {};
+    if (gpu.device_index >= 16 || !cfg[gpu.device_index]) {
+        cudaFuncSetAttribute(gemm_4bit_sm80_m16n8k16<T, MT, NT, KC>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        if (gpu.device_index < 16)
+            cfg[gpu.device_index] = true;
+    }
+    dim3 grid((M + MT - 1) / MT, (N + NT - 1) / NT);
+    gemm_4bit_sm80_m16n8k16<T, MT, NT, KC><<<grid, dim3(CTA_SIZE), smem, stream>>>(
+        A, B, absmax, absmax_8bit, absmax_code, absmax_offset, C, bias, M, N, K, blocksize, quant_type
+    );
+}
+
+/// @brief Auto-dispatch launcher for the sm80+ MMA kernel. Selects MT/NT/KC tile
+///        based on GPU arch, SM count, and shape.
+/// @tparam T Input/output dtype (`__nv_bfloat16` or `half`)
+template <typename T>
+void launch_gemm_4bit_sm80_m16n8k16(
+    // clang-format off
+    const T* A,
+    const uint8_t* B,
+    const float* absmax,
+    const uint8_t* absmax_8bit,
+    const float* absmax_code,
+    const float* absmax_offset,
+    T* C,
+    const T* bias,
+    int M, int N, int K,
+    int blocksize,
+    int quant_type,
+    GpuProps gpu,
+    cudaStream_t stream
+    // clang-format on
+) {
+    const int num_sms = gpu.num_sms;
+    const int cc_major = gpu.cc_major;
+    const int cc_minor = gpu.cc_minor;
+
+    const bool hbm_arch = (cc_major == 8 && cc_minor == 0) || cc_major == 9 || cc_major == 10;
+    const bool sm86 = cc_major == 8 && cc_minor == 6;
+    // A10-class sm86 cards run ~600 GB/s; RTX 3090 (82 SMs) and A40 (84 SMs) are above
+    // the 72-SM threshold and have higher bandwidth (behavior not validated here).
+    const bool sm86_low_bw = sm86 && num_sms <= 72;
+    // RTX Pro 6000 (sm120, 188 SMs) is the only validated high-SM sm120 card.
+    const bool high_sm_sm120 = cc_major == 12 && num_sms >= 150;
+
+    const int m_blocks_32 = (M + 31) / 32;
+    const int m_blocks_64 = (M + 63) / 64;
+    const int m_blocks_128 = (M + 127) / 128;
+    const int n_blocks_64 = (N + 63) / 64;
+    const int n_blocks_128 = (N + 127) / 128;
+
+    const int blocks_32x64 = m_blocks_32 * n_blocks_64;
+    const int blocks_64x64 = m_blocks_64 * n_blocks_64;
+    const int blocks_128x128 = m_blocks_128 * n_blocks_128;
+
+    // MT=128 wastes M-rows when M % 128 is in [1, 64]: the last tile is <=50% full.
+    const bool mt128_row_waste = (M % 128 != 0) && (M % 128 <= 64);
+    // MT=128 is adequate at >=3/4 wave. At M=96 on A10 (N=8192: 0.89 waves),
+    // MT=128 compute efficiency beats MT=32 despite modest under-subscription.
+    const bool mt128_adequate = blocks_128x128 * 4 >= num_sms * 3;
+    // Suppress MT=32 when M just crossed a 64-row boundary and the extra MT=32 block is
+    // nearly empty. Once blocks_64x64 >= num_sms (1 wave with 64x64 tiles), MT=64 fills cleanly.
+    const bool mt32_boundary_waste = (m_blocks_32 > m_blocks_64) && (blocks_64x64 >= num_sms);
+
+    const bool use_mt32 =
+        (M < 48 && !mt32_boundary_waste) || (M <= 128 && !(mt32_boundary_waste && mt128_adequate) &&
+                                             blocks_32x64 >= num_sms * 2 && m_blocks_32 * 32 < m_blocks_64 * 64);
+
+    const bool use_mt64 = !use_mt32 && (mt128_row_waste || !mt128_adequate) && blocks_64x64 > blocks_128x128;
+
+    struct Tile {
+        int mt, nt, kc;
+    };
+
+    auto select_tile = [&]() -> Tile {
+        int mt = use_mt32 ? 32 : (use_mt64 ? 64 : 128);
+
+        if (mt == 64) {
+            // sm86 low-BW, tall-K (K>=N) at >=0.5 wave: MT=128 amortizes B-matrix bandwidth
+            // more efficiently than MT=64.
+            // Calibrated on A10: 128x128 beats 64x128 at M=97-128 for tall-K.
+            if (sm86_low_bw && K >= N && !mt128_row_waste && blocks_128x128 * 2 >= num_sms)
+                mt = 128;
+            // High-SM sm120 below 1 wave: MT=64 is severely under-subscribed.
+            // MT=32 doubles M-block count and recovers occupancy.
+            // Calibrated on RTX Pro 6000: N=8192,K=8192 M=63-64.
+            else if (high_sm_sm120 && blocks_64x64 < num_sms)
+                mt = 32;
+            // HBM narrow-N below 0.5 wave.
+            // Calibrated on A100: N=512,K=4096 M=48-384.
+            else if (hbm_arch && blocks_64x64 < num_sms / 2)
+                mt = 32;
+            // Short-K small-weight (K*2<N, weight<2MB): K-loop too short to amortize MT=64.
+            // MT=32 fills >=1 wave and wins when more M-blocks are in flight.
+            else if (K * 2 < N && (long long)N * K < 4LL * 1024 * 1024 && blocks_32x64 >= num_sms)
+                mt = 32;
+            // GDDR short-K at 1/4-3/4 wave: 32x64-128 outperforms MT=64 because the shorter
+            // K-loop makes KC=128 ILP more valuable than a wider output tile.
+            // num_sms >= 60 excludes L4 (58 SMs) where KC=64 competes.
+            else if (!hbm_arch && K * 2 < N && num_sms >= 60 && blocks_64x64 >= num_sms / 4 &&
+                     blocks_64x64 < num_sms * 3 / 4)
+                return {32, 64, 128};
+        }
+
+        if (mt == 32) {
+            if (hbm_arch) {
+                // HBM MT=32: always KC=128 (longer chunks hide HBM latency).
+                // NT=256 in the 3/4-to-1-wave window; NT=64's 4x block advantage
+                // takes over above 1 wave.
+                // Calibrated on A100/H100/H200: N=36864 (>1 wave), 32x64 beats 32x256.
+                const int n_blocks_256 = (N + 255) / 256;
+                const int blocks_32x256 = m_blocks_32 * n_blocks_256;
+                const int nt = (blocks_32x256 * 4 >= num_sms * 3 && blocks_32x256 <= num_sms) ? 256 : 64;
+                return {32, nt, 128};
+            }
+
+            // GDDR MT=32: KC and NT driven by occupancy and register pressure.
+            if (m_blocks_32 >= 2 && blocks_32x64 > num_sms) {
+                // M>=33, >1 wave: register pressure at this occupancy favors KC=64.
+                // NT=128 in the 1-2 wave window on sm86 or short-K (K*3<=N).
+                if (m_blocks_32 >= 3) {
+                    const int blocks_32x128 = m_blocks_32 * n_blocks_128;
+                    if (blocks_32x128 > num_sms && blocks_32x128 <= num_sms * 2 && (sm86 || K * 3 <= N))
+                        return {32, 128, 64};
+                }
+                return {32, 64, 64};
+            }
+            if (m_blocks_32 == 1) {
+                // M<33, just above 1 wave (1.0-1.2x): KC=64 wins in this narrow window.
+                if (blocks_32x64 > num_sms && blocks_32x64 < num_sms + num_sms / 5)
+                    return {32, 64, 64};
+                // M<33, >3 waves on sm86: NT=128 + KC=64.
+                // Calibrated on A10: N=14336-36864 M=5-32; not validated on sm89/sm120.
+                if (sm86 && blocks_32x64 > num_sms * 3)
+                    return {32, 128, 64};
+            }
+            // 64x32-128: NT=32 gives 2x more N-blocks than NT=64 when occupancy-limited.
+            // Excluded for high-SM sm120 (no calibrated wins on RTX Pro 6000).
+            if (!high_sm_sm120) {
+                const int blocks_64x32 = m_blocks_64 * ((N + 31) / 32);
+                if (blocks_64x32 <= num_sms)
+                    return {64, 32, 128};
+            }
+            // KC=128 fallback: NT=128 when >=2/3 wave, NT=64 otherwise.
+            const int nt = (m_blocks_32 * n_blocks_128 * 3 >= num_sms * 2) ? 128 : 64;
+            return {32, nt, 128};
+        }
+
+        if (mt == 64) {
+            // sm90/sm100: no calibrated wins for 64x128; default to NT=64.
+            // A100 and GDDR retain NT=128 when well-subscribed.
+            int nt;
+            if (cc_major == 9 || cc_major == 10)
+                nt = 64;
+            else if (m_blocks_64 * n_blocks_128 < num_sms)
+                nt = 64;
+            else
+                nt = 128;
+            // KC=128 for sm100 (Blackwell) or GDDR tall-K (K>=N).
+            // sm80: no calibrated wins for KC=128 at MT=64.
+            if (nt == 64 && (cc_major == 10 || (!hbm_arch && K >= N)))
+                return {64, 64, 128};
+            return {64, nt, 64};
+        }
+
+        // MT=128: KC=128 not dispatched (needs M>768 benchmarks to calibrate HBM crossover).
+        // NT=128 threshold is halved on sm86 low-BW vs other arches.
+        // Calibrated on A10: N=8192,K=2048 M=127, NT=128 wins 1.49x vs NT=64.
+        const int nt128_min_wave = sm86_low_bw ? num_sms / 2 : num_sms;
+        const int nt = (blocks_128x128 >= nt128_min_wave) ? 128 : 64;
+        return {128, nt, 64};
+    };
+
+    auto [mt, nt, kc] = select_tile();
+
+    // KC=128 requires K%128==0 (k_iters = K/K_CHUNK truncates the remainder).
+    // Remap to the best valid KC=64 tile for this arch without changing any __trap() guards.
+    if (kc == 128 && K % 128 != 0) {
+        kc = 64;
+        if (hbm_arch) {
+            // MT=32 KC=64 tiles are trapped on all HBM arches; sm100 also traps MT=64 KC=64.
+            nt = 64;
+            mt = (cc_major == 10) ? 128 : 64;
+        } else if (nt == 32) {
+            nt = 64; // no 64x32-64 tile
+        }
+    }
+
+    // clang-format off
+#define LAUNCH_SM80(MT, NT, KC) \
+    launch_tile<T, MT, NT, KC>(A, B, absmax, absmax_8bit, absmax_code, absmax_offset, C, bias, M, N, K, blocksize, quant_type, gpu, stream)
+
+    if (kc == 64) {
+        if      (mt ==  32 && nt ==  64) LAUNCH_SM80( 32,  64,  64);
+        else if (mt ==  32 && nt == 128) LAUNCH_SM80( 32, 128,  64);
+        else if (mt ==  64 && nt ==  64) LAUNCH_SM80( 64,  64,  64);
+        else if (mt ==  64 && nt == 128) LAUNCH_SM80( 64, 128,  64);
+        else if (mt == 128 && nt ==  64) LAUNCH_SM80(128,  64,  64);
+        else if (mt == 128 && nt == 128) LAUNCH_SM80(128, 128,  64);
+    } else {
+        if      (mt ==  32 && nt ==  64) LAUNCH_SM80( 32,  64, 128);
+        else if (mt ==  32 && nt == 128) LAUNCH_SM80( 32, 128, 128);
+        else if (mt ==  32 && nt == 256) LAUNCH_SM80( 32, 256, 128);
+        else if (mt ==  64 && nt ==  32) LAUNCH_SM80( 64,  32, 128);
+        else if (mt ==  64 && nt ==  64) LAUNCH_SM80( 64,  64, 128);
+        // else if (mt ==  64 && nt == 128) LAUNCH_SM80( 64, 128, 128);  // unreachable: KC=128 at MT=64 requires NT=64
+        // else if (mt == 128 && nt ==  64) LAUNCH_SM80(128,  64, 128);  // unreachable: MT=128 always dispatches KC=64
+        // else if (mt == 128 && nt == 128) LAUNCH_SM80(128, 128, 128);  // unreachable: same
+    }
+#undef LAUNCH_SM80
+    // clang-format on
+}
+
+// Explicit instantiations
+template void launch_gemm_4bit_sm80_m16n8k16<__nv_bfloat16>(
+    const __nv_bfloat16*, const uint8_t*, const float*, const uint8_t*, const float*, const float*, __nv_bfloat16*,
+    const __nv_bfloat16*, int, int, int, int, int, GpuProps, cudaStream_t
+);
+template void launch_gemm_4bit_sm80_m16n8k16<half>(
+    const half*, const uint8_t*, const float*, const uint8_t*, const float*, const float*, half*, const half*, int, int,
+    int, int, int, GpuProps, cudaStream_t
+);
+
+// Copyright (c) Facebook, Inc. and its affiliates.
+//
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+
+#include "common.cuh"
+#include "compat_device.cuh"
+#include "kernels.cuh"
+
+#define HLF_MAX 65504
+#define TH 1024
+#define NUM 4
+#define NUM_BLOCK 4096
+
+__device__ static float fp4_dequantization_lut[8] = {
+    0.0f,            // 0b000
+    0.005208333333f, // 0b001
+    0.66666667f,     // 0b010
+    1.0f,            // 0b011
+    0.33333333f,     // 0b100
+    0.5f,            // 0b101
+    0.16666667f,     // 0b110
+    0.25f            // 0b111
+};
+
+__device__ static float nf4_dequantization_lut[16] = {
+    -1.0f,                 // 0b0000
+    -0.6961928009986877f,  // 0b0001
+    -0.5250730514526367f,  // 0b0010
+    -0.39491748809814453f, // 0b0011
+    -0.28444138169288635f, // 0b0100
+    -0.18477343022823334f, // 0b0101
+    -0.09105003625154495f, // 0b0110
+    0.0f,                  // 0b0111
+    0.07958029955625534f,  // 0b1000
+    0.16093020141124725f,  // 0b1001
+    0.24611230194568634f,  // 0b1010
+    0.33791524171829224f,  // 0b1011
+    0.44070982933044434f,  // 0b1100
+    0.5626170039176941f,   // 0b1101
+    0.7229568362236023f,   // 0b1110
+    1.0f                   // 0b1111
+};
+
+// source: https://stackoverflow.com/questions/17399119/how-do-i-use-atomicmax-on-floating-point-values-in-cuda
+// HIP has native atomicMax for float; CUDA needs a CAS loop
+#if !BNB_HIP
+__device__ float atomicMax(float* address, float val) {
+    int* address_as_i = reinterpret_cast<int*>(address);
+    int old = *address_as_i, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(reinterpret_cast<int*>(address), assumed, __float_as_int(fmaxf(val, __int_as_float(assumed))));
+    } while (assumed != old);
+    return __int_as_float(old);
+}
+#endif // !BNB_HIP
+
+__device__ __forceinline__ float dDequantizeFP4Tree(unsigned char val) {
+    float sign = 1.0f - 2 * ((val & 0b1000) >> 3);
+    return fp4_dequantization_lut[val & 0b111] * sign;
+}
+
+__device__ unsigned char dQuantizeFP4(float x) {
+    // FP4 with bias of 3
+    // first bit is a sign
+    // subnormals
+    // 0b000 = 0
+    // 0b001 = 0.0625
+    // 0b110 = 2
+    // 0b111 = 3
+    // 0b100 = 4
+    // 0b101 = 6
+    // 0b010 = 8
+    // 0b011 = 12
+
+    // we do a binary search
+    // the pivots are divided by 12 (the FP4 absmax)
+    // since we assume input data is in [-1.0, 1.0]
+
+    // !be careful here, its easy to make a mistake
+    // that is difficult to notice if you add an extra
+    // zero somewhere!
+
+    int sign = x < 0 ? 0b1000 : 0b0000;
+    x = fabsf(x);
+    if (x > 0.29166667f)
+        if (x > 0.583333f)
+            if (x > 0.8333333f)
+                return 0b0011 + sign;
+            else
+                return 0b0010 + sign;
+        else if (x > 0.4166667f)
+            return 0b101 + sign;
+        else
+            return 0b100 + sign;
+    else if (x > 0.0859375f)
+        if (x > 0.20833333f)
+            return 0b0111 + sign;
+        else
+            return 0b0110 + sign;
+    else if (x > 0.00260417f)
+        return 0b0001 + sign;
+    else
+        return 0b0000 + sign;
+}
+
+__device__ __forceinline__ float dDequantizeNF4(unsigned char val) { return nf4_dequantization_lut[val & 0x0F]; }
+
+__device__ unsigned char dQuantizeNF4(float x) {
+
+    // the values for this tree was generated by test_normal_map_tree
+    // in the file tests/test_functional.py
+    if (x > 0.03979014977812767f)
+        if (x > 0.3893125355243683f)         // 1
+            if (x > 0.6427869200706482f)     // 11
+                if (x > 0.8614784181118011f) // 111
+                    return 0b1111;
+                else
+                    return 0b1110;
+            else if (x > 0.5016634166240692f) // 110
+                return 0b1101;
+            else
+                return 0b1100;
+        else if (x > 0.2035212516784668f) // 10
+            if (x > 0.2920137718319893f)  // 101
+                return 0b1011;
+            else
+                return 0b1010;
+        else if (x > 0.1202552504837513f) // 100
+            return 0b1001;
+        else
+            return 0b1000;
+    else if (x > -0.33967943489551544f)     // 0
+        if (x > -0.13791173323988914f)      // 01
+            if (x > -0.045525018125772476f) // 011
+                return 0b0111;
+            else
+                return 0b0110;
+        else if (x > -0.23460740596055984f) // 010
+            return 0b0101;
+        else
+            return 0b0100;
+    else if (x > -0.6106329262256622f) // 00
+        if (x > -0.4599952697753906f)  // 001
+            return 0b0011;
+        else
+            return 0b0010;
+    else if (x > -0.8480964004993439f) // 000
+        return 0b0001;
+    else
+        return 0b0000;
+}
+
+// sign function for lion
+// taken from https://stackoverflow.com/a/4609795, but not sure if there's a proper way to do this in CUDA
+
+template <typename T> __device__ int sgn(T val) { return (T(0) < val) - (val < T(0)); }
+
+template <int STOCHASTIC> __device__ unsigned char dQuantize(float* smem_code, const float rand, float x) {
+    int pivot = 127;
+    int upper_pivot = 255;
+    int lower_pivot = 0;
+
+    float lower = -1.0f;
+    float upper = 1.0f;
+
+    float val = smem_code[pivot];
+    // i>>=1 = {32, 16, 8, 4, 2, 1}
+    for (int i = 64; i > 0; i >>= 1) {
+ 
