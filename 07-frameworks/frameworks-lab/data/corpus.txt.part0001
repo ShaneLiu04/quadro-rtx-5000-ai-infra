@@ -1,0 +1,4813 @@
+ls - lr * (mixed_momentum / adaptive_term)
+
+    tl.store(p_ptr + offsets, p_vals, mask=mask)
+    tl.store(state1_ptr + offsets, s1_vals, mask=mask)
+    tl.store(state2_ptr + offsets, s2_vals, mask=mask)
+
+    if OPTIMIZER_ID == 5:  # ADEMAMIX
+        tl.store(state1_ptr + n_elements + offsets, s3_vals, mask=mask)
+
+
+@triton.jit
+def _optimizer_update_1state_32bit_triton_kernel(
+    g_ptr,
+    p_ptr,
+    state1_ptr,
+    state2_ptr,
+    unorm_ptr,
+    max_unorm: tl.constexpr,
+    param_norm,
+    beta1: tl.constexpr,
+    beta2: tl.constexpr,
+    beta3,
+    alpha,
+    eps: tl.constexpr,
+    weight_decay: tl.constexpr,
+    step,
+    beta1_step,
+    beta2_step,
+    lr,
+    gnorm_scale: tl.constexpr,
+    skip_zeros,
+    n_elements,
+    OPTIMIZER_ID: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    N_PER_TH: tl.constexpr,
+):
+    """1-state optimizer kernel"""
+    pid = tl.program_id(axis=0)
+    block_start_idx = pid * N_PER_TH
+    offsets = block_start_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE * N_PER_TH)
+    mask = offsets < n_elements
+
+    g_vals = tl.load(g_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    p_vals = tl.load(p_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    s1_vals = tl.load(state1_ptr + offsets, mask=mask, other=0.0)
+
+    g_vals = gnorm_scale * g_vals
+    # Coupled (L2) weight decay: fold wd into the gradient. This is correct for
+    # MOMENTUM/RMSPROP/ADAGRAD, but NOT for LION (id 4), which uses *decoupled*
+    # (AdamW-style) weight decay applied to the param directly (see the LION branch
+    # below and Chen et al. 2023). LION is intentionally excluded here.
+    if OPTIMIZER_ID != 4 and weight_decay > 0.0:
+        g_vals = g_vals + p_vals * weight_decay
+
+    update_scale = 1.0
+    if max_unorm > 0.0:
+        current_unorm = tl.sqrt(tl.load(unorm_ptr))
+        if current_unorm > max_unorm * param_norm + eps:
+            update_scale = (max_unorm * param_norm + eps) / current_unorm
+
+    if OPTIMIZER_ID == 0:  # MOMENTUM
+        if step == 1:
+            s1_vals = g_vals
+        else:
+            s1_vals = s1_vals * beta1 + g_vals
+
+        update_val = update_scale * (-lr * s1_vals)
+        p_vals = p_vals + update_val
+
+    elif OPTIMIZER_ID == 4:  # LION
+        # Lion uses decoupled weight decay: shrink the param directly (p *= 1 - lr*wd)
+        # rather than folding wd into the gradient. Matches the 8-bit blockwise kernel,
+        # the default/cpu backends, and the Lion paper (Chen et al. 2023).
+        if weight_decay > 0.0:
+            p_vals = p_vals * (1.0 - lr * weight_decay)
+
+        momentum_update = s1_vals * beta1 + (1.0 - beta1) * g_vals
+        update_val = update_scale * lr * tl.where(momentum_update > 0, 1.0, tl.where(momentum_update < 0, -1.0, 0.0))
+        p_vals = p_vals - update_val
+
+        s1_vals = s1_vals * beta2 + (1.0 - beta2) * g_vals
+
+    elif OPTIMIZER_ID == 1:  # RMSPROP
+        s1_vals = s1_vals * beta1 + (1.0 - beta1) * g_vals * g_vals
+
+        update_val = update_scale * lr * g_vals / (tl.sqrt(s1_vals) + eps)
+        p_vals = p_vals - update_val
+
+    elif OPTIMIZER_ID == 2:  # ADAGRAD
+        s1_vals = s1_vals + g_vals * g_vals
+
+        update_val = lr * g_vals / (tl.sqrt(s1_vals) + eps)
+        p_vals = p_vals - update_val
+
+    tl.store(p_ptr + offsets, p_vals, mask=mask)
+    tl.store(state1_ptr + offsets, s1_vals, mask=mask)
+
+
+name2optimizer_32bit_fn = {
+    "adam": {
+        "preprocess": _optimizer_precondition_2state_32bit,
+        "update": _optimizer_update_2state_32bit_triton_kernel,
+    },
+    "lamb": {
+        "preprocess": _optimizer_precondition_2state_32bit,
+        "update": _optimizer_update_2state_32bit_triton_kernel,
+    },
+    "ademamix": {
+        "preprocess": _optimizer_precondition_2state_32bit,
+        "update": _optimizer_update_2state_32bit_triton_kernel,
+    },
+    "momentum": {
+        "preprocess": _optimizer_precondition_1state_32bit,
+        "update": _optimizer_update_1state_32bit_triton_kernel,
+    },
+    "lars": {
+        "preprocess": _optimizer_precondition_1state_32bit,
+        "update": _optimizer_update_1state_32bit_triton_kernel,
+    },
+    "rmsprop": {
+        "preprocess": _optimizer_precondition_1state_32bit,
+        "update": _optimizer_update_1state_32bit_triton_kernel,
+    },
+    "adagrad": {
+        "preprocess": _optimizer_precondition_1state_32bit,
+        "update": _optimizer_update_1state_32bit_triton_kernel,
+    },
+    "lion": {
+        "preprocess": _optimizer_precondition_1state_32bit,
+        "update": _optimizer_update_1state_32bit_triton_kernel,
+    },
+}
+
+
+def optimizer_update_32bit_impl(
+    optimizer_name: str,
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2: Optional[torch.Tensor],
+    unorm_vec: Optional[torch.Tensor],
+    max_unorm: float,
+    param_norm: float,
+    beta1: float,
+    beta2: float,
+    beta3: float,
+    alpha: float,
+    eps: float,
+    weight_decay: float,
+    step: int,
+    lr: float,
+    gnorm_scale: float = 1.0,
+    skip_zeros=False,
+) -> None:
+    """
+    32-bit optimizer implemented by Triton
+    """
+    if skip_zeros:
+        raise NotImplementedError("skip_zeros is not supported on XPU yet")
+
+    BLOCK_SIZE = 256
+    N_PER_TH = 1  # Number of blocks processed per thread.
+    grid = (triton.cdiv(p.numel(), BLOCK_SIZE * N_PER_TH),)
+    optimizer_id = name2optimizer_id[optimizer_name]
+    fn_preprocess = name2optimizer_32bit_fn[optimizer_name]["preprocess"]
+    fn_update = name2optimizer_32bit_fn[optimizer_name]["update"]
+
+    # In torch=2.7 on XPU there is an issue with libdevice.pow, leading to an error.
+    # For backwards compatibility we precompute the bias correction factors.
+    beta1_step = beta1**step
+    beta2_step = beta2**step
+
+    if optimizer_name == "lion":
+        fn_update[grid](
+            g,
+            p,
+            state1,
+            state2,
+            unorm_vec,
+            max_unorm,
+            param_norm,
+            beta1,
+            beta2,
+            beta3,
+            alpha,
+            eps,
+            weight_decay,
+            step,
+            beta1_step,
+            beta2_step,
+            lr,
+            gnorm_scale,
+            skip_zeros,
+            p.numel(),
+            optimizer_id,
+            BLOCK_SIZE,
+            N_PER_TH,
+            num_warps=2,
+        )
+
+        if max_unorm > 0.0:
+            unorm_vec.zero_()
+            fn_preprocess[grid](
+                g,
+                p,
+                state1,
+                state2,
+                unorm_vec,
+                beta1,
+                beta2,
+                eps,
+                weight_decay,
+                step,
+                beta1_step,
+                beta2_step,
+                lr,
+                gnorm_scale,
+                p.numel(),
+                optimizer_id,
+                BLOCK_SIZE,
+                N_PER_TH,
+                num_warps=2,
+            )
+
+    else:
+        if max_unorm > 0.0:
+            unorm_vec.zero_()
+            fn_preprocess[grid](
+                g,
+                p,
+                state1,
+                state2,
+                unorm_vec,
+                beta1,
+                beta2,
+                eps,
+                weight_decay,
+                step,
+                beta1_step,
+                beta2_step,
+                lr,
+                gnorm_scale,
+                p.numel(),
+                optimizer_id,
+                BLOCK_SIZE,
+                N_PER_TH,
+                num_warps=2,
+            )
+
+        fn_update[grid](
+            g,
+            p,
+            state1,
+            state2,
+            unorm_vec,
+            max_unorm,
+            param_norm,
+            beta1,
+            beta2,
+            beta3,
+            alpha,
+            eps,
+            weight_decay,
+            step,
+            beta1_step,
+            beta2_step,
+            lr,
+            gnorm_scale,
+            skip_zeros,
+            p.numel(),
+            optimizer_id,
+            BLOCK_SIZE,
+            N_PER_TH,
+            num_warps=2,
+        )
+
+
+###########################################
+# Pure torch implementation for reference #
+###########################################
+
+
+@torch.compile
+def _dequantize_blockwise_pytorch(
+    A: torch.Tensor,
+    absmax: torch.Tensor,
+    code: torch.Tensor,
+    blocksize: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Pure PyTorch reference implementation for block-wise dequantization.
+    """
+    if A.numel() == 0:
+        return torch.empty_like(A, dtype=dtype)
+
+    A_flat = A.flatten()
+    num_elements = A_flat.numel()
+
+    dequantized_flat = code.to(A.device)[A_flat.long()].to(dtype)
+
+    num_blocks = math.ceil(num_elements / blocksize)
+    pad_len = num_blocks * blocksize - num_elements
+    if pad_len > 0:
+        dequantized_flat = torch.nn.functional.pad(dequantized_flat, (0, pad_len))
+
+    dequantized_blocks = dequantized_flat.reshape(num_blocks, blocksize)
+
+    rescaled_blocks = dequantized_blocks * absmax.unsqueeze(1).to(dtype)
+
+    rescaled_flat = rescaled_blocks.flatten()
+    if pad_len > 0:
+        rescaled_flat = rescaled_flat[:-pad_len]
+
+    return rescaled_flat.reshape(A.shape)
+
+
+@torch.compile
+def _quantize_blockwise_pytorch(
+    A: torch.Tensor,
+    code: torch.Tensor,
+    blocksize: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pure PyTorch reference implementation for block-wise quantization.
+    """
+    if A.numel() == 0:
+        return torch.empty_like(A, dtype=torch.uint8), torch.empty(0, dtype=torch.float32, device=A.device)
+
+    A_flat = A.flatten()
+    num_elements = A_flat.numel()
+
+    num_blocks = math.ceil(num_elements / blocksize)
+
+    pad_len = num_blocks * blocksize - num_elements
+    if pad_len > 0:
+        A_flat = torch.nn.functional.pad(A_flat, (0, pad_len))
+
+    A_blocks = A_flat.reshape(num_blocks, blocksize)
+
+    absmax = torch.max(torch.abs(A_blocks), dim=1, keepdim=True)[0]
+    absmax[absmax == 0] = 1.0
+
+    scaled_blocks = A_blocks / absmax
+
+    # Inefficient but straightforward quantization, takes a lot of memory
+    diff = torch.abs(scaled_blocks.unsqueeze(2) - code.to(A.device))
+    quantized_indices = torch.argmin(diff, dim=2).to(torch.uint8)
+
+    quantized_flat = quantized_indices.flatten()
+    if pad_len > 0:
+        quantized_flat = quantized_flat[:-pad_len]
+
+    return quantized_flat.reshape(A.shape), absmax.flatten()
+
+
+# Main updated function
+def optimizer_update_8bit_blockwise_pytorch(
+    p: torch.Tensor,
+    g: torch.Tensor,
+    state1: torch.Tensor,
+    state2: Optional[torch.Tensor],
+    beta1: float,
+    beta2: float,
+    beta3: float,  # ADEMIX
+    alpha: float,  # ADEMIX
+    eps: float,
+    step: int,
+    lr: float,
+    qmap1: torch.Tensor,
+    qmap2: Optional[torch.Tensor],
+    absmax1: torch.Tensor,
+    absmax2: Optional[torch.Tensor],
+    weight_decay: float,
+    gnorm_scale: float,
+    skip_zeros: bool,
+    # ADEMIX
+    *,
+    optimizer_name: str,
+) -> None:
+    """
+    Pure PyTorch implementation of the 8-bit block-wise optimizer update step.
+    This version ensures high-precision updates for float16 parameters.
+    """
+    if skip_zeros:
+        raise ValueError("skip_zeros is not supported on XPU yet.")
+
+    blocksize = 256
+
+    with torch.no_grad():
+        # Dequantize states to perform updates in 32-bit precision
+        if optimizer_name == "ademamix" and absmax1.ndim == 2:
+            # For AdEMAMix, state1 holds two EMAs, so absmax1 is stacked.
+            s1_1_fp32 = _dequantize_blockwise_pytorch(state1[0], absmax1[0], qmap1, blocksize, torch.float32)
+            s1_2_fp32 = _dequantize_blockwise_pytorch(state1[1], absmax1[1], qmap1, blocksize, torch.float32)
+            state1_fp32 = torch.stack([s1_1_fp32, s1_2_fp32])
+        else:
+            state1_fp32 = _dequantize_blockwise_pytorch(state1, absmax1, qmap1, blocksize, torch.float32)
+
+        state2_fp32 = None
+        if state2 is not None:
+            state2_fp32 = _dequantize_blockwise_pytorch(state2, absmax2, qmap2, blocksize, torch.float32)
+
+        grad = g.float() * gnorm_scale
+
+        # Create a 32-bit copy of the parameter for high-precision updates
+        p_fp32 = p.data.float()
+
+        if optimizer_name == "adam":
+            state1_fp32.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+            state2_fp32.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+            bias_correction1 = 1.0 - beta1**step
+            bias_correction2 = 1.0 - beta2**step
+
+            denom = (state2_fp32.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+
+            if weight_decay > 0.0:
+                p_fp32.mul_(1.0 - lr * weight_decay)
+            p_fp32.addcdiv_(state1_fp32, denom, value=-lr / bias_correction1)
+
+        elif optimizer_name == "ademamix":
+            m1_fp32, m2_fp32 = state1_fp32[0], state1_fp32[1]
+            nu_fp32 = state2_fp32
+
+            m1_fp32.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+            m2_fp32.mul_(beta3).add_(grad, alpha=1.0 - beta3)
+            nu_fp32.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+            bias_correction1 = 1.0 - beta1**step
+            bias_correction2 = math.sqrt(1.0 - beta2**step)
+
+            update = (m1_fp32 / bias_correction1 + alpha * m2_fp32) / (nu_fp32.sqrt() / bias_correction2 + eps)
+
+            if weight_decay > 0.0:
+                p_fp32.mul_(1.0 - lr * weight_decay)
+
+            p_fp32.add_(update, alpha=-lr)
+            state1_fp32 = torch.stack([m1_fp32, m2_fp32])
+
+        elif optimizer_name == "momentum":
+            grad.add_(p_fp32, alpha=weight_decay)
+            if step == 1:
+                state1_fp32.copy_(grad)
+            else:
+                state1_fp32.mul_(beta1).add_(grad)
+            p_fp32.add_(state1_fp32, alpha=-lr)
+
+        elif optimizer_name == "rmsprop":
+            grad.add_(p_fp32, alpha=weight_decay)
+            state1_fp32.mul_(beta1).addcmul_(grad, grad, value=1.0 - beta1)
+            p_fp32.addcdiv_(grad, state1_fp32.sqrt().add_(eps), value=-lr)
+
+        elif optimizer_name == "lion":
+            if weight_decay > 0.0:
+                p_fp32.mul_(1.0 - lr * weight_decay)
+
+            update_dir = torch.sign(state1_fp32.mul(beta1) + grad.mul(1.0 - beta1))
+            p_fp32.add_(update_dir, alpha=-lr)
+
+            state1_fp32.mul_(beta2).add_(grad, alpha=1.0 - beta2)
+
+        elif optimizer_name == "adagrad":
+            grad.add_(p_fp32, alpha=weight_decay)
+            state1_fp32.addcmul_(grad, grad, value=1.0)
+            p_fp32.addcdiv_(grad, state1_fp32.sqrt().add_(eps), value=-lr)
+
+        else:
+            raise NotImplementedError(
+                f"Pure PyTorch implementation for optimizer '{optimizer_name}' is not available."
+            )
+
+        # Copy the updated 32-bit parameter back to the original tensor
+        p.data.copy_(p_fp32)
+
+        # Re-quantize states and update state tensors in-place
+        if optimizer_name == "ademamix":
+            new_m1_8bit, new_absmax_m1 = _quantize_blockwise_pytorch(state1_fp32[0], qmap1, blocksize)
+            new_m2_8bit, new_absmax_m2 = _quantize_blockwise_pytorch(state1_fp32[1], qmap1, blocksize)
+            state1[0].copy_(new_m1_8bit)
+            state1[1].copy_(new_m2_8bit)
+            absmax1[0].copy_(new_absmax_m1)
+            absmax1[1].copy_(new_absmax_m2)
+
+            new_state2_8bit, new_absmax2 = _quantize_blockwise_pytorch(state2_fp32, qmap2, blocksize)
+            state2.copy_(new_state2_8bit)
+            absmax2.copy_(new_absmax2)
+        else:
+            new_state1_8bit, new_absmax1 = _quantize_blockwise_pytorch(state1_fp32, qmap1, blocksize)
+            state1.copy_(new_state1_8bit)
+            absmax1.copy_(new_absmax1)
+
+            if state2_fp32 is not None:
+                new_state2_8bit, new_absmax2 = _quantize_blockwise_pytorch(state2_fp32, qmap2, blocksize)
+                state2.copy_(new_state2_8bit)
+                absmax2.copy_(new_absmax2)
+
+
+#######################################
+# Mixed torch + triton implementation #
+#######################################
+
+
+# Much more memory efficient due to using triton for quantization/dequantization
+def optimizer_update_8bit_blockwise_triton_quant(
+    p: torch.Tensor,
+    g: torch.Tensor,
+    state1: torch.Tensor,
+    state2: Optional[torch.Tensor],
+    beta1: float,
+    beta2: float,
+    beta3: float,  # ADEMIX
+    alpha: float,  # ADEMIX
+    eps: float,
+    step: int,
+    lr: float,
+    qmap1: torch.Tensor,
+    qmap2: Optional[torch.Tensor],
+    absmax1: torch.Tensor,
+    absmax2: Optional[torch.Tensor],
+    weight_decay: float,
+    gnorm_scale: float,
+    skip_zeros: bool,
+    # ADEMIX
+    *,
+    optimizer_name: str,
+) -> None:
+    """
+    Pure PyTorch implementation of the 8-bit block-wise optimizer update step.
+    This version ensures high-precision updates for float16 parameters.
+    """
+    if skip_zeros and not torch.any(g):
+        return
+
+    blocksize = 256
+    grad = g.float() * gnorm_scale
+
+    with torch.no_grad():
+        # Create a 32-bit copy of the parameter for high-precision updates
+        p_fp32 = p.data.float()
+
+        # Dequantize states to perform updates in 32-bit precision
+        if optimizer_name == "ademamix" and absmax1.ndim == 2:
+            # For AdEMAMix, state1 holds two EMAs, so absmax1 is stacked.
+            s1_1_fp32 = dequant_8bit_blockwise(state1[0], absmax1[0], qmap1, blocksize, dtype=torch.float32)
+            s1_2_fp32 = dequant_8bit_blockwise(state1[1], absmax1[1], qmap1, blocksize, dtype=torch.float32)
+            state1_fp32 = torch.stack([s1_1_fp32, s1_2_fp32])
+        else:
+            state1_fp32 = dequant_8bit_blockwise(state1, absmax1, qmap1, blocksize, dtype=torch.float32)
+
+        state2_fp32 = None
+        if state2 is not None:
+            state2_fp32 = dequant_8bit_blockwise(state2, absmax2, qmap2, blocksize, dtype=torch.float32)
+
+        # Apply optimizer-specific update logic
+        if optimizer_name == "adam":
+            if weight_decay > 0.0:
+                p_fp32.mul_(1.0 - lr * weight_decay)
+
+            state1_fp32.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+            state2_fp32.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+            bias_correction1 = 1.0 - beta1**step
+            bias_correction2 = 1.0 - beta2**step
+
+            denom = (state2_fp32.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+            p_fp32.addcdiv_(state1_fp32, denom, value=-lr / bias_correction1)
+
+        elif optimizer_name == "ademamix":
+            m1_fp32, m2_fp32 = state1_fp32[0], state1_fp32[1]
+            nu_fp32 = state2_fp32
+
+            m1_fp32.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+            m2_fp32.mul_(beta3).add_(grad, alpha=1.0 - beta3)
+            nu_fp32.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+            bias_correction1 = 1.0 - beta1**step
+            bias_correction2 = math.sqrt(1.0 - beta2**step)
+
+            update = (m1_fp32 / bias_correction1 + alpha * m2_fp32) / (nu_fp32.sqrt() / bias_correction2 + eps)
+
+            if weight_decay > 0.0:
+                p_fp32.mul_(1.0 - lr * weight_decay)
+
+            p_fp32.add_(update, alpha=-lr)
+            state1_fp32 = torch.stack([m1_fp32, m2_fp32])
+
+        elif optimizer_name == "momentum":
+            grad.add_(p_fp32, alpha=weight_decay)
+            if step == 1:
+                state1_fp32.copy_(grad)
+            else:
+                state1_fp32.mul_(beta1).add_(grad)
+            p_fp32.add_(state1_fp32, alpha=-lr)
+
+        elif optimizer_name == "rmsprop":
+            grad.add_(p_fp32, alpha=weight_decay)
+            state1_fp32.mul_(beta1).addcmul_(grad, grad, value=1.0 - beta1)
+            p_fp32.addcdiv_(grad, state1_fp32.sqrt().add_(eps), value=-lr)
+
+        elif optimizer_name == "lion":
+            if weight_decay > 0.0:
+                p_fp32.mul_(1.0 - lr * weight_decay)
+
+            update_dir = torch.sign(state1_fp32.mul(beta1) + grad.mul(1.0 - beta1))
+            p_fp32.add_(update_dir, alpha=-lr)
+
+            state1_fp32.mul_(beta2).add_(grad, alpha=1.0 - beta2)
+
+        elif optimizer_name == "adagrad":
+            grad.add_(p_fp32, alpha=weight_decay)
+            state1_fp32.addcmul_(grad, grad, value=1.0)
+            p_fp32.addcdiv_(grad, state1_fp32.sqrt().add_(eps), value=-lr)
+
+        else:
+            raise NotImplementedError(
+                f"Pure PyTorch implementation for optimizer '{optimizer_name}' is not available."
+            )
+
+        # Copy the updated 32-bit parameter back to the original tensor
+        p.data.copy_(p_fp32)
+
+        # Re-quantize states and update state tensors in-place
+        if optimizer_name == "ademamix":
+            new_m1_8bit, new_absmax_m1 = quantize_blockwise_triton(state1_fp32[0], qmap1, blocksize)
+            new_m2_8bit, new_absmax_m2 = quantize_blockwise_triton(state1_fp32[1], qmap1, blocksize)
+            state1[0].copy_(new_m1_8bit)
+            state1[1].copy_(new_m2_8bit)
+            absmax1[0].copy_(new_absmax_m1)
+            absmax1[1].copy_(new_absmax_m2)
+
+            new_state2_8bit, new_absmax2 = quantize_blockwise_triton(state2_fp32, qmap2, blocksize)
+            state2.copy_(new_state2_8bit)
+            absmax2.copy_(new_absmax2)
+        else:
+            new_state1_8bit, new_absmax1 = quantize_blockwise_triton(state1_fp32, qmap1, blocksize)
+            state1.copy_(new_state1_8bit)
+            absmax1.copy_(new_absmax1)
+
+            if state2_fp32 is not None:
+                new_state2_8bit, new_absmax2 = quantize_blockwise_triton(state2_fp32, qmap2, blocksize)
+                state2.copy_(new_state2_8bit)
+                absmax2.copy_(new_absmax2)
+
+
+#########################
+# Triton implementation #
+#########################
+
+
+@triton.jit
+def _optimizer_update_1state_8bit_blockwise_triton_kernel(
+    # Tensors
+    p_ptr,
+    g_ptr,
+    state1_ptr,
+    state2_ptr,
+    beta1: tl.constexpr,
+    beta2: tl.constexpr,
+    beta3,
+    alpha,
+    eps: tl.constexpr,
+    step,
+    beta1_step,
+    beta2_step,
+    lr,
+    qmap1_ptr,
+    qmap2_ptr,
+    absmax1_ptr,
+    absmax2_ptr,
+    weight_decay,
+    gnorm_scale,
+    # Meta-parameters
+    n_elements,
+    BLOCK_SIZE_N: tl.constexpr,
+    N_PER_TH: tl.constexpr,
+    OPTIMIZER_ID: tl.constexpr,
+):
+    """
+    Triton kernel for 8-bit optimizers that use one momentum state.
+    Supports: Momentum, RMSprop, Adagrad, Lion.
+    """
+    # 1. Boilerplate: pid, offsets, mask
+    pid = tl.program_id(axis=0)
+    block_start_idx = pid * N_PER_TH
+    offsets = block_start_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N * N_PER_TH)
+    mask = offsets < n_elements
+
+    # 2. Load and dequantize tensors
+    g = tl.load(g_ptr + offsets, mask=mask, other=0.0).to(tl.float32) * gnorm_scale
+    p = tl.load(p_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    s1 = dequant_8bit_blockwise_kernel_util(state1_ptr, offsets, qmap1_ptr, absmax1_ptr, mask, BLOCK_SIZE_N)
+
+    # 3. Optimizer-specific updates
+    # LION
+    if weight_decay > 0.0 and OPTIMIZER_ID == 2:
+        p *= 1.0 - lr * weight_decay
+    # Apply weight decay for momentum, rmsprop, adagrad
+    elif weight_decay > 0.0:
+        g += p * weight_decay
+
+    # Momentum update
+    if OPTIMIZER_ID == 0:  # MOMENTUM
+        if step == 1:
+            s1 = g
+        else:
+            s1 = s1 * beta1 + g
+        p -= lr * s1
+
+    # RMSprop update
+    elif OPTIMIZER_ID == 1:  # RMSPROP
+        s1 = s1 * beta1 + (1.0 - beta1) * g * g
+        p -= lr * (g / (tl.sqrt(s1) + eps))
+
+    # Adagrad update
+    elif OPTIMIZER_ID == 2:  # ADAGRAD
+        s1 += g * g
+        p -= lr * (g / (tl.sqrt(s1) + eps))
+
+    # Lion update
+    elif OPTIMIZER_ID == 4:  # LION
+        val = s1 * beta1 + (1.0 - beta1) * g
+        update = tl.where(val > 0.0, 1.0, tl.where(val < 0.0, -1.0, 0.0))
+        p -= lr * update
+        s1 = s1 * beta2 + (1.0 - beta2) * g
+
+    # 4. Store updated parameter and requantized state
+    tl.store(p_ptr + offsets, p.to(p_ptr.dtype.element_ty), mask=mask)
+    s1_codes, new_absmax1 = quantize_8bit_blockwise_kernel_util(s1, qmap1_ptr, 256, BLOCK_SIZE_N, N_PER_TH)
+    tl.store(state1_ptr + offsets, s1_codes, mask=mask)
+    tl.store(absmax1_ptr + block_start_idx + tl.arange(0, N_PER_TH), new_absmax1)
+
+
+@triton.jit
+def _optimizer_update_2state_8bit_blockwise_triton_kernel(
+    # Tensors
+    p_ptr,
+    g_ptr,
+    state1_ptr,
+    state2_ptr,
+    beta1: tl.constexpr,
+    beta2: tl.constexpr,
+    # ademamix changes alpha and beta3
+    beta3,
+    # ademamix changes alpha and beta3
+    alpha,
+    eps: tl.constexpr,
+    step,
+    beta1_step,
+    beta2_step,
+    lr,
+    qmap1_ptr,
+    qmap2_ptr,
+    absmax1_ptr,
+    absmax2_ptr,
+    weight_decay: tl.constexpr,
+    gnorm_scale: tl.constexpr,
+    # Meta-parameters
+    n_elements,
+    BLOCK_SIZE_N: tl.constexpr,
+    N_PER_TH: tl.constexpr,
+    OPTIMIZER_ID: tl.constexpr,
+):
+    """
+    Triton kernel for 8-bit optimizers that use two momentum states.
+    Supports: Adam, AdEMAMix.
+    """
+    # 1. Boilerplate: pid, offsets, mask
+    pid = tl.program_id(axis=0)
+    block_start_idx = pid * N_PER_TH
+    offsets = block_start_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N * N_PER_TH)
+    mask = offsets < n_elements
+
+    # 2. Load and dequantize tensors
+    g = tl.load(g_ptr + offsets, mask=mask, other=0.0).to(tl.float32) * gnorm_scale
+    p = tl.load(p_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    # 3. Optimizer-specific updates
+    if OPTIMIZER_ID == 3:  # ADAM
+        s1 = dequant_8bit_blockwise_kernel_util(state1_ptr, offsets, qmap1_ptr, absmax1_ptr, mask, BLOCK_SIZE_N)
+        s2 = dequant_8bit_blockwise_kernel_util(state2_ptr, offsets, qmap2_ptr, absmax2_ptr, mask, BLOCK_SIZE_N)
+
+        s1 = s1 * beta1 + (1.0 - beta1) * g
+        s2 = s2 * beta2 + (1.0 - beta2) * g * g
+
+        # In torch=2.7 on XPU there is an issue with libdevice.pow, leading to an error.
+        # For backwards compatibility we precompute the bias correction factors.
+        # bias_correction1 = 1.0 - libdevice.pow(beta1, step)
+        # bias_correction2 = 1.0 - libdevice.pow(beta2, step)
+        bias_correction1 = 1.0 - beta1_step
+        bias_correction2 = 1.0 - beta2_step
+
+        if weight_decay > 0.0:
+            p *= 1.0 - lr * weight_decay
+
+        denom = tl.sqrt(s2) / tl.sqrt(bias_correction2) + eps
+        p -= (lr / bias_correction1) * (s1 / denom)
+
+        # Store updated parameter
+        tl.store(p_ptr + offsets, p.to(p_ptr.dtype.element_ty), mask=mask)
+
+        # Requantize and store states
+        s1_codes, new_absmax1 = quantize_8bit_blockwise_kernel_util(s1, qmap1_ptr, 256, BLOCK_SIZE_N, N_PER_TH)
+        tl.store(state1_ptr + offsets, s1_codes, mask=mask)
+        tl.store(absmax1_ptr + block_start_idx + tl.arange(0, N_PER_TH), new_absmax1)
+
+        s2_codes, new_absmax2 = quantize_8bit_blockwise_kernel_util(s2, qmap2_ptr, 256, BLOCK_SIZE_N, N_PER_TH)
+        tl.store(state2_ptr + offsets, s2_codes, mask=mask)
+        tl.store(absmax2_ptr + block_start_idx + tl.arange(0, N_PER_TH), new_absmax2)
+
+    elif OPTIMIZER_ID == 5:  # ADEMAMIX
+        # AdEMAMix has a stacked state1 (m1, m2) and state2 (nu)
+        m1 = dequant_8bit_blockwise_kernel_util(state1_ptr, offsets, qmap1_ptr, absmax1_ptr, mask, BLOCK_SIZE_N)
+        m2 = dequant_8bit_blockwise_kernel_util(
+            state1_ptr + n_elements,
+            offsets,
+            qmap1_ptr,
+            absmax1_ptr + n_elements // BLOCK_SIZE_N,
+            mask,
+            BLOCK_SIZE_N,
+        )
+        nu = dequant_8bit_blockwise_kernel_util(state2_ptr, offsets, qmap2_ptr, absmax2_ptr, mask, BLOCK_SIZE_N)
+
+        m1 = m1 * beta1 + (1.0 - beta1) * g
+        m2 = m2 * beta3 + (1.0 - beta3) * g
+        nu = nu * beta2 + (1.0 - beta2) * g * g
+
+        # In torch=2.7 on XPU there is an issue with libdevice.pow, leading to an error.
+        # For backwards compatibility we precompute the bias correction factors.
+        # bias_correction1 = 1.0 - libdevice.pow(beta1, step)
+        # bias_correction2 = tl.sqrt(1.0 - libdevice.pow(beta2, step))
+        bias_correction1 = 1.0 - beta1_step
+        bias_correction2 = tl.sqrt(1.0 - beta2_step)
+
+        update = (m1 / bias_correction1 + alpha * m2) / (tl.sqrt(nu) / bias_correction2 + eps)
+
+        if weight_decay > 0.0:
+            p *= 1.0 - lr * weight_decay
+
+        p -= lr * update
+
+        # Store updated parameter
+        tl.store(p_ptr + offsets, p.to(p_ptr.dtype.element_ty), mask=mask)
+
+        # Requantize and store all three states
+        m1_codes, new_absmax_m1 = quantize_8bit_blockwise_kernel_util(m1, qmap1_ptr, 256, BLOCK_SIZE_N, N_PER_TH)
+        tl.store(state1_ptr + offsets, m1_codes, mask=mask)
+        tl.store(absmax1_ptr + block_start_idx + tl.arange(0, N_PER_TH), new_absmax_m1)
+
+        m2_codes, new_absmax_m2 = quantize_8bit_blockwise_kernel_util(m2, qmap1_ptr, 256, BLOCK_SIZE_N, N_PER_TH)
+        tl.store(state1_ptr + n_elements + offsets, m2_codes, mask=mask)
+        tl.store(
+            absmax1_ptr + block_start_idx + tl.arange(0, N_PER_TH) + n_elements // BLOCK_SIZE_N,
+            new_absmax_m2,
+        )
+
+        nu_codes, new_absmax_nu = quantize_8bit_blockwise_kernel_util(nu, qmap2_ptr, 256, BLOCK_SIZE_N, N_PER_TH)
+        tl.store(state2_ptr + offsets, nu_codes, mask=mask)
+        tl.store(absmax2_ptr + block_start_idx + tl.arange(0, N_PER_TH), new_absmax_nu)
+
+
+name2optimizer_fn = {
+    "momentum": _optimizer_update_1state_8bit_blockwise_triton_kernel,
+    "lars": _optimizer_update_1state_8bit_blockwise_triton_kernel,
+    "rmsprop": _optimizer_update_1state_8bit_blockwise_triton_kernel,
+    "adagrad": _optimizer_update_1state_8bit_blockwise_triton_kernel,
+    "adam": _optimizer_update_2state_8bit_blockwise_triton_kernel,
+    "lamb": _optimizer_update_2state_8bit_blockwise_triton_kernel,
+    "lion": _optimizer_update_1state_8bit_blockwise_triton_kernel,
+    "ademamix": _optimizer_update_2state_8bit_blockwise_triton_kernel,
+}
+
+
+def optimizer_update_8bit_blockwise_impl(
+    optimizer_name: str,
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2: Optional[torch.Tensor],
+    beta1: float,
+    beta2: float,
+    beta3: float,
+    alpha: float,
+    eps: float,
+    step: int,
+    lr: float,
+    qmap1: torch.Tensor,
+    qmap2: Optional[torch.Tensor],
+    absmax1: torch.Tensor,
+    absmax2: Optional[torch.Tensor],
+    weight_decay: float = 0.0,
+    gnorm_scale: float = 1.0,
+    skip_zeros=False,
+) -> None:
+    if skip_zeros:
+        raise NotImplementedError("skip_zeros is not supported on XPU yet")
+
+    if optimizer_name == "ademamix":
+        # Handle AdEMAMIX's stacked state tensors
+        if state1.dim() < 2 or state1.shape[0] != 2:
+            raise ValueError(
+                f"For ademamix, state1 must be a stacked tensor of shape (2, ...), but got {state1.shape}"
+            )
+        if absmax1.dim() < 2 or absmax1.shape[0] != 2:
+            raise ValueError(
+                f"For ademamix, absmax1 must be a stacked tensor of shape (2, ...), but got {absmax1.shape}"
+            )
+
+    BLOCK_SIZE = 256
+    N_PER_TH = 1  # Number of blocks processed per thread.
+    grid = (triton.cdiv(p.numel(), BLOCK_SIZE * N_PER_TH),)
+    fn = name2optimizer_fn[optimizer_name]
+    optimizer_id = name2optimizer_id[optimizer_name]
+
+    # In torch=2.7 on XPU there is an issue with libdevice.pow, leading to an error.
+    # For backwards compatibility we precompute the bias correction factors.
+    beta1_step = beta1**step
+    beta2_step = beta2**step
+
+    fn[grid](
+        p,
+        g,
+        state1,
+        state2,
+        beta1,
+        beta2,
+        beta3,
+        alpha,
+        eps,
+        step,
+        beta1_step,
+        beta2_step,
+        lr,
+        qmap1,
+        qmap2,
+        absmax1,
+        absmax2,
+        weight_decay,
+        gnorm_scale,
+        p.numel(),
+        BLOCK_SIZE_N=BLOCK_SIZE,
+        N_PER_TH=N_PER_TH,
+        OPTIMIZER_ID=optimizer_id,
+        num_warps=2,
+    )
+
+
+# optimizer_update_8bit_blockwise_impl = optimizer_update_8bit_blockwise_pytorch
+# optimizer_update_8bit_blockwise_impl = torch.compile(optimizer_update_8bit_blockwise_pytorch_impl)
+# optimizer_update_8bit_blockwise_impl = optimizer_update_8bit_blockwise_triton_quant
+# optimizer_update_8bit_blockwise_impl = torch.compile(optimizer_update_8bit_blockwise_triton_quant)
+optimizer_update_8bit_blockwise_impl = optimizer_update_8bit_blockwise_impl
+
+from collections.abc import Sequence
+from typing import Optional
+
+import torch
+
+from . import kernels_4bit, kernels_8bit_quant, kernels_optim
+
+# currently codes unused, kept for reference
+# Should be the same for quant/dequant
+# from bitsandbytes.functional import get_4bit_type
+# _FP4_QUANT_TABLE = get_4bit_type("fp4", device="xpu")
+# _NF4_QUANT_TABLE = get_4bit_type("nf4", device="xpu")
+device_type = torch.accelerator.current_accelerator().type if hasattr(torch, "accelerator") else "cuda"
+torch_accelerator_module = getattr(torch, device_type, torch.cuda)
+
+
+def quantize_blockwise(A: torch.Tensor, code: torch.Tensor, blocksize: int) -> tuple[torch.Tensor, torch.Tensor]:
+    # torch._check(A.dtype == torch.float32, lambda: f"A must be float32 on xpu, got {A.dtype}")
+    with torch_accelerator_module.device(A.device):
+        out, absmax = kernels_8bit_quant.quantize_blockwise_triton(A.contiguous(), code, blocksize)
+        return out, absmax.float()
+
+
+def dequantize_blockwise(
+    A: torch.Tensor, absmax: torch.Tensor, code: torch.Tensor, blocksize: int, dtype: torch.dtype
+) -> torch.Tensor:
+    if A.dtype != torch.uint8:
+        raise ValueError(f"A must be uint8, got {A.dtype}")
+    # torch._check(dtype == torch.float32, lambda: f"dtype must be float32 on xpu, got {dtype}")
+    with torch_accelerator_module.device(A.device):
+        out = kernels_8bit_quant.dequant_8bit_blockwise(
+            A.contiguous(),
+            absmax,
+            code,
+            blocksize,
+            dtype=dtype,
+        )
+    return out
+
+
+def dequantize_blockwise_inplace(
+    A: torch.Tensor,
+    absmax: torch.Tensor,
+    code: torch.Tensor,
+    blocksize: int,
+    dtype: torch.dtype,
+    out: torch.Tensor,
+) -> None:
+    if A.dtype != torch.uint8:
+        raise ValueError(f"A must be uint8, got {A.dtype}")
+    if out.shape != A.shape:
+        raise ValueError(f"Expected out.shape == {A.shape}, got {out.shape}")
+    if out.device != A.device:
+        raise ValueError(f"Expected out.device == {A.device}, got {out.device}")
+    if out.dtype != dtype:
+        raise ValueError(f"Expected out.dtype == {dtype}, got {out.dtype}")
+
+    with torch_accelerator_module.device(A.device):
+        kernels_8bit_quant.dequant_8bit_blockwise(
+            A,
+            absmax,
+            code,
+            blocksize,
+            dtype=dtype,
+            out=out,
+        )
+
+
+def quantize_4bit(
+    A: torch.Tensor, blocksize: int, quant_type: str, quant_storage: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # torch._check(quant_type == "nf4", lambda: f"quant_type must be nf4 on CPU, got {quant_type}")
+    if A.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(f"Blockwise 4bit quantization only supports 16/32-bit floats, but got {A.dtype}")
+
+    n = A.numel()
+
+    # Pad to next multiple of blocksize so the kernel always processes full blocks
+    remainder = n % blocksize
+    if remainder != 0:
+        padding = blocksize - remainder
+        A = torch.nn.functional.pad(A.view(-1), (0, padding), value=0.0)
+        n = A.numel()
+
+    blocks = -(n // -(blocksize * 2))
+
+    absmax = torch.empty((blocks * 2,), device=A.device, dtype=A.dtype)
+    # Use n - n//2 instead of (n+1)//2 to avoid integer overflow for large n
+    out = torch.empty((n - n // 2, 1), device=A.device, dtype=torch.uint8)
+
+    with torch_accelerator_module.device(A.device):
+        kernels_4bit.quantize_4bit_blockwise_triton(
+            A, blocksize, quant_type, blocks, absmax, num_elements=n, quantized_out=out
+        )
+    packed = out
+
+    if quant_storage != torch.uint8:
+        packed = out.squeeze().view(quant_storage).unsqueeze(1)
+
+    return packed, absmax.float()
+
+
+def dequantize_4bit(
+    A: torch.Tensor,
+    absmax: torch.Tensor,
+    blocksize: int,
+    quant_type: str,
+    shape: Sequence[int],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    # torch._check(quant_type == "nf4", lambda: f"quant_type must be nf4 on XPU, got {quant_type}")
+    if dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(f"Blockwise 4bit dequantization only supports 16/32-bit floats, but got {dtype}")
+    # torch._check(
+    #     A.dtype == torch.uint8,
+    #     lambda: f"Blockwise 4bit dequantization on XPU only supports uint8 storage, got {A.dtype}",
+    # )
+    # Check if this is fine and fast
+    if A.dtype != torch.uint8:
+        A = A.squeeze().view(torch.uint8).unsqueeze(1)
+
+    out = torch.empty(shape, dtype=dtype, device=A.device)
+    with torch_accelerator_module.device(A.device):
+        kernels_4bit.dequantize_4bit_impl(A, absmax, blocksize, quant_type, dtype, out=out)
+
+    return out
+
+
+def dequantize_4bit_inplace(
+    A: torch.Tensor,
+    absmax: torch.Tensor,
+    blocksize: int,
+    quant_type: str,
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    out: torch.Tensor,
+) -> None:
+    if out.shape != tuple(shape):
+        raise ValueError(f"Expected out.shape == {shape}, got {out.shape}")
+    if out.dtype != dtype:
+        raise ValueError(f"Expected out.dtype == {dtype}, got {out.dtype}")
+    with torch_accelerator_module.device(A.device):
+        kernels_4bit.dequantize_4bit_impl(A, absmax, blocksize, quant_type, dtype, out=out)
+
+
+def gemv_4bit(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    shapeB: Sequence[int],
+    absmax: torch.Tensor,
+    code: torch.Tensor,
+    blocksize: int,
+) -> torch.Tensor:
+    if B.dtype != torch.uint8:
+        B = B.squeeze().view(torch.uint8).unsqueeze(1)
+
+    B_dq_triton = torch.empty(shapeB, dtype=A.dtype, device=A.device)
+
+    with torch_accelerator_module.device(A.device):
+        kernels_4bit.dequantize_4bit_impl_passing_code(
+            B,
+            absmax,
+            blocksize,
+            code,
+            dtype=A.dtype,
+            out=B_dq_triton,
+        )
+
+        return torch.nn.functional.linear(
+            A,
+            B_dq_triton,
+            bias=None,
+        )
+
+
+# optimizer_update_8bit_blockwise_impl = kernels_optim.optimizer_update_8bit_blockwise_pytorch
+# optimizer_update_8bit_blockwise_impl = torch.compile(kernels_optim.optimizer_update_8bit_blockwise_pytorch) # 60ms
+# optimizer_update_8bit_blockwise_impl = kernels_optim.optimizer_update_8bit_blockwise_triton_quant #2.8ms
+# optimizer_update_8bit_blockwise_impl = torch.compile(kernels_optim.optimizer_update_8bit_blockwise_triton_quant) # 2.3ms
+optimizer_update_8bit_blockwise_impl = kernels_optim.optimizer_update_8bit_blockwise_impl  # ~0.95ms for adam
+
+
+def optimizer_update_8bit_blockwise(
+    optimizer_name: str,
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2: Optional[torch.Tensor],
+    beta1: float,
+    beta2: float,
+    beta3: float,
+    alpha: float,
+    eps: float,
+    step: int,
+    lr: float,
+    qmap1: torch.Tensor,
+    qmap2: Optional[torch.Tensor],
+    absmax1: torch.Tensor,
+    absmax2: Optional[torch.Tensor],
+    weight_decay: float = 0.0,
+    gnorm_scale: float = 1.0,
+    skip_zeros=False,
+) -> None:
+    # torch._check(
+    #     g.numel() == p.numel(),
+    #     lambda: f"g and p must have the same number of elements, got {g.numel()} and {p.numel()}",
+    # )
+    # compute_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+
+    # torch._check(
+    #     g.dtype in compute_dtypes,
+    #     lambda: f"g must be bfloat16, float16, or float32, got {g.dtype}",
+    # )
+    # torch._check(
+    #     g.dtype == p.dtype,
+    #     lambda: f"Expected all tensors to have the same dtype, got g.dtype={g.dtype}, p.dtype={p.dtype}",
+    # )
+    # torch._check(
+    #     state1.dtype == torch.uint8,
+    #     lambda: f"state1 must be uint8, got {state1.dtype}",
+    # )
+    # torch._check(
+    #     qmap1.dtype == absmax1.dtype == torch.float32,
+    #     lambda: f"Expected qmap1 and absmax1 to be float32, got qmap1.dtype={qmap1.dtype}, absmax1.dtype={absmax1.dtype}",
+    # )
+    # if state2 is not None:
+    #     torch._check(
+    #         state2.dtype == torch.uint8,
+    #         lambda: f"state2 must be uint8, got {state2.dtype}",
+    #     )
+    #     torch._check(
+    #         qmap2.dtype == absmax2.dtype == torch.float32,
+    #         lambda: f"Expected qmap2 and absmax2 to be float32, got qmap2.dtype={qmap2.dtype}, absmax2.dtype={absmax2.dtype}",
+    #     )
+
+    # Use g.device for device context: paged state tensors appear as CPU tensors
+    # but are backed by USM shared memory and accessible from the accelerator.
+    with torch_accelerator_module.device(g.device):
+        optimizer_update_8bit_blockwise_impl(
+            optimizer_name=optimizer_name,
+            g=g,
+            p=p,
+            state1=state1,
+            state2=state2,
+            beta1=beta1,
+            beta2=beta2,
+            beta3=beta3,
+            alpha=alpha,
+            eps=eps,
+            step=step,
+            lr=lr,
+            qmap1=qmap1,
+            qmap2=qmap2,
+            absmax1=absmax1,
+            absmax2=absmax2,
+            weight_decay=weight_decay,
+            gnorm_scale=gnorm_scale,
+            skip_zeros=skip_zeros,
+        )
+
+
+def optimizer_update_32bit(
+    optimizer_name: str,
+    g: torch.Tensor,
+    p: torch.Tensor,
+    state1: torch.Tensor,
+    state2: Optional[torch.Tensor],
+    unorm_vec: Optional[torch.Tensor],
+    max_unorm: float,
+    param_norm: float,
+    beta1: float,
+    beta2: float,
+    beta3: float,
+    alpha: float,
+    eps: float,
+    weight_decay: float,
+    step: int,
+    lr: float,
+    gnorm_scale: float,
+    skip_zeros=False,
+) -> None:
+    # Use g.device for device context: paged state tensors appear as CPU tensors
+    # but are backed by USM shared memory and accessible from the accelerator.
+    with torch_accelerator_module.device(g.device):
+        kernels_optim.optimizer_update_32bit_impl(
+            optimizer_name=optimizer_name,
+            g=g,
+            p=p,
+            state1=state1,
+            state2=state2,
+            unorm_vec=unorm_vec,
+            max_unorm=max_unorm,
+            param_norm=param_norm,
+            beta1=beta1,
+            beta2=beta2,
+            beta3=beta3,
+            alpha=alpha,
+            eps=eps,
+            weight_decay=weight_decay,
+            step=step,
+            lr=lr,
+            gnorm_scale=gnorm_scale,
+            skip_zeros=skip_zeros,
+        )
+
+from importlib.metadata import metadata
+
+from packaging import version
+import torch
+
+try:
+    import triton  # noqa: F401
+    import triton.language as tl  # noqa: F401
+
+    triton_available = True
+except ImportError:
+    triton_available = False
+
+
+_NF4_QUANT_TABLE = torch.tensor(
+    [
+        -1.0,
+        -0.6961928009986877,
+        -0.5250730514526367,
+        -0.39491748809814453,
+        -0.28444138169288635,
+        -0.18477343022823334,
+        -0.09105003625154495,
+        0.0,
+        0.07958029955625534,
+        0.16093020141124725,
+        0.24611230194568634,
+        0.33791524171829224,
+        0.44070982933044434,
+        0.5626170039176941,
+        0.7229568362236023,
+        1.0,
+    ],
+    dtype=torch.float32,
+    device="xpu"
+    if hasattr(torch, "xpu") and torch.xpu.is_available()
+    else "cpu",  # Only cpu/xpu use this table for now.
+)
+_FP4_QUANT_TABLE = torch.tensor(
+    [
+        0.0000,
+        0.0052,
+        0.6667,
+        1.0000,
+        0.3333,
+        0.5000,
+        0.1667,
+        0.2500,
+        0.0000,
+        -0.0052,
+        -0.6667,
+        -1.0000,
+        -0.3333,
+        -0.5000,
+        -0.1667,
+        -0.2500,
+    ],
+    dtype=torch.float32,
+    device="xpu"
+    if hasattr(torch, "xpu") and torch.xpu.is_available()
+    else "cpu",  # Only cpu/xpu use this table for now.
+)
+CODE = {"nf4": _NF4_QUANT_TABLE, "fp4": _FP4_QUANT_TABLE}
+
+# Cache 4-bit dequantization code tensors per (quant_type, device).
+_code_4bit_cache: dict[tuple[str, torch.device], torch.Tensor] = {}
+
+
+def _get_4bit_code(quant_type: str, device: torch.device) -> torch.Tensor:
+    key = (quant_type, device)
+    if key not in _code_4bit_cache:
+        from bitsandbytes.functional import get_4bit_type
+
+        _code_4bit_cache[key] = get_4bit_type(quant_type, device=device)
+    return _code_4bit_cache[key]
+
+
+def get_gaudi_sw_version():
+    """
+    Returns the installed version of Gaudi SW.
+    """
+    try:
+        # if we find the spec, examine the installed version
+        plugin_metadata = metadata("habana-torch-plugin")
+        plugin_version = plugin_metadata.get("Version")
+        if plugin_version:
+            gaudi_version = version.parse(plugin_version)
+    except Exception:
+        gaudi_version = None
+
+    return gaudi_version
+
+
+GAUDI_SW_VER = get_gaudi_sw_version()
+
+
+from collections.abc import Sequence
+import ctypes as ct
+import logging
+from typing import Optional
+from warnings import warn
+
+from packaging import version
+import torch
+
+from bitsandbytes.functional import _get_tensor_stream, get_ptr
+
+from ..._ops import register_kernel
+from ...cextension import ErrorHandlerMockBNBNativeLibrary, lib
+from ..default.ops import _gemm_4bit_default_impl
+from ..utils import _get_4bit_code, triton_available
+
+logger = logging.getLogger(__name__)
+
+# _int_mm is available in torch starting from 2.9 version
+if version.parse(torch.__version__).release >= version.parse("2.9").release:
+
+    @register_kernel("bitsandbytes::int8_linear_matmul", "xpu")
+    def _(A: torch.Tensor, B: torch.Tensor):
+        return torch._int_mm(
+            A.reshape(-1, A.shape[-1]),
+            B.t(),
+        ).reshape(*A.shape[:-1], B.shape[0])
+
+
+def _dequantize_4bit_impl(
+    A: torch.Tensor,
+    absmax: torch.Tensor,
+    blocksize: int,
+    quant_type: str,
+    dtype: torch.dtype,
+    out: torch.Tensor,
+) -> None:
+    # XPU SYCL kernels only support contiguous tensors.
+    A = A.contiguous()
+    args = (
+        None,
+        get_ptr(A),
+        get_ptr(absmax),
+        get_ptr(out),
+        ct.c_int(blocksize),
+        ct.c_int(out.numel()),
+        _get_tensor_stream(A),
+    )
+    if dtype == torch.bfloat16:
+        if quant_type == "fp4":
+            lib.cdequantize_blockwise_bf16_fp4(*args)
+        else:
+            lib.cdequantize_blockwise_bf16_nf4(*args)
+    elif dtype == torch.float16:
+        if quant_type == "fp4":
+            lib.cdequantize_blockwise_fp16_fp4(*args)
+        else:
+            lib.cdequantize_blockwise_fp16_nf4(*args)
+    elif dtype == torch.float32:
+        if quant_type == "fp4":
+            lib.cdequantize_blockwise_fp32_fp4(*args)
+        else:
+            lib.cdequantize_blockwise_fp32_nf4(*args)
+
+
+def _dequantize_blockwise_impl(
+    A: torch.Tensor, absmax: torch.Tensor, code: torch.Tensor, blocksize: int, dtype: torch.dtype, out: torch.Tensor
+) -> None:
+    # XPU SYCL kernels only support contiguous tensors.
+    A = A.contiguous()
+    args = (
+        get_ptr(code),
+        get_ptr(A),
+        get_ptr(absmax),
+        get_ptr(out),
+        ct.c_int(blocksize),
+        ct.c_int(A.numel()),
+        _get_tensor_stream(A),
+    )
+    if dtype == torch.float16:
+        lib.cdequantize_blockwise_fp16(*args)
+    elif dtype == torch.bfloat16:
+        lib.cdequantize_blockwise_bf16(*args)
+    elif dtype == torch.float32:
+        lib.cdequantize_blockwise_fp32(*args)
+
+
+def _gemv_4bit_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    shapeB: Sequence[int],
+    absmax: torch.Tensor,
+    code: torch.Tensor,
+    blocksize: int,
+    out: torch.Tensor,
+) -> None:
+    m = ct.c_int32(1)
+    n = ct.c_int32(shapeB[0])
+    k = ct.c_int32(shapeB[1])
+
+    lda = m
+    ldb = ct.c_int32((A.shape[-1] + 1) // 2)
+    ldc = m
+
+    stream = _get_tensor_stream(A)
+    if A.dtype == torch.float16:
+        lib.cgemv_4bit_inference_fp16(
+            m,
+            n,
+            k,
+            get_ptr(A),
+            get_ptr(B),
+            get_ptr(absmax),
+            get_ptr(code),
+            get_ptr(out),
+            lda,
+            ldb,
+            ldc,
+            ct.c_int32(blocksize),
+            stream,
+        )
+    elif A.dtype == torch.bfloat16:
+        lib.cgemv_4bit_inference_bf16(
+            m,
+            n,
+            k,
+            get_ptr(A),
+            get_ptr(B),
+            get_ptr(absmax),
+            get_ptr(code),
+            get_ptr(out),
+            lda,
+            ldb,
+            ldc,
+            ct.c_int32(blocksize),
+            stream,
+        )
+    elif A.dtype == torch.float32:
+        lib.cgemv_4bit_inference_fp32(
+            m,
+            n,
+            k,
+            get_ptr(A),
+            get_ptr(B),
+            get_ptr(absmax),
+            get_ptr(code),
+            get_ptr(out),
+            lda,
+            ldb,
+            ldc,
+            ct.c_int32(blocksize),
+            stream,
+        )
+
+
+@register_kernel("bitsandbytes::gemm_4bit", "xpu")
+def _(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    shapeB: Sequence[int],
+    absmax: torch.Tensor,
+    blocksize: int,
+    quant_type: str,
+    bias: Optional[torch.Tensor] = None,
+    absmax_8bit: Optional[torch.Tensor] = None,
+    absmax_code: Optional[torch.Tensor] = None,
+    absmax_offset: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    K = A.shape[-1]
+    M = A.numel() // K
+
+    if M == 1:
+        if K % blocksize == 0:
+            if absmax_8bit is not None:
+                absmax = (
+                    torch.ops.bitsandbytes.dequantize_blockwise.default(
+                        absmax_8bit, absmax, absmax_code, 256, torch.float32
+                    )
+                    + absmax_offset
+                )
+
+            code = _get_4bit_code(quant_type, A.device)
+            out = torch.ops.bitsandbytes.gemv_4bit.default(A, B, shapeB, absmax, code, blocksize)
+
+            if bias is not None:
+                out = out + bias
+            return out
+
+        warn(
+            f"inner dimension ({K}) is not aligned for fast kernel "
+            f"with blocksize={blocksize}, falling back to slower implementation.",
+            UserWarning,
+        )
+
+    return _gemm_4bit_default_impl(
+        A,
+        B,
+        shapeB,
+        absmax,
+        blocksize,
+        quant_type,
+        bias,
+        absmax_8bit=absmax_8bit,
+        absmax_code=absmax_code,
+        absmax_offset=absmax_offset,
+    )
+
+
+# SYCL should be faster for xpu, so at first checking if it is available.
+if not isinstance(lib, ErrorHandlerMockBNBNativeLibrary):
+    logger.info("Register sycl bitsandbytes kernels for XPU")
+
+    # TODO: Remove the triton register when quantization sycl kernel is ready.
+    if triton_available:
+        from ..triton import ops as triton_ops
+
+        register_kernel("bitsandbytes::quantize_blockwise", "xpu")(triton_ops.quantize_blockwise)
+        register_kernel("bitsandbytes::quantize_4bit", "xpu")(triton_ops.quantize_4bit)
+        register_kernel("bitsandbytes::optimizer_update_8bit_blockwise", "xpu")(
+            triton_ops.optimizer_update_8bit_blockwise
+        )
+        register_kernel("bitsandbytes::optimizer_update_32bit", "xpu")(triton_ops.optimizer_update_32bit)
+
+    @register_kernel("bitsandbytes::dequantize_4bit", "xpu")
+    def _(
+        A: torch.Tensor,
+        absmax: torch.Tensor,
+        blocksize: int,
+        quant_type: str,
+        shape: Sequence[int],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        out = torch.empty(shape, dtype=dtype, device=A.device)
+        _dequantize_4bit_impl(A, absmax, blocksize, quant_type, dtype, out=out)
+        return out
+
+    @register_kernel("bitsandbytes::dequantize_blockwise", "xpu")
+    def _(
+        A: torch.Tensor, absmax: torch.Tensor, code: torch.Tensor, blocksize: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        out = torch.empty_like(A, dtype=dtype)
+        _dequantize_blockwise_impl(A, absmax, code, blocksize, dtype, out=out)
+        return out
+
+    @register_kernel("bitsandbytes::dequantize_blockwise.out", "xpu")
+    def _(
+        A: torch.Tensor,
+        absmax: torch.Tensor,
+        code: torch.Tensor,
+        blocksize: int,
+        dtype: torch.dtype,
+        out: torch.Tensor,
+    ) -> None:
+        if out.dtype != dtype:
+            raise ValueError(f"Expected out.dtype == {dtype}, got {out.dtype}")
+        if out.shape != A.shape:
+            raise ValueError(f"Expected out.shape == {A.shape}, got {out.shape}")
+        _dequantize_blockwise_impl(A, absmax, code, blocksize, dtype, out=out)
+
+    @register_kernel("bitsandbytes::gemv_4bit", "xpu")
+    def _(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        shapeB: Sequence[int],
+        absmax: torch.Tensor,
+        code: torch.Tensor,
+        blocksize: int,
+    ) -> torch.Tensor:
+        shape = (*A.shape[:-1], shapeB[0])
+        out = torch.empty(shape, device=A.device, dtype=A.dtype)
+        _gemv_4bit_impl(A, B, shapeB, absmax, code, blocksize, out=out)
+        return out
+
+    @register_kernel("bitsandbytes::gemv_4bit.out", "xpu")
+    def _(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        shapeB: Sequence[int],
+        absmax: torch.Tensor,
+        code: torch.Tensor,
+        blocksize: int,
+        out: torch.Tensor,
+    ) -> None:
+        expected_shape = (*A.shape[:-1], shapeB[0])
+        if out.shape != expected_shape:
+            raise ValueError(f"Expected out.shape == {expected_shape}, got {out.shape}")
+        if out.dtype != A.dtype:
+            raise ValueError(f"Expected out.dtype == {A.dtype}, got {out.dtype}")
+        _gemv_4bit_impl(A, B, shapeB, absmax, code, blocksize, out=out)
+
+elif triton_available:
+    logger.info("Register triton bitsandbytes kernels for XPU")
+    from ..triton import ops as triton_ops
+
+    register_kernel("bitsandbytes::quantize_blockwise", "xpu")(triton_ops.quantize_blockwise)
+    register_kernel("bitsandbytes::dequantize_blockwise.out", "xpu")(triton_ops.dequantize_blockwise_inplace)
+    register_kernel("bitsandbytes::dequantize_blockwise", "xpu")(triton_ops.dequantize_blockwise)
+    register_kernel("bitsandbytes::quantize_4bit", "xpu")(triton_ops.quantize_4bit)
+    register_kernel("bitsandbytes::dequantize_4bit.out", "xpu")(triton_ops.dequantize_4bit_inplace)
+    register_kernel("bitsandbytes::dequantize_4bit", "xpu")(triton_ops.dequantize_4bit)
+    register_kernel("bitsandbytes::gemv_4bit", "xpu")(triton_ops.gemv_4bit)
+    register_kernel("bitsandbytes::optimizer_update_8bit_blockwise", "xpu")(triton_ops.optimizer_update_8bit_blockwise)
+    register_kernel("bitsandbytes::optimizer_update_32bit", "xpu")(triton_ops.optimizer_update_32bit)
+else:
+    logger.warning("Register pytorch bitsandbytes kernels for XPU because no native library or triton packages found.")
+
+import ctypes as ct
+import functools
+import logging
+import os
+from pathlib import Path
+import re
+from typing import Optional
+
+import torch
+
+from bitsandbytes.consts import DYNAMIC_LIBRARY_SUFFIX, PACKAGE_DIR
+from bitsandbytes.cuda_specs import (
+    CUDASpecs,
+    get_cuda_specs,
+    get_cuda_version_tuple,
+    get_rocm_gpu_arch,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def get_cuda_bnb_library_path(cuda_specs: CUDASpecs) -> Path:
+    """
+    Get the path to the best matching CUDA/ROCm BNB native library for the given specs.
+
+    When no override is set, selects from packaged libraries using the following priority:
+    1. Exact version match.
+    2. Highest packaged version <= runtime version, same major (e.g. runtime 12.9, ship 12.8).
+    3. Lowest packaged version > runtime version, same major (e.g. runtime 12.0, ship 12.1).
+    No cross-major fallback: if no same-major library exists, returns the exact non-existent
+    path so the caller raises a clear "not found" error.
+    A warning is logged when falling back. Override env vars bypass selection entirely
+    and load the named version with no fallback. The returned path is not guaranteed to
+    exist when no packaged libs are found, or when an override names an absent version.
+    """
+    is_hip = bool(torch.version.hip)
+    prefix = "rocm" if is_hip else "cuda"
+    override_var = "BNB_ROCM_VERSION" if is_hip else "BNB_CUDA_VERSION"
+
+    override_value = os.environ.get(override_var)
+
+    if override_value is not None:
+        if not override_value.isdigit():
+            raise RuntimeError(f"{override_var}={override_value!r}: value must be digits only (e.g. '124' for 12.4).")
+        library_name = f"libbitsandbytes_{prefix}{override_value}{DYNAMIC_LIBRARY_SUFFIX}"
+        logger.warning(
+            f"WARNING: {override_var}={override_value} environment variable detected; loading {library_name}.\n"
+            f"This overrides automatic {'ROCm' if is_hip else 'CUDA'} version selection.\n"
+            f"If this was unintended clear the variable and retry: unset {override_var}\n",
+        )
+        return PACKAGE_DIR / library_name
+
+    available = _find_cuda_libs(prefix, is_hip)
+    runtime_version = cuda_specs.cuda_version_tuple
+
+    if not available:
+        return PACKAGE_DIR / f"libbitsandbytes_{prefix}{cuda_specs.cuda_version_string}{DYNAMIC_LIBRARY_SUFFIX}"
+
+    if runtime_version in available:
+        return available[runtime_version]
+
+    lower = [v for v in available if v[0] == runtime_version[0] and v < runtime_version]
+    if lower:
+        selected = max(lower)
+    else:
+        higher_same = [v for v in available if v[0] == runtime_version[0] and v > runtime_version]
+        if higher_same:
+            selected = min(higher_same)
+        else:
+            # No same-major library available. Return the non-existent exact path so
+            # get_native_library() raises a clear "not found" error.
+            return PACKAGE_DIR / f"libbitsandbytes_{prefix}{cuda_specs.cuda_version_string}{DYNAMIC_LIBRARY_SUFFIX}"
+
+    logger.warning(
+        f"No prebuilt binary for {'ROCm' if is_hip else 'CUDA'} "
+        f"{runtime_version[0]}.{runtime_version[1]}, loading "
+        f"{'ROCm' if is_hip else 'CUDA'} {selected[0]}.{selected[1]} instead. "
+        f"Set {override_var} to override."
+    )
+    return available[selected]
+
+
+class BNBNativeLibrary:
+    _lib: ct.CDLL
+    compiled_with_cuda = False
+
+    def __init__(self, lib: ct.CDLL):
+        self._lib = lib
+
+    @functools.cache  # noqa: B019
+    def __getattr__(self, name):
+        fn = getattr(self._lib, name, None)
+
+        if fn is not None:
+            return fn
+
+        def throw_on_call(*args, **kwargs):
+            raise RuntimeError(
+                f"Method '{name}' not available in CPU-only version of bitsandbytes.\n"
+                "Reinstall with GPU support or use CUDA-enabled hardware."
+            )
+
+        return throw_on_call
+
+    def __getitem__(self, item):
+        return self.__getattr__(item)
+
+
+class CudaBNBNativeLibrary(BNBNativeLibrary):
+    compiled_with_cuda = True
+
+    def __init__(self, lib: ct.CDLL):
+        super().__init__(lib)
+        lib.get_context.restype = ct.c_void_p
+        lib.cget_managed_ptr.restype = ct.c_void_p
+
+
+class XpuBNBNativeLibrary(BNBNativeLibrary):
+    """XPU native library with SYCL USM paged memory support."""
+
+    def __init__(self, lib: ct.CDLL):
+        super().__init__(lib)
+        if hasattr(lib, "cget_managed_ptr"):
+            lib.cget_managed_ptr.restype = ct.c_void_p
+
+
+def _split_cuda_version(compact: str, is_hip: bool) -> tuple[int, int]:
+    """Split a compact CUDA/ROCm version string from a library filename into (major, minor).
+
+    CUDA: major is always 2 digits (11, 12, 13...), e.g. '118' -> (11, 8), '132' -> (13, 2).
+    ROCm: major is always 1 digit for now (6, 7...), e.g. '72' -> (7, 2), '713' -> (7, 13).
+    Note: revisit if ROCm major reaches 10.
+    """
+    if is_hip:
+        return int(compact[:1]), int(compact[1:])
+    return int(compact[:2]), int(compact[2:])
+
+
+def _find_cuda_libs(prefix: str, is_hip: bool) -> dict[tuple[int, int], Path]:
+    """Return a {(major, minor): Path} mapping for all packaged CUDA/ROCm library files."""
+    result = {}
+    for lib in PACKAGE_DIR.glob(f"libbitsandbytes_{prefix}*{DYNAMIC_LIBRARY_SUFFIX}"):
+        match = re.search(rf"{prefix}(\d+)", lib.name)
+        if match:
+            try:
+                result[_split_cuda_version(match.group(1), is_hip)] = lib
+            except (ValueError, IndexError):
+                continue
+    return result
+
+
+def get_available_cuda_binary_versions() -> list[str]:
+    """Get formatted CUDA/ROCm versions from existing library files."""
+    is_hip = bool(torch.version.hip)
+    prefix = "rocm" if is_hip else "cuda"
+    return sorted(f"{major}.{minor}" for major, minor in _find_cuda_libs(prefix, is_hip))
+
+
+def parse_cuda_version(version_str: str) -> str:
+    """Convert a raw version code string (e.g. '118', '713') to a dotted version (e.g. '11.8', '7.13')."""
+    if version_str.isdigit():
+        is_hip = bool(torch.version.hip)
+        try:
+            major, minor = _split_cuda_version(version_str, is_hip)
+            return f"{major}.{minor}"
+        except (ValueError, IndexError):
+            pass
+    return version_str
+
+
+class ErrorHandlerMockBNBNativeLibrary(BNBNativeLibrary):
+    """
+    Mock library handler that defers errors until native methods are called.
+
+    This class serves as a fallback when the native bitsandbytes library fails to load.
+    It captures the original error and generates detailed troubleshooting guidance.
+
+    Key behaviors:
+    - Allows attribute access and method assignment without immediate errors
+    - Throws a RuntimeError with diagnostic information only when a native method is called, as otherwise it would error out on import, breaking backward compatibility
+    - Handles both missing CUDA dependencies and version mismatch scenarios
+
+    Error scenarios covered:
+    1. Missing shared library dependencies (e.g., libcudart.so not in LD_LIBRARY_PATH or through PyTorch CUDA installation)
+    2. CUDA version mismatch between PyTorch and available pre-compiled binaries
+    3. Completely missing pre-compiled binaries when CUDA is detected
+    4. Custom BNB_CUDA_VERSION or BNB_ROCM_VERSION override but mismatch
+    5. CPU-only installation attempts when GPU functionality is requested
+
+    """
+
+    def __init__(self, error_msg: str):
+        self.error_msg = error_msg
+        self.available_versions = get_available_cuda_binary_versions()
+        override_value = os.environ.get("BNB_ROCM_VERSION") if HIP_ENVIRONMENT else os.environ.get("BNB_CUDA_VERSION")
+        user_version = get_cuda_version_tuple()
+        user_version_str = f"{user_version[0]}.{user_version[1]}" if user_version else "unknown"
+        self.requested_version = parse_cuda_version(override_value) if override_value else user_version_str
+
+        # Pre-generate the error message based on error type
+        if "cannot open shared object file" in error_msg:
+            self.formatted_error = self._format_dependency_error()
+        else:  # lib loading errors
+            self.formatted_error = self._format_lib_error_message(
+                available_versions=self.available_versions,
+                user_cuda_version=user_version_str,
+                original_error=f"Original error: {self.error_msg}\n" if self.error_msg else "",
+                requested_version=self.requested_version,
+            )
+
+    def _format_lib_error_message(
+        self,
+        available_versions: list[str],
+        user_cuda_version: str,
+        original_error: str = "",
+        requested_version: Optional[str] = None,
+    ) -> str:
+        """Format detailed error message for library loading failures"""
+        analysis = ""
+        no_cpu_lib_found = "libbitsandbytes_cpu.so: cannot open" in original_error
+        no_cuda_lib_found = f"{BNB_BACKEND} binary not found" in original_error
+
+        if no_cpu_lib_found:
+            analysis = "\n🚨 Failed to load CPU-only bitsandbytes library 🚨\n\n"
+
+        elif no_cuda_lib_found:
+            version_list_str = "\n  - " + "\n  - ".join(available_versions) if available_versions else "NONE"
+            analysis = (
+                (
+                    f"\n🚨 {BNB_BACKEND} VERSION MISMATCH 🚨\n"
+                    f"Requested {BNB_BACKEND} version:          {requested_version}\n"
+                    f"Detected PyTorch {BNB_BACKEND} version:   {user_cuda_version}\n"
+                    f"Available pre-compiled versions: {version_list_str}\n\n"
+                    "This means:\n"
+                    "The version you're trying to use is NOT distributed with this package\n\n"
+                )
+                if available_versions
+                else "\n🚨 Forgot to compile the bitsandbytes library? 🚨\n"
+                "1. You're not using the package but checked-out the source code\n"
+                "2. You MUST compile from source\n\n"
+            )
+
+        base_msg = "Attempted to use bitsandbytes native library functionality but it's not available.\n\n"
+
+        troubleshooting = (
+            (
+                f"This typically happens when:\n"
+                f"1. bitsandbytes doesn't ship with a pre-compiled binary for your {BNB_BACKEND} version\n"
+                f"2. The library wasn't compiled properly during installation from source\n\n"
+            )
+            if no_cuda_lib_found
+            else f"This typically happens when you checked the code out from source and your torch installation doesn't detect {BNB_BACKEND} on your machine.\n\n"
+        )
+
+        note = (
+            (
+                f"bitsandbytes tried to find a compatible {BNB_BACKEND} binary but none could be loaded.\n"
+                f"If your {BNB_BACKEND} version isn't among the available pre-compiled versions above, you must compile from source.\n\n"
+            )
+            if no_cuda_lib_found
+            else ""
+        )
+
+        compile_instructions = (
+            ("COMPILE FROM SOURCE for CPU-only:\n  `cmake -DCOMPUTE_BACKEND=cpu -S . && make`\n\n")
+            if not no_cuda_lib_found
+            else (
+                "You have two options:\n"
+                "1. COMPILE FROM SOURCE (required if no binary exists):\n"
+                "   https://huggingface.co/docs/bitsandbytes/main/en/installation#cuda-compile\n"
+                "2. Use BNB_CUDA_VERSION to specify a DIFFERENT CUDA version from the detected one, which is installed on your machine and matching an available pre-compiled version listed above\n\n"
+            )
+            if not HIP_ENVIRONMENT
+            else (
+                "You have two options:\n"
+                "1. COMPILE FROM SOURCE as mentioned here:\n"
+                "   https://huggingface.co/docs/bitsandbytes/main/en/installation?backend=AMD+ROCm#amd-gpu\n"
+                "2. Use BNB_ROCM_VERSION to specify a DIFFERENT ROCm version from the detected one, matching the version the library was built with.\n\n"
+            )
+        )
+
+        diagnostics = (
+            f"🔍 Run this command for detailed diagnostics:\n"
+            f"python -m bitsandbytes\n\n"
+            f"If you've tried everything and still have issues:\n"
+            f"1. Include ALL version info (operating system, bitsandbytes, pytorch, {BNB_BACKEND.lower()}, python)\n"
+            f"2. Describe what you've tried in detail\n"
+            f"3. Open an issue with this information:\n"
+            f"   https://github.com/bitsandbytes-foundation/bitsandbytes/issues\n\n"
+        )
+
+        return f"{analysis}{base_msg}{troubleshooting}{note}{compile_instructions}{original_error}\n{diagnostics}"
+
+    def _format_dependency_error(self) -> str:
+        """Format error message for missing shared libraries"""
+        # Extract missing library name from error
+        error_parts = self.error_msg.split(":")
+        missing_lib = error_parts[0].strip() if len(error_parts) > 0 else "unknown library"
+        cuda_major_version = (
+            self.requested_version.split(".")[0] if "." in self.requested_version else self.requested_version
+        )
+
+        return (
+            f"\n🚨 {BNB_BACKEND} SETUP ERROR: Missing dependency: {missing_lib} 🚨\n\n"
+            f"{BNB_BACKEND} {cuda_major_version}.x runtime libraries were not found in the LD_LIBRARY_PATH.\n\n"
+            f"To fix this, make sure that:\n"
+            f"1. You have installed {BNB_BACKEND} {cuda_major_version}.x toolkit on your system\n"
+            f"2. The {BNB_BACKEND} runtime libraries are in your LD_LIBRARY_PATH\n\n"
+            f"You can add them with (and persist the change by adding the line to your .bashrc):\n"
+            f"   export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/path/to/{BNB_BACKEND.lower()}-{cuda_major_version}.x/"
+            f"{'lib64' if not HIP_ENVIRONMENT else 'lib'}\n\n"
+            f"Original error: {self.error_msg}\n\n"
+            f"🔍 Run this command for detailed diagnostics:\n"
+            f"python -m bitsandbytes\n\n"
+            f"If you've tried everything and still have issues:\n"
+            f"1. Include ALL version info (operating system, bitsandbytes, pytorch, {BNB_BACKEND.lower()}, python)\n"
+            f"2. Describe what you've tried in detail\n"
+            f"3. Open an issue with this information:\n"
+            f"   https://github.com/bitsandbytes-foundation/bitsandbytes/issues\n\n"
+        )
+
+    def __getattr__(self, name):
+        """Return a dummy function that throws when called, rather than on attribute access"""
+
+        def throw_on_call(*args, **kwargs):
+            raise RuntimeError(f"{self.formatted_error}Native code method attempted to call: lib.{name}()")
+
+        return throw_on_call
+
+    def __getitem__(self, name):
+        return self.__getattr__(name)
+
+
+def get_xpu_bnb_library_path() -> Path:
+    """Get the path to the XPU native library matching the oneAPI toolchain.
+
+    Prefers the versioned library (e.g. libbitsandbytes_xpu2026) matching the first
+    4 digits of torch.version.xpu, falling back to an unversioned libbitsandbytes_xpu.
+    """
+    xpu_version = getattr(torch.version, "xpu", None)
+    if xpu_version:
+        versioned = PACKAGE_DIR / f"libbitsandbytes_xpu{xpu_version[:4]}{DYNAMIC_LIBRARY_SUFFIX}"
+        if versioned.exists():
+            return versioned
+    return PACKAGE_DIR / f"libbitsandbytes_xpu{DYNAMIC_LIBRARY_SUFFIX}"
+
+
+def get_native_library() -> BNBNativeLibrary:
+    """
+    Load CUDA library XOR CPU, as the latter contains a subset of symbols of the former.
+    """
+    cuda_specs = get_cuda_specs()
+    binary_path = PACKAGE_DIR / f"libbitsandbytes_cpu{DYNAMIC_LIBRARY_SUFFIX}"
+
+    if cuda_specs:
+        cuda_binary_path = get_cuda_bnb_library_path(cuda_specs)
+
+        if not cuda_binary_path.exists():
+            raise RuntimeError(f"No compatible {BNB_BACKEND} binary found at {cuda_binary_path}")
+
+        binary_path = cuda_binary_path
+
+    if torch._C._has_xpu:
+        binary_path = get_xpu_bnb_library_path()
+
+    logger.debug(f"Loading bitsandbytes native library from: {binary_path}")
+
+    # Try to load the library - any errors will propagate up
+    dll = ct.cdll.LoadLibrary(str(binary_path))
+
+    if hasattr(dll, "get_context"):  # only a CUDA-built library exposes this
+        return CudaBNBNativeLibrary(dll)
+
+    if torch._C._has_xpu:
+        return XpuBNBNativeLibrary(dll)
+
+    return BNBNativeLibrary(dll)
+
+
+ROCM_GPU_ARCH = get_rocm_gpu_arch()
+
+HIP_ENVIRONMENT = False
+BNB_BACKEND = "CPU"
+if torch.version.hip:
+    HIP_ENVIRONMENT = True
+    BNB_BACKEND = "ROCm"
+elif torch.cuda.is_available():
+    BNB_BACKEND = "CUDA"
+elif torch._C._has_xpu:
+    BNB_BACKEND = "XPU"
+
+try:
+    lib = get_native_library()
+except Exception as e:
+    if BNB_BACKEND in ("CPU", "XPU"):
+        lib = ErrorHandlerMockBNBNativeLibrary("XPU/CPU can run without native library.")
+    else:
+        error_msg = str(e)
+        logger.error(
+            f"bitsandbytes library load error: {error_msg}",
+            exc_info=True,
+        )
+
+        # create a mock with error messaging as fallback
+        lib = ErrorHandlerMockBNBNativeLibrary(error_msg)
+
+from pathlib import Path
+import platform
+
+DYNAMIC_LIBRARY_SUFFIX = {
+    "Darwin": ".dylib",
+    "Linux": ".so",
+    "Windows": ".dll",
+}.get(platform.system(), ".so")
+
+PACKAGE_DIR = Path(__file__).parent
+PACKAGE_GITHUB_URL = "https://github.com/TimDettmers/bitsandbytes"
+NONPYTORCH_DOC_URL = "https://github.com/TimDettmers/bitsandbytes/blob/main/docs/source/nonpytorchcuda.mdx"
+
+import dataclasses
+from functools import lru_cache
+import logging
+import platform
+import re
+import subprocess
+from typing import Optional
+
+import torch
+
+
+@dataclasses.dataclass(frozen=True)
+class CUDASpecs:
+    highest_compute_capability: tuple[int, int]
+    cuda_version_string: str
+    cuda_version_tuple: tuple[int, int]
+
+    @property
+    def has_imma(self) -> bool:
+        return torch.version.hip or self.highest_compute_capability >= (7, 5)
+
+
+def get_compute_capabilities() -> list[tuple[int, int]]:
+    return sorted(torch.cuda.get_device_capability(torch.cuda.device(i)) for i in range(torch.cuda.device_count()))
+
+
+@lru_cache(None)
+def get_cuda_version_tuple() -> Optional[tuple[int, int]]:
+    """Get CUDA/HIP version as a tuple of (major, minor)."""
+    try:
+        if torch.version.cuda:
+            version_str = torch.version.cuda
+        elif torch.version.hip:
+            version_str = torch.version.hip
+        else:
+            return None
+
+        parts = version_str.split(".")
+        if len(parts) >= 2:
+            return tuple(map(int, parts[:2]))
+        return None
+    except (AttributeError, ValueError, IndexError):
+        return None
+
+
+def get_cuda_version_string() -> Optional[str]:
+    """Get CUDA/HIP version as a string."""
+    version_tuple = get_cuda_version_tuple()
+    if version_tuple is None:
+        return None
+    major, minor = version_tuple
+    return f"{major}{minor}"
+
+
+def get_cuda_specs() -> Optional[CUDASpecs]:
+    """Get CUDA/HIP specifications."""
+    if not torch.cuda.is_available():
+        return None
+
+    try:
+        compute_capabilities = get_compute_capabilities()
+        if not compute_capabilities:
+            return None
+
+        version_tuple = get_cuda_version_tuple()
+        if version_tuple is None:
+            return None
+
+        version_string = get_cuda_version_string()
+        if version_string is None:
+            return None
+
+        return CUDASpecs(
+            highest_compute_capability=compute_capabilities[-1],
+            cuda_version_string=version_string,
+            cuda_version_tuple=version_tuple,
+        )
+    except Exception:
+        return None
+
+
+def get_rocm_gpu_arch() -> str:
+    """Get ROCm GPU architecture."""
+    logger = logging.getLogger(__name__)
+    try:
+        if torch.version.hip:
+            # On Windows, use hipinfo.exe; on Linux, use rocminfo
+            if platform.system() == "Windows":
+                cmd = ["hipinfo.exe"]
+                arch_pattern = r"gcnArchName:\s+gfx([a-zA-Z\d]+)"
+            else:
+                cmd = ["rocminfo"]
+                arch_pattern = r"Name:\s+gfx([a-zA-Z\d]+)"
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            match = re.search(arch_pattern, result.stdout)
+            if match:
+                return "gfx" + match.group(1)
+            else:
+                return "unknown"
+        else:
+            return "unknown"
+    except Exception as e:
+        logger.error(f"Could not detect ROCm GPU architecture: {e}")
+        if torch.cuda.is_available():
+            logger.warning(
+                """
+ROCm GPU architecture detection failed despite ROCm being available.
+                """,
+            )
+        return "unknown"
+
+
+from collections.abc import Iterable, Iterator
+import logging
+import os
+from pathlib import Path
+
+import torch
+
+from bitsandbytes.cextension import HIP_ENVIRONMENT, get_cuda_bnb_library_path
+from bitsandbytes.cuda_specs import CUDASpecs
+from bitsandbytes.diagnostics.utils import print_dedented
+
+CUDART_PATH_PREFERRED_ENVVARS = ("CONDA_PREFIX", "LD_LIBRARY_PATH")
+
+CUDART_PATH_IGNORED_ENVVARS = {
+    "DBUS_SESSION_BUS_ADDRESS",  # hardware related
+    "GOOGLE_VM_CONFIG_LOCK_FILE",  # GCP: requires elevated permissions, causing problems in VMs and Jupyter notebooks
+    "HOME",  # Linux shell default
+    "LESSCLOSE",
+    "LESSOPEN",  # related to the `less` command
+    "MAIL",  # something related to emails
+    "OLDPWD",
+    "PATH",  # this is for finding binaries, not libraries
+    "PWD",  # PWD: this is how the shell keeps track of the current working dir
+    "SHELL",  # binary for currently invoked shell
+    "SSH_AUTH_SOCK",  # SSH stuff, therefore unrelated
+    "SSH_TTY",
+    "TMUX",  # Terminal Multiplexer
+    "XDG_DATA_DIRS",  # XDG: Desktop environment stuff
+    "XDG_GREETER_DATA_DIR",  # XDG: Desktop environment stuff
+    "XDG_RUNTIME_DIR",
+    "_",  # current Python interpreter
+}
+
+CUDA_RUNTIME_LIB_PATTERNS = (
+    (
+        "libamdhip64.so*",  # Linux
+        "amdhip64*.dll",  # Windows
+    )
+    if HIP_ENVIRONMENT
+    else (
+        "cudart64*.dll",  # Windows
+        "libcudart*.so*",  # libcudart.so, libcudart.so.11.0, libcudart.so.12.0, libcudart.so.12.1, libcudart.so.12.2 etc.
+        "nvcuda*.dll",  # Windows
+    )
+)
+
+logger = logging.getLogger(__name__)
+
+
+def find_cuda_libraries_in_path_list(paths_list_candidate: str) -> Iterable[Path]:
+    for dir_string in paths_list_candidate.split(os.pathsep):
+        if not dir_string:
+            continue
+        if os.sep not in dir_string:
+            continue
+        try:
+            dir = Path(dir_string)
+            try:
+                if not dir.exists():
+                    logger.warning(f"The directory listed in your path is found to be non-existent: {dir}")
+                    continue
+            except OSError:  # Assume an esoteric error trying to poke at the directory
+                pass
+            for lib_pattern in CUDA_RUNTIME_LIB_PATTERNS:
+                for pth in dir.glob(lib_pattern):
+                    if pth.is_file() and not pth.is_symlink():
+                        yield pth
+        except (OSError, PermissionError):
+            pass
+
+
+def is_relevant_candidate_env_var(env_var: str, value: str) -> bool:
+    return (
+        env_var in CUDART_PATH_PREFERRED_ENVVARS  # is a preferred location
+        or (
+            os.sep in value  # might contain a path
+            and env_var not in CUDART_PATH_IGNORED_ENVVARS  # not ignored
+            and "CONDA" not in env_var  # not another conda envvar
+            and "BASH_FUNC" not in env_var  # not a bash function defined via envvar
+            and "\n" not in value  # likely e.g. a script or something?
+        )
+    )
+
+
+def get_potentially_lib_path_containing_env_vars() -> dict[str, str]:
+    return {env_var: value for env_var, value in os.environ.items() if is_relevant_candidate_env_var(env_var, value)}
+
+
+def find_cudart_libraries() -> Iterator[Path]:
+    """
+    Searches for a cuda installations, in the following order of priority:
+        1. active conda env
+        2. LD_LIBRARY_PATH
+        3. any other env vars, while ignoring those that
+            - are known to be unrelated
+            - don't contain the path separator `/`
+
+    If multiple libraries are found in part 3, we optimistically try one,
+    while giving a warning message.
+    """
+    candidate_env_vars = get_potentially_lib_path_containing_env_vars()
+
+    for envvar in CUDART_PATH_PREFERRED_ENVVARS:
+        if envvar in candidate_env_vars:
+            directory = candidate_env_vars[envvar]
+            yield from find_cuda_libraries_in_path_list(directory)
+            candidate_env_vars.pop(envvar)
+
+    for env_var, value in candidate_env_vars.items():
+        yield from find_cuda_libraries_in_path_list(value)
+
+
+def _print_cuda_diagnostics(cuda_specs: CUDASpecs) -> None:
+    print(
+        f"PyTorch settings found: CUDA_VERSION={cuda_specs.cuda_version_string}, "
+        f"Highest Compute Capability: {cuda_specs.highest_compute_capability}.",
+    )
+
+    binary_path = get_cuda_bnb_library_path(cuda_specs)
+    if not binary_path.exists():
+        print_dedented(
+            f"""
+            No compatible CUDA library found (tried: {binary_path.name}). You may need to compile from source:
+            https://huggingface.co/docs/bitsandbytes/main/en/installation#cuda-compile
+            """,
+        )
+
+    # 7.5 is the minimum CC for int8 tensor cores
+    if not cuda_specs.has_imma:
+        print_dedented(
+            """
+            WARNING: Compute capability < 7.5 detected! Only slow 8-bit matmul is supported for your GPU!
+            If you run into issues with 8-bit matmul, you can try 4-bit quantization:
+            https://huggingface.co/blog/4bit-transformers-bitsandbytes
+            """,
+        )
+
+
+def _print_hip_diagnostics(cuda_specs: CUDASpecs) -> None:
+    print(f"PyTorch settings found: ROCM_VERSION={cuda_specs.cuda_version_string}")
+
+    rocm_override = os.environ.get("BNB_ROCM_VERSION")
+    if rocm_override:
+        print(f"BNB_ROCM_VERSION override: {rocm_override}")
+
+    binary_path = get_cuda_bnb_library_path(cuda_specs)
+    if not binary_path.exists():
+        print_dedented(
+            f"""
+            No compatible ROCm library found (tried: {binary_path.name}). You may need to compile from source:
+            https://huggingface.co/docs/bitsandbytes/main/en/installation#rocm-compile
+            Use BNB_ROCM_VERSION to force a specific version if needed.
+            """,
+        )
+
+    hip_major, hip_minor = cuda_specs.cuda_version_tuple
+    if (hip_major, hip_minor) < (6, 1):
+        print_dedented(
+            """
+            WARNING: bitsandbytes is fully supported only from ROCm 6.1.
+            """,
+        )
+
+
+def print_diagnostics(cuda_specs: CUDASpecs) -> None:
+    if HIP_ENVIRONMENT:
+        _print_hip_diagnostics(cuda_specs)
+    else:
+        _print_cuda_diagnostics(cuda_specs)
+
+
+def print_runtime_diagnostics() -> None:
+    backend = "ROCm" if HIP_ENVIRONMENT else "CUDA"
+    runtime_version = torch.version.hip if HIP_ENVIRONMENT else torch.version.cuda
+    override_var = "BNB_ROCM_VERSION" if HIP_ENVIRONMENT else "BNB_CUDA_VERSION"
+    override_example = "72" if HIP_ENVIRONMENT else "122"
+
+    cudart_paths = list(find_cudart_libraries())
+    if not cudart_paths:
+        print(f"{backend} SETUP: WARNING! {backend} runtime files not found in any environmental path.")
+    elif len(cudart_paths) > 1:
+        print_dedented(
+            f"""
+            Found duplicate {backend} runtime files (see below).
+
+            bitsandbytes will use PyTorch's {backend} runtime ({runtime_version}) and auto-select
+            the closest available library version. If you need to force a specific version,
+            set {override_var}, e.g.:
+                export {override_var}={override_example}
+            """,
+        )
+        for pth in cudart_paths:
+            print(f"* Found {backend} runtime at: {pth}")
+
+import importlib
+import platform
+import sys
+import traceback
+
+import torch
+
+from bitsandbytes import __version__ as bnb_version
+from bitsandbytes.consts import PACKAGE_GITHUB_URL
+from bitsandbytes.cuda_specs import get_cuda_specs
+from bitsandbytes.diagnostics.cuda import print_diagnostics
+from bitsandbytes.diagnostics.utils import print_dedented, print_header
+
+_RELATED_PACKAGES = [
+    "accelerate",
+    "diffusers",
+    "numpy",
+    "pip",
+    "peft",
+    "safetensors",
+    "transformers",
+    "triton",
+    "trl",
+]
+
+
+def sanity_check():
+    from bitsandbytes.optim import Adam
+
+    p = torch.nn.Parameter(torch.rand(10, 10).cuda())
+    a = torch.rand(10, 10).cuda()
+    p1 = p.data.sum().item()
+    adam = Adam([p])
+    out = a * p
+    loss = out.sum()
+    loss.backward()
+    adam.step()
+    p2 = p.data.sum().item()
+    assert p1 != p2
+
+
+def get_package_version(name: str) -> str:
+    try:
+        version = importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        version = "not found"
+    return version
+
+
+def show_environment():
+    """Simple utility to print out environment information."""
+
+    print(f"Platform: {platform.platform()}")
+    if platform.system() == "Linux":
+        print(f"  libc: {'-'.join(platform.libc_ver())}")
+
+    print(f"Python: {platform.python_version()}")
+
+    print(f"PyTorch: {torch.__version__}")
+    print(f"  CUDA: {torch.version.cuda or 'N/A'}")
+    print(f"  HIP: {torch.version.hip or 'N/A'}")
+    print(f"  XPU: {getattr(torch.version, 'xpu', 'N/A') or 'N/A'}")
+
+    print("Related packages:")
+    for pkg in _RELATED_PACKAGES:
+        version = get_package_version(pkg)
+        print(f"  {pkg}: {version}")
+
+
+def main():
+    print_header(f"bitsandbytes v{bnb_version}")
+    show_environment()
+    print_header("")
+
+    cuda_specs = get_cuda_specs()
+
+    if cuda_specs:
+        print_diagnostics(cuda_specs)
+
+    has_rocm = torch.version.hip is not None
+    has_cuda = not has_rocm and torch.version.cuda is not None and torch.cuda.is_available()
+    has_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
+
+    from bitsandbytes.cextension import ErrorHandlerMockBNBNativeLibrary, lib
+
+    lib_loaded = not isinstance(lib, ErrorHandlerMockBNBNativeLibrary)
+
+    if not (has_cuda or has_rocm or has_xpu):
+        print(
+            f"No CUDA, ROCm, or XPU detected; CPU library {'loaded successfully' if lib_loaded else 'failed to load'}."
+        )
+    elif has_xpu:
+        from bitsandbytes.backends.utils import triton_available
+
+        if not isinstance(lib, ErrorHandlerMockBNBNativeLibrary):
+            print("XPU native library loaded successfully.")
+        elif triton_available:
+            print("XPU native library not loaded; using triton fallback.")
+        else:
+            print("XPU native library not loaded and triton not available.")
+    else:
+        if not lib_loaded:
+            print_dedented(
+                f"""
+                See above for details on why the library failed to load.
+                Please provide this info when creating an issue via {PACKAGE_GITHUB_URL}/issues/new/choose
+                WARNING: Please be sure to sanitize sensitive info from the output before posting it.
+                """,
+            )
+            sys.exit(1)
+
+        print("Checking that the library is importable and callable...")
+        try:
+            sanity_check()
+            print("SUCCESS!")
+            return
+        except RuntimeError as e:
+            if "not available in CPU-only" in str(e):
+                print("WARNING: bitsandbytes is running as CPU-only!")
+                print("8-bit optimizers and GPU quantization are unavailable.")
+                print("If you think this is an error, please report an issue.")
+            else:
+                raise e
+        except Exception:
+            traceback.print_exc()
+
+        print_dedented(
+            f"""
+            Above we output some debug information.
+            Please provide this info when creating an issue via {PACKAGE_GITHUB_URL}/issues/new/choose
+            WARNING: Please be sure to sanitize sensitive info from the output before posting it.
+            """,
+        )
+        sys.exit(1)
+
+import textwrap
+
+HEADER_WIDTH = 60
+
+
+def print_header(txt: str, width: int = HEADER_WIDTH, filler: str = "=") -> None:
+    txt = f" {txt} " if txt else ""
+    print(txt.center(width, filler))
+
+
+def print_dedented(text):
+    print("\n".join(textwrap.dedent(text).strip().split("\n")))
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+from collections.abc import Iterable
+import ctypes as ct
+import itertools
+from math import prod
+from typing import Any, Optional
+
+import numpy as np
+import torch
+from torch import Tensor
+from typing_extensions import deprecated
+
+from bitsandbytes.utils import pack_dict_to_tensor, unpack_tensor_to_dict
+
+from .cextension import lib
+
+name2qmap = {}
+
+"""C FUNCTIONS FOR OPTIMIZERS"""
+
+
+class GlobalPageManager:
+    _instance = None
+
+    def __init__(self):
+        raise RuntimeError("Call get_instance() instead")
+
+    def initialize(self):
+        self.paged_tensors = []
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls.__new__(cls)
+            cls._instance.initialize()
+        return cls._instance
+
+    def prefetch_all(self, to_cpu=False):
+        # assume the first added, will be the
+        # ones that are used first, so swap them in last
+        # in the case they are evicted again
+        for t in self.paged_tensors[::-1]:
+            prefetch_tensor(t, to_cpu)
+
+
+class CUBLAS_Context:
+    _instance = None
+
+    def __init__(self):
+        raise RuntimeError("Call get_instance() instead")
+
+    def initialize(self):
+        self.context = {}
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls.__new__(cls)
+            cls._instance.initialize()
+        return cls._instance
+
+    def get_context(self, device):
+        if device.index not in self.context:
+            prev_device = torch.cuda.current_device()
+            torch.cuda.set_device(device)
+            self.context[device.index] = ct.c_void_p(lib.get_context())
+            torch.cuda.set_device(prev_device)
+        return self.context[device.index]
+
+
+FIRST_CUDA_DEVICE = torch.device("cuda", index=0)
+
+# When multiple GPUs are present, we use a context manager to
+# switch to the correct device of a tensor before invoking our CUDA
+# kernels in the C++ library. However, when there's only one device
+# there is no need to incur the overhead of cudaGetDevice/cudaSetDevice.
+if torch.cuda.device_count() > 1:
+
+    def _cuda_device_of(a: torch.Tensor):
+        return torch.cuda.device_of(a)
+else:
+    import contextlib
+
+    def _cuda_device_of(a: torch.Tensor):
+        return contextlib.nullcontext()
+
+
+def get_paged(*shape, dtype=torch.float32, device=FIRST_CUDA_DEVICE):
+    num_bytes = dtype.itemsize * prod(shape)
+    managed_ptr = lib.cget_managed_ptr(ct.c_size_t(num_bytes))
+    c_ptr = ct.cast(managed_ptr, ct.POINTER(ct.c_int))
+    new_array = np.ctypeslib.as_array(c_ptr, shape=shape)
+    out = torch.frombuffer(new_array, dtype=dtype, count=prod(shape)).view(shape)
+    out.is_paged = True
+    out.page_deviceid = device.index
+    return out
+
+
+def prefetch_tensor(A: torch.Tensor, to_cpu=False):
+    assert A.is_paged, "Only paged tensors can be prefetched!"
+    if to_cpu:
+        deviceid = -1
+    else:
+        deviceid = A.page_deviceid
+
+    lib.cprefetch(get_ptr(A), ct.c_size_t(A.nbytes), ct.c_int32(deviceid))
+
+
+def elementwise_func(func_name, A, B, value, prefetch=True):
+    func = None
+    if A.dtype == torch.float32:
+        func = getattr(lib, f"c{func_name}_fp32", None)
+        cvalue = ct.c_float(value)
+    elif A.dtype == torch.uint8:
+        func = getattr(lib, f"c{func_name}_uint8", None)
+        cvalue = ct.c_uint8(value)
+
+    if func is None:
+        raise NotImplementedError(f"Function not implemented: {func_name}")
+
+    is_managed = getattr(A, "is_managed", False)
+    if is_managed and prefetch:
+        prefetch_tensor(A)
+        if B is not None:
+            prefetch_tensor(B)
+
+    func(get_ptr(A), get_ptr(B), cvalue, ct.c_int64(A.numel()))
+    if A.is_paged or B.is_paged:
+        # paged function are fully asynchronous
+        # if we return from this function, we want to the tensor
+        # to be in the correct state, that is the final state after the
+        # operation occurred. So we synchronize.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.synchronize()
+
+
+def fill(A, value, device=None, prefetch=True):
+    elementwise_func("fill", A, None, value)
+
+
+def _mul(A, B, device=None):
+    elementwise_func("_mul", A, B, 0)
+
+
+def create_linear_map(signed=True, total_bits=8, add_zero=True):
+    sign = -1.0 if signed else 0.0
+    total_values = 2**total_bits
+    if add_zero or total_bits < 8:
+        # add a zero
+        # since we simulate less bits by having zeros in the data type, we
+        # we need to center the quantization around zero and as such lose
+        # a single value
+        total_values = 2**total_bits if not signed else 2**total_bits - 1
+
+    values = torch.linspace(sign, 1.0, total_values)
+    gap = 256 - values.numel()
+    if gap == 0:
+        return values
+    else:
+        l = values.numel() // 2  # noqa: E741
+        return torch.Tensor(values[:l].tolist() + [0] * gap + values[l:].tolist())
+
+
+def create_normal_map(offset=0.9677083, use_extra_value=True):
+    """Create the NormalFloat (NF4) quantization map.
+
+    Constructs a lookup table of 16 quantization values (stored in a 256-element tensor for
+    indexing convenience) derived from quantiles of the standard normal distribution N(0, 1).
+    Each bin has approximately equal probability mass under the normal distribution, which is
+    optimal for normally-distributed data like neural network weights.
+
+    Unlike floating-point types (FP4, FP8), NF4 is NOT a float encoding — the 4-bit index is
+    simply a lookup into this table. There is no sign/exponent/mantissa decomposition.
+
+    The values are generated by computing ``scipy.stats.norm.ppf()`` (inverse CDF) at evenly
+    spaced quantile points, then normalizing to [-1, 1].
+
+    For more details, see: QLoRA: Efficient Finetuning of Quantized LLMs
+    (https://arxiv.org/abs/2305.14314)
+
+    Args:
+        offset: The outermost quantile boundary, controlling the range of the normal distribution
+            that is covered. ``norm.ppf(offset)`` gives the largest bin edge in standard deviations.
+            The default (0.9677083) covers up to ~1.845 standard deviations and was empirically
+            optimized to minimize quantization error for typical neural network weight distributions.
+        use_extra_value: If True, creates an asymmetric type with 8 negative and 9 positive values
+            (including zero), for 15 non-zero values total. If False, creates a symmetric type
+            with 7 negative and 7 positive values (14 non-zero values total).
+
+    Returns:
+        A 256-element tensor where the first 16 values are the sorted NF4 quantization levels
+        normalized to [-1, 1], and the remaining values are zero (padding for 8-bit indexing).
+    """
+    try:
+        from scipy.stats import norm
+    except ImportError as ie:
+        raise ImportError(
+            "Scipy is required for `create_normal_map`. Install `bitsandbytes` with the `[test]` extra.",
+        ) from ie
+
+    if use_extra_value:
+        # one more positive value, this is an asymmetric type
+        v1 = norm.ppf(torch.linspace(offset, 0.5, 9)[:-1]).tolist()
+        v2 = [0] * (256 - 15)  ## we have 15 non-zero values in this data type
+        v3 = (-norm.ppf(torch.linspace(offset, 0.5, 8)[:-1])).tolist()
+    else:
+        v1 = norm.ppf(torch.linspace(offset, 0.5, 8)[:-1]).tolist()
+        v2 = [0] * (256 - 14)  ## we have 14 non-zero values in this data type
+        v3 = (-norm.ppf(torch.linspace(offset, 0.5, 8)[:-1])).tolist()
+
+    v = v1 + v2 + v3
+
+    values = torch.Tensor(v)
+    values = values.sort().values
+    values /= values.max()
+
+    assert values.numel() == 256
+
+    return values
+
+
+def create_fp8_map(signed=True, exponent_bits=5, precision_bits=2, total_bits=8):
+    """Create a floating-point quantization map with configurable bit layout.
+
+    Generates a lookup table for a custom floating-point format following IEEE 754-like encoding
+    with configurable exponent and mantissa (precision) bits. Despite the name, this function
+    handles any total bit width (including FP4 when called with ``total_bits=4``).
+
+    The encoding uses:
+        - Exponent bias: ``2^(exponent_bits - 1)``
+        - Normal values: ``(1 + mantissa) * 2^(exponent - bias - 1)``
+        - Subnormal values (exponent field = 0): ``mantissa * 2^(-bias)``
+
+    Note: The values in the returned tensor are normalized by dividing by the maximum value,
+    so the actual represented range is [-1, 1].
+
+    For the FP4 type used in bitsandbytes (2 exponent bits, 1 mantissa bit, signed):
+        ``create_fp8_map(signed=True, exponent_bits=2, precision_bits=1, total_bits=4)``
+
+    Args:
+        signed: Whether the format includes a sign bit.
+        exponent_bits: Number of bits for the exponent field.
+        precision_bits: Number of bits for the mantissa (precision/fraction) field.
+        total_bits: Total number of bits per value (must equal sign + exponent + precision).
+
+    Returns:
+        A 256-element tensor of sorted quantization levels normalized to [-1, 1].
+        For types with fewer than 8 bits, the remaining entries are zero-padded.
+    """
+    e = exponent_bits
+    p = precision_bits
+    has_sign = 1 if signed else 0
+    assert e + p == total_bits - has_sign
+    # the exponent is biased to 2^(e-1) -1 == 0
+    evalues = []
+    for i, val in enumerate(range(-(2 ** (exponent_bits - has_sign)), 2 ** (exponent_bits - has_sign), 1)):
+        evalues.append(2**val)
+
+    values = []
+    lst = list(itertools.product([0, 1], repeat=precision_bits))
+    # for ev in evalues:
+    bias = 2 ** (exponent_bits - 1)
+    for evalue in range(2 ** (exponent_bits)):
+        for bit_pattern in lst:
+            value = 1 if evalue != 0 else 0
+            for i, pval in enumerate(list(bit_pattern)):
+                value += pval * (2 ** -(i + 1))
+            if evalue == 0:
+                # subnormals
+                value = value * 2**-(bias)
+            else:
+                # normals
+                value = value * 2 ** -(evalue - bias - 1)
+            values.append(value)
+            if signed:
+                values.append(-value)
+
+    assert len(values) == 2**total_bits
+    values.sort()
+    if total_bits < 8:
+        gap = 256 - len(values)
+        for i in range(gap):
+            values.append(0)
+    values.sort()
+    code = torch.tensor(values)
+    code /= code.max()
+
+    return code
+
+
+def create_dynamic_map(signed=True, max_exponent_bits=7, total_bits=8):
+    """
+    Creates the dynamic quantiztion map.
+
+    The dynamic data type is made up of a dynamic exponent and
+    fraction. As the exponent increase from 0 to -7 the number
+    of bits available for the fraction shrinks.
+
+    This is a generalization of the dynamic type where a certain
+    number of the bits and be reserved for the linear quantization
+    region (the fraction). n determines the maximum number of
+    exponent bits.
+
+    For more details see
+    (8-Bit Approximations for Parallelism in Deep Learning)[https://arxiv.org/abs/1511.04561]
+    """
+
+    data = []
+    # these are additional items that come from the case
+    # where all the exponent bits are zero and no
+    # indicator bit is present
+    non_sign_bits = total_bits - 1
+    additional_items = 2 ** (non_sign_bits - max_exponent_bits) - 1
+    for i in range(max_exponent_bits):
+        fraction_items = int(
+            2 ** (i + non_sign_bits - max_exponent_bits) + 1
+            if signed
+            else 2 ** (i + non_sign_bits - max_exponent_bits + 1) + 1,
+        )
+        boundaries = torch.linspace(0.1, 1, fraction_items, dtype=torch.float32)
+        means = (boundaries[:-1] + boundaries[1:]) / 2.0
+        data += ((10 ** (-(max_exponent_bits - 1) + i)) * means).tolist()
+        if signed:
+            data += (-(10 ** (-(max_exponent_bits - 1) + i)) * means).tolist()
+
+    if additional_items > 0:
+        boundaries = torch.linspace(0.1, 1, additional_items + 1, dtype=torch.float32)
+        means = (boundaries[:-1] + boundaries[1:]) / 2.0
+        data += ((10 ** (-(max_exponent_bits - 1) + i)) * means).tolist()
+        if signed:
+            data += (-(10 ** (-(max_exponent_bits - 1) + i)) * means).tolist()
+
+    data.append(0)
+    data.append(1.0)
+
+    assert len(data) == 2**total_bits
+
+    gap = 256 - len(data)
+    for i in range(gap):
+        data.append(0)
+
+    data.sort()
+    return torch.tensor(data, dtype=torch.float32)
+
+
+def is_on_gpu(tensors: Iterable[Optional[torch.Tensor]]):
+    """Verifies that the input tensors are all on the same device.
+
+    An input tensor may also be marked as `paged`, in which case the device placement is ignored.
+    CPU tensors are allowed and checked for consistency among themselves.
+
+    Args:
+        tensors (`Iterable[Optional[torch.Tensor]]`): A list of tensors to verify.
+
+    Raises:
+        `RuntimeError`: Raised when the verification fails.
+
+    Returns:
+        `Literal[True]`
+    """
+
+    devices = set()
+
+    for t in tensors:
+        # NULL pointers and paged tensors are OK.
+        if t is not None and not getattr(t, "is_paged", False):
+            devices.add((t.device.type, t.device.index))
+
+    # All tensors on CPU is valid
+    if devices == {("cpu", None)}:
+        return True
+
+    # Check that no CPU tensors are mixed with GPU tensors
+    has_cpu = ("cpu", None) in devices
+    if has_cpu and len(devices) > 1:
+        raise RuntimeError(
+            f"Input tensors need to be on the same device, but found the following tensor and device combinations:\n {[(t.shape, t.device) for t in tensors if t is not None]}",
+        )
+
+    # GPU path: all tensors must be on the same single GPU
+    if len(devices) > 1:
+        raise RuntimeError(
+            f"Input tensors need to be on the same GPU, but found the following tensor and device combinations:\n {[(t.shape, t.device) for t in tensors if t is not None]}",
+        )
+    return True
+
+
+def _get_tensor_stream(tensor: Tensor) -> ct.c_void_p:
+    # We use the raw stream for performance reasons.
+    if tensor.device.type == "cuda":
+        return ct.c_void_p(torch._C._cuda_getCurrentRawStream(tensor.device.index))
+    if tensor.device.type == "xpu":
+        return ct.c_void_p(torch._C._xpu_getCurrentRawStream(tensor.device.index))
+    # For CPU tensors (e.g. paged optimizer states), use current device's stream.
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return ct.c_void_p(torch._C._xpu_getCurrentRawStream(torch.xpu.current_device()))
+    return ct.c_void_p(torch._C._cuda_getCurrentRawStream(torch.cuda.current_device()))
+
+
+def get_ptr(A: Optional[Tensor]) -> Optional[ct.c_void_p]:
+    """Gets the memory address of the first element of a tenso
+
+    Args:
+        A (`Optional[Tensor]`): A PyTorch tensor.
+
+    Returns:
+        `Optional[ct.c_void_p]`: A pointer to the underlying tensor data.
+    """
+    if A is None:
+        return None
+
+    return ct.c_void_p(A.data_ptr())
+
+
+class QuantState:
+    """container for quantization state components to work with Params4bit and similar classes"""
+
+    valid_quant_types = ("fp4", "nf4")
+    valid_qs_type_keys = [f"bitsandbytes__{x}" for x in valid_quant_types]
+    valid_qs_keys = [
+        "absmax",
+        "quant_map",
+        "nested_absmax",
+        "nested_quant_map",
+        "quant_state",
+        "quant_type",
+        "blocksize",
+        "dtype",
+        "shape",
+        "nested_blocksize",
+        "nested_dtype",
+        "nested_offset",
+    ]
+
+    def __init__(
+        self,
+        absmax,
+        shape=None,
+        code=None,
+        blocksize=None,
+        quant_type=None,
+        dtype=None,
+        offset=None,
+        state2=None,
+    ):
+        self.absmax = absmax
+        self.shape = shape
+        self.code = code
+        self.dtype = dtype
+        self.blocksize = blocksize
+        self.quant_type = quant_type
+        self.offset = offset
+        self.state2 = state2
+        self.nested = state2 is not None
+
+    def __getattr__(self, name):
+        # Support attribute access for packed state_dict keys like "bitsandbytes__nf4".
+        # PyTorch's FSDP state_dict traversal (_get_fqns) resolves dotted FQN paths via
+        # getattr. The packed key "quant_state.bitsandbytes__nf4" causes it to call
+        # getattr(quant_state_obj, "bitsandbytes__nf4"), which we handle here.
+        if name.startswith("bitsandbytes__"):
+            qs_dict = self.as_dict(packed=True)
+            packed_key = "quant_state." + name
+            if packed_key in qs_dict:
+                return qs_dict[packed_key]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
+    def __getitem__(self, idx):
+        """
+        ensures compatibility with older quant state scheme with nested lists.
+        assumes the following layout:
+        state = [qabsmax, input_shape, A.dtype, blocksize, [offset, state2], quant_type]
+        state2 = [absmax, input_shape, A.dtype, blocksize, None, quant_type]
+        """
+        if self.nested:
+            list_repr = [
+                self.absmax,
+                self.shape,
+                self.dtype,
+                self.blocksize,
+                [self.offset, self.state2],
+                self.quant_type,
+            ]
+        else:
+            list_repr = [self.absmax, self.shape, self.dtype, self.blocksize, None, self.quant_type]
+        return list_repr[idx]
+
+    @classmethod
+    def from_dict(cls, qs_dict: dict[str, Any], device: torch.device) -> "QuantState":
+        """
+        unpacks components of state_dict into QuantState
+        where necessary, convert into strings, torch.dtype, ints, etc.
+
+        qs_dict: based on state_dict, with only relevant keys, striped of prefixes.
+
+        item with key `quant_state.bitsandbytes__[nf4/fp4]` may contain minor and non-tensor quant state items.
+        """
+
+        # unpacking tensor with non-tensor components
+        qs_key = [k for k, v in qs_dict.items() if "quant_state" in k and isinstance(v, torch.Tensor)]
+        if "quant_type" not in qs_dict:
+            if not qs_key:
+                raise ValueError("Expected packed or unpacked quant_state items, found neither")
+            elif len(qs_key) != 1 or qs_key[0].split(".")[-1] not in cls.valid_qs_type_keys:
+                raise ValueError(
+                    f"There should be exactly one `quant_state` item with ending from {cls.valid_qs_type_keys}.\nDetected {qs_key}.",
+                )
+
+        # unpacking minor and non-tensor quant state items if necessary
+        if len(qs_key) == 1:
+            first_qs_key = qs_key[0]
+            qs_dict.update(unpack_tensor_to_dict(qs_dict.pop(first_qs_key)))
+
+        qs_dict = {k.split(".")[-1]: v for k, v in qs_dict.items()}  # strip prefixes
+        assert set(qs_dict.keys()).issubset(cls.valid_qs_keys)
+
+        if "nested_absmax" in qs_dict:
+            offset = torch.tensor(float(qs_dict["nested_offset"])).to(device)
+            state2 = cls(
+                absmax=qs_dict["nested_absmax"].to(device),
+                blocksize=qs_dict["nested_blocksize"],
+                code=qs_dict["nested_quant_map"].to(device),
+                dtype=getattr(torch, qs_dict["nested_dtype"]),
+            )
+        else:
+            offset, state2 = None, None
+
+        quant_state = cls(
+            quant_type=qs_dict["quant_type"],
+            absmax=qs_dict["absmax"].to(device),
+            blocksize=qs_dict["blocksize"],
+            code=qs_dict["quant_map"].to(device),
+            dtype=getattr(torch, qs_dict["dtype"]),
+            shape=torch.Size(qs_dict["shape"]) if qs_dict["shape"] is not None else None,
+            offset=offset,
+            state2=state2,
+        )
+        return quant_state
+
+    def as_dict(self, packed: bool = False) -> dict[str, Any]:
+        """
+        returns dict of tensors and strings to use in serialization via _save_to_state_dict()
+        param: packed -- returns dict[str, torch.Tensor] for state_dict fit for safetensors saving
+        """
+        qs_dict = {
+            "quant_type": self.quant_type,
+            "absmax": self.absmax,
+            "blocksize": self.blocksize,
+            "quant_map": self.code,
+            "dtype": str(self.dtype).strip("torch."),
+            "shape": tuple(self.shape) if self.shape is not None else None,
+        }
+        if self.nested:
+            qs_dict.update(
+                {
+                    "nested_absmax": self.state2.absmax,
+                    "nested_blocksize": self.state2.blocksize,
+                    "nested_quant_map": self.state2.code.clone(),  # un-shared to avoid restoring it after shared tensors are removed by safetensors
+                    "nested_dtype": str(self.state2.dtype).strip("torch."),
+                    "nested_offset": self.offset.item(),
+                },
+            )
+        if not packed or self.quant_type is None:
+            return qs_dict
+
+        # packed format allows serialization of non-tensor components, critical for saving in safetensors format
+        qs_packed_dict = {k: v for k, v in qs_dict.items() if isinstance(v, torch.Tensor)}
+        non_tensor_dict = {k: v for k, v in qs_dict.items() if not isinstance(v, torch.Tensor)}
+        key = "quant_state.bitsandbytes__"
+        if self.quant_type is not None:
+            key += self.quant_type
+        qs_packed_dict[key] = pack_dict_to_tensor(non_tensor_dict)
+        return qs_packed_dict
+
+    def to(self, device):
+        # make sure the quantization state is on the right device
+        self.code = self.code.to(device)
+        self.absmax = self.absmax.to(device)
+        if self.nested:
+            self.offset = self.offset.to(device)
+            self.state2.absmax = self.state2.absmax.to(device)
+            self.state2.code = self.state2.code.to(device)
+
+    def __eq__(self, other):
+        if not isinstance(other, QuantState):
+            return False
+
+        return (
+            torch.allclose(self.absmax, other.absmax, atol=1e-6)
+            and self.shape == other.shape
+            and torch.allclose(self.code, other.code, atol=1e-6)
+            and self.dtype == other.dtype
+            and self.blocksize == other.blocksize
+            and self.quant_type == other.quant_type
+            and (
+                self.offset == other.offset
+                if self.offset is not None and other.offset is not None
+                else self.offset is other.offset
+            )
+            and (
+                self.state2 == other.state2
+                if self.state2 is not None and other.state2 is not None
+                else self.state2 is other.state2
+            )
+        )
+
+
+def quantize_blockwise(
+    A: torch.Tensor,
+    code: Optional[torch.Tensor] = None,
+    absmax: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize=4096,
+    nested=False,
+) -> tuple[torch.Tensor, QuantState]:
+    """Quantize a tensor in blocks of values.
+
+    The input tensor is quantized by dividing it into blocks of `blocksize` values.
+    The the absolute maximum value within these blocks is calculated for scaling
+    the non-linear quantization.
+
+    Args:
+        A (`torch.Tensor`): The input tensor. Supports `float16`, `bfloat16`, or `float32` datatypes.
+        code (`torch.Tensor`, *optional*):
+            A mapping describing the low-bit data type. Defaults to a signed 8-bit dynamic type.
+            For more details, see  (8-Bit Approximations for Parallelism in Deep Learning)[https://arxiv.org/abs/1511.04561].
+        absmax (`torch.Tensor`, *optional*): A tensor to use to store the absmax values.
+        out (`torch.Tensor`, *optional*): A tensor to use to store the result.
+        blocksize (`int`, *optional*):
+            The size of the blocks. Defaults to 4096.
+            Valid values are 64, 128, 256, 512, 1024, 2048, and 4096.
+        nested (`bool`, *optional*): Whether to additionally quantize the absmax values. Defaults to False.
+
+    Raises:
+        ValueError: Raised when the input data type is not supported.
+
+    Returns:
+        `Tuple[torch.Tensor, QuantState]`: A tuple containing the quantization results.
+        - `torch.Tensor`: The quantized tensor.
+        - [`QuantState`]: The state object used to undo the quantization.
+    """
+
+    if blocksize <= 0:
+        raise ValueError(f"blocksize must be positive, got {blocksize}")
+    if A.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError(f"Blockwise quantization only supports 16/32-bit floats, but got {A.dtype}")
+
+    if code is None:
+        if "dynamic" not in name2qmap:
+            name2qmap["dynamic"] = create_dynamic_map().to(A.device)
+        code = name2qmap["dynamic"]
+
+    _out, _absmax = torch.ops.bitsandbytes.quantize_blockwise.default(
+        A,
+        code.to(A.device),
+        blocksize,
+    )
+
+    if nested:
+        offset = _absmax.mean()
+        _absmax -= offset
+        qabsmax, state2 = quantize_blockwise(_absmax, blocksize=blocksize, nested=False)
+        quant_state = QuantState(
+            absmax=qabsmax,
+            code=code.to(A.device, copy=True),
+            blocksize=blocksize,
+            dtype=A.dtype,
+            offset=offset,
+            state2=state2,
+        )
+    else:
+        quant_state = QuantState(absmax=_absmax, code=code.to(A.device, copy=True), blocksize=blocksize, dtype=A.dtype)
+
+    # TODO(matthewdouglas): Deprecate out kwarg
+    out = out.copy_(_out) if out is not None else _out
+
+    # TODO(matthewdouglas): Deprecate absmax kwarg
+    if absmax is not None:
+        quant_state.absmax = absmax.copy_(quant_state.absmax)
+
+    return out, quant_state
+
+
+def dequantize_blockwise(
+    A: torch.Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[torch.Tensor] = None,
+    code: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize: int = 4096,
+    nested=False,
+) -> torch.Tensor:
+    """Dequantize a tensor in blocks of values.
+
+    The input tensor is dequantized by dividing it into blocks of `blocksize` values.
+    The the absolute maximum value within these blocks is used for scaling
+    the non-linear dequantization.
+
+    Args:
+        A (`torch.Tensor`): The quantized input tensor.
+        quant_state ([`QuantState`], *optional*):
+            The quantization state as returned by [`quantize_blockwise`].
+            Required if `absmax` is not provided.
+        absmax (`torch.Tensor`, *optional*):
+            A tensor containing the scaling values.
+            Required if `quant_state` is not provided and ignored otherwise.
+        code (`torch.Tensor`, *optional*):
+            A mapping describing the low-bit data type. Defaults to a signed 8-bit dynamic type.
+            For more details, see  (8-Bit Approximations for Parallelism in Deep Learning)[https://arxiv.org/abs/1511.04561].
+            Ignored when `quant_state` is provided.
+        out (`torch.Tensor`, *optional*): A tensor to use to store the result.
+        blocksize (`int`, *optional*):
+            The size of the blocks. Defaults to 4096.
+            Valid values are 64, 128, 256, 512, 1024, 2048, and 4096.
+            Ignored when `quant_state` is provided.
+
+    Raises:
+        ValueError: Raised when the input data type is not supported.
+
+    Returns:
+        `torch.Tensor`:
+            The dequantized tensor. The datatype is indicated by `quant_state.dtype` and defaults to `torch.float32`.
+    """
+
+    if quant_state is None and absmax is None:
+        raise ValueError("dequantize_blockwise requires either quant_state or absmax")
+    if A.dtype != torch.uint8:
+        raise ValueError(f"A must be uint8, got {A.dtype}")
+    if code is None and quant_state is None:
+        if "dynamic" not in name2qmap:
+            name2qmap["dynamic"] = create_dynamic_map().to(A.device)
+        code = name2qmap["dynamic"]
+
+    if quant_state is None:
+        quant_state = QuantState(absmax=absmax, code=code, blocksize=blocksize, dtype=torch.float32)
+
+    if quant_state.blocksize <= 0:
+        raise ValueError(f"blocksize must be positive, got {quant_state.blocksize}")
+
+    absmax = quant_state.absmax
+    if quant_state.nested:
+        absmax = dequantize_blockwise(quant_state.absmax, quant_state.state2)
+        absmax += quant_state.offset
+        if absmax.dtype != torch.float32:
+            absmax = absmax.float()
+
+    if out is not None:
+        torch.ops.bitsandbytes.dequantize_blockwise.out(
+            A,
+            absmax,
+            quant_state.code.to(A.device),
+            quant_state.blocksize,
+            quant_state.dtype,
+            out=out,
+        )
+        return out
+
+    return torch.ops.bitsandbytes.dequantize_blockwise.default(
+        A,
+        absmax,
+        quant_state.code.to(A.device),
+        quant_state.blocksize,
+        quant_state.dtype,
+    )
+
+
+def get_4bit_type(typename, device=None, blocksize=64):
+    if device is None:
+        device = "cuda"
+    data = None
+    if typename == "nf4":
+        # NF4 (NormalFloat4) quantization type.
+        #
+        # These 16 values are a lookup table derived from quantiles of the standard normal
+        # distribution N(0, 1), where each bin has equal probability mass. The 4-bit index
+        # is just a position in this table — NF4 is NOT a floating-point encoding (no
+        # sign/exponent/mantissa decomposition). This is fundamentally different from FP4.
+        #
+        # Generated by: create_normal_map(offset=0.9677083, use_extra_value=True)
+        # Values are hardcoded to avoid a scipy dependency at runtime.
+        #
+        # For details see: QLoRA (https://arxiv.org/abs/2305.14314)
+        data = [
+            -1.0,
+            -0.6961928009986877,
+            -0.5250730514526367,
+            -0.39491748809814453,
+            -0.28444138169288635,
+            -0.18477343022823334,
+            -0.09105003625154495,
+            0.0,
+            0.07958029955625534,
+            0.16093020141124725,
+            0.24611230194568634,
+            0.33791524171829224,
+            0.44070982933044434,
+            0.5626170039176941,
+            0.7229568362236023,
+            1.0,
+        ]
+    elif typename == "fp4":
+        # FP4 (4-bit floating point) quantization type.
+        #
+        # Unlike NF4, FP4 is an actual floating-point encoding with 1 sign bit, 2 exponent
+        # bits, and 1 mantissa bit. Values below are listed in bit-pattern order (not value
+        # order), where only the 3 non-sign bits are shown:
+        #
+        #   0b000 = 0       (subnormal: zero)
+        #   0b001 = 0.0625  (subnormal: 0.5 * 2^-2)
+        #   0b010 = 8       0b011 = 12      0b100 = 4
+        #   0b101 = 6       0b110 = 2       0b111 = 3
+        #
+        # The exponent bias is 2^(e-1) = 2, which differs from IEEE 754's convention.
+        # These can be regenerated with:
+        #   create_fp8_map(signed=True, exponent_bits=2, precision_bits=1, total_bits=4)
+        #
+        # All values are normalized to [-1, 1] after construction (see end of function).
+        data = [0, 0.0625, 8.0, 12.0, 4.0, 6.0, 2.0, 3.0, -0, -0.0625, -8.0, -12.0, -4.0, -6.0, -2.0, -3.0]
+    elif typename == "int4":
+        data = [7, 6, 5, 4, 3, 2, 1, 0, -0, -1, -2, -3, -4, -5, -6, -7]
+    elif typename == "af4":
+        # Taken from: NF4 Isn't Information Theoretically Optimal (and that's Good)
+        # https://arxiv.org/abs/2306.06965
+        if blocksize == 64:
+            data = [
+                -1.0,
+                -0.69441008,
+                -0.51243739,
+                -0.3736951,
+                -0.25607552,
+                -0.14982478,
+                -0.04934812,
+                0.0,
+                0.04273164,
+                0.12934483,
+                0.21961274,
+                0.31675666,
+                0.42563882,
+                0.55496234,
+                0.72424863,
+                1.0,
+            ][::-1]
+        else:
+            raise NotImplementedError("4-bit AbnormalFloats currently only support blocksize 64.")
+
+    if data is None:
+        raise NotImplementedError(f"Typename {typename} not supported")
+
+    data = torch.tensor(data, device=device)
+    data.div_(data.abs().max())
+
+    assert data.numel() == 16
+
+    return data
+
+
+def quantize_fp4(
+    A: torch.Tensor,
+    absmax: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize=None,
+    compress_statistics=False,
+    quant_storage=torch.uint8,
+):
+    return quantize_4bit(A, absmax, out, blocksize, compress_statistics, "fp4", quant_storage)
+
+
+def quantize_nf4(
+    A: torch.Tensor,
+    absmax: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize=None,
+    compress_statistics=False,
+    quant_storage=torch.uint8,
+):
+    return quantize_4bit(A, absmax, out, blocksize, compress_statistics, "nf4", quant_storage)
+
+
+def quantize_4bit(
+    A: torch.Tensor,
+    absmax: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize=None,
+    compress_statistics=False,
+    quant_type="fp4",
+    quant_storage=torch.uint8,
+) -> tuple[torch.Tensor, QuantState]:
+    """Quantize tensor A in blocks of 4-bit values.
+
+    Quantizes tensor A by dividing it into blocks which are independently quantized.
+
+    Args:
+        A (`torch.Tensor`): The input tensor. Supports `float16`, `bfloat16`, or `float32` datatypes.
+        absmax (`torch.Tensor`, *optional*): A tensor to use to store the absmax values.
+        out (`torch.Tensor`, *optional*): A tensor to use to store the result.
+        blocksize (`int`, *optional*):
+            The size of the blocks. Defaults to 64.
+            Valid values are 32, 64, 128, 256, 512, 1024, 2048, and 4096.
+        compress_statistics (`bool`, *optional*): Whether to additionally quantize the absmax values. Defaults to False.
+        quant_type (`str`, *optional*): The data type to use: `nf4` or `fp4`. Defaults to `fp4`.
+        quant_storage (`torch.dtype`, *optional*): The dtype of the tensor used to store the result. Defaults to `torch.uint8`.
+
+    Raises:
+        ValueError: Raised when the input data type is not supported.
+
+    Returns:
+        Tuple[`torch.Tensor`, `QuantState`]: A tuple containing the quantization results.
+        - `torch.Tensor`: The quantized tensor with packed 4-bit values.
+        - [`QuantState`]: The state object used to undo the quantization.
+    """
+
+    if blocksize is None:
+        blocksize = 64
+
+    if blocksize not in (32, 64, 128, 256, 512, 1024, 2048, 4096):
+        raise ValueError(f"invalid blocksize {blocksize}")
+    if quant_type not in ("nf4", "fp4"):
+        raise ValueError(f"quant_type must be 'nf4' or 'fp4', got {quant_type!r}")
+    if A.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(f"Blockwise 4bit quantization only supports 16/32-bit floats, but got {A.dtype}")
+
+    input_shape = A.shape
+
+    _out, _absmax = torch.ops.bitsandbytes.quantize_4bit.default(
+        A,
+        blocksize,
+        quant_type,
+        quant_storage,
+    )
+
+    code = get_4bit_type(quant_type, device=A.device)
+
+    if compress_statistics:
+        offset = _absmax.mean()
+        qabsmax, state2 = quantize_blockwise(_absmax - offset, blocksize=256)
+        del _absmax
+        state = QuantState(
+            absmax=qabsmax,
+            shape=input_shape,
+            dtype=A.dtype,
+            blocksize=blocksize,
+            code=code,
+            quant_type=quant_type,
+            offset=offset,
+            state2=state2,
+        )
+    else:
+        state = QuantState(
+            absmax=_absmax,
+            shape=input_shape,
+            dtype=A.dtype,
+            blocksize=blocksize,
+            code=code,
+            quant_type=quant_type,
+        )
+
+    # TODO(matthewdouglas): Deprecate out kwarg
+    out = out.copy_(_out) if out is not None else _out
+
+    # TODO(matthewdouglas): Deprecate absmax kwarg
+    if absmax is not None:
+        state.absmax = absmax.copy_(state.absmax)
+
+    return out, state
+
+
+def dequantize_fp4(
+    A: torch.Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize: Optional[int] = None,
+) -> torch.Tensor:
+    return dequantize_4bit(A, quant_state, absmax, out, blocksize, "fp4")
+
+
+def dequantize_nf4(
+    A: torch.Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize: Optional[int] = None,
+) -> torch.Tensor:
+    return dequantize_4bit(A, quant_state, absmax, out, blocksize, "nf4")
+
+
+def dequantize_4bit(
+    A: torch.Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize: Optional[int] = None,
+    quant_type="fp4",
+) -> torch.Tensor:
+    """Dequantizes a packed 4-bit quantized tensor.
+
+    The input tensor is dequantized by dividing it into blocks of `blocksize` values.
+    The absolute maximum value within these blocks is used for scaling
+    the non-linear dequantization.
+
+    Args:
+        A (`torch.Tensor`): The quantized input tensor.
+        quant_state ([`QuantState`], *optional*):
+            The quantization state as returned by [`quantize_4bit`].
+            Required if `absmax` is not provided.
+        absmax (`torch.Tensor`, *optional*):
+            A tensor containing the scaling values.
+            Required if `quant_state` is not provided and ignored otherwise.
+        out (`torch.Tensor`, *optional*): A tensor to use to store the result.
+        blocksize (`int`, *optional*):
+            The size of the blocks. Defaults to 64.
+            Valid values are 32, 64, 128, 256, 512, 1024, 2048, and 4096.
+        quant_type (`str`, *optional*): The data type to use: `nf4` or `fp4`. Defaults to `fp4`.
+
+    Raises:
+        ValueError: Raised when the input data type or blocksize is not supported.
+
+    Returns:
+        `torch.Tensor`: The dequantized tensor.
+    """
+
+    if blocksize is None:
+        blocksize = 64
+
+    if quant_state is None:
+        if absmax is None or out is None:
+            raise ValueError("dequantize_4bit requires both absmax and out when quant_state is not provided")
+
+        quant_state = QuantState(
+            absmax=absmax,
+            shape=out.shape,
+            dtype=out.dtype,
+            blocksize=blocksize,
+            quant_type=quant_type,
+        )
+
+    else:
+        absmax = quant_state.absmax
+
+    if quant_state.blocksize not in (32, 64, 128, 256, 512, 1024, 2048, 4096):
+        raise ValueError(f"invalid blocksize {quant_state.blocksize}")
+    if quant_state.quant_type not in ("nf4", "fp4"):
+        raise ValueError(f"quant_type must be 'nf4' or 'fp4', got {quant_state.quant_type!r}")
+    if quant_state.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(f"Blockwise 4bit dequantization only supports 16/32-bit floats, but got {quant_state.dtype}")
+
+    if quant_state.nested:
+        absmax = dequantize_blockwise(quant_state.absmax, quant_state.state2)
+        absmax += quant_state.offset
+        if absmax.dtype != torch.float32:
+            absmax = absmax.float()
+
+    if out is not None:
+        torch.ops.bitsandbytes.dequantize_4bit.out(
+            A, absmax, quant_state.blocksize, quant_state.quant_type, quant_state.shape, quant_state.dtype, out=out
+        )
+    else:
+        out = torch.ops.bitsandbytes.dequantize_4bit.default(
+            A,
+            absmax,
+            quant_state.blocksize,
+            quant_state.quant_type,
+            quant_state.shape,
+            quant_state.dtype,
+        )
+
+    # BC shim: callers that pass the packed weight in transposed [1, (N*K+1)//2] form
+    # receive the output transposed back to [K, N]. bnb's own paths no longer trigger
+    # this since B is normalized to [(N*K+1)//2, 1] at the matmul_4bit entry point.
+    if A.shape[0] == 1:
+        return out.t()
+    return out
+
+
+def optimizer_update_32bit(
+    optimizer_name: str,
+    g: Tensor,
+    p: Tensor,
+    state1: Tensor,
+    beta1: float,
+    eps: float,
+    step: int,
+    lr: float,
+    state2: Optional[torch.Tensor] = None,
+    beta2: float = 0.0,
+    beta3: float = 0.0,
+    alpha: float = 0.0,
+    weight_decay: float = 0.0,
+    gnorm_scale: float = 1.0,
+    unorm_vec: Optional[torch.Tensor] = None,
+    max_unorm: float = 0.0,
+    skip_zeros=False,
+) -> None:
+    """
+    Performs an inplace optimizer update with one or two optimizer states.
+
+    Universal optimizer update for 32-bit state and 32/16-bit gradients/weights.
+
+    Parameters
+    ----------
+    optimizer_name : str
+        The name of the optimizer: {adam}.
+    g : torch.Tensor
+        Gradient tensor.
+    p : torch.Tensor
+        Parameter tensor.
+    state1 : torch.Tensor
+        Optimizer state 1.
+    beta1 : float
+        Optimizer beta1.
+    eps : float
+        Optimizer epsilon.
+    weight_decay : float
+        Weight decay.
+    step : int
+        Current optimizer step.
+    lr : float
+        The learning rate.
+    state2 : torch.Tensor
+        Optimizer state 2.
+    beta2 : float
+        Optimizer beta2.
+    beta3 : float
+        Optimizer beta3.
+    alpha : float
+        Optimizer alpha.
+    gnorm_scale : float
+        The factor to rescale the gradient to the max clip value.
+    unorm_vec : torch.Tensor
+        The tensor for the update norm.
+    max_unorm : float
+        The maximum update norm relative to the weight norm.
+    skip_zeros : bool
+        Whether to skip zero-valued gradients or not (default: False).
+    """
+
+    param_norm = 0.0
+    if max_unorm > 0.0:
+        param_norm = torch.norm(p.data.float())
+
+    is_on_gpu([g, p, state1, state2, unorm_vec])
+    torch.ops.bitsandbytes.optimizer_update_32bit(
+        optimizer_name,
+        g,
+        p,
+        state1,
+        state2,
+        unorm_vec,
+        max_unorm,
+        param_norm,
+        beta1,
+        beta2,
+        beta3,
+        alpha,
+        eps,
+        weight_decay,
+        step,
+        lr,
+        gnorm_scale,
+        skip_zeros,
+    )
+
+
+def optimizer_update_8bit_blockwise(
+    optimizer_name: str,
+    g: Tensor,
+    p: Tensor,
+    state1: Tensor,
+    state2: Optional[torch.Tensor],
+    beta1: float,
+    beta2: float,
+    beta3: float,
+    alpha: float,
+    eps: float,
+    step: int,
+    lr: float,
+    qmap1: Tensor,
+    qmap2: Optional[torch.Tensor],
+    absmax1: Tensor,
+    absmax2: Optional[torch.Tensor],
+    weight_decay: float = 0.0,
+    gnorm_scale: float = 1.0,
+    skip_zeros=False,
+) -> None:
+    is_on_gpu([p, g, state1, state2, qmap1, qmap2, absmax1, absmax2])
+
+    torch.ops.bitsandbytes.optimizer_update_8bit_blockwise(
+        optimizer_name,
+        g,
+        p,
+        state1,
+        state2,
+        beta1,
+        beta2,
+        beta3,
+        alpha,
+        eps,
+        step,
+        lr,
+        qmap1,
+        qmap2,
+        absmax1,
+        absmax2,
+        weight_decay,
+        gnorm_scale,
+        skip_zeros,
+    )
+
+
+@deprecated("This function is deprecated and will be removed in a future release.", category=FutureWarning)
+def check_matmul(A, B, out, transposed_A, transposed_B, expected_type=torch.int8):
+    if not torch.cuda.is_initialized():
+        torch.cuda.init()
+    if A.dtype != expected_type or B.dtype != expected_type:
+        raise TypeError(f"Expected torch.int8 input tensors A and B, but got {A.dtype} and {B.dtype}")
+
+    sA = A.shape
+    sB = B.shape
+    tA = transposed_A
+    tB = transposed_B
+
+    correct = True
+
+    if len(sA) == 2 and len(sB) == 2:
+        if not tA and not tB and A.shape[1] != B.shape[0]:
+            correct = False
+        elif tA and not tB and A.shape[0] != B.shape[0]:
+            correct = False
+        elif tA and tB and A.shape[0] != B.shape[1]:
+            correct = False
+        elif not tA and tB and A.shape[1] != B.shape[1]:
+            correct = False
+    elif len(sA) == 3 and len(sB) == 2:
+        if not tA and not tB and A.shape[2] != B.shape[0]:
+            correct = False
+        elif tA and not tB and A.shape[1] != B.shape[0]:
+            correct = False
+        elif tA and tB and A.shape[1] != B.shape[1]:
+            correct = False
+        elif not tA and tB and A.shape[2] != B.shape[1]:
+            correct = False
+    elif len(sA) == 3 and len(sB) == 3:
+        if not tA and not tB and A.shape[2] != B.shape[1]:
+            correct = False
+        elif tA and not tB and A.shape[1] != B.shape[1]:
+            correct = False
+        elif tA and tB and A.shape[1] != B.shape[2]:
+            correct = False
+        elif not tA and tB and A.shape[2] != B.shape[2]:
+            correct = False
+
+    if out is not None:
+        sout = out.shape
+        # special case common in backprop
+        if not correct and len(sA) == 3 and len(sB) == 3:
+            if sout[0] == sA[2] and sout[1] == sB[2] and sA[0] == sB[0] and sA[1] == sB[1]:
+                correct = True
+    else:
+        if len(sA) == 2 and len(sB) == 2:
+            if not tA and not tB:
+                sout = (sA[0], sB[1])
+            elif tA and tB:
+                sout = (sA[1], sB[0])
+            elif tA and not tB:
+                sout = (sA[1], sB[1])
+            elif not tA and tB:
+                sout = (sA[0], sB[0])
+        elif len(sA) == 3 and len(sB) == 2:
+            if not tA and not tB:
+                sout = (sA[0], sA[1], sB[1])
+            elif tA and tB:
+                sout = (sA[0], sA[2], sB[0])
+            elif tA and not tB:
+                sout = (sA[0], sA[2], sB[1])
+            elif not tA and tB:
+                sout = (sA[0], sA[1], sB[0])
+        elif len(sA) == 3 and len(sB) == 3:
+            if not tA and not tB:
+                sout = (sA[0], sA[1], sB[2])
+            elif tA and tB:
+                sout = (sA[0], sA[2], sB[1])
+            elif tA and not tB:
+                sout = (sA[0], sA[2], sB[2])
+            elif not tA and tB:
+                sout = (sA[0], sA[1], sB[1])
+
+    if not correct:
+        raise ValueError(
+            f"Tensor dimensions incorrect for matrix mulitiplication: A x B: {sA} x {sB} with transpose for A x B: {tA} x {tB}.",
+        )
+
+    return sout
+
+
+def gemv_4bit(
+    A: Tensor,
+    B: Tensor,
+    out: Optional[torch.Tensor] = None,
+    transposed_A=False,
+    transposed_B=False,
+    state=None,
+):
+    if state is None:
+        raise ValueError("state cannot be None. gemv_4bit() requires the state from quantize_4bit()")
+
+    absmax = state.absmax
+    if state.nested:
+        absmax = dequantize_blockwise(absmax, state.state2) + state.offset
+
+    if out is not None:
+        torch.ops.bitsandbytes.gemv_4bit.out(
+            A,
+            B,
+            state.shape,
+            absmax,
+            state.code,
+            state.blocksize,
+            out=out,
+        )
+        return out
+
+    return torch.ops.bitsandbytes.gemv_4bit.default(
+        A,
+        B,
+        state.shape,
+        absmax,
+        state.code,
+        state.blocksize,
+    )
+
+
+@deprecated("This function is deprecated and will be removed in a future release.", category=FutureWarning)
+def igemm(
+    A: Tensor,
+    B: Tensor,
+    out: Optional[torch.Tensor] = None,
+    transposed_A=False,
+    transposed_B=False,
+):
+    sout = check_matmul(A, B, out, transposed_A, transposed_B)
+    if out is None:
+        out = torch.zeros(size=sout, dtype=torch.int32, device=A.device)
+    if len(A.shape) == 3 and len(B.shape) == 3:
+        if A.shape[0] == B.shape[0] and A.shape[2] == B.shape[1]:
+            return batched_igemm(A, B, out)
+
+    sA = A.shape
+    sB = B.shape
+    if transposed_A and len(sA) == 2:
+        sA = (sA[1], sA[0])
+    elif transposed_A and len(sA) == 3:
+        sA = (sA[0], sA[2], sA[0])
+    if transposed_B and len(sB) == 2:
+        sB = (sB[1], sB[0])
+    elif transposed_B and len(sB) == 3:
+        sB = (sB[0], sB[2], sB[0])
+    # this is a mess: cuBLAS expect column major, but PyTorch is row major.
+    # So to perform the matrix multiplication, we have to treat A, B, and C matrices
+    # (transpose of row major is column major)
+    # This means we compute B^T A^T = C^T and we explicitly switch the dimensions of each of these
+
+    # matrices in the input arguments for cuBLAS
+    # column major: A @ B = C: [m, k] @ [k, n] = [m, n]
+    # row major: B^T @ A^T = C^T: [m, k] @ [k, n] = [m, n]
+    # column major with row major layout: B^T @ A^T = C^T: [k, m] @ [n, k] = [n, m]
+    if len(sB) == 2:
+        if B.stride()[0] == B.shape[1]:
+            transposed_B = False
+        elif B.stride()[1] == B.shape[0]:
+            transposed_B = True
+        if len(A.shape) == 2:
+            if A.stride()[0] == A.shape[1]:
+                transposed_A = False
+            elif A.stride()[1] == A.shape[0]:
+                transposed_A = True
+        else:
+            if A.stride()[1] == A.shape[2]:
+                transposed_A = False
+            elif A.stride()[2] == A.shape[1]:
+                transposed_A = True
+
+        if len(sA) == 2:
+            n = sA[0]
+            ldb = A.stride()[1 if transposed_A else 0]
+        elif len(sA) == 3 and len(sB) == 2:
+            n = sA[0] * sA[1]
+            ldb = sA[2]
+
+        m = sB[1]
+        k = sB[0]
+        lda = B.stride()[(1 if transposed_B else 0)]
+        ldc = sB[1]
+    elif len(sB) == 3:
+        # special case
+        assert len(sA) == 3
+        if not (sA[0] == sB[0] and sA[1] == sB[1]):
+            raise ValueError(
+                f"Only bsi,bso->io supported for tensor contractions, but dims for A x B were: {sA} x {sB}",
+            )
+
+        transposed_A = True
+        transposed_B = False
+
+        m = sB[2]
+        n = sA[2]
+        k = sB[0] * sB[1]
+
+        lda = m
+        ldb = sA[2]
+        ldc = m
+
+    ptr = CUBLAS_Context.get_instance().get_context(A.device)
+
+    # B^T @ A^T = C^T
+    # [km, nk -> mn]
+    is_on_gpu([B, A, out])
+    lib.cigemm(
+        ptr,
+        ct.c_bool(transposed_B),
+        ct.c_bool(transposed_A),
+        ct.c_int32(m),
+        ct.c_int32(n),
+        ct.c_int32(k),
+        get_ptr(B),
+        get_ptr(A),
+        get_ptr(out),
+        ct.c_int32(lda),
+        ct.c_int32(ldb),
+        ct.c_int32(ldc),
+    )
+    return out
+
+
+@deprecated("This function is deprecated and will be removed in a future release.", category=FutureWarning)
+def batched_igemm(
+    A: Tensor,
+    B: Tensor,
+    out: Optional[torch.Tensor] = None,
+    transposed_A=False,
+    transposed_B=False,
+):
+    if not len(A.shape) == 3 or not len(B.shape) == 3:
+        raise ValueError(f"Expected 3-dimensional tensors for bmm, but got shapes A and B: {A.shape} and {B.shape}")
+    sout = check_matmul(A, B, out, transposed_A, transposed_B)
+    if out is None:
+        out = torch.zeros(size=sout, dtype=torch.int32, device=A.device)
+
+    if B.is_contiguous():
+        lda = B.stride()[1]
+        transposed_A = False
+    else:
+        s = B.stride()
+        if s[0] != B.shape[0]:
+            B = B.contiguous()
+            lda = B.stride()[1]
+        elif s[2] == B.shape[1]:
+            transposed_A = True
+            lda = B.stride()[2]
+        else:
+            if s[2] == 1:
+                B = B.contiguous()
+                lda = B.stride()[1]
+            elif s[1] == 1:
+                B = B.contiguous()
+                lda = B.stride()[1]
+            else:
+                B = B.contiguous()
+                lda = B.stride()[1]
+
+    if A.is_contiguous():
+        ldb = A.stride()[1]
+        transposed_B = False
+    else:
+        s = A.stride()
+        if s[0] != A.shape[0]:
+            A = A.contiguous()
+            ldb = A.stride()[1]
+            transposed_B = False
+        elif s[2] == A.shape[1]:
+            ldb = A.stride()[2]
+            transposed_B = True
+        else:
+            A = A.contiguous()
+            ldb = A.stride()[1]
+            transposed_B = False
+
+    # this is a mess: cuBLAS expect column major, but PyTorch is row major.
+    # So to perform the matrix multiplication, we have to treat A, B, and C matrices
+    # (transpose of row major is column major)
+    # This means we compute B^T A^T = C^T and we explicitly switch the dimensions of each of these
+    # matrices in the input arguments for cuBLAS
+
+    # column major: A @ B = C: [batch, m, k] @ [batch, k, n] = [batch, m, n]
+    # row major: B^T @ A^T = C^T: [batch, m, k] @ [batch, k, n] = [batch, m, n]
+    # column major with row major layout: B^T @ A^T = C^T: [batch, k, m] @ [batch, n, k] = [batch, n, m]
+    num_batch = A.shape[0]
+    n = A.shape[1]
+    m = B.shape[2]
+    k = B.shape[1]
+
+    ldc = m
+
+    strideA = B.shape[1] * B.shape[2]
+    strideB = A.shape[1] * A.shape[2]
+    strideC = A.shape[1] * B.shape[2]
+
+    ptr = CUBLAS_Context.get_instance().get_context(A.device)
+
+    is_on_gpu([B, A, out])
+    lib.cbatched_igemm(
+        ptr,
+        ct.c_bool(transposed_B),
+        ct.c_bool(transposed_A),
+        ct.c_int32(m),
+        ct.c_int32(n),
+        ct.c_int32(k),
+        get_ptr(B),
+        get_ptr(A),
+        get_ptr(out),
+        ct.c_int32(lda),
+        ct.c_int32(ldb),
+        ct.c_int32(ldc),
+        ct.c_long(strideA),
+        ct.c_long(strideB),
+        ct.c_long(strideC),
+        ct.c_uint32(num_batch),
+    )
+    return out
+
+
+def int8_linear_matmul(A: torch.Tensor, B: torch.Tensor, out: Optional[torch.Tensor] = None, dtype=torch.int32):
+    """Performs an 8-bit integer matrix multiplication.
+
+    A linear transformation is applied such that `out = A @ B.T`. When possible, integer tensor core hardware is
+    utilized to accelerate the operation.
+
+    Args:
+        A (`torch.Tensor`): The first matrix operand with the data type `torch.int8`.
+        B (`torch.Tensor`): The second matrix operand with the data type `torch.int8`.
+        out (`torch.Tensor`, *optional*): A pre-allocated tensor used to store the result.
+        dtype (`torch.dtype`, *optional*): The expected data type of the output. Defaults to `torch.int32`.
+
+    Raises:
+        `NotImplementedError`: The operation is not supported in the current environment.
+        `RuntimeError`: Raised when the cannot be completed for any other reason.
+
+    Returns:
+        `torch.Tensor`: The result of the operation.
+    """
+    if out is not None:
+        torch.ops.bitsandbytes.int8_linear_matmul.out(A, B, out)
+        return out
+
+    return torch.ops.bitsandbytes.int8_linear_matmul.default(A, B)
+
+
+def int8_mm_dequant(
+    A: torch.Tensor,
+    row_stats: torch.Tensor,
+    col_stats: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+):
+    """Performs dequantization on the result of a quantized int8 matrix multiplication.
+
+    Args:
+        A (`torch.Tensor` with dtype `torch.int32`): The result of a quantized int8 matrix multiplication.
+        row_stats (`torch.Tensor`): The row-wise quantization statistics for the lhs operand of the matrix multiplication.
+        col_stats (`torch.Tensor`): The column-wise quantization statistics for the rhs operand of the matrix multiplication.
+        out (`torch.Tensor`, *optional*): A pre-allocated tensor to store the output of the operation.
+        bias (`torch.Tensor`, *optional*): An optional bias vector to add to the result.
+
+    Returns:
+        `torch.Tensor`: The dequantized result with an optional bias, with dtype `torch.float16`.
+    """
+    result = torch.ops.bitsandbytes.int8_mm_dequant.default(A, row_stats, col_stats, dtype=torch.float16, bias=bias)
+
+    # TODO(matthewdouglas): Deprecate out kwarg
+    if out is not None:
+        return out.copy_(result)
+
+    return result
+
+
+def int8_double_quant(
+    A: torch.Tensor,
+    col_stats: Optional[torch.Tensor] = None,
+    row_stats: Optional[torch.Tensor] = None,
+    out_col: Optional[torch.Tensor] = None,
+    out_row: Optional[torch.Tensor] = None,
+    threshold=0.0,
+):
+    """Determine the quantization statistics for input matrix `A` in accordance to the `LLM.int8()` algorithm.
+
+    The statistics are determined both row-wise and column-wise (transposed).
+
+    For more information, see the [LLM.int8() paper](https://arxiv.org/abs/2208.07339).
+
+    <Tip>
+    This function is useful for training, but for inference it is advised to use [`int8_vectorwise_quant`] instead.
+    This implementation performs additional column-wise transposed calculations which are not optimized.
+    </Tip>
+
+    Args:
+        A (`torch.Tensor` with dtype `torch.float16`): The input matrix.
+        col_stats (`torch.Tensor`, *optional*): A pre-allocated tensor to hold the column-wise quantization scales.
+        row_stats (`torch.Tensor`, *optional*): A pre-allocated tensor to hold the row-wise quantization scales.
+        out_col (`torch.Tensor`, *optional*): A pre-allocated tensor to hold the column-wise quantized data.
+        out_row (`torch.Tensor`, *optional*): A pre-allocated tensor to hold the row-wise quantized data.
+        threshold (`float`, *optional*):
+            An optional threshold for sparse decomposition of outlier features.
+
+            No outliers are held back when 0.0. Defaults to 0.0.
+
+    Returns:
+        `Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]`: A tuple containing the quantized tensor and relevant statistics.
+        - `torch.Tensor` with dtype `torch.int8`: The row-wise quantized data.
+        - `torch.Tensor` with dtype `torch.int8`: The column-wise quantized data.
+        - `torch.Tensor` with dtype `torch.float32`: The row-wise quantization scales.
+        - `torch.Tensor` with dtype `torch.float32`: The column-wise quantization scales.
+        - `torch.Tensor` with dtype `torch.int32`, *optional*: A list of column indices which contain outlier features.
+    """
+
+    if row_stats is not None:
+        raise ValueError("row_stats must be None. int8_double_quant() does not support pre-allocated row_stats.")
+    if col_stats is not None:
+        raise ValueError("col_stats must be None. int8_double_quant() does not support pre-allocated col_stats.")
+    if out_col is not None:
+        raise ValueError("out_col must be None. int8_double_quant() does not support pre-allocated out_col.")
+    if out_row is not None:
+        raise ValueError("out_row must be None. int8_double_quant() does not support pre-allocated out_row.")
+
+    return torch.ops.bitsandbytes.int8_double_quant.default(A, threshold=threshold)
+
+
+def int8_vectorwise_dequant(A: torch.Tensor, stats: torch.Tensor):
+    """Dequantizes a tensor with dtype `torch.int8` to `torch.float32`.
+
+    Args:
+        A (`torch.Tensor` with dtype `torch.int8`): The quantized int8 tensor.
+        stats (`torch.Tensor` with dtype `torch.float32`): The row-wise quantization statistics.
+
+    Returns:
+        `torch.Tensor` with dtype `torch.float32`: The dequantized tensor.
+    """
+    # To dequantize we divide by 127, or multiply by the reciprocal.
+    return torch.ops.bitsandbytes.int8_vectorwise_dequant.default(A, stats)
+
+
+def int8_vectorwise_quant(A: torch.Tensor, threshold=0.0):
+    """Quantizes a tensor with dtype `torch.float16` to `torch.int8` in accordance to the `LLM.int8()` algorithm.
+
+    For more information, see the [LLM.int8() paper](https://arxiv.org/abs/2208.07339).
+
+    Args:
+        A (`torch.Tensor` with dtype `torch.float16`): The input tensor.
+        threshold (`float`, *optional*):
+            An optional threshold for sparse decomposition of outlier features.
+
+            No outliers are held back when 0.0. Defaults to 0.0.
+
+    Returns:
+        `Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]`: A tuple containing the quantized tensor and relevant statistics.
+        - `torch.Tensor` with dtype `torch.int8`: The quantized data.
+        - `torch.Tensor` with dtype `torch.float32`: The quantization scales.
+        - `torch.Tensor` with dtype `torch.int32`, *optional*: A list of column indices which contain outlier features.
+    """
+    return torch.ops.bitsandbytes.int8_vectorwise_quant.default(A, threshold)
+
+
+def _convert_weight_packed_for_cpu(qweight: torch.Tensor, quant_state: QuantState, block_n: int = 32):
+    """
+    qweight: (K * N / 2)  uint8
+    return: packed_weight
+    """
+    if qweight.dtype != torch.uint8:
+        quant_state.original_storage_type = qweight.dtype
+        qweight = qweight.view(torch.uint8)
+    quant_state.original_dtype = quant_state.dtype
+    quant_state.original_nested = quant_state.nested
+    quant_state.original_qshape = qweight.shape
+
+    qweight = qweight.reshape(-1)
+    unpacked_w = torch.empty(qweight.shape[0] * 2, dtype=torch.int32, device=qweight.device)
+    unpacked_w[1::2] = qweight & 0xF
+    unpacked_w[::2] = qweight >> 4
+    qweight_final = unpacked_w.reshape(quant_state.shape).to(torch.uint8)  # (*, N, K)
+    # pack weight: [*, N, K] -> [*, N, K/2] combine low and high bit
+    assert len(qweight_final.shape) == 2
+    N, K = qweight_final.shape[0], qweight_final.shape[1]
+    assert N % block_n == 0, "N must be divisible by block_n"
+    assert K % 2 == 0, "K must be even"
+    BLOCK_N = block_n
+    BIT_COUNT = 32  # (=32 low +32 high)
+    new_shape = [N // BLOCK_N, BLOCK_N, K // 2, 2]
+    out_shape = [N, K // 2]
+    qw = qweight_final.reshape(new_shape)  # (..., N/B, B, K/2, 2)
+    qw = qw.transpose(-3, -2).contiguous()  # (..., N/B, K/2, B, 2)
+    qw = qw.reshape(-1, BIT_COUNT * 2)  # [-1, 64]
+    high = qw[:, BIT_COUNT:]  # high 32
+    low = qw[:, :BIT_COUNT]  # low 32
+    packed = ((high << 4) | low).to(torch.uint8)  # combine
+    final_qweight = packed.reshape(out_shape)
+    if quant_state.nested:
+        absmax = dequantize_blockwise(quant_state.absmax, quant_state.state2)
+        absmax += quant_state.offset
+        if absmax.dtype != torch.float32:
+            absmax = absmax.float()
+
+        quant_state.absmax = absmax
+        quant_state.nested = False
+        delattr(quant_state, "state2")
+
+    quant_state.absmax = (
+        quant_state.absmax.reshape(quant_state.shape[0], quant_state.shape[1] // quant_state.blocksize)
+        .T.to(torch.bfloat16)
+        .contiguous()
+    )
+
+    quant_state.dtype = torch.bfloat16
+    quant_state.packing_format_for_cpu = True
+    return final_qweight, quant_state
+
+
+def _convert_weight_packed_for_cpu_inverse(
+    packed_weight: torch.Tensor,
+    quant_state: QuantState,
+    block_n: int = 32,
+) -> tuple[torch.Tensor, QuantState]:
+    """
+    packed_weight: [N, K/2] uint8, output of `_convert_weight_packed_for_cpu` (final_qweight)
+    quant_state:   QuantState that was modified by `_convert_weight_packed_for_cpu`
+    Returns:
+        qweight: [*, N, K] uint8, original qweight shape (quant_state.shape)
+        recovered_state: QuantState with partially restored fields (best-effort inverse)
+    """
+    assert quant_state.packing_format_for_cpu, "only for packing format"
+    assert packed_weight.dtype == torch.uint8
+    assert len(packed_weight.shape) == 2, "packed_weight should be [N, K/2]"
+    N, K_half = packed_weight.shape
+    K = K_half * 2
+
+    # 1) packed [N, K/2] -> [N//BLOCK_N, BLOCK_N, K/2, 2]
+    BLOCK_N = block_n
+    BIT_COUNT = 32  # (=32 low + 32 high)
+
+    assert N % BLOCK_N == 0, "N must be divisible by block_n"
+    assert K % 2 == 0, "K must be even"
+
+    # [N, K/2] -> [-1, 64] (32 low + 32 high)
+    packed = packed_weight.reshape(-1, BIT_COUNT)  # [-1, 64]
+    # split high/low nibbles
+    high = (packed >> 4) & 0xF
+    low = packed & 0xF
+    # concatenate to [..., 64], first 32 are low, last 32 are high
+    qw = torch.cat([low, high], dim=-1).to(torch.uint8)  # [..., 64]
+
+    # -> [N/BLOCK_N, K/2, BLOCK_N, 2] -> [N, K]
+    qw = qw.reshape(N // BLOCK_N, K_half, BLOCK_N, 2)  # [N/B, K/2, B, 2]
+    qw = qw.transpose(-3, -2).contiguous()  # [N/B, B, K/2, 2]
+    qw = qw.reshape(N, K)  # [N, K]
+
+    qweight = qw  # [N, K]
+
+    unpacked_w = qweight.reshape(-1).to(torch.int32)  # [K*N]
+    high4 = (unpacked_w[::2] & 0xF).to(torch.uint8)
+    low4 = (unpacked_w[1::2] & 0xF).to(torch.uint8)
+    qweight = (high4 << 4) | low4  # [K*N/2]
+
+    # 2) Best-effort restore of quant_state fields (absmax / dtype / nested flags, etc.)
+    recovered_state = quant_state
+    qweight = qweight.to(torch.uint8).reshape(recovered_state.original_qshape)
+
+    # quantize absmax
+    if recovered_state.original_nested:
+        absmax = recovered_state.absmax.T.reshape(-1).to(recovered_state.original_dtype)
+        offset = absmax.mean()
+        qabsmax, state2 = quantize_blockwise(absmax - offset, blocksize=256)
+        recovered_state.absmax = qabsmax
+        recovered_state.offset = offset
+        recovered_state.state2 = state2
+        recovered_state.nested = True
+
+    recovered_state.dtype = recovered_state.original_dtype
+    recovered_state.packing_format_for_cpu = False
+
+    if getattr(recovered_state, "original_storage_type", None):
+        qweight = qweight.view(recovered_state.original_storage_type)
+
+    return qweight, recovered_state
+
+
+def has_avx512bf16():
+    """
+    Try calling native lib.has_avx512bf16_cpu().
+    Return False explicitly if symbol missing or call fails.
+    """
+    try:
+        support_avx_bf16 = lib.has_avx512bf16_cpu()
+    except (AttributeError, RuntimeError, OSError):
+        support_avx_bf16 = False
+    return support_avx_bf16
+
+
+C = 127.0
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+from .modules import (
+    Embedding,
+    Embedding4bit,
+    Embedding8bit,
+    EmbeddingFP4,
+    EmbeddingNF4,
+    Int8Params,
+    Linear4bit,
+    Linear8bitLt,
+    LinearFP4,
+    LinearNF4,
+    OutlierAwareLinear,
+    Params4bit,
+    StableEmbedding,
+)
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+import copy
+import logging
+from typing import Any, Optional, TypeVar, Union, overload
+
+import torch
+from torch import Tensor, device, dtype, nn
+import torch.nn.functional as F
+
+import bitsandbytes as bnb
+from bitsandbytes.functional import (
+    QuantState,
+    _convert_weight_packed_for_cpu,
+    _convert_weight_packed_for_cpu_inverse,
+    has_avx512bf16,
+)
+from bitsandbytes.optim import GlobalOptimManager
+from bitsandbytes.utils import INVERSE_LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING, OutlierTracer
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T", bound="torch.nn.Module")
+
+
+class StableEmbedding(torch.nn.Embedding):
+    """
+    Custom embedding layer designed to improve stability during training for NLP tasks by using 32-bit optimizer states. It is designed to reduce gradient variations that can result from quantization. This embedding layer is initialized with Xavier uniform initialization followed by layer normalization.
+
+    Example:
+
+    ```
+    # Initialize StableEmbedding layer with vocabulary size 1000, embedding dimension 300
+    embedding_layer = StableEmbedding(num_embeddings=1000, embedding_dim=300)
+
+    # Reset embedding parameters
+    embedding_layer.reset_parameters()
+
+    # Perform a forward pass with input tensor
+    input_tensor = torch.tensor([1, 2, 3])
+    output_embedding = embedding_layer(input_tensor)
+    ```
+
+    Attributes:
+        norm (`torch.nn.LayerNorm`): Layer normalization applied after the embedding.
+
+    Methods:
+        reset_parameters(): Reset embedding parameters using Xavier uniform initialization.
+        forward(input: Tensor) -> Tensor: Forward pass through the stable embedding layer.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: Optional[int] = None,
+        max_norm: Optional[float] = None,
+        norm_type: float = 2.0,
+        scale_grad_by_freq: bool = False,
+        sparse: bool = False,
+        _weight: Optional[Tensor] = None,
+        device=None,
+        dtype=None,
+    ) -> None:
+        """
+        Args:
+            num_embeddings (`int`):
+                The number of unique embeddings (vocabulary size).
+            embedding_dim (`int`):
+                The dimensionality of the embedding.
+            padding_idx (`Optional[int]`):
+                Pads the output with zeros at the given index.
+            max_norm (`Optional[float]`):
+                Renormalizes embeddings to have a maximum L2 norm.
+            norm_type (`float`, defaults to `2.0`):
+                The p-norm to compute for the `max_norm` option.
+            scale_grad_by_freq (`bool`, defaults to `False`):
+                Scale gradient by frequency during backpropagation.
+            sparse (`bool`, defaults to `False`):
+                Computes dense gradients. Set to `True` to compute sparse gradients instead.
+            _weight (`Optional[Tensor]`):
+                Pretrained embeddings.
+        """
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            padding_idx,
+            max_norm,
+            norm_type,
+            scale_grad_by_freq,
+            sparse,
+            _weight,
+            device,
+            dtype,
+        )
+        self.norm = torch.nn.LayerNorm(embedding_dim, device=device)
+        GlobalOptimManager.get_instance().register_module_override(self, "weight", {"optim_bits": 32})
+
+    def reset_parameters(self) -> None:
+        torch.nn.init.xavier_uniform_(self.weight)
+        self._fill_padding_idx_with_zero()
+
+    """ !!! This is a redefinition of _fill_padding_idx_with_zero in torch.nn.Embedding
+        to make the Layer compatible with Pytorch < 1.9.
+        This means that if this changes in future PyTorch releases this need to change too
+        which is cumbersome. However, with this we can ensure compatibility with previous
+        PyTorch releases.
+    """
+
+    def _fill_padding_idx_with_zero(self) -> None:
+        if self.padding_idx is not None:
+            with torch.no_grad():
+                self.weight[self.padding_idx].fill_(0)
+
+    def forward(self, input: Tensor) -> Tensor:
+        emb = F.embedding(
+            input,
+            self.weight,
+            self.padding_idx,
+            self.max_norm,
+            self.norm_type,
+            self.scale_grad_by_freq,
+            self.sparse,
+        )
+
+        # always apply layer norm in full precision
+        emb = emb.to(torch.get_default_dtype())
+
+        return self.norm(emb).to(self.weight.dtype)
+
+
+class Embedding(torch.nn.Embedding):
+    """
+    Embedding class to store and retrieve word embeddings from their indices.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: Optional[int] = None,
+        max_norm: Optional[float] = None,
+        norm_type: float = 2.0,
+        scale_grad_by_freq: bool = False,
+        sparse: bool = False,
+        _weight: Optional[Tensor] = None,
+        device: Optional[device] = None,
+    ) -> None:
+        """
+        Args:
+            num_embeddings (`int`):
+                The number of unique embeddings (vocabulary size).
+            embedding_dim (`int`):
+                The dimensionality of the embedding.
+            padding_idx (`Optional[int]`):
+                Pads the output with zeros at the given index.
+            max_norm (`Optional[float]`):
+                Renormalizes embeddings to have a maximum L2 norm.
+            norm_type (`float`, defaults to `2.0`):
+                The p-norm to compute for the `max_norm` option.
+            scale_grad_by_freq (`bool`, defaults to `False`):
+                Scale gradient by frequency during backpropagation.
+            sparse (`bool`, defaults to `False`):
+                Computes dense gradients. Set to `True` to compute sparse gradients instead.
+            _weight (`Optional[Tensor]`):
+                Pretrained embeddings.
+        """
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            padding_idx,
+            max_norm,
+            norm_type,
+            scale_grad_by_freq,
+            sparse,
+            _weight,
+            device=device,
+        )
+        GlobalOptimManager.get_instance().register_module_override(self, "weight", {"optim_bits": 32})
+
+    def reset_parameters(self) -> None:
+        torch.nn.init.xavier_uniform_(self.weight)
+        self._fill_padding_idx_with_zero()
+
+    """ !!! This is a redefinition of _fill_padding_idx_with_zero in torch.nn.Embedding
+        to make the Layer compatible with Pytorch < 1.9.
+        This means that if this changes in future PyTorch releases this need to change too
+        which is cumbersome. However, with this we can ensure compatibility with previous
+        PyTorch releases.
+    """
+
+    def _fill_padding_idx_with_zero(self) -> None:
+        if self.padding_idx is not None:
+            with torch.no_grad():
+                self.weight[self.padding_idx].fill_(0)
+
+    def forward(self, input: Tensor) -> Tensor:
+        emb = F.embedding(
+            input,
+            self.weight,
+            self.padding_idx,
+            self.max_norm,
+            self.norm_type,
+            self.scale_grad_by_freq,
+            self.sparse,
+        )
+
+        return emb
+
+
+class Params4bit(torch.nn.Parameter):
+    def __new__(
+        cls,
+        data: Optional[torch.Tensor] = None,
+        requires_grad=False,  # quantized weights should be frozen by default
+        quant_state: Optional[QuantState] = None,
+        blocksize: Optional[int] = None,
+        compress_statistics: bool = True,
+        quant_type: str = "fp4",
+        quant_storage: torch.dtype = torch.uint8,
+        module: Optional["Linear4bit"] = None,
+        bnb_quantized: bool = False,
+        **kwargs,
+    ) -> "Params4bit":
+        if data is None:
+            data = torch.empty(0)
+
+        if blocksize is None:
+            blocksize = 64
+
+        self = torch.Tensor._make_subclass(cls, data, requires_grad)
+        self.blocksize = blocksize
+        self.compress_statistics = compress_statistics
+        self.quant_type = quant_type
+        self.quant_state = quant_state
+        self.quant_storage = quant_storage
+        self.bnb_quantized = bnb_quantized
+        self.data = data
+        self.module = module
+        return self
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["data"] = self.data
+        state["requires_grad"] = self.requires_grad
+        return state
+
+    def __setstate__(self, state):
+        self.requires_grad = state["requires_grad"]
+        self.blocksize = state["blocksize"]
+        self.compress_statistics = state["compress_statistics"]
+        self.quant_type = state["quant_type"]
+        self.quant_state = state["quant_state"]
+        self.data = state["data"]
+        self.quant_storage = state["quant_storage"]
+        self.bnb_quantized = state["bnb_quantized"]
+        self.module = state["module"]
+
+    # Properties that proxy QuantState attributes for FSDP state_dict traversal.
+    # FSDP's _get_fqns() resolves dotted FQN keys via getattr, e.g. "weight.absmax"
+    # becomes getattr(weight, "absmax"). Using @property instead of __getattr__
+    # avoids torch.compile graph breaks (see #1904), since Dynamo can trace
+    # descriptor protocol access but not __getattr__ on Tensor subclasses.
+    #
+    # Note: attributes that collide with Params4bit instance attrs (blocksize,
+    # quant_type) or Tensor attrs (dtype, shape) are intentionally omitted —
+    # they are packed into the bitsandbytes__* blob and not traversed by FSDP.
+
+    @property
+    def absmax(self):
+        qs = self.__dict__.get("quant_state")
+        if qs is not None:
+            return qs.absmax
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute 'absmax'")
+
+    @property
+    def code(self):
+        qs = self.__dict__.get("quant_state")
+        if qs is not None:
+            return qs.code
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute 'code'")
+
+    @property
+    def quant_map(self):
+        qs = self.__dict__.get("quant_state")
+        if qs is not None:
+            return qs.code
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute 'quant_map'")
+
+    @property
+    def offset(self):
+        qs = self.__dict__.get("quant_state")
+        if qs is not None:
+            return qs.offset
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute 'offset'")
+
+    @property
+    def state2(self):
+        qs = self.__dict__.get("quant_state")
+        if qs is not None:
+            return qs.state2
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute 'state2'")
+
+    @property
+    def nested_absmax(self):
+        qs = self.__dict__.get("quant_state")
+        if qs is not None and qs.state2 is not None:
+            return qs.state2.absmax
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute 'nested_absmax'")
+
+    @property
+    def nested_blocksize(self):
+        qs = self.__dict__.get("quant_state")
+        if qs is not None and qs.state2 is not None:
+            return qs.state2.blocksize
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute 'nested_blocksize'")
+
+    @property
+    def nested_quant_map(self):
+        qs = self.__dict__.get("quant_state")
+        if qs is not None and qs.state2 is not None:
+            return qs.state2.code
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute 'nested_quant_map'")
+
+    @property
+    def nested_dtype(self):
+        qs = self.__dict__.get("quant_state")
+        if qs is not None and qs.state2 is not None:
+            return qs.state2.dtype
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute 'nested_dtype'")
+
+    @property
+    def nested_offset(self):
+        qs = self.__dict__.get("quant_state")
+        if qs is not None:
+            return qs.offset
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute 'nested_offset'")
+
+    def __deepcopy__(self, memo):
+        new_instance = type(self).__new__(type(self))
+        state = self.__getstate__()
+        new_instance.__setstate__(state)
+        new_instance.quant_state = copy.deepcopy(state["quant_state"])
+        new_instance.data = copy.deepcopy(state["data"])
+        return new_instance
+
+    def __copy__(self):
+        new_instance = type(self).__new__(type(self))
+        state = self.__getstate__()
+        new_instance.__setstate__(state)
+        return new_instance
+
+    @classmethod
+    def from_prequantized(
+        cls,
+        data: torch.Tensor,
+        quantized_stats: dict[str, Any],
+        requires_grad: bool = False,
+        device="cuda",
+        module: Optional["Linear4bit"] = None,
+        **kwargs,
+    ) -> "Params4bit":
+        self = torch.Tensor._make_subclass(cls, data.to(device))
+        self.requires_grad = requires_grad
+        self.quant_state = QuantState.from_dict(qs_dict=quantized_stats, device=device)
+        self.blocksize = self.quant_state.blocksize
+        self.compress_statistics = self.quant_state.nested
+        self.quant_type = self.quant_state.quant_type
+        self.bnb_quantized = True
+
+        self.quant_storage = data.dtype
+        self.module = module
+
+        if self.module is not None:
+            self.module.quant_state = self.quant_state
+
+        return self
+
+    def _quantize(self, device):
+        w = self.data.contiguous().to(device)
+        w_4bit, quant_state = bnb.functional.quantize_4bit(
+            w,
+            blocksize=self.blocksize,
+            compress_statistics=self.compress_statistics,
+            quant_type=self.quant_type,
+            quant_storage=self.quant_storage,
+        )
+        self.data = w_4bit
+        self.quant_state = quant_state
+        if self.module is not None:
+            self.module.quant_state = quant_state
+        self.bnb_quantized = True
+        return self
+
+    def cpu(self):
+        return self.to(device="cpu")
+
+    def cuda(self, device: Optional[int | device | str] = None, non_blocking: bool = False):
+        if getattr(self.quant_state, "packing_format_for_cpu", False):
+            self.data, self.quant_state = _convert_weight_packed_for_cpu_inverse(self.data, self.quant_state)
+        return self.to(device="cuda" if device is None else device, non_blocking=non_blocking)
+
+    def xpu(self, device: Optional[int | device | str] = None, non_blocking: bool = False):
+        if getattr(self.quant_state, "packing_format_for_cpu", False):
+            self.data, self.quant_state = _convert_weight_packed_for_cpu_inverse(self.data, self.quant_state)
+        return self.to(device="xpu" if device is None else device, non_blocking=non_blocking)
+
+    @overload
+    def to(
+        self: T,
+        device: Optional[int | device] = ...,
+        dtype: Optional[dtype | str] = ...,
+        non_blocking: bool = ...,
+    ) -> T: ...
+
+    @overload
+    def to(self: T, dtype: dtype | str, non_blocking: bool = ...) -> T: ...
+
+    @overload
+    def to(self: T, tensor: Tensor, non_blocking: bool = ...) -> T: ...
+
+    def to(self, *args, **kwargs):
+        device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
+
+        if device is not None and device.type != "meta" and not self.bnb_quantized:
+            return self._quantize(device)
+        else:
+            if self.quant_state is not None:
+                self.quant_state.to(device)
+
+            new_param = Params4bit(
+                super().to(device=device, dtype=dtype, non_blocking=non_blocking),
+                requires_grad=self.requires_grad,
+                quant_state=self.quant_state,
+                blocksize=self.blocksize,
+                compress_statistics=self.compress_statistics,
+                quant_type=self.quant_type,
+                quant_storage=self.quant_storage,
+                bnb_quantized=self.bnb_quantized,
+            )
+
+            return new_param
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        if kwargs is N
