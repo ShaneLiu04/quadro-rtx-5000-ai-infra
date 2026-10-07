@@ -1,0 +1,4604 @@
+one:
+            kwargs = {}
+
+        if func in [torch.chunk, torch.split]:
+            tensor = args[0]
+
+            result = super().__torch_function__(func, types, args, kwargs)
+
+            if isinstance(result, tuple):
+                return tuple(
+                    cls(
+                        data=chunk,
+                        requires_grad=tensor.requires_grad,
+                        quant_state=tensor.quant_state,
+                        blocksize=tensor.blocksize,
+                        compress_statistics=tensor.compress_statistics,
+                        quant_type=tensor.quant_type,
+                        quant_storage=tensor.quant_storage,
+                        module=tensor.module,
+                        bnb_quantized=tensor.bnb_quantized,
+                    )
+                    for chunk in result
+                )
+            else:
+                return cls(
+                    data=result,
+                    requires_grad=tensor.requires_grad,
+                    quant_state=tensor.quant_state,
+                    blocksize=tensor.blocksize,
+                    compress_statistics=tensor.compress_statistics,
+                    quant_type=tensor.quant_type,
+                    quant_storage=tensor.quant_storage,
+                    module=tensor.module,
+                    bnb_quantized=tensor.bnb_quantized,
+                )
+
+        return super().__torch_function__(func, types, args, kwargs)
+
+
+def fix_4bit_weight_quant_state_from_module(module: Union["Embedding4bit", "Linear4bit"]):
+    if getattr(module.weight, "quant_state", None) is not None:
+        return
+
+    if getattr(module, "quant_state", None) is None:
+        logger.warning(
+            "FP4 quantization state not initialized. Please call .cuda() or .to(device) on the LinearFP4 layer first.",
+        )
+
+    # the quant state got lost when the parameter got converted. This happens for example for fsdp
+    # since we registered the module, we can recover the state here
+    assert module.weight.shape[1] == 1
+    if not isinstance(module.weight, Params4bit):
+        module.weight = Params4bit(module.weight, quant_storage=module.quant_storage, bnb_quantized=True)
+    module.weight.quant_state = module.quant_state
+
+
+class Linear4bit(nn.Linear):
+    """
+    This class is the base module for the 4-bit quantization algorithm presented in [QLoRA](https://arxiv.org/abs/2305.14314).
+    QLoRA 4-bit linear layers uses blockwise k-bit quantization under the hood, with the possibility of selecting various
+    compute datatypes such as FP4 and NF4.
+
+    In order to quantize a linear layer one should first load the original fp16 / bf16 weights into
+    the Linear4bit module, then call `quantized_module.to("cuda")` to quantize the fp16 / bf16 weights.
+
+    Example:
+
+    ```python
+    import torch
+    import torch.nn as nn
+
+    import bitsandbytes as bnb
+    from bitsandbytes.nn import Linear4bit
+
+    fp16_model = nn.Sequential(
+        nn.Linear(64, 64),
+        nn.Linear(64, 64)
+    )
+
+    quantized_model = nn.Sequential(
+        Linear4bit(64, 64),
+        Linear4bit(64, 64)
+    )
+
+    quantized_model.load_state_dict(fp16_model.state_dict())
+    quantized_model = quantized_model.to(0) # Quantization happens here
+    ```
+    """
+
+    def __init__(
+        self,
+        input_features,
+        output_features,
+        bias=True,
+        compute_dtype=None,
+        compress_statistics=True,
+        quant_type="fp4",
+        quant_storage=torch.uint8,
+        device=None,
+    ):
+        """
+        Initialize Linear4bit class.
+
+        Args:
+            input_features (`str`):
+                Number of input features of the linear layer.
+            output_features (`str`):
+                Number of output features of the linear layer.
+            bias (`bool`, defaults to `True`):
+                Whether the linear class uses the bias term as well.
+        """
+        super().__init__(input_features, output_features, bias, device)
+        self.weight = Params4bit(
+            self.weight.data,
+            requires_grad=False,
+            compress_statistics=compress_statistics,
+            quant_type=quant_type,
+            quant_storage=quant_storage,
+            module=self,
+        )
+        # self.persistent_buffers = []  # TODO consider as way to save quant state
+        self.compute_dtype = compute_dtype
+        self.compute_type_is_set = compute_dtype is not None
+        self.quant_state = None
+        self.quant_storage = quant_storage
+        self.support_avx512bf16_for_cpu = has_avx512bf16()
+
+    def set_compute_type(self, x):
+        if x.dtype in [torch.float32, torch.bfloat16]:
+            # the input is in a dtype that is safe to compute in, we switch
+            # to this type for speed and stability
+            self.compute_dtype = x.dtype
+        elif x.dtype == torch.float16:
+            # we take the compoute dtype passed into the layer
+            if self.compute_dtype in [None, torch.float32] and (x.numel() == x.shape[-1]):
+                # single batch inference with input torch.float16 and compute_dtype float32 -> slow inference when it could be fast
+                # warn the user about this
+                logger.warning(
+                    "Input type into Linear4bit is torch.float16, but bnb_4bit_compute_dtype=torch.float32 (default). This will lead to slow inference.",
+                )
+            if self.compute_dtype in [None, torch.float32] and (x.numel() != x.shape[-1]):
+                logger.warning(
+                    "Input type into Linear4bit is torch.float16, but bnb_4bit_compute_dtype=torch.float32 (default). This will lead to slow inference or training speed.",
+                )
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        """
+        save weight and bias,
+        then fill state_dict with components of quant_state
+        """
+        if getattr(self.weight, "quant_state", None) is not None and getattr(
+            self.weight.quant_state, "packing_format_for_cpu", False
+        ):
+            self.weight.data, self.weight.quant_state = _convert_weight_packed_for_cpu_inverse(
+                self.weight.data, self.weight.quant_state
+            )
+        super()._save_to_state_dict(destination, prefix, keep_vars)  # saving weight and bias
+        if getattr(self.weight, "quant_state", None) is not None:
+            for k, v in self.weight.quant_state.as_dict(packed=True).items():
+                destination[prefix + "weight." + k] = v if keep_vars else v.detach()
+
+    def forward(self, x: torch.Tensor):
+        fix_4bit_weight_quant_state_from_module(self)
+        quant_state = self.weight.quant_state
+
+        if (
+            x.device.type == "cpu"
+            and self.support_avx512bf16_for_cpu
+            and not self.training
+            and x.requires_grad == False
+            and not getattr(quant_state, "packing_format_for_cpu", False)
+        ):
+            self.weight.data, quant_state = _convert_weight_packed_for_cpu(self.weight.data, quant_state)
+
+        if not self.compute_type_is_set:
+            self.set_compute_type(x)
+            self.compute_type_is_set = True
+
+        inp_dtype = x.dtype
+        if self.compute_dtype is not None:
+            x = x.to(self.compute_dtype)
+
+        bias = self.bias
+        if bias is not None:
+            if bias.dtype != x.dtype:
+                # TODO: do we need to cast bias like this?
+                bias.data = bias.data.to(x.dtype)
+            bias = bias.to(self.compute_dtype)
+
+        return bnb.matmul_4bit(x, self.weight, bias=bias, quant_state=quant_state).to(inp_dtype)
+
+
+class LinearFP4(Linear4bit):
+    """
+    Implements the FP4 data type.
+    """
+
+    def __init__(
+        self,
+        input_features,
+        output_features,
+        bias=True,
+        compute_dtype=None,
+        compress_statistics=True,
+        quant_storage=torch.uint8,
+        device=None,
+    ):
+        """
+        Args:
+            input_features (`str`):
+                Number of input features of the linear layer.
+            output_features (`str`):
+                Number of output features of the linear layer.
+            bias (`bool`, defaults to `True`):
+                Whether the linear class uses the bias term as well.
+        """
+        super().__init__(
+            input_features,
+            output_features,
+            bias,
+            compute_dtype,
+            compress_statistics,
+            "fp4",
+            quant_storage,
+            device,
+        )
+
+
+class LinearNF4(Linear4bit):
+    """Implements the NF4 data type.
+
+    Constructs a quantization data type where each bin has equal area under a standard normal distribution N(0, 1) that
+    is normalized into the range [-1, 1].
+
+    For more information read the paper: QLoRA: Efficient Finetuning of Quantized LLMs (https://arxiv.org/abs/2305.14314)
+
+    Implementation of the NF4 data type in bitsandbytes can be found in the `create_normal_map` function in
+    the `functional.py` file: https://github.com/TimDettmers/bitsandbytes/blob/main/bitsandbytes/functional.py#L236.
+    """
+
+    def __init__(
+        self,
+        input_features,
+        output_features,
+        bias=True,
+        compute_dtype=None,
+        compress_statistics=True,
+        quant_storage=torch.uint8,
+        device=None,
+    ):
+        """
+        Args:
+            input_features (`str`):
+                Number of input features of the linear layer.
+            output_features (`str`):
+                Number of output features of the linear layer.
+            bias (`bool`, defaults to `True`):
+                Whether the linear class uses the bias term as well.
+        """
+        super().__init__(
+            input_features,
+            output_features,
+            bias,
+            compute_dtype,
+            compress_statistics,
+            "nf4",
+            quant_storage,
+            device,
+        )
+
+
+class Int8Params(torch.nn.Parameter):
+    def __new__(
+        cls,
+        data: Optional[torch.Tensor] = None,
+        requires_grad=True,
+        has_fp16_weights=False,
+        CB: Optional[torch.Tensor] = None,
+        SCB: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        if data is None:
+            data = torch.empty(0)
+        obj = torch.Tensor._make_subclass(cls, data, requires_grad)
+        obj.CB = CB
+        obj.SCB = SCB
+        obj.has_fp16_weights = has_fp16_weights
+        return obj
+
+    def _quantize(self, device):
+        if self.has_fp16_weights:
+            return super().to(device)
+
+        # We quantize the weight and store in 8bit row-major
+        B = self.data.contiguous().to(device=device, dtype=torch.float16)
+        CB, SCB, _ = bnb.functional.int8_vectorwise_quant(B)
+        self.data = CB
+        self.CB = CB
+        self.SCB = SCB
+
+        return self
+
+    def cpu(self):
+        return self.to(device="cpu")
+
+    def cuda(self, device: Optional[int | device | str] = None, non_blocking: bool = False):
+        return self.to(device="cuda" if device is None else device, non_blocking=non_blocking)
+
+    def xpu(self, device: Optional[int | device | str] = None, non_blocking: bool = False):
+        return self.to(device="xpu" if device is None else device, non_blocking=non_blocking)
+
+    def __deepcopy__(self, memo):
+        # adjust this if new arguments are added to the constructor
+        new_instance = type(self).__new__(
+            type(self),
+            data=copy.deepcopy(self.data, memo),
+            requires_grad=self.requires_grad,
+            has_fp16_weights=self.has_fp16_weights,
+            CB=copy.deepcopy(self.CB, memo),
+            SCB=copy.deepcopy(self.SCB, memo),
+        )
+        return new_instance
+
+    @overload
+    def to(
+        self: T,
+        device: Optional[int | device] = ...,
+        dtype: Optional[dtype | str] = ...,
+        non_blocking: bool = ...,
+    ) -> T: ...
+
+    @overload
+    def to(self: T, dtype: dtype | str, non_blocking: bool = ...) -> T: ...
+
+    @overload
+    def to(self: T, tensor: Tensor, non_blocking: bool = ...) -> T: ...
+
+    def to(self, *args, **kwargs):
+        device, dtype, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
+
+        is_quantized = self.data.dtype == torch.int8
+
+        if not is_quantized and device is not None and device.type != "meta" and self.data.device.type == "cpu":
+            # We're moving from a CPU device to a non-meta device.
+            # In this circumstance, we want to quantize if we haven't already.
+            return self._quantize(device)
+
+        # Create a new parameter on the target device.
+        new_param = Int8Params(
+            super().to(device=device, dtype=dtype, non_blocking=non_blocking),
+            requires_grad=self.requires_grad,
+            has_fp16_weights=self.has_fp16_weights,
+        )
+
+        # If we had already quantized, move the statistics appropriately.
+        if is_quantized:
+            new_param.CB = new_param.data
+
+            if device is not None and self.SCB is not None and self.SCB.device.type != "meta":
+                new_param.SCB = self.SCB.to(device)
+
+        return new_param
+
+
+def maybe_rearrange_weight(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+    weight = state_dict.get(f"{prefix}weight")
+    if weight is None:
+        # if the state dict has no weights for this layer (e.g., LoRA finetuning), do nothing
+        return
+    weight_format = state_dict.pop(f"{prefix}weight_format", "row")
+
+    if isinstance(weight_format, torch.Tensor):
+        weight_format = weight_format.item()
+
+    # For new weights format storage type, we explicitly check
+    # if weights_format is on the mapping
+    if isinstance(weight_format, int) and weight_format not in INVERSE_LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING:
+        raise ValueError(f"Expected supported weight format - got {weight_format}")
+    elif isinstance(weight_format, int) and weight_format in INVERSE_LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING:
+        weight_format = INVERSE_LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING[weight_format]
+
+    if weight_format != "row":
+        raise ValueError(f"Only 'row' weight format is supported, got {weight_format}")
+
+
+class Embedding8bit(nn.Embedding):
+    """
+    This class implements [LLM.int8()](https://arxiv.org/abs/2208.07339) algorithm for embedding layer
+
+    Quantization API is similar to Linear8bitLt:
+    ```python
+    import torch
+    import torch.nn as nn
+
+    from bitsandbytes.nn import Embedding8bit
+
+    fp16_module = nn.Embedding(128, 64)
+    int8_module = Embedding8bit(128, 64)
+
+    int8_module.load_state_dict(fp16_module.state_dict())
+
+    int8_module = int8_module.to(0) # Quantization happens here
+    ```
+    """
+
+    def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
+        super().__init__(num_embeddings, embedding_dim, device=device, dtype=dtype)
+        self.dtype = self.weight.data.dtype
+
+        self.weight = Int8Params(self.weight.data, has_fp16_weights=False, requires_grad=False)
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        raise NotImplementedError("Saving Embedding8bit module is not implemented")
+
+    def forward(self, input: Tensor) -> Tensor:
+        if not hasattr(self.weight, "SCB"):
+            raise RuntimeError("Embedding layer is not quantized. Please call .cuda() or .to(device) first.")
+
+        rows = self.weight.data
+        row_stats = self.weight.SCB
+
+        assert rows.shape == (self.num_embeddings, self.embedding_dim)
+        assert row_stats.shape == (self.num_embeddings,)
+
+        compressed_output = F.embedding(input, rows)
+        compressed_output_stats = F.embedding(input, row_stats.view(self.num_embeddings, 1))
+
+        output = compressed_output * (compressed_output_stats / 127.0)
+
+        return output.to(self.dtype)
+
+
+class Embedding4bit(nn.Embedding):
+    """
+    This is the base class similar to Linear4bit. It implements the 4-bit quantization algorithm presented in
+    [QLoRA](https://arxiv.org/abs/2305.14314) for embeddings.
+
+    Quantization API is similar to Linear4bit:
+    ```python
+    import torch
+    import torch.nn as nn
+
+    from bitsandbytes.nn import Embedding4bit
+
+    fp16_module = nn.Embedding(128, 64)
+    quantized_module = Embedding4bit(128, 64)
+
+    quantized_module.load_state_dict(fp16_module.state_dict())
+
+    quantized_module = quantized_module.to(0) # Quantization happens here
+    ```
+    """
+
+    def __init__(
+        self,
+        num_embeddings,
+        embedding_dim,
+        dtype=None,
+        quant_type="fp4",
+        quant_storage=torch.uint8,
+        device=None,
+    ):
+        super().__init__(num_embeddings, embedding_dim, device=device, dtype=dtype)
+        self.dtype = self.weight.data.dtype
+
+        self.weight = Params4bit(
+            self.weight.data,
+            requires_grad=False,
+            compress_statistics=None,
+            quant_type=quant_type,
+            quant_storage=quant_storage,
+            module=self,
+        )
+
+        blocksize = self.weight.blocksize
+
+        if embedding_dim % blocksize != 0:
+            logger.warning(
+                f"Embedding size {embedding_dim} is not divisible by block size {blocksize}. "
+                "This will lead to slow inference.",
+            )
+
+    def _forward_with_partial_dequantize(self, input: Tensor):
+        assert self.embedding_dim % self.weight.quant_state.blocksize == 0
+
+        w_4bit_uint8 = self.weight.data.view(torch.uint8).view(self.num_embeddings * self.embedding_dim // 2, 1)
+
+        output_4bit = torch.nn.functional.embedding(
+            weight=w_4bit_uint8.view(self.num_embeddings, self.embedding_dim // 2),
+            input=input,
+        ).view(-1, 1)
+        assert output_4bit.shape == (input.numel() * self.embedding_dim // 2, 1)
+
+        blocks_per_emb = self.embedding_dim // self.weight.blocksize
+
+        absmax = self.weight.quant_state.absmax
+        assert absmax.shape == (self.num_embeddings * blocks_per_emb,)
+
+        output_absmax = torch.nn.functional.embedding(
+            weight=absmax.view(self.num_embeddings, blocks_per_emb),
+            input=input,
+        ).view(
+            -1,
+        )
+        assert output_absmax.shape == (input.numel() * blocks_per_emb,)
+
+        output_quant_state = copy.deepcopy(self.weight.quant_state)
+        output_quant_state.absmax = output_absmax
+        output_quant_state.shape = torch.Size((*input.shape, self.embedding_dim))
+
+        output = bnb.functional.dequantize_4bit(output_4bit, output_quant_state)
+        assert output.shape == (*input.shape, self.embedding_dim)
+
+        return output.to(self.dtype)
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        raise NotImplementedError("Saving Embedding4bit module is not implemented")
+
+    def forward(self, input: Tensor) -> Tensor:
+        fix_4bit_weight_quant_state_from_module(self)
+
+        if self.embedding_dim % self.weight.quant_state.blocksize == 0:
+            return self._forward_with_partial_dequantize(input)
+
+        dequantized_weight = bnb.functional.dequantize_4bit(self.weight.data, self.weight.quant_state)
+
+        return torch.nn.functional.embedding(
+            weight=dequantized_weight,
+            input=input,
+        ).to(self.dtype)
+
+
+class EmbeddingFP4(Embedding4bit):
+    def __init__(
+        self,
+        num_embeddings,
+        embedding_dim,
+        dtype=None,
+        quant_storage=torch.uint8,
+        device=None,
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            dtype=dtype,
+            quant_type="fp4",
+            quant_storage=quant_storage,
+            device=device,
+        )
+
+
+class EmbeddingNF4(Embedding4bit):
+    def __init__(
+        self,
+        num_embeddings,
+        embedding_dim,
+        dtype=None,
+        quant_storage=torch.uint8,
+        device=None,
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            dtype=dtype,
+            quant_type="nf4",
+            quant_storage=quant_storage,
+            device=device,
+        )
+
+
+class Linear8bitLt(nn.Linear):
+    """
+    This class is the base module for the [LLM.int8()](https://arxiv.org/abs/2208.07339) algorithm.
+    To read more about it, have a look at the paper.
+
+    In order to quantize a linear layer one should first load the original fp16 / bf16 weights into
+    the Linear8bitLt module, then call `int8_module.to("cuda")` to quantize the fp16 weights.
+
+    Example:
+
+    ```python
+    import torch
+    import torch.nn as nn
+
+    import bitsandbytes as bnb
+    from bitsandbytes.nn import Linear8bitLt
+
+    fp16_model = nn.Sequential(
+        nn.Linear(64, 64),
+        nn.Linear(64, 64)
+    )
+
+    int8_model = nn.Sequential(
+        Linear8bitLt(64, 64, has_fp16_weights=False),
+        Linear8bitLt(64, 64, has_fp16_weights=False)
+    )
+
+    int8_model.load_state_dict(fp16_model.state_dict())
+    int8_model = int8_model.to(0) # Quantization happens here
+    ```
+    """
+
+    def __init__(
+        self,
+        input_features: int,
+        output_features: int,
+        bias=True,
+        has_fp16_weights=True,
+        threshold=0.0,
+        index=None,
+        device=None,
+    ):
+        """
+        Initialize Linear8bitLt class.
+
+        Args:
+            input_features (`int`):
+                Number of input features of the linear layer.
+            output_features (`int`):
+                Number of output features of the linear layer.
+            bias (`bool`, defaults to `True`):
+                Whether the linear class uses the bias term as well.
+            has_fp16_weights (`bool`, defaults to `True`):
+                If False, weights are quantized to int8 on ``.to(device)``. If True,
+                weights remain in fp16 and are quantized on-the-fly during each forward pass.
+            threshold (`float`, defaults to `0.0`):
+                Outlier threshold for mixed-precision decomposition (LLM.int8()). During the
+                forward pass, activation columns where any value exceeds this threshold are
+                computed in fp16, while the remaining columns use int8. This operates on
+                **activations** (inputs), not on weight values. Set to 0.0 to disable
+                mixed-precision decomposition and quantize all columns to int8.
+            index: Indices for weight reordering (used internally).
+            device: Device to initialize the layer on.
+        """
+        super().__init__(input_features, output_features, bias, device)
+        self.state = bnb.MatmulLtState()
+        self.index = index
+
+        self.state.threshold = threshold
+        self.state.has_fp16_weights = has_fp16_weights
+
+        if threshold > 0.0 and not has_fp16_weights:
+            self.state.use_pool = True
+
+        self.weight = Int8Params(self.weight.data, has_fp16_weights=has_fp16_weights, requires_grad=has_fp16_weights)
+        self._register_load_state_dict_pre_hook(maybe_rearrange_weight)
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+
+        # we only need to save SCB as extra data, because CB for quantized weights is already stored in weight.data
+        scb_name = "SCB"
+
+        # case 1: .cuda was called, SCB is in self.weight
+        param_from_weight = getattr(self.weight, scb_name, None)
+        # case 2: self.init_8bit_state was called, SCB is in self.state
+        param_from_state = getattr(self.state, scb_name)
+
+        key_name = prefix + f"{scb_name}"
+
+        # We now only save in row-major. This format information is stored for backwards compatibility.
+        format_name = prefix + "weight_format"
+
+        if not self.state.has_fp16_weights:
+            if param_from_weight is not None:
+                destination[key_name] = param_from_weight if keep_vars else param_from_weight.detach()
+                destination[format_name] = torch.tensor(0, dtype=torch.uint8)
+            elif param_from_state is not None:
+                destination[key_name] = param_from_state if keep_vars else param_from_state.detach()
+                destination[format_name] = torch.tensor(0, dtype=torch.uint8)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        unexpected_copy = list(unexpected_keys)
+
+        for key in unexpected_copy:
+            input_name = key[len(prefix) :]
+            if input_name == "SCB":
+                weight_scb = getattr(self.weight, "SCB", None)
+                if weight_scb is None:
+                    # buffers not yet initialized, can't access them directly without quantizing first
+                    raise RuntimeError(
+                        "Loading a quantized checkpoint into non-quantized Linear8bitLt is "
+                        "not supported. Please call module.cuda() before module.load_state_dict()",
+                    )
+
+                input_param = state_dict[key]
+                weight_scb.copy_(input_param)
+
+                if self.state.SCB is not None:
+                    self.state.SCB = self.weight.SCB
+
+                unexpected_keys.remove(key)
+
+    def init_8bit_state(self):
+        self.state.CB = self.weight.CB
+        self.state.SCB = self.weight.SCB
+        self.weight.CB = None
+        self.weight.SCB = None
+
+    def to(self, *args, **kwargs):
+        # Call the parent to() method to handle standard parameter/buffer movement
+        result = super().to(*args, **kwargs)
+
+        device, _, _, _ = torch._C._nn._parse_to(*args, **kwargs)
+
+        # Handle state tensors if needed.
+        if device is not None:
+            if result.state.CB is not None:
+                result.state.CB = result.state.CB.to(device)
+            if result.state.SCB is not None:
+                result.state.SCB = result.state.SCB.to(device)
+
+        return result
+
+    def forward(self, x: torch.Tensor):
+        self.state.is_training = self.training
+        if self.weight.CB is not None:
+            self.init_8bit_state()
+
+        # weights are cast automatically as Int8Params, but the bias has to be cast manually
+        if self.bias is not None and self.bias.dtype != x.dtype:
+            self.bias.data = self.bias.data.to(x.dtype)
+
+        out = bnb.matmul(x, self.weight, bias=self.bias, state=self.state)
+
+        if not self.state.has_fp16_weights and self.state.CB is not None:
+            self.weight.data = self.state.CB
+
+        return out
+
+
+class OutlierAwareLinear(nn.Linear):
+    def __init__(self, input_features, output_features, bias=True, device=None):
+        super().__init__(input_features, output_features, bias, device)
+        self.outlier_dim = None
+        self.is_quantized = False
+
+    def forward_with_outliers(self, x, outlier_idx):
+        raise NotImplementedError("Please override the `forward_with_outliers(self, x, outlier_idx)` function")
+
+    def quantize_weight(self, w, outlier_idx):
+        raise NotImplementedError("Please override the `quantize_weights(self, w, outlier_idx)` function")
+
+    def forward(self, x):
+        if self.outlier_dim is None:
+            tracer = OutlierTracer.get_instance()
+            if not tracer.is_initialized():
+                logger.warning("Please use OutlierTracer.initialize(model) before using the OutlierAwareLinear layer")
+            outlier_idx = tracer.get_outliers(self.weight)
+            self.outlier_dim = outlier_idx
+
+        if not self.is_quantized:
+            w = self.quantize_weight(self.weight, self.outlier_dim)
+            self.weight.data.copy_(w)
+            self.is_quantized = True
+
+from functools import partial
+from typing import Any, Literal, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.utils.parametrize as P
+
+from .. import functional as F
+
+
+class Bnb4bitParametrization(nn.Module):
+    """
+    A parametrization module that handles dequantization of a 4-bit quantized parameter.
+
+    The parameter data is expected to be already quantized when this parametrization is applied.
+    This module will dequantize the parameter data to its original floating-point representation
+    when the forward method is called (i.e. when the parameter is accessed).
+
+    Args:
+        quant_state (`F.QuantState`):
+            The quantization state containing the necessary information for dequantization.
+    """
+
+    def __init__(self, quant_state: F.QuantState):
+        super().__init__()
+        self.quant_state = quant_state
+
+    @torch.no_grad()
+    def forward(self, quantized_param: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass to dequantize the parameter.
+
+        Args:
+            quantized_param (`torch.Tensor`): The quantized parameter tensor (from .original)
+
+        Returns:
+            `torch.Tensor`: The dequantized parameter tensor in the original shape and dtype.
+        """
+        return F.dequantize_4bit(quantized_param, self.quant_state)
+
+
+def replace_parameter_4bit_prequantized(
+    module: nn.Module, param_name: str, qs_dict: dict[str, Any], device: torch.device
+):
+    if not hasattr(module, param_name):
+        raise AttributeError(f"Module does not have parameter '{param_name}'")
+
+    original_param = getattr(module, param_name)
+
+    if not isinstance(original_param, nn.Parameter):
+        raise TypeError(f"Parameter '{param_name}' is not an instance of nn.Parameter")
+
+    quant_state = F.QuantState.from_dict(qs_dict, device=device)
+
+    # Apply a parametrization to the module to handle dequantization.
+    P.register_parametrization(module, param_name, Bnb4bitParametrization(quant_state), unsafe=True)
+
+    # Next, register hooks.
+    _register_parametrization_hooks(module, param_name)
+
+
+def replace_parameter_4bit(
+    module: nn.Module,
+    param_name: str,
+    compress_statistics: bool = False,
+    quant_type: Literal["nf4", "fp4"] = "nf4",
+    blocksize: Optional[int] = None,
+):
+    """
+    Replace a module parameter with a 4-bit quantized version using parametrization.
+
+    This function quantizes an existing parameter in a PyTorch module to 4-bit precision
+    and sets up parametrization to handle automatic dequantization during forward passes.
+    The original parameter is replaced with quantized data, and a parametrization layer
+    is registered to manage the quantization state and dequantization process.
+
+    Additional, it registers a state dict post-hook to ensure that the quantization state
+    is saved correctly when the model's state dict is saved.
+
+    It is useful for MoE models or other scenarios where you want to quantize parameters
+    outside of nn.Linear layers without changing the model's architecture.
+
+    <Tip warning={true}>This feature is experimental and may change in future releases.</Tip>
+
+    Args:
+        module (`nn.Module`):
+            The PyTorch module containing the parameter to be quantized.
+        param_name (`str`):
+            The name of the parameter within the module to quantize.
+        compress_statistics (`bool`, *optional*, defaults to `False`):
+            Whether to compress quantization statistics to reduce memory usage.
+        quant_type (`Literal["nf4", "fp4"]`, *optional*, defaults to `"nf4"`):
+            The quantization format to use.
+        blocksize (`int`, *optional*, defaults to `None`):
+            The block size for quantization. If None, uses the default block size.
+
+    Raises:
+        AttributeError: If the module does not have the specified parameter.
+        TypeError: If the specified attribute is not an instance of nn.Parameter.
+    """
+
+    if not hasattr(module, param_name):
+        raise AttributeError(f"Module does not have parameter '{param_name}'")
+
+    original_param = getattr(module, param_name)
+
+    if not isinstance(original_param, nn.Parameter):
+        raise TypeError(f"Parameter '{param_name}' is not an instance of nn.Parameter")
+
+    # Quantize the original parameter.
+    quantized_data, quant_state = F.quantize_4bit(
+        original_param.data,
+        blocksize=blocksize,
+        compress_statistics=compress_statistics,
+        quant_type=quant_type,
+    )
+
+    # Replace the parameter with the quantized data.
+    setattr(module, param_name, nn.Parameter(quantized_data, requires_grad=False))
+    del original_param
+
+    # Apply a parametrization to the module to handle dequantization.
+    P.register_parametrization(module, param_name, Bnb4bitParametrization(quant_state), unsafe=True)
+
+    # Next, register hooks.
+    _register_parametrization_hooks(module, param_name)
+
+
+def _disable_parametrization_cache(module: nn.Module, inputs: tuple[Any, ...], output: Any):
+    # Clamp instead of a bare decrement: with ``always_call=True`` this hook also runs
+    # when the forward raised before the pre-hook incremented (e.g. an earlier pre-hook
+    # failed), and the counter must never go negative — a negative value is truthy, so
+    # ``if not P._cache_enabled`` would stop clearing the cache forever.
+    P._cache_enabled = max(0, P._cache_enabled - 1)
+    if not P._cache_enabled:
+        P._cache = {}
+
+
+def _enable_parametrization_cache(module: nn.Module, inputs: tuple[Any, ...]):
+    P._cache_enabled += 1
+
+
+def _register_parametrization_hooks(module: nn.Module, param_name: str):
+    # Register a state dict hook for saving. Note that this requires torch >= 2.5.0.
+    if torch.__version__ >= (2, 5):
+        module.register_state_dict_post_hook(
+            partial(
+                _parametrized_state_dict_post_hook,
+                param_name=param_name,
+            )
+        )
+
+    # Register hooks to enable caching for the dequantization parametrization.
+    # This helps preserve time and memory when the same quantized parameter
+    # is accessed multiple times in the forward computation.
+    #
+    # ``always_call=True`` is load-bearing: activation checkpointing with
+    # ``use_reentrant=False`` aborts its backward recompute mid-forward by design
+    # (early stop, via an internal exception) once the last needed activation has
+    # been rematerialized. A plain forward hook is skipped in that case, so the
+    # global ``parametrize._cache_enabled`` counter leaks upward once per
+    # checkpointed region per step, after which the cache is enabled (and never
+    # cleared) for the remainder of training — every dequantized parameter this
+    # module produces stays resident, i.e. a memory leak of the full dequantized
+    # model size (4x the packed 4-bit bytes).
+    module.register_forward_pre_hook(_enable_parametrization_cache)
+    module.register_forward_hook(_disable_parametrization_cache, always_call=True)
+
+
+def _parametrized_state_dict_post_hook(
+    module: nn.Module,
+    state_dict: dict[str, Any],
+    prefix: str,
+    local_metadata: Any,
+    *,
+    param_name: str = "weight",
+    **kwargs: dict[str, Any],
+) -> None:
+    """
+    Hook to modify the state dict to include the quantization state.
+    """
+
+    original_key = f"{prefix}parametrizations.{param_name}.original"
+
+    if original_key in state_dict:
+        # Create a clean entry.
+        # The `parametrizations.{param_name}.original` key will have the quantized data,
+        # but we would like it to keep it in the state_dict as `{param_name}`.
+        clean_key = f"{prefix}{param_name}"
+        state_dict[clean_key] = state_dict.pop(original_key)
+
+        assert P.is_parametrized(module, param_name)
+
+        # Find the parametrization, which should have the quantization state.
+        parametrization: Bnb4bitParametrization = next(
+            filter(lambda x: isinstance(x, Bnb4bitParametrization), module.parametrizations[param_name]), None
+        )
+
+        assert parametrization is not None, "Parametrization not found for the parameter."
+
+        quant_state = parametrization.quant_state
+
+        # Next, we need to store the quantization state.
+        if quant_state is not None:
+            for k, v in quant_state.as_dict(packed=True).items():
+                state_dict[f"{prefix}{param_name}.{k}"] = v
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+from .adagrad import Adagrad, Adagrad8bit, Adagrad32bit
+from .adam import Adam, Adam8bit, Adam32bit, PagedAdam, PagedAdam8bit, PagedAdam32bit
+from .adamw import (
+    AdamW,
+    AdamW8bit,
+    AdamW32bit,
+    PagedAdamW,
+    PagedAdamW8bit,
+    PagedAdamW32bit,
+)
+from .ademamix import AdEMAMix, AdEMAMix8bit, AdEMAMix32bit, PagedAdEMAMix, PagedAdEMAMix8bit, PagedAdEMAMix32bit
+from .lamb import LAMB, LAMB8bit, LAMB32bit
+from .lars import LARS, LARS8bit, LARS32bit, PytorchLARS
+from .lion import Lion, Lion8bit, Lion32bit, PagedLion, PagedLion8bit, PagedLion32bit
+from .optimizer import GlobalOptimManager
+from .rmsprop import RMSprop, RMSprop8bit, RMSprop32bit
+from .sgd import SGD, SGD8bit, SGD32bit
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+from bitsandbytes.optim.optimizer import Optimizer1State
+
+
+class Adagrad(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr=1e-2,
+        lr_decay=0,
+        weight_decay=0,
+        initial_accumulator_value=0,
+        eps=1e-10,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        Base Adagrad optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-2):
+                The learning rate.
+            lr_decay (`int`, defaults to 0):
+                The learning rate decay.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            initial_accumulator_value (`int`, defaults to 0):
+                The initial momemtum values.
+            eps (`float`, defaults to 1e-10):
+                The epsilon value prevents division by zero in the optimizer.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if initial_accumulator_value != 0.0:
+            raise ValueError("Initial accumulator value != 0.0 not supported!")
+        if lr_decay != 0.0:
+            raise ValueError("Lr Decay != 0.0 not supported!")
+        super().__init__(
+            "adagrad",
+            params,
+            lr,
+            (0.0, 0.0),
+            eps,
+            weight_decay,
+            optim_bits,
+            args,
+            min_8bit_size,
+        )
+
+
+class Adagrad8bit(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr=1e-2,
+        lr_decay=0,
+        weight_decay=0,
+        initial_accumulator_value=0,
+        eps=1e-10,
+        optim_bits=8,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        8-bit Adagrad optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-2):
+                The learning rate.
+            lr_decay (`int`, defaults to 0):
+                The learning rate decay.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            initial_accumulator_value (`int`, defaults to 0):
+                The initial momemtum values.
+            eps (`float`, defaults to 1e-10):
+                The epsilon value prevents division by zero in the optimizer.
+            optim_bits (`int`, defaults to 8):
+                The number of bits of the optimizer state.
+                Note: This parameter is not used in Adagrad8bit as it always uses 8-bit optimization.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if initial_accumulator_value != 0.0:
+            raise ValueError("Initial accumulator value != 0.0 not supported!")
+        if lr_decay != 0.0:
+            raise ValueError("Lr Decay != 0.0 not supported!")
+        if optim_bits != 8:
+            # We allow the default value of 8 to maintain compatibility with the function signature,
+            # but any other value is invalid since Adagrad8bit always uses 8-bit optimization
+            raise ValueError("Adagrad8bit only supports optim_bits=8 (default value for compatibility)")
+        super().__init__(
+            "adagrad",
+            params,
+            lr,
+            (0.0, 0.0),
+            eps,
+            weight_decay,
+            8,
+            args,
+            min_8bit_size,
+        )
+
+
+class Adagrad32bit(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr=1e-2,
+        lr_decay=0,
+        weight_decay=0,
+        initial_accumulator_value=0,
+        eps=1e-10,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        32-bit Adagrad optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-2):
+                The learning rate.
+            lr_decay (`int`, defaults to 0):
+                The learning rate decay.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            initial_accumulator_value (`int`, defaults to 0):
+                The initial momemtum values.
+            eps (`float`, defaults to 1e-10):
+                The epsilon value prevents division by zero in the optimizer.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if initial_accumulator_value != 0.0:
+            raise ValueError("Initial accumulator value != 0.0 not supported!")
+        if lr_decay != 0.0:
+            raise ValueError("Lr Decay != 0.0 not supported!")
+        super().__init__(
+            "adagrad",
+            params,
+            lr,
+            (0.0, 0.0),
+            eps,
+            weight_decay,
+            32,
+            args,
+            min_8bit_size,
+        )
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+from bitsandbytes.optim.optimizer import Optimizer2State
+
+
+class Adam(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0,
+        amsgrad=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        is_paged=False,
+    ):
+        """
+        Base Adam optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        super().__init__(
+            "adam",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            optim_bits,
+            args,
+            min_8bit_size,
+            is_paged=is_paged,
+        )
+
+
+class Adam8bit(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0,
+        amsgrad=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        is_paged=False,
+    ):
+        """
+        8-bit Adam optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+                Note: This parameter is not supported in Adam8bit and must be False.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+                Note: This parameter is not used in Adam8bit as it always uses 8-bit optimization.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        # Validate unsupported parameters
+        if amsgrad:
+            raise ValueError("Adam8bit does not support amsgrad=True")
+
+        if optim_bits != 32:
+            # We allow the default value of 32 to maintain compatibility with the function signature,
+            # but any other value is invalid since Adam8bit always uses 8-bit optimization
+            raise ValueError("Adam8bit only supports optim_bits=32 (default value for compatibility)")
+
+        super().__init__(
+            "adam",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            8,  # Hardcoded to 8 bits
+            args,
+            min_8bit_size,
+            is_paged=is_paged,
+        )
+
+
+class Adam32bit(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0,
+        amsgrad=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        is_paged=False,
+    ):
+        """
+        32-bit Adam optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        super().__init__(
+            "adam",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            32,
+            args,
+            min_8bit_size,
+            is_paged=is_paged,
+        )
+
+
+class PagedAdam(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0,
+        amsgrad=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        is_paged=False,
+    ):
+        """
+        Paged Adam optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        super().__init__(
+            "adam",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            optim_bits,
+            args,
+            min_8bit_size,
+            is_paged=True,
+        )
+
+
+class PagedAdam8bit(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0,
+        amsgrad=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        is_paged=False,
+    ):
+        """
+        8-bit paged Adam optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+                Note: This parameter is not supported in PagedAdam8bit and must be False.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+                Note: This parameter is not used in PagedAdam8bit as it always uses 8-bit optimization.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        # Validate unsupported parameters
+        if amsgrad:
+            raise ValueError("PagedAdam8bit does not support amsgrad=True")
+
+        if optim_bits != 32:
+            # We allow the default value of 32 to maintain compatibility with the function signature,
+            # but any other value is invalid since PagedAdam8bit always uses 8-bit optimization
+            raise ValueError("PagedAdam8bit only supports optim_bits=32 (default value for compatibility)")
+
+        super().__init__(
+            "adam",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            8,  # Hardcoded to 8 bits
+            args,
+            min_8bit_size,
+            is_paged=True,
+        )
+
+
+class PagedAdam32bit(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0,
+        amsgrad=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        is_paged=False,
+    ):
+        """
+        Paged 32-bit Adam optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        super().__init__(
+            "adam",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            32,
+            args,
+            min_8bit_size,
+            is_paged=True,
+        )
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+from bitsandbytes.optim.optimizer import Optimizer2State
+
+
+class AdamW(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-2,
+        amsgrad=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        is_paged=False,
+    ):
+        """
+        Base AdamW optimizer.
+
+        Arguments:
+            params (`torch.Tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 1e-2):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        super().__init__(
+            "adam",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            optim_bits,
+            args,
+            min_8bit_size,
+            is_paged=is_paged,
+        )
+
+
+class AdamW8bit(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-2,
+        amsgrad=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        is_paged=False,
+    ):
+        """
+        8-bit AdamW optimizer.
+
+        Arguments:
+            params (`torch.Tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 1e-2):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+                Note: This parameter is not supported in AdamW8bit and must be False.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+                Note: This parameter is not used in AdamW8bit as it always uses 8-bit optimization.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        # Validate unsupported parameters
+        if amsgrad:
+            raise ValueError("AdamW8bit does not support amsgrad=True")
+
+        if optim_bits != 32:
+            # We allow the default value of 32 to maintain compatibility with the function signature,
+            # but any other value is invalid since AdamW8bit always uses 8-bit optimization
+            raise ValueError("AdamW8bit only supports optim_bits=32 (default value for compatibility)")
+
+        super().__init__(
+            "adam",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            8,  # Hardcoded to 8 bits
+            args,
+            min_8bit_size,
+            is_paged=is_paged,
+        )
+
+
+class AdamW32bit(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-2,
+        amsgrad=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        is_paged=False,
+    ):
+        """
+        32-bit AdamW optimizer.
+
+        Arguments:
+            params (`torch.Tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 1e-2):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        super().__init__(
+            "adam",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            32,
+            args,
+            min_8bit_size,
+            is_paged=is_paged,
+        )
+
+
+class PagedAdamW(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-2,
+        amsgrad=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        Paged AdamW optimizer.
+
+        Arguments:
+            params (`torch.Tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 1e-2):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        super().__init__(
+            "adam",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            optim_bits,
+            args,
+            min_8bit_size,
+            is_paged=True,
+        )
+
+
+class PagedAdamW8bit(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-2,
+        amsgrad=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        Paged 8-bit AdamW optimizer.
+
+        Arguments:
+            params (`torch.Tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 1e-2):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+                Note: This parameter is not supported in PagedAdamW8bit and must be False.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+                Note: This parameter is not used in PagedAdamW8bit as it always uses 8-bit optimization.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        # Validate unsupported parameters
+        if amsgrad:
+            raise ValueError("PagedAdamW8bit does not support amsgrad=True")
+
+        if optim_bits != 32:
+            # We allow the default value of 32 to maintain compatibility with the function signature,
+            # but any other value is invalid since PagedAdamW8bit always uses 8-bit optimization
+            raise ValueError("PagedAdamW8bit only supports optim_bits=32 (default value for compatibility)")
+
+        super().__init__(
+            "adam",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            8,  # Hardcoded to 8 bits
+            args,
+            min_8bit_size,
+            is_paged=True,
+        )
+
+
+class PagedAdamW32bit(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-2,
+        amsgrad=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        Paged 32-bit AdamW optimizer.
+
+        Arguments:
+            params (`torch.Tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 1e-2):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        super().__init__(
+            "adam",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            32,
+            args,
+            min_8bit_size,
+            is_paged=True,
+        )
+
+from collections.abc import Iterable
+import math
+from typing import Literal, Optional
+
+import torch
+
+import bitsandbytes.functional as F
+from bitsandbytes.optim.optimizer import Optimizer2State
+
+
+class _ReferenceAdEMAMix(torch.optim.Optimizer):
+    """
+    Reference: https://hf.co/papers/2409.03137
+    """
+
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float = 1e-3,
+        betas: tuple[float, float, float] = (0.9, 0.999, 0.9999),
+        alpha: float = 5.0,
+        eps: float = 1e-8,
+        weight_decay: float = 1e-2,  # default 0.0 or 1e-2?
+        t_beta3: Optional[int] = None,
+        t_alpha: Optional[int] = None,
+    ):
+        defaults = dict(
+            lr=lr, betas=betas, alpha=alpha, eps=eps, weight_decay=weight_decay, t_beta3=t_beta3, t_alpha=t_alpha
+        )
+
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if "step" in group:
+                group["step"] += 1
+            else:
+                group["step"] = 1
+
+            lr = group["lr"]
+            eps = group["eps"]
+            beta1, beta2, beta3 = group["betas"]
+            alpha = group["alpha"]
+            t_alpha = group["t_alpha"]
+            t_beta3 = group["t_beta3"]
+            weight_decay = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    # For parity with bnb implementation we combine both fast
+                    # and slow EMA stats into one stacked tensor.
+                    state["m1_m2"] = p.new_zeros((2, *p.size()))
+                    state["nu"] = torch.zeros_like(p)  # second moment estimate
+
+                m1, m2, nu = state["m1_m2"][0], state["m1_m2"][1], state["nu"]
+
+                bias_correction1 = 1 - beta1 ** group["step"]
+
+                bias_correction2 = 1 - beta2 ** group["step"]
+
+                # Apply scheduler for alpha
+                if t_alpha is not None:
+                    alpha = min(group["step"] * alpha / t_alpha, alpha)
+
+                # Apply scheduler for beta3
+                if t_beta3 is not None:
+                    ln_beta1 = math.log(beta1)
+                    ln_beta3 = math.log(beta3)
+                    step_scale = group["step"] / t_beta3
+                    beta3 = min(
+                        math.exp((ln_beta1 * ln_beta3) / (((1 - step_scale) * ln_beta3) + (step_scale * ln_beta1))),
+                        beta3,
+                    )
+
+                # Update the EMAs
+                m1.mul_(beta1).add_(grad, alpha=1 - beta1)
+                m2.mul_(beta3).add_(grad, alpha=1 - beta3)
+                nu.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                # Compute step
+                denom = (nu.sqrt() / (bias_correction2**0.5)).add(eps)
+                update = (m1.div(bias_correction1) + alpha * m2) / denom
+
+                # Add weight decay
+                update.add_(p, alpha=weight_decay)
+
+                # Apply update scaled by learning rate
+                p.add_(-lr * update)
+
+        return loss
+
+
+class AdEMAMix(Optimizer2State):
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float = 1e-3,
+        betas: tuple[float, float, float] = (0.9, 0.999, 0.9999),
+        alpha: float = 5.0,
+        t_alpha: Optional[int] = None,
+        t_beta3: Optional[int] = None,
+        eps: float = 1e-8,
+        weight_decay: float = 1e-2,
+        optim_bits: Literal[8, 32] = 32,
+        min_8bit_size: int = 4096,
+        is_paged: bool = False,
+    ):
+        super().__init__(
+            "ademamix",
+            params=params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            optim_bits=optim_bits,
+            args=None,
+            min_8bit_size=min_8bit_size,
+            is_paged=is_paged,
+            alpha=alpha,
+            t_alpha=t_alpha,
+            t_beta3=t_beta3,
+        )
+
+    @torch.no_grad()
+    def init_state(self, group, p, gindex, pindex):
+        # In our AdEMAMix implementation, we use `state` to hold
+        # both the fast and slow EMAs. Here we override the base
+        # `Optimizer2State` to allocate a buffer twice as large.
+
+        config = self.get_config(gindex, pindex, group)
+
+        if config["optim_bits"] == 32:
+            dtype = torch.float32
+        elif config["optim_bits"] == 8:
+            dtype = torch.uint8
+        else:
+            raise NotImplementedError(f"Amount of optimizer bits not supported: {config['optim_bits']}")
+
+        if p.numel() < config["min_8bit_size"]:
+            dtype = torch.float32
+
+        state = self.state[p]
+        state["step"] = 0
+
+        if dtype == torch.uint8:
+            if "dynamic" not in self.name2qmap:
+                self.fill_qmap()
+            self.name2qmap["dynamic"] = state["qmap1"] = self.name2qmap["dynamic"].to(p.device)
+            self.name2qmap["udynamic"] = state["qmap2"] = self.name2qmap["udynamic"].to(p.device)
+
+            blocksize = 256
+            n = p.numel()
+            blocks = (n // blocksize) + bool(n % blocksize)
+
+            state["absmax1"] = torch.zeros((2, blocks), dtype=torch.float32, device=p.device)
+            state["absmax2"] = torch.zeros((blocks,), dtype=torch.float32, device=p.device)
+
+        state["state1"] = self._get_state_double_buffer(p, dtype=dtype)
+        state["state2"] = self.get_state_buffer(p, dtype=dtype)
+
+    @torch.no_grad()
+    def update_step(self, group, p, gindex, pindex):
+        config = self.get_config(gindex, pindex, group)
+
+        if not config["t_alpha"] and not config["t_beta3"]:
+            # Not using alpha/beta3 scheduler; we can fall through.
+            super().update_step(group, p, gindex, pindex)
+            return
+
+        # Ensure contiguous memory layout
+        p.data = p.data.contiguous()
+        p.grad = p.grad.contiguous()
+
+        state = self.state[p]
+        grad = p.grad
+
+        state["step"] += 1
+        step = state["step"]
+
+        beta1, beta2, beta3 = config["betas"]
+        alpha = config["alpha"]
+        t_alpha = config["t_alpha"]
+        t_beta3 = config["t_beta3"]
+
+        # Apply scheduler for alpha
+        if t_alpha:
+            alpha_t = min(step * alpha / t_alpha, alpha)
+        else:
+            alpha_t = alpha
+
+        # Apply scheduler for beta3
+        if t_beta3:
+            ln_beta1 = math.log(beta1)
+            ln_beta3 = math.log(beta3)
+            step_scale = step / t_beta3
+            beta3_t = min(
+                math.exp((ln_beta1 * ln_beta3) / (((1 - step_scale) * ln_beta3) + (step_scale * ln_beta1))), beta3
+            )
+        else:
+            beta3_t = beta3
+
+        # Apply updates
+        if state["state1"].dtype == torch.float32:
+            F.optimizer_update_32bit(
+                self.optimizer_name,
+                grad,
+                p,
+                state["state1"],
+                beta1,
+                config["eps"],
+                step,
+                config["lr"],
+                state["state2"],
+                beta2,
+                beta3_t,
+                alpha_t,
+                config["weight_decay"],
+                gnorm_scale=1.0,
+                unorm_vec=state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
+                max_unorm=config["max_unorm"],
+                skip_zeros=config["skip_zeros"],
+            )
+        elif state["state1"].dtype == torch.uint8:
+            F.optimizer_update_8bit_blockwise(
+                self.optimizer_name,
+                grad,
+                p,
+                state["state1"],
+                state["state2"],
+                config["betas"][0],
+                config["betas"][1],
+                beta3_t,
+                alpha_t,
+                config["eps"],
+                step,
+                config["lr"],
+                state["qmap1"],
+                state["qmap2"],
+                state["absmax1"],
+                state["absmax2"],
+                config["weight_decay"],
+                gnorm_scale=1.0,
+                skip_zeros=config["skip_zeros"],
+            )
+
+    def _get_state_double_buffer(self, p, dtype=torch.float32):
+        if not self.is_paged or p.numel() < 1e5:
+            return torch.zeros((2, *p.size()), dtype=dtype, device=p.device)
+        else:
+            buff = F.get_paged(*(2, *p.size()), dtype=dtype, device=p.device)
+            F.fill(buff, 0)
+            self.page_mng.paged_tensors.append(buff)
+            return buff
+
+
+class AdEMAMix8bit(AdEMAMix):
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float = 1e-3,
+        betas: tuple[float, float, float] = (0.9, 0.999, 0.9999),
+        alpha: float = 5.0,
+        t_alpha: Optional[int] = None,
+        t_beta3: Optional[int] = None,
+        eps: float = 1e-8,
+        weight_decay: float = 1e-2,
+        min_8bit_size: int = 4096,
+        is_paged: bool = False,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            alpha=alpha,
+            t_alpha=t_alpha,
+            t_beta3=t_beta3,
+            eps=eps,
+            weight_decay=weight_decay,
+            optim_bits=8,
+            min_8bit_size=min_8bit_size,
+            is_paged=is_paged,
+        )
+
+
+class PagedAdEMAMix8bit(AdEMAMix8bit):
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float = 1e-3,
+        betas: tuple[float, float, float] = (0.9, 0.999, 0.9999),
+        alpha: float = 5.0,
+        t_alpha: Optional[int] = None,
+        t_beta3: Optional[int] = None,
+        eps: float = 1e-8,
+        weight_decay: float = 1e-2,
+        min_8bit_size: int = 4096,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            alpha=alpha,
+            t_alpha=t_alpha,
+            t_beta3=t_beta3,
+            eps=eps,
+            weight_decay=weight_decay,
+            min_8bit_size=min_8bit_size,
+            is_paged=True,
+        )
+
+
+class PagedAdEMAMix(AdEMAMix):
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float = 1e-3,
+        betas: tuple[float, float, float] = (0.9, 0.999, 0.9999),
+        alpha: float = 5.0,
+        t_alpha: Optional[int] = None,
+        t_beta3: Optional[int] = None,
+        eps: float = 1e-8,
+        weight_decay: float = 1e-2,
+        optim_bits: Literal[8, 32] = 32,
+        min_8bit_size: int = 4096,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            alpha=alpha,
+            t_alpha=t_alpha,
+            t_beta3=t_beta3,
+            eps=eps,
+            weight_decay=weight_decay,
+            optim_bits=optim_bits,
+            min_8bit_size=min_8bit_size,
+            is_paged=True,
+        )
+
+
+class AdEMAMix32bit(Optimizer2State):
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float = 1e-3,
+        betas: tuple[float, float, float] = (0.9, 0.999, 0.9999),
+        alpha: float = 5.0,
+        t_alpha: Optional[int] = None,
+        t_beta3: Optional[int] = None,
+        eps: float = 1e-8,
+        weight_decay: float = 1e-2,
+        min_8bit_size: int = 4096,
+        is_paged: bool = False,
+    ):
+        super().__init__(
+            "ademamix",
+            params=params,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            optim_bits=32,
+            args=None,
+            min_8bit_size=min_8bit_size,
+            is_paged=is_paged,
+            alpha=alpha,
+            t_alpha=t_alpha,
+            t_beta3=t_beta3,
+        )
+
+
+class PagedAdEMAMix32bit(AdEMAMix32bit):
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float = 1e-3,
+        betas: tuple[float, float, float] = (0.9, 0.999, 0.9999),
+        alpha: float = 5.0,
+        t_alpha: Optional[int] = None,
+        t_beta3: Optional[int] = None,
+        eps: float = 1e-8,
+        weight_decay: float = 1e-2,
+        min_8bit_size: int = 4096,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            betas=betas,
+            alpha=alpha,
+            t_alpha=t_alpha,
+            t_beta3=t_beta3,
+            eps=eps,
+            weight_decay=weight_decay,
+            min_8bit_size=min_8bit_size,
+            is_paged=True,
+        )
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+from bitsandbytes.optim.optimizer import Optimizer2State
+
+
+class LAMB(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        bias_correction=True,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0,
+        amsgrad=False,
+        adam_w_mode=True,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        max_unorm=1.0,
+    ):
+        """
+        Base LAMB optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            bias_correction (`bool`, defaults to `True`):
+                Whether to apply bias correction to the first and second-order moments.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 1e-2):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+            adam_w_mode (`bool`, defaults to `True`):
+                Whether to use the AdamW variant.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            max_unorm (`float`, defaults to 1.0):
+                The maximum gradient norm.
+        """
+        super().__init__(
+            "lamb",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            optim_bits,
+            args,
+            min_8bit_size,
+            max_unorm=max_unorm,
+        )
+
+
+class LAMB8bit(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        bias_correction=True,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0,
+        amsgrad=False,
+        adam_w_mode=True,
+        args=None,
+        min_8bit_size=4096,
+        max_unorm=1.0,
+    ):
+        """
+        8-bit LAMB optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            bias_correction (`bool`, defaults to `True`):
+                Whether to apply bias correction to the first and second-order moments.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 1e-2):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+                Note: This parameter is not supported in LAMB8bit and must be False.
+            adam_w_mode (`bool`, defaults to `True`):
+                Whether to use the AdamW variant.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            max_unorm (`float`, defaults to 1.0):
+                The maximum update norm for trust-ratio clipping.
+                Note: This parameter is not supported in LAMB8bit and must be left at the
+                default 1.0. The 8-bit blockwise update does not implement update-norm
+                clipping; it is honored by the 32-bit LAMB / LAMB32bit optimizers.
+        """
+        # Validate unsupported parameters
+        if amsgrad:
+            raise ValueError("LAMB8bit does not support amsgrad=True")
+
+        if max_unorm != 1.0:
+            # We allow the default value of 1.0 to maintain compatibility with the function
+            # signature, but the 8-bit blockwise update does not implement update-norm
+            # clipping, so any other value would be silently ignored.
+            raise ValueError("LAMB8bit only supports max_unorm=1.0 (default value for compatibility)")
+
+        super().__init__(
+            "lamb",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            8,
+            args,
+            min_8bit_size,
+            max_unorm=max_unorm,
+        )
+
+
+class LAMB32bit(Optimizer2State):
+    def __init__(
+        self,
+        params,
+        lr=1e-3,
+        bias_correction=True,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0,
+        amsgrad=False,
+        adam_w_mode=True,
+        args=None,
+        min_8bit_size=4096,
+        max_unorm=1.0,
+    ):
+        """
+        32-bit LAMB optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            bias_correction (`bool`, defaults to `True`):
+                Whether to apply bias correction to the first and second-order moments.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 1e-2):
+                The weight decay value for the optimizer.
+            amsgrad (`bool`, defaults to `False`):
+                Whether to use the [AMSGrad](https://hf.co/papers/1904.09237) variant of Adam that uses the maximum of past squared gradients instead.
+            adam_w_mode (`bool`, defaults to `True`):
+                Whether to use the AdamW variant.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            max_unorm (`float`, defaults to 1.0):
+                The maximum gradient norm.
+        """
+        super().__init__(
+            "lamb",
+            params,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            32,
+            args,
+            min_8bit_size,
+            max_unorm=max_unorm,
+        )
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+import torch
+from torch.optim import Optimizer
+
+from bitsandbytes.optim.optimizer import Optimizer1State
+
+
+class LARS(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr,
+        momentum=0,
+        dampening=0,
+        weight_decay=0,
+        nesterov=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        max_unorm=0.02,
+    ):
+        """
+        Base LARS optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`):
+                The learning rate.
+            momentum (`float`, defaults to 0):
+                The momentum value speeds up the optimizer by taking bigger steps.
+            dampening (`float`, defaults to 0):
+                The dampening value reduces the momentum of the optimizer.
+            weight_decay (`float`, defaults to 1e-2):
+                The weight decay value for the optimizer.
+            nesterov (`bool`, defaults to `False`):
+                Whether to use Nesterov momentum.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            max_unorm (`float`, defaults to 0.02):
+                The maximum gradient norm.
+        """
+        if momentum == 0:
+            raise NotImplementedError("LARS without momentum is not supported!")
+        super().__init__(
+            "lars",
+            params,
+            lr,
+            (momentum, dampening),
+            0.0,
+            weight_decay,
+            optim_bits,
+            args,
+            min_8bit_size,
+            max_unorm=max_unorm,
+        )
+
+
+class LARS8bit(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr,
+        momentum=0,
+        dampening=0,
+        weight_decay=0,
+        nesterov=False,
+        args=None,
+        min_8bit_size=4096,
+        max_unorm=0.02,
+    ):
+        """
+        8-bit LARS optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`):
+                The learning rate.
+            momentum (`float`, defaults to 0):
+                The momentum value speeds up the optimizer by taking bigger steps.
+            dampening (`float`, defaults to 0):
+                The dampening value reduces the momentum of the optimizer.
+            weight_decay (`float`, defaults to 1e-2):
+                The weight decay value for the optimizer.
+            nesterov (`bool`, defaults to `False`):
+                Whether to use Nesterov momentum.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            max_unorm (`float`, defaults to 0.02):
+                The maximum gradient norm.
+        """
+        if momentum == 0:
+            raise NotImplementedError("LARS without momentum is not supported!")
+        super().__init__(
+            "lars",
+            params,
+            lr,
+            (momentum, dampening),
+            0.0,
+            weight_decay,
+            8,
+            args,
+            min_8bit_size,
+            max_unorm=max_unorm,
+        )
+
+
+class LARS32bit(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr,
+        momentum=0,
+        dampening=0,
+        weight_decay=0,
+        nesterov=False,
+        args=None,
+        min_8bit_size=4096,
+        max_unorm=0.02,
+    ):
+        """
+        32-bit LARS optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`):
+                The learning rate.
+            momentum (`float`, defaults to 0):
+                The momentum value speeds up the optimizer by taking bigger steps.
+            dampening (`float`, defaults to 0):
+                The dampening value reduces the momentum of the optimizer.
+            weight_decay (`float`, defaults to 1e-2):
+                The weight decay value for the optimizer.
+            nesterov (`bool`, defaults to `False`):
+                Whether to use Nesterov momentum.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            max_unorm (`float`, defaults to 0.02):
+                The maximum gradient norm.
+        """
+        if momentum == 0:
+            raise NotImplementedError("LARS without momentum is not supported!")
+        super().__init__(
+            "lars",
+            params,
+            lr,
+            (momentum, dampening),
+            0.0,
+            weight_decay,
+            32,
+            args,
+            min_8bit_size,
+            max_unorm=max_unorm,
+        )
+
+
+class PytorchLARS(Optimizer):
+    def __init__(
+        self,
+        params,
+        lr=0.01,
+        momentum=0,
+        dampening=0,
+        weight_decay=0,
+        nesterov=False,
+        max_unorm=0.02,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if momentum < 0.0:
+            raise ValueError(f"Invalid momentum value: {momentum}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+
+        defaults = dict(
+            lr=lr,
+            momentum=momentum,
+            dampening=dampening,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            max_unorm=max_unorm,
+        )
+        if nesterov and (momentum <= 0 or dampening != 0):
+            raise ValueError("Nesterov momentum requires a momentum and zero dampening")
+        super().__init__(params, defaults)
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault("nesterov", False)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Args:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            weight_decay = group["weight_decay"]
+            momentum = group["momentum"]
+            dampening = group["dampening"]
+            nesterov = group["nesterov"]
+            max_unorm = group["max_unorm"]
+            lr = group["lr"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                state = self.state[p]
+                d_p = p.grad
+                if weight_decay != 0:
+                    d_p = d_p.add(p, alpha=weight_decay)
+
+                if momentum != 0:
+                    buf = state.get("momentum_buffer", None)
+
+                    if buf is None:
+                        buf = torch.clone(d_p).detach()
+                        state["momentum_buffer"] = buf
+                    else:
+                        buf.mul_(momentum).add_(d_p, alpha=1 - dampening)
+
+                    if nesterov:
+                        update = d_p + buf * momentum
+                    else:
+                        update = buf
+
+                update_scale = 1.0
+                if max_unorm > 0.0:
+                    assert p.dtype == torch.float32
+                    pnorm = torch.norm(p.detach())
+                    unorm = torch.norm(update)
+                    if unorm > max_unorm * pnorm:
+                        update_scale = max_unorm * pnorm / unorm
+
+                p.add_(update, alpha=-lr * update_scale)
+
+        return loss
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+from bitsandbytes.optim.optimizer import Optimizer1State
+
+
+class Lion(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr=1e-4,
+        betas=(0.9, 0.99),
+        weight_decay=0,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        is_paged=False,
+    ):
+        """
+        Base Lion optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-4):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            weight_decay (`float`, defaults to 0):
+                The weight decay value for the optimizer.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        super().__init__(
+            "lion",
+            params,
+            lr,
+            betas,
+            0.0,
+            weight_decay,
+            optim_bits,
+            args,
+            min_8bit_size,
+            is_paged=is_paged,
+        )
+
+
+class Lion8bit(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr=1e-4,
+        betas=(0.9, 0.99),
+        weight_decay=0,
+        args=None,
+        min_8bit_size=4096,
+        is_paged=False,
+    ):
+        """
+        8-bit Lion optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-4):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            weight_decay (`float`, defaults to 0):
+                The weight decay value for the optimizer.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        super().__init__(
+            "lion",
+            params,
+            lr,
+            betas,
+            0.0,
+            weight_decay,
+            8,
+            args,
+            min_8bit_size,
+            is_paged=is_paged,
+        )
+
+
+class Lion32bit(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr=1e-4,
+        betas=(0.9, 0.99),
+        weight_decay=0,
+        args=None,
+        min_8bit_size=4096,
+        is_paged=False,
+    ):
+        """
+        32-bit Lion optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-4):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            weight_decay (`float`, defaults to 0):
+                The weight decay value for the optimizer.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        super().__init__(
+            "lion",
+            params,
+            lr,
+            betas,
+            0.0,
+            weight_decay,
+            32,
+            args,
+            min_8bit_size,
+            is_paged=is_paged,
+        )
+
+
+class PagedLion(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr=1e-4,
+        betas=(0.9, 0.99),
+        weight_decay=0,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        Paged Lion optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-4):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            weight_decay (`float`, defaults to 0):
+                The weight decay value for the optimizer.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        super().__init__(
+            "lion",
+            params,
+            lr,
+            betas,
+            0.0,
+            weight_decay,
+            optim_bits,
+            args,
+            min_8bit_size,
+            is_paged=True,
+        )
+
+
+class PagedLion8bit(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr=1e-4,
+        betas=(0.9, 0.99),
+        weight_decay=0,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        Paged 8-bit Lion optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-4):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            weight_decay (`float`, defaults to 0):
+                The weight decay value for the optimizer.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        super().__init__(
+            "lion",
+            params,
+            lr,
+            betas,
+            0.0,
+            weight_decay,
+            8,
+            args,
+            min_8bit_size,
+            is_paged=True,
+        )
+
+
+class PagedLion32bit(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr=1e-4,
+        betas=(0.9, 0.99),
+        weight_decay=0,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        Paged 32-bit Lion optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-4):
+                The learning rate.
+            betas (`tuple(float, float)`, defaults to (0.9, 0.999)):
+                The beta values are the decay rates of the first and second-order moment of the optimizer.
+            weight_decay (`float`, defaults to 0):
+                The weight decay value for the optimizer.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        super().__init__(
+            "lion",
+            params,
+            lr,
+            betas,
+            0.0,
+            weight_decay,
+            32,
+            args,
+            min_8bit_size,
+            is_paged=True,
+        )
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+from collections import abc as container_abcs, defaultdict
+from copy import deepcopy
+from itertools import chain
+import logging
+from typing import Optional
+import warnings
+
+import torch
+
+import bitsandbytes.functional as F
+from bitsandbytes.utils import sync_gpu
+
+logger = logging.getLogger(__name__)
+
+
+class MockArgs:
+    def __init__(self, initial_data):
+        for key in initial_data:
+            setattr(self, key, initial_data[key])
+
+
+class GlobalOptimManager:
+    """
+    A global optimizer manager for enabling custom optimizer configs.
+    """
+
+    _instance = None
+
+    def __init__(self):
+        raise RuntimeError("Call get_instance() instead")
+
+    def initialize(self):
+        self.pid2config = {}
+        self.index2config = {}
+        self.optimizer = None
+        self.uses_config_override = False
+        self.module_weight_config_triple = []
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls.__new__(cls)
+            cls._instance.initialize()
+        return cls._instance
+
+    def register_parameters(self, params):
+        param_groups = list(params)
+        if not isinstance(param_groups[0], dict):
+            param_groups = [{"params": param_groups}]
+
+        for group_index, group in enumerate(param_groups):
+            for p_index, p in enumerate(group["params"]):
+                if id(p) in self.pid2config:
+                    self.index2config[(group_index, p_index)] = self.pid2config[id(p)]
+
+    def override_config(self, parameters, key=None, value=None, key_value_dict=None):
+        """
+        Override initial optimizer config with specific hyperparameters.
+
+        The key-values of the optimizer config for the input parameters are overridden
+        This can be both, optimizer parameters like `betas` or `lr`, or it can be
+        8-bit specific parameters like `optim_bits`.
+
+        Arguments:
+           parameters (`torch.Tensor` or `list(torch.Tensors)`):
+             The input parameters.
+           key (`str`):
+             The hyperparameter to override.
+           value:
+             The hyperparameter value.
+           key_value_dict (`dict`):
+             A dictionary with multiple key-values to override.
+
+        Example:
+
+        ```py
+        import torch
+        import bitsandbytes as bnb
+
+        mng = bnb.optim.GlobalOptimManager.get_instance()
+
+        model = MyModel()
+        mng.register_parameters(model.parameters()) # 1. register parameters while still on CPU
+
+        model = model.cuda()
+        # use 8-bit optimizer states for all parameters
+        adam = bnb.optim.Adam(model.parameters(), lr=0.001, optim_bits=8)
+
+        # 2. override: the parameter model.fc1.weight now uses 32-bit Adam
+        mng.override_config(model.fc1.weight, 'optim_bits', 32)
+        ```
+        """
+        self.uses_config_override = True
+        if isinstance(parameters, torch.nn.Parameter):
+            parameters = [parameters]
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+        if key is not None and value is not None:
+            assert key_value_dict is None
+            key_value_dict = {key: value}
+
+        if key_value_dict is not None:
+            for p in parameters:
+                if id(p) in self.pid2config:
+                    self.pid2config[id(p)].update(key_value_dict)
+                else:
+                    self.pid2config[id(p)] = key_value_dict
+
+    def register_module_override(self, module, param_name, config):
+        self.module_weight_config_triple.append((module, param_name, config))
+
+
+class Optimizer8bit(torch.optim.Optimizer):
+    _FSDP_WRAPPED_QUANT_STATE_KEY = "__bnb_optimizer_quant_state__"
+
+    def __init__(self, params, defaults, optim_bits=32, is_paged=False):
+        """
+        Base 8-bit optimizer class.
+
+        Arguments:
+            params (`torch.Tensor`):
+                The input parameters to optimize.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        super().__init__(params, defaults)
+        self.initialized = False
+        self.name2qmap = {}
+        self.is_paged = is_paged
+        self.page_mng = F.GlobalPageManager.get_instance()
+
+        self.mng = GlobalOptimManager.get_instance()
+        self.non_castable_tensor_keys = {
+            "qmap1",
+            "qmap2",
+            "max1",
+            "max2",
+            "new_max1",
+            "new_max2",
+            "state1",
+            "state2",
+            "gnorm_vec",
+            "absmax1",
+            "absmax2",
+            "unorm_vec",
+        }
+
+        if optim_bits == 8:
+            self.fill_qmap()
+
+    def fill_qmap(self):
+        self.name2qmap["dynamic"] = F.create_dynamic_map(signed=True)
+        self.name2qmap["udynamic"] = F.create_dynamic_map(signed=False)
+
+    def state_dict(self):
+        """Return optimizer state, wrapping quantization tensors for FSDP compatibility.
+
+        FSDP's full_optim_state_dict gathers all tensor states across ranks.
+        Quantization states (state1, state2, absmax, etc.) have different shapes
+        than model parameters, causing gather operations to fail. By wrapping
+        these tensors in a nested dict, FSDP skips them during gathering.
+        """
+        state_dict = super().state_dict()
+
+        # Deep copy the state to avoid modifying the original optimizer state
+        # PyTorch's state_dict() only does a shallow copy
+        state_dict["state"] = {
+            k: {kk: vv for kk, vv in v.items()} if isinstance(v, dict) else v for k, v in state_dict["state"].items()
+        }
+
+        # Wrap quantization-specific tensors in a nested dict to hide from FSDP
+        for param_state in state_dict["state"].values():
+            if isinstance(param_state, dict):
+                quant_state = {}
+                keys_to_wrap = [k for k in param_state if k in self.non_castable_tensor_keys]
+                for key in keys_to_wrap:
+                    quant_state[key] = param_state.pop(key)
+                if quant_state:
+                    param_state[self._FSDP_WRAPPED_QUANT_STATE_KEY] = quant_state
+
+        return state_dict
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+
+    def load_state_dict(self, state_dict, move_to_device=True):
+        """Load an optimizer state.
+
+        Arguments:
+            state_dict (`dict`):
+                An optimizer state (should be returned from a call to `state_dict`) to load.
+            move_to_device (`bool`, defaults to `True`):
+                Whether to move the optimizer's state to the device.
+        """
+        # deepcopy, to be consistent with module API
+        state_dict = deepcopy(state_dict)
+
+        # Unwrap quantization states that were wrapped for FSDP compatibility
+        for param_state in state_dict["state"].values():
+            if isinstance(param_state, dict) and self._FSDP_WRAPPED_QUANT_STATE_KEY in param_state:
+                quant_state = param_state.pop(self._FSDP_WRAPPED_QUANT_STATE_KEY)
+                param_state.update(quant_state)
+
+        # Validate the state_dict
+        groups = self.param_groups
+        saved_groups = state_dict["param_groups"]
+
+        if len(groups) != len(saved_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+        param_lens = (len(g["params"]) for g in groups)
+        saved_lens = (len(g["params"]) for g in saved_groups)
+        if any(p_len != s_len for p_len, s_len in zip(param_lens, saved_lens)):
+            raise ValueError(
+                "loaded state dict contains a parameter group that doesn't match the size of optimizer's group",
+            )
+
+        # Update the state
+        id_map = {
+            old_id: p
+            for old_id, p in zip(
+                chain.from_iterable(g["params"] for g in saved_groups),
+                chain.from_iterable(g["params"] for g in groups),
+            )
+        }
+
+        def cast(param, value):
+            r"""Make a deep copy of value, casting all tensors to device of param."""
+            if isinstance(value, torch.Tensor):
+                # Floating-point types are a bit special here. They are the only ones
+                # that are assumed to always match the type of params.
+                if param.is_floating_point() and value.dtype != torch.uint8:
+                    value = value.to(param.dtype)
+                return value
+            elif isinstance(value, dict):
+                for k, v in value.items():
+                    if k in self.non_castable_tensor_keys:
+                        if move_to_device:
+                            value[k] = v.to(param.device)
+                    else:
+                        value[k] = cast(param, v)
+
+                return value
+            elif isinstance(value, container_abcs.Iterable):
+                return type(value)(cast(param, v) for v in value)
+            else:
+                return value
+
+        # Copy state assigned to params (and cast tensors to appropriate types).
+        # State that is not assigned to params is copied as is (needed for
+        # backward compatibility).
+        state = defaultdict(dict)
+        for k, v in state_dict["state"].items():
+            if k in id_map:
+                param = id_map[k]
+                state[param] = cast(param, v)
+            else:
+                state[k] = v
+
+        # Update parameter groups, setting their 'params' value
+        def update_group(group, new_group):
+            new_group["params"] = group["params"]
+            return new_group
+
+        param_groups = [update_group(g, ng) for g, ng in zip(groups, saved_groups)]
+        self.__setstate__({"state": state, "param_groups": param_groups})
+
+    def to_gpu(self):
+        for gindex, group in enumerate(self.param_groups):
+            for pindex, p in enumerate(group["params"]):
+                if p.device.type == "cpu":
+                    continue
+                if p in self.state:
+                    values = self.state[p]
+                    for k, v in values.items():
+                        if isinstance(v, torch.Tensor):
+                            is_paged = getattr(v, "is_paged", False)
+                            if not is_paged:
+                                self.state[p][k] = v.to(p.device)
+
+    def check_overrides(self):
+        for module, attr, config in self.mng.module_weight_config_triple:
+            pmodule = getattr(module, attr)
+            assert pmodule is not None
+            assert isinstance(pmodule, torch.Tensor) or isinstance(pmodule, torch.Parameter)
+            found = False
+            for gindex, group in enumerate(self.param_groups):
+                if found:
+                    break
+                for pindex, p in enumerate(group["params"]):
+                    if found:
+                        break
+                    if id(p) == id(pmodule):
+                        # found the matching parameter
+                        # init override
+                        self.mng.pid2config[id(p)] = config
+                        self.mng.index2config[(gindex, pindex)] = self.mng.pid2config[id(p)]
+                        found = True
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Perform a single optimization step.
+
+        Arguments:
+            closure (`Callable`, *optional*, defaults to `None`):
+                A closure that reevaluates the model and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        if not self.initialized:
+            self.check_overrides()
+            self.to_gpu()  # needed for fairseq pure fp16 training
+            self.initialized = True
+
+        # if self.is_paged: self.page_mng.prefetch_all()
+        p = None
+        for gindex, group in enumerate(self.param_groups):
+            for pindex, p in enumerate(group["params"]):
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if len(state) == 0:
+                    self.init_state(group, p, gindex, pindex)
+
+                self.prefetch_state(p)
+                self.update_step(group, p, gindex, pindex)
+                sync_gpu(p)
+        if self.is_paged and p is not None:
+            # all paged operations are asynchronous, we need
+            # to sync to make sure all tensors are in the right state
+            sync_gpu(p)
+
+        return loss
+
+    def get_config(self, gindex, pindex, group):
+        config = {}
+        config["betas"] = group["betas"]
+        config["eps"] = group["eps"]
+        config["weight_decay"] = group["weight_decay"]
+        config["lr"] = group["lr"]
+        config["alpha"] = group.get("alpha", 0.0)
+        config["t_alpha"] = group.get("t_alpha", None)
+        config["t_beta3"] = group.get("t_beta3", None)
+        config["optim_bits"] = self.args.optim_bits
+        config["min_8bit_size"] = self.args.min_8bit_size
+        config["max_unorm"] = self.args.max_unorm
+        config["skip_zeros"] = self.args.skip_zeros
+
+        if (gindex, pindex) in self.mng.index2config:
+            config.update(self.mng.index2config[(gindex, pindex)])
+
+        # Also check pid2config as a fallback so that override_config works
+        # regardless of whether it was called before or after register_parameters.
+        p = self.param_groups[gindex]["params"][pindex]
+        if id(p) in self.mng.pid2config:
+            config.update(self.mng.pid2config[id(p)])
+
+        return config
+
+    def init_state(self, group, p, gindex, pindex):
+        raise NotImplementedError("init_state method needs to be overridden")
+
+    def update_step(self, group, p, gindex, pindex):
+        raise NotImplementedError("The update_step method needs to be overridden")
+
+    def get_state_buffer(self, p, dtype=torch.float32):
+        if p.device.type == "cpu":
+            if self.is_paged and not getattr(self, "_cpu_paged_warned", False):
+                warnings.warn(
+                    "Paged optimizers are not supported on CPU. Falling back to non-paged optimizer behavior.",
+                    stacklevel=2,
+                )
+                self._cpu_paged_warned = True
+            return torch.zeros_like(p, dtype=dtype, device=p.device)
+        if not self.is_paged or p.numel() < 1e5:
+            return torch.zeros_like(p, dtype=dtype, device=p.device)
+        else:
+            # > 1 MB
+            buff = F.get_paged(*p.shape, dtype=dtype, device=p.device)
+            F.fill(buff, 0)
+            self.page_mng.paged_tensors.append(buff)
+            return buff
+
+    def prefetch_state(self, p):
+        if self.is_paged:
+            state = self.state[p]
+            s1 = state["state1"]
+            is_paged = getattr(s1, "is_paged", False)
+            if is_paged:
+                F.prefetch_tensor(state["state1"])
+                if "state2" in state:
+                    F.prefetch_tensor(state["state2"])
+
+
+class Optimizer2State(Optimizer8bit):
+    def __init__(
+        self,
+        optimizer_name,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.0,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        max_unorm=0.0,
+        skip_zeros=False,
+        is_paged=False,
+        alpha=0.0,
+        t_alpha: Optional[int] = None,
+        t_beta3: Optional[int] = None,
+    ):
+        """
+        Base 2-state update optimizer class.
+
+        Arguments:
+            optimizer_name (`str`):
+                The name of the optimizer.
+            params (`torch.Tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple`, defaults to (0.9, 0.999)):
+                The beta values for the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value for the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            max_unorm (`float`, defaults to 0.0):
+                The maximum value to normalize each block with.
+            skip_zeros (`bool`, defaults to `False`):
+                Whether to skip zero values for sparse gradients and models to ensure correct updates.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+            alpha (`float`, defaults to 0.0):
+                The alpha value for the AdEMAMix optimizer.
+            t_alpha (`Optional[int]`, defaults to `None`):
+                Number of iterations for alpha scheduling with AdEMAMix.
+            t_beta3 (`Optional[int]`, defaults to `None`):
+                Number of iterations for beta scheduling with AdEMAMix.
+
+        """
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if isinstance(betas, str):
+            # format: '(beta1, beta2)'
+            betas = betas.replace("(", "").replace(")", "").strip().split(",")
+            betas = [float(b) for b in betas]
+        for i in range(len(betas)):
+            if not 0.0 <= betas[i] < 1.0:
+                raise ValueError(f"Invalid beta parameter at index {i}: {betas[i]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+
+        defaults = dict(
+            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, alpha=alpha, t_alpha=t_alpha, t_beta3=t_beta3
+        )
+
+        super().__init__(params, defaults, optim_bits, is_paged)
+
+        if args is None:
+            args = {}
+            args["optim_bits"] = optim_bits
+            args["min_8bit_size"] = min_8bit_size
+            args["max_unorm"] = max_unorm
+            args["skip_zeros"] = skip_zeros
+
+            self.args = MockArgs(args)
+        else:
+            self.args = args
+
+        self.optimizer_name = optimizer_name
+
+    @torch.no_grad()
+    def init_state(self, group, p, gindex, pindex):
+        config = self.get_config(gindex, pindex, group)
+
+        if config["optim_bits"] == 32:
+            dtype = torch.float32
+        elif config["optim_bits"] == 8:
+            dtype = torch.uint8
+        else:
+            raise NotImplementedError(f"Amount of optimizer bits not supported: {config['optim_bits']}")
+
+        if p.numel() < config["min_8bit_size"]:
+            dtype = torch.float32
+
+        state = self.state[p]
+        state["step"] = 0
+
+        if dtype == torch.float32:
+            state["state1"] = self.get_state_buffer(p, dtype=torch.float32)
+            state["state2"] = self.get_state_buffer(p, dtype=torch.float32)
+        elif dtype == torch.uint8:
+            if state["step"] == 0:
+                if "dynamic" not in self.name2qmap:
+                    self.fill_qmap()
+                self.name2qmap["dynamic"] = self.name2qmap["dynamic"].to(p.device)
+                self.name2qmap["udynamic"] = self.name2qmap["udynamic"].to(p.device)
+
+            state["state1"] = self.get_state_buffer(p, dtype=torch.uint8)
+            state["qmap1"] = self.name2qmap["dynamic"]
+
+            state["state2"] = self.get_state_buffer(p, dtype=torch.uint8)
+            state["qmap2"] = self.name2qmap["udynamic"]
+
+            blocksize = 256
+            n = p.numel()
+            blocks = (n // blocksize) + bool(n % blocksize)
+
+            state["absmax1"] = torch.zeros((blocks,), dtype=torch.float32, device=p.device)
+            state["absmax2"] = torch.zeros((blocks,), dtype=torch.float32, device=p.device)
+
+        if config["max_unorm"] > 0.0:
+            state["unorm_vec"] = torch.zeros((1,), device=p.device)
+
+    @torch.no_grad()
+    def update_step(self, group, p, gindex, pindex):
+        # avoid update error from non-contiguous memory layout
+        p.data = p.data.contiguous()
+        p.grad = p.grad.contiguous()
+
+        state = self.state[p]
+        grad = p.grad
+
+        config = self.get_config(gindex, pindex, group)
+
+        state["step"] += 1
+        step = state["step"]
+
+        if state["state1"].dtype == torch.float:
+            F.optimizer_update_32bit(
+                self.optimizer_name,
+                grad,
+                p,
+                state["state1"],
+                config["betas"][0],
+                config["eps"],
+                step,
+                config["lr"],
+                state["state2"],
+                config["betas"][1],
+                config["betas"][2] if len(config["betas"]) >= 3 else 0.0,
+                config.get("alpha", 0.0),
+                config["weight_decay"],
+                1.0,
+                state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
+                max_unorm=config["max_unorm"],
+                skip_zeros=config["skip_zeros"],
+            )
+
+        elif state["state1"].dtype == torch.uint8:
+            F.optimizer_update_8bit_blockwise(
+                self.optimizer_name,
+                grad,
+                p,
+                state["state1"],
+                state["state2"],
+                config["betas"][0],
+                config["betas"][1],
+                config["betas"][2] if len(config["betas"]) >= 3 else 0.0,
+                config.get("alpha", 0.0),
+                config["eps"],
+                step,
+                config["lr"],
+                state["qmap1"],
+                state["qmap2"],
+                state["absmax1"],
+                state["absmax2"],
+                config["weight_decay"],
+                gnorm_scale=1.0,
+                skip_zeros=config["skip_zeros"],
+            )
+
+
+class Optimizer1State(Optimizer8bit):
+    def __init__(
+        self,
+        optimizer_name,
+        params,
+        lr=1e-3,
+        betas=(0.9, 0.0),
+        eps=1e-8,
+        weight_decay=0.0,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+        max_unorm=0.0,
+        skip_zeros=False,
+        is_paged=False,
+    ):
+        """
+        Base 1-state update optimizer class.
+
+        Arguments:
+            optimizer_name (`str`):
+                The name of the optimizer.
+            params (`torch.Tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-3):
+                The learning rate.
+            betas (`tuple`, defaults to (0.9, 0.0)):
+                The beta values for the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value for the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+            max_unorm (`float`, defaults to 0.0):
+                The maximum value to normalize each block with.
+            skip_zeros (`bool`, defaults to `False`):
+                Whether to skip zero values for sparse gradients and models to ensure correct updates.
+            is_paged (`bool`, defaults to `False`):
+                Whether the optimizer is a paged optimizer or not.
+        """
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        for i in range(len(betas)):
+            if not 0.0 <= betas[i] < 1.0:
+                raise ValueError(f"Invalid beta parameter at index {i}: {betas[i]}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults, optim_bits, is_paged)
+
+        if args is None:
+            args = {}
+            args["optim_bits"] = optim_bits
+            args["min_8bit_size"] = min_8bit_size
+            args["max_unorm"] = max_unorm
+            args["skip_zeros"] = skip_zeros
+
+            self.args = MockArgs(args)
+        else:
+            self.args = args
+
+        self.optimizer_name = optimizer_name
+
+    @torch.no_grad()
+    def init_state(self, group, p, gindex, pindex):
+        config = self.get_config(gindex, pindex, group)
+
+        if config["optim_bits"] == 32:
+            dtype = torch.float32
+        elif config["optim_bits"] == 8:
+            dtype = torch.uint8
+        else:
+            raise NotImplementedError(f"Amount of optimizer bits not supported: {config['optim_bits']}")
+
+        if p.numel() < config["min_8bit_size"]:
+            dtype = torch.float32
+
+        state = self.state[p]
+        state["step"] = 0
+
+        if dtype == torch.float32:
+            state["state1"] = self.get_state_buffer(p, dtype=torch.float32)
+        elif dtype == torch.uint8:
+            if state["step"] == 0:
+                if "dynamic" not in self.name2qmap:
+                    self.fill_qmap()
+                self.name2qmap["dynamic"] = self.name2qmap["dynamic"].to(p.device)
+
+            state["state1"] = self.get_state_buffer(p, dtype=torch.uint8)
+            state["qmap1"] = self.name2qmap["dynamic"]
+
+            blocksize = 256
+            n = p.numel()
+            blocks = (n // blocksize) + bool(n % blocksize)
+
+            state["absmax1"] = torch.zeros((blocks,), dtype=torch.float32, device=p.device)
+
+        if config["max_unorm"] > 0.0:
+            state["unorm_vec"] = torch.zeros((1,), device=p.device)
+
+    @torch.no_grad()
+    def update_step(self, group, p, gindex, pindex):
+        # avoid update error from non-contiguous memory layout
+        p.data = p.data.contiguous()
+        p.grad = p.grad.contiguous()
+
+        state = self.state[p]
+        grad = p.grad
+
+        config = self.get_config(gindex, pindex, group)
+
+        state["step"] += 1
+        step = state["step"]
+
+        if state["state1"].dtype == torch.float:
+            F.optimizer_update_32bit(
+                self.optimizer_name,
+                grad,
+                p,
+                state["state1"],
+                config["betas"][0],
+                config["eps"],
+                step,
+                config["lr"],
+                None,
+                config["betas"][1],
+                0.0,
+                0.0,
+                config["weight_decay"],
+                1.0,
+                state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
+                max_unorm=config["max_unorm"],
+                skip_zeros=config["skip_zeros"],
+            )
+
+        elif state["state1"].dtype == torch.uint8:
+            F.optimizer_update_8bit_blockwise(
+                self.optimizer_name,
+                grad,
+                p,
+                state["state1"],
+                None,
+                config["betas"][0],
+                config["betas"][1],
+                0.0,
+                0.0,
+                config["eps"],
+                step,
+                config["lr"],
+                state["qmap1"],
+                None,
+                state["absmax1"],
+                None,
+                config["weight_decay"],
+                gnorm_scale=1.0,
+                skip_zeros=config["skip_zeros"],
+            )
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+from bitsandbytes.optim.optimizer import Optimizer1State
+
+
+class RMSprop(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr=1e-2,
+        alpha=0.99,
+        eps=1e-8,
+        weight_decay=0,
+        momentum=0,
+        centered=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        Base RMSprop optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-2):
+                The learning rate.
+            alpha (`float`, defaults to 0.99):
+                The alpha value is the decay rate of the squared gradients of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            momentum (`float`, defaults to 0):
+                The momentum value speeds up the optimizer by taking bigger steps.
+            centered (`bool`, defaults to `False`):
+                Whether the gradients are normalized by the variance. If `True`, it can help training at the expense of additional compute.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        if alpha == 0:
+            raise NotImplementedError("RMSprop with alpha==0.0 is not supported!")
+        if centered:
+            raise NotImplementedError("Centered RMSprop is not supported!")
+        super().__init__(
+            "rmsprop",
+            params,
+            lr,
+            (alpha, momentum),
+            eps,
+            weight_decay,
+            optim_bits,
+            args,
+            min_8bit_size,
+        )
+
+
+class RMSprop8bit(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr=1e-2,
+        alpha=0.99,
+        eps=1e-8,
+        weight_decay=0,
+        momentum=0,
+        centered=False,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        8-bit RMSprop optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-2):
+                The learning rate.
+            alpha (`float`, defaults to 0.99):
+                The alpha value is the decay rate of the squared gradients of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            momentum (`float`, defaults to 0):
+                The momentum value speeds up the optimizer by taking bigger steps.
+            centered (`bool`, defaults to `False`):
+                Whether the gradients are normalized by the variance. If `True`, it can help training at the expense of additional compute.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        if alpha == 0:
+            raise NotImplementedError("RMSprop with alpha==0.0 is not supported!")
+        if centered:
+            raise NotImplementedError("Centered RMSprop is not supported!")
+        super().__init__(
+            "rmsprop",
+            params,
+            lr,
+            (alpha, momentum),
+            eps,
+            weight_decay,
+            8,
+            args,
+            min_8bit_size,
+        )
+
+
+class RMSprop32bit(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr=1e-2,
+        alpha=0.99,
+        eps=1e-8,
+        weight_decay=0,
+        momentum=0,
+        centered=False,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        32-bit RMSprop optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`, defaults to 1e-2):
+                The learning rate.
+            alpha (`float`, defaults to 0.99):
+                The alpha value is the decay rate of the squared gradients of the optimizer.
+            eps (`float`, defaults to 1e-8):
+                The epsilon value prevents division by zero in the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            momentum (`float`, defaults to 0):
+                The momentum value speeds up the optimizer by taking bigger steps.
+            centered (`bool`, defaults to `False`):
+                Whether the gradients are normalized by the variance. If `True`, it can help training at the expense of additional compute.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+
+        if alpha == 0:
+            raise NotImplementedError("RMSprop with alpha==0.0 is not supported!")
+        if centered:
+            raise NotImplementedError("Centered RMSprop is not supported!")
+        super().__init__(
+            "rmsprop",
+            params,
+            lr,
+            (alpha, momentum),
+            eps,
+            weight_decay,
+            32,
+            args,
+            min_8bit_size,
+        )
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+from bitsandbytes.optim.optimizer import Optimizer1State
+
+
+class SGD(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr,
+        momentum=0,
+        dampening=0,
+        weight_decay=0,
+        nesterov=False,
+        optim_bits=32,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        Base SGD optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`):
+                The learning rate.
+            momentum (`float`, defaults to 0):
+                The momentum value speeds up the optimizer by taking bigger steps.
+            dampening (`float`, defaults to 0):
+                The dampening value reduces the momentum of the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            nesterov (`bool`, defaults to `False`):
+                Whether to use Nesterov momentum.
+            optim_bits (`int`, defaults to 32):
+                The number of bits of the optimizer state.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        if momentum == 0:
+            raise NotImplementedError("SGD without momentum is not supported!")
+        super().__init__(
+            "momentum",
+            params,
+            lr,
+            (momentum, dampening),
+            0.0,
+            weight_decay,
+            optim_bits,
+            args,
+            min_8bit_size,
+        )
+
+
+class SGD8bit(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr,
+        momentum=0,
+        dampening=0,
+        weight_decay=0,
+        nesterov=False,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        8-bit SGD optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`):
+                The learning rate.
+            momentum (`float`, defaults to 0):
+                The momentum value speeds up the optimizer by taking bigger steps.
+            dampening (`float`, defaults to 0):
+                The dampening value reduces the momentum of the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            nesterov (`bool`, defaults to `False`):
+                Whether to use Nesterov momentum.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        if momentum == 0:
+            raise NotImplementedError("SGD without momentum is not supported!")
+        super().__init__(
+            "momentum",
+            params,
+            lr,
+            (momentum, dampening),
+            0.0,
+            weight_decay,
+            8,
+            args,
+            min_8bit_size,
+        )
+
+
+class SGD32bit(Optimizer1State):
+    def __init__(
+        self,
+        params,
+        lr,
+        momentum=0,
+        dampening=0,
+        weight_decay=0,
+        nesterov=False,
+        args=None,
+        min_8bit_size=4096,
+    ):
+        """
+        32-bit SGD optimizer.
+
+        Arguments:
+            params (`torch.tensor`):
+                The input parameters to optimize.
+            lr (`float`):
+                The learning rate.
+            momentum (`float`, defaults to 0):
+                The momentum value speeds up the optimizer by taking bigger steps.
+            dampening (`float`, defaults to 0):
+                The dampening value reduces the momentum of the optimizer.
+            weight_decay (`float`, defaults to 0.0):
+                The weight decay value for the optimizer.
+            nesterov (`bool`, defaults to `False`):
+                Whether to use Nesterov momentum.
+            args (`object`, defaults to `None`):
+                An object with additional arguments.
+            min_8bit_size (`int`, defaults to 4096):
+                The minimum number of elements of the parameter tensors for 8-bit optimization.
+        """
+        if momentum == 0:
+            raise NotImplementedError("SGD without momentum is not supported!")
+        super().__init__(
+            "momentum",
+            params,
+            lr,
+            (momentum, dampening),
+            0.0,
+            weight_decay,
+            32,
+            args,
+            min_8bit_size,
+        )
+
+import json
+import logging
+import shlex
+import subprocess
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+
+def outlier_hook(module, input):
+    assert isinstance(module, torch.nn.Linear)
+    tracer = OutlierTracer.get_instance()
+    hvalue = tracer.get_hvalue(module.weight)
+    if hvalue not in tracer.hvalue2outlier_idx:
+        outlier_idx = find_outlier_dims(module.weight)
+        tracer.outliers.append(outlier_idx)
+        tracer.hvalues.append(hvalue)
+        if len(tracer.outliers) > 1:
+            # assign the current layer the outlier idx found from the weight
+            # of the previous linear layer
+            if tracer.outliers[-1].numel() > 0:
+                assert tracer.outliers[-1].max() < module.weight.shape[1]
+            tracer.hvalue2outlier_idx[hvalue] = tracer.outliers[-1]
+
+        else:
+            # first layer, we cannot use the weight for outlier detection
+            # we follow a mixed approach:
+            # (1) zscore test of std of hidden dimension
+            # (2) magnitude > 6 test
+            merged = input[0].view(-1, input[0].shape[-1])
+            # (1) zscore test of std of hidden dimension
+            outlier_idx = find_outlier_dims(merged, reduction_dim=1, zscore=3)
+            # (2) magnitude > 6 test
+            dims = (torch.abs(input[0]) > 6).sum(dim=list(range(len(input[0].shape) - 1)))
+            outlier_idx2 = torch.where(dims > 0)[0]
+            outlier_idx = torch.cat([outlier_idx, outlier_idx2]).unique()
+            tracer.hvalue2outlier_idx[hvalue] = outlier_idx
+    else:
+        for hook in tracer.hooks:
+            hook.remove()
+
+
+class OutlierTracer:
+    _instance = None
+
+    def __init__(self):
+        raise RuntimeError("Call get_instance() instead")
+
+    def initialize(self, model):
+        self.last_w = None
+        self.current_outlier_dims = None
+        self.hvalues = []
+        self.outliers = []
+        self.hvalue2outlier_idx = {}
+        self.initialized = True
+        self.hooks = []
+
+        for n, m in model.named_modules():
+            if isinstance(m, torch.nn.Linear):
+                self.hooks.append(m.register_forward_pre_hook(outlier_hook))
+
+    def is_initialized(self):
+        return getattr(self, "initialized", False)
+
+    def get_hvalue(self, weight):
+        return weight.data.storage().data_ptr()
+
+    def get_outliers(self, weight):
+        if not self.is_initialized():
+            logger.warning("Outlier tracer is not initialized...")
+            return None
+        hvalue = self.get_hvalue(weight)
+        if hvalue in self.hvalue2outlier_idx:
+            return self.hvalue2outlier_idx[hvalue]
+        else:
+            return None
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls.__new__(cls)
+        return cls._instance
+
+
+def find_outlier_dims(weight, reduction_dim=0, zscore=4.0, topk=None, rdm=False):
+    if rdm:
+        return torch.randint(0, weight.shape[1], size=(topk,), device=weight.device).long()
+
+    std = weight.std(reduction_dim)
+    stdm = std.mean()
+    stdstd = std.std()
+
+    zstd = (std - stdm) / stdstd
+
+    if topk is not None:
+        _, idx = torch.topk(std.abs(), k=topk, dim=0)
+    else:
+        idx = torch.where(zstd > zscore)[0]
+
+    return idx
+
+
+def execute_and_return(command_string: str) -> tuple[str, str]:
+    def _decode(subprocess_err_out_tuple):
+        return tuple(to_decode.decode("UTF-8").strip() for to_decode in subprocess_err_out_tuple)
+
+    def execute_and_return_decoded_std_streams(command_string):
+        return _decode(
+            subprocess.Popen(
+                shlex.split(command_string),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).communicate(),
+        )
+
+    std_out, std_err = execute_and_return_decoded_std_streams(command_string)
+    return std_out, std_err
+
+
+def replace_linear(
+    model,
+    linear_replacement,
+    skip_modules=("lm_head",),
+    copy_weights=False,
+    post_processing_function=None,
+):
+    """
+    Replace linear modules with a new Linear module.
+    Parameters:
+        model (`torch.nn.Module`):
+            Input model or `torch.nn.Module` as the function is run recursively.
+        linear_replacement (`torch.nn.Module`):
+            The linear module that replaces the old one. Only expects standard arguments.
+            If other arguments need to be passed, use a lambda.
+        skip_modules (`List[str]`, *optional*, defaults to `lm_head`):
+            List of modules names not to convert. Defaults to `lm_head`.
+        copy_weights (`bool`):
+            Copy the weights from the old linear module to the new one
+        post_processing_function (`str`):
+            A function name of the replacement linear class that is called
+            after processing.
+    """
+    for name, module in model.named_children():
+        if len(list(module.children())) > 0:
+            replace_linear(module, linear_replacement, skip_modules, copy_weights, post_processing_function)
+
+        if isinstance(module, torch.nn.Linear) and name not in skip_modules:
+            old_module = model._modules[name]
+            model._modules[name] = linear_replacement(
+                module.in_features,
+                module.out_features,
+                module.bias is not None,
+            )
+            if copy_weights:
+                model._modules[name].weight = old_module.weight
+                model._modules[name].bias = old_module.bias
+
+            if post_processing_function is not None:
+                func = getattr(module, post_processing_function, None)
+                if func is not None:
+                    func(module)
+    return model
+
+
+def pack_dict_to_tensor(source_dict):
+    """
+    Pack a dictionary into a torch tensor for storing quant_state items in state_dict.
+
+    Parameters:
+    - source_dict: The dictionary to be packed.
+
+    Returns:
+    A torch tensor containing the packed data.
+    """
+    json_str = json.dumps(source_dict)
+    json_bytes = json_str.encode("utf-8")
+    tensor_data = torch.tensor(list(json_bytes), dtype=torch.uint8)
+
+    return tensor_data
+
+
+def unpack_tensor_to_dict(tensor_data):
+    """
+    Unpack a torch tensor into a Python dictionary.
+
+    Parameters:
+    - tensor_data: The torch tensor containing the packed data.
+
+    Returns:
+    A Python dictionary containing the unpacked data.
+    """
+    json_bytes = bytes(tensor_data.cpu().numpy())
+    json_str = json_bytes.decode("utf-8")
+    unpacked_dict = json.loads(json_str)
+
+    return unpacked_dict
+
+
+LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING = {"row": 0, "col32": 1, "col_turing": 2, "col_ampere": 3}
+INVERSE_LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING = {val: name for (name, val) in LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING.items()}
+
+
+def sync_gpu(t: torch.Tensor):
+    if t.device.type == "cuda":
+        torch.cuda.synchronize()
+    elif t.device.type == "xpu":
+        torch.xpu.synchronize()
+
+### v0.45.1
+
+#### Improvements:
+
+* Compatibility for `triton>=3.2.0`
+* Moved package configuration to `pyproject.toml`
+* Build system: initial support for NVIDIA Blackwell B100 GPUs, RTX 50 Blackwell series GPUs and Jetson Thor Blackwell.
+  * Note: Binaries built for these platforms are not included in this release. They will be included in future releases upon the availability of the upcoming CUDA Toolkit 12.7 and 12.8.
+
+#### Bug Fixes:
+* Packaging: wheels will no longer include unit tests. (#1478)
+
+#### Dependencies:
+* Sets the minimum PyTorch version to 2.0.0.
+
+### 0.45.0
+
+This is a significant release, bringing support for LLM.int8() to NVIDIA Hopper GPUs such as the H100.
+
+As part of the compatibility enhancements, we've rebuilt much of the LLM.int8() code in order to simplify for future compatibility and maintenance. We no longer use the col32 or architecture-specific tensor layout formats while maintaining backwards compatibility. We additionally bring performance improvements targeted for inference scenarios.
+
+#### Performance Improvements
+This release includes broad performance improvements for a wide variety of inference scenarios. See [this X thread](https://x.com/Tim_Dettmers/status/1864706051171287069) for a detailed explanation.
+
+#### Breaking Changes
+🤗[PEFT](https://github.com/huggingface/peft) users wishing to merge adapters with 8-bit weights will need to upgrade to `peft>=0.14.0`.
+
+#### Packaging Improvements
+* The size of our wheel has been reduced by ~43.5% from 122.4 MB to 69.1 MB! This results in an on-disk size decrease from ~396MB to ~224MB.
+* Binaries built with CUDA Toolkit 12.6.2 are now included in the PyPI distribution.
+* The CUDA 12.5.0 build has been updated to CUDA Toolkit 12.5.1.
+
+
+#### Deprecations
+* A number of public API functions have been marked for deprecation and will emit `FutureWarning` when used. These functions will become unavailable in future releases. This should have minimal impact on most end-users.
+* The k-bit quantization features are deprecated in favor of blockwise quantization. For all optimizers, using `block_wise=False` is not recommended and support will be removed in a future release.
+* As part of the refactoring process, we've implemented many new 8bit operations. These operations no longer use specialized data layouts.
+
+#### Full Changelog
+
+* refine docs for multi-backend alpha release by @Titus-von-Koeller in #1380
+* README: Replace special Unicode text symbols with regular characters by @akx in #1385
+* Update CI tools & fix typos by @akx in #1386
+* Fix invalid escape sequence warning in Python 3.12 by @oshiteku in #1420
+* [Build] Add CUDA 12.6.2 build; update 12.5.0 to 12.5.1 by @matthewdouglas in #1431
+* LLM.int8() Refactoring: Part 1 by @matthewdouglas in #1401
+
+### 0.44.1
+
+#### Bug fixes:
+* Fix optimizer support for Python <= 3.9 by @matthewdouglas in #1379
+
+### 0.44.0
+
+#### New: AdEMAMix Optimizer
+The [AdEMAMix](https://hf.co/papers/2409.03137) optimizer is a modification to AdamW which proposes tracking two EMAs to better leverage past gradients. This allows for faster convergence with less training data and improved resistance to forgetting.
+
+We've implemented 8bit and paged variations: `AdEMAMix`, `AdEMAMix8bit`, `PagedAdEMAMix`, and `PagedAdEMAMix8bit`. These can be used with a similar API to existing optimizers.
+
+#### Improvements:
+* **8-bit Optimizers**: The block size for all 8-bit optimizers has been reduced from 2048 to 256 in this release. This is a change from the original implementation proposed in [the paper](https://hf.co/papers/2110.02861) which improves accuracy.
+* **CUDA Graphs support**: A fix to enable [CUDA Graphs](https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/) capture of kernel functions was made in #1330. This allows for performance improvements with inference frameworks like vLLM. Thanks @jeejeelee!
+
+#### Full Changelog:
+* Embedding4bit and Embedding8bit implementation by @galqiwi in #1292
+* Bugfix: Load correct nocublaslt library variant when BNB_CUDA_VERSION override is set by @matthewdouglas in #1318
+* Enable certain CUDA kernels to accept specified cuda stream by @jeejeelee in #1330
+* Initial support for ppc64le by @mgiessing in #1316
+* Cuda source cleanup , refactor and fixes by @abhilash1910 in #1328
+* Update for VS2022 17.11 compatibility with CUDA < 12.4 by @matthewdouglas in #1341
+* Bump the minor-patch group with 3 updates by @dependabot in #1362
+* Update matplotlib requirement from ~=3.9.1 to ~=3.9.2 in the major group by @dependabot in #1361
+* docs: add internal reference to multi-backend guide by @Titus-von-Koeller in #1352
+* Add move_to_device kwarg to the optimizer's load_state_dict by @koute in #1344
+* Add AdEMAMix optimizer by @matthewdouglas in #1360
+* Change 8bit optimizer blocksize 2048->256; additional bf16 support by @matthewdouglas in #1365
+
+### 0.43.3
+
+#### Improvements:
+
+- FSDP: Enable loading prequantized weights with bf16/fp16/fp32 quant_storage
+    - Background: This update, linked to [Transformer PR #32276](https://github.com/huggingface/transformers/pull/32276), allows loading prequantized weights with alternative storage formats. Metadata is tracked similarly to `Params4bit.__new__` post PR #970. It supports models exported with non-default `quant_storage`, such as [this NF4 model with BF16 storage](https://huggingface.co/hugging-quants/Meta-Llama-3.1-405B-BNB-NF4-BF16).
+    - Special thanks to @winglian and @matthewdouglas for enabling FSDP+QLoRA finetuning of Llama 3.1 405B on a single 8xH100 or 8xA100 node with as little as 256GB system RAM.
+
+
+### 0.43.2
+
+This release is quite significant as the QLoRA bug fix big implications for higher `seqlen` and batch sizes.
+
+For each sequence (i.e. batch size increase of one) we expect memory savings of:
+- 405B: 39GB for `seqlen=1024`, and 4888GB for `seqlen=128,00`
+- 70B: 10.1GB for `seqlen=1024` and  1258GB for `seqlen=128,00`
+
+This was due to activations being unnecessary for frozen parameters, yet the memory for them was still erroneously allocated due to the now fixed bug.
+
+#### Improvements:
+
+- docs: FSDP+QLoRA and CPU install guide (#1211 #1227, thanks @stevhliu)
+- Add CUDA 12.5 and update 12.4 builds (#1284)
+
+#### Bug Fixes
+
+- 4bit getstate and 8bit deepcopy (#1230 #1231, thanks @BenjaminBossan)
+- missing optimizers in `str2optimizer32bit` (#1222, thanks @EtienneDosSantos)
+- CUDA 12.5 build issue (#1273, thanks @HennerM)
+- fix for min_8bit_size functionality in Optimizer base classes (#1286, thanks @Edenzzzz)
+- QLoRA mem bug (#1270, thanks @Ther-nullptr)
+- tests for cpu only platforms (#1259, thanks @galqiwi)
+- restoration of quant_storage for CPU offloading (#1279)
+- optim update error with non-contiguous grads/params (deepspeed) (#1187)
+
+### 0.43.1
+
+#### Improvements:
+
+- Improved the serialization format for 8-bit weights; this change is fully backwards compatible. (#1164, thanks to @younesbelkada for the contributions and @akx for the review).
+- Added CUDA 12.4 support to the Linux x86-64 build workflow, expanding the library's compatibility with the latest CUDA versions. (#1171, kudos to @matthewdouglas for this addition).
+- Docs enhancement: Improved the instructions for installing the library from source. (#1149, special thanks to @stevhliu for the enhancements).
+
+#### Bug Fixes
+
+- Fix 4bit quantization with blocksize = 4096, where an illegal memory access was encountered. (#1160, thanks @matthewdouglas for fixing and @YLGH for reporting)
+
+#### Internal Improvements:
+
+- Tests: improve memory usage (#1147, thanks @matthewdouglas)
+- Add CUDA 12.4 to docs/install helper (#1136, thanks @matthewdouglas)
+- Minor type/doc fixes (#1128, thanks @akx)
+- Reformat Python code with Ruff (#1081, thanks @akx)
+- Rework of CUDA/native-library setup and diagnostics (#1041, thanks @akx)
+
+### 0.43.0
+
+#### Improvements and New Features:
+
+- QLoRA + FSDP official support is now live! https://github.com/TimDettmers/bitsandbytes/pull/970 by @warner-benjamin and team - with FSDP you can train very large models (70b scale) on multiple 24GB consumer-type GPUs. See https://www.answer.ai/posts/2024-03-06-fsdp-qlora.html for more details.
+- Introduced improvements to the CI process for enhanced performance and efficiency during builds, specifically enabling more effective cross-compilation on Linux platforms. This was accomplished by deprecating Make and migrating to Cmake, as well as implementing new corresponding workflows. Huge thanks go to @wkpark, @rickardp, @matthewdouglas and @younesbelkada; #1055, #1050, #1111.
+- Windows should be officially supported in bitsandbytes if you install the library from source. See: https://huggingface.co/docs/bitsandbytes/main/en/index for more details
+- Updated installation instructions to provide more comprehensive guidance for users. This includes clearer explanations and additional tips for various setup scenarios, making the library more accessible to a broader audience (@rickardp, #1047).
+- Enhanced the library's compatibility and setup process, including fixes for CPU-only installations and improvements in CUDA setup error messaging. This effort aims to streamline the installation process and improve user experience across different platforms and setups (@wkpark, @akx, #1038, #996, #1012).
+- Setup a new documentation at https://huggingface.co/docs/bitsandbytes/main with extensive new sections and content to help users better understand and utilize the library. Especially notable are the new API docs. (big thanks to @stevhliu and @mishig25 from HuggingFace #1012). The API docs have been also addressed in #1075.
+
+#### Bug Fixes:
+
+- Addressed a race condition in kEstimateQuantiles, enhancing the reliability of quantile estimation in concurrent environments (@pnunna93, #1061).
+- Fixed various minor issues, including typos in code comments and documentation, to improve code clarity and prevent potential confusion (@Brian Vaughan, #1063).
+
+#### Backwards Compatibility
+
+- After upgrading from `v0.42` to `v0.43`, when using 4bit quantization, models may generate slightly different outputs (approximately up to the 2nd decimal place) due to a fix in the code. For anyone interested in the details, [see this comment](https://github.com/TimDettmers/bitsandbytes/discussions/1094#discussioncomment-8984069).
+
+#### Internal and Build System Enhancements:
+
+- Implemented several enhancements to the internal and build systems, including adjustments to the CI workflows, portability improvements, and build artifact management. These changes contribute to a more robust and flexible development process, ensuring the library's ongoing quality and maintainability (@rickardp, @akx, @wkpark, @matthewdouglas; #949, #1053, #1045, #1037).
+
+#### Contributors:
+
+This release is made possible thanks to the many active contributors that submitted PRs and many others who contributed to discussions, reviews, and testing. Your efforts greatly enhance the library's quality and user experience. It's truly inspiring to work with such a dedicated and competent group of volunteers and professionals!
+
+We give a special thanks to @TimDettmers for managing to find a little bit of time for valuable consultations on critical topics, despite preparing for and touring the states applying for professor positions. We wish him the utmost success!
+
+We also extend our gratitude to the broader community for your continued support, feedback, and engagement, which play a crucial role in driving the library's development forward.
+
+### 0.42.0
+
+Features:
+
+- 4-bit serialization now supported. This enables 4-bit load/store. Thank you @poedator #753
+- the bitsandbytes library now has a version attribute: `bitsandbytes.__version__` @rasbt #710
+
+Bug fixes:
+
+- Fixed bugs in dynamic exponent data type creation. Thank you @RossM, @KohakuBlueleaf, @ArrowM #659 #227 #262 #152
+- Fixed an issue where 4-bit serialization would fail for layers without double quantization #868. Thank you, @poedator
+- Fixed an issue where calling .to() or .cuda() on a 4-bit layer twice would result in an error #867. Thank you, @jph00
+- Fixed a bug where a missing access permission in a path searched for CUDA would lead to an error @osma #677
+- Fixed a bug where the GOOGLE_VM_CONFIG_LOCK_FILE variable could cause errors in colab environments @akrentsel @xaptronic #715 #883 #622
+- Fixed a bug where kgetColRowStats (LLM.int8()) would fail for certain dimensions @LucQueen @905
+- Fixed a bug where the adjusted regular Embedding layer was not available via bnb.nn.Embedding @neel04 #563
+- Fixed added missing scipy requirement @dulalbert #525
+
+### 0.41.3
+
+Bug fixes:
+
+- Fixed an issue where 4-bit serialization would fail for layers without double quantization #868. Thank you, @poedator
+- Fixed an issue where calling .to() or .cuda() on a 4-bit layer twice would result in an error #867. Thank you, @jph00
+
+### 0.41.2
+
+Feature:
+
+- 4-bit serialization now supported. This enables 4-bit load/store. Thank you @poedator #753
+
+### 0.41.1
+
+Bug fixes:
+
+- Fixed bugs in dynamic exponent data type creation. Thank you @RossM, @KohakuBlueleaf, @ArrowM #659 #227 #262 #152
+
+### 0.41.0
+
+Features:
+
+- Added precompiled CUDA 11.8 binaries to support H100 GPUs without compilation #571
+- CUDA SETUP now no longer looks for libcuda and libcudart and relies PyTorch CUDA libraries. To manually override this behavior see: how_to_use_nonpytorch_cuda.md. Thank you @rapsealk
+
+Bug fixes:
+
+- Fixed a bug where the default type of absmax was undefined which leads to errors if the default type is different than torch.float32. # 553
+- Fixed a missing scipy dependency in requirements.txt. #544
+- Fixed a bug, where a view operation could cause an error in 8-bit layers.
+- Fixed a bug where CPU bitsandbytes would during the import. #593 Thank you @bilelomrani
+- Fixed a but where a non-existent LD_LIBRARY_PATH variable led to a failure in python -m bitsandbytes #588
+- Removed outdated get_cuda_lib_handle calls that lead to errors. #595 Thank you @ihsanturk
+- Fixed bug where read-permission was assumed for a file. #497
+- Fixed a bug where prefetchAsync lead to errors on GPUs that do not support unified memory but not prefetching (Maxwell, SM52). #470 #451 #453 #477 Thank you @jllllll and @stoperro
+
+Documentation:
+
+- Improved documentation for GPUs that do not support 8-bit matmul. #529
+- Added description and pointers for the NF4 data type. #543
+
+User experience:
+
+- Improved handling of default compute_dtype for Linear4bit Layers, so that compute_dtype = input_dtype if the input data type is stable enough (float32, bfloat16, but not float16).
+
+Performance:
+
+- improved 4-bit inference performance for A100 GPUs. This degraded performance for A40/RTX3090 and RTX 4090 GPUs slightly.
+
+### 0.40.2
+
+Bug fixes:
+
+- Fixed a but where a non-existent LD_LIBRARY_PATH variable led to a failure in python -m bitsandbytes #588
+- Removed outdated get_cuda_lib_handle calls that lead to errors. #595 Thank you @ihsanturk
+- Fixed bug where read-permission was assumed for a file. #497
+- Fixed a bug where prefetchAsync lead to errors on GPUs that do not support unified memory but not prefetching (Maxwell, SM52). #470 #451 #453 #477 Thank you @jllllll and @stoperro
+
+### 0.40.1
+
+Features:
+
+- Added precompiled CUDA 11.8 binaries to support H100 GPUs without compilation #571
+- CUDA SETUP now no longer looks for libcuda and libcudart and relies PyTorch CUDA libraries. To manually override this behavior see: how_to_use_nonpytorch_cuda.md. Thank you @rapsealk
+
+Bug fixes:
+
+- Fixed a bug where the default type of absmax was undefined which leads to errors if the default type is different than torch.float32. # 553
+- Fixed a missing scipy dependency in requirements.txt. #544
+- Fixed a bug, where a view operation could cause an error in 8-bit layers.
+- Fixed a bug where CPU bitsandbytes would during the import. #593 Thank you @bilelomrani
+
+Documentation:
+
+- Improved documentation for GPUs that do not support 8-bit matmul. #529
+- Added description and pointers for the NF4 data type. #543
+
+### 0.40.0
+
+Features:
+
+- Added 4-bit inference kernels for batch size=1. Currently support are the NF4, FP4 data types.
+- Added support for quantizations of bfloat16 input data.
+
+Bug fixes:
+
+- Added `device` variable for bitsandbytes layers to be compatible with PyTorch layers.
+
+Deprecated:
+
+- Binaries for CUDA 11.2, 11.6 no longer ship with `pip install bitsandbytes` and need to be compiled from source.
+
+### 0.39.0
+
+Features:
+
+- 4-bit matrix multiplication for Float4 and NormalFloat4 data types.
+- Added 4-bit quantization routines
+- Doubled quantization routines for 4-bit quantization
+- Paged optimizers for Adam and Lion.
+- bfloat16 gradient / weight support for Adam and Lion with 8 or 32-bit states.
+
+Bug fixes:
+
+- Fixed a bug where 8-bit models consumed twice the memory as expected after serialization
+
+Deprecated:
+
+- Kepler binaries (GTX 700s and Tesla K40/K80) are not longer provided via pip and need to be compiled from source. Kepler support might be fully removed in the future.
+
+### 0.38.1
+
+Features:
+
+- Added Int8 SwitchBack layers
+- Added Fake FP8 layers for research purposes (available under `bnb.research.nn. ...`)
+
+### 0.38.0
+
+#### 8-bit Lion, Load/Store 8-bit Models directly from/to HF Hub
+
+Features:
+
+- Support for 32 and 8-bit Lion has been added. Thank you @lucidrains
+- Support for serialization of Linear8bitLt layers (LLM.int8()). This allows to
