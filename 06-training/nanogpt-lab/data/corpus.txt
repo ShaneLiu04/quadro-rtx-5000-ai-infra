@@ -10203,4 +10203,3205 @@ The `llama-server` application supports several implementations of speculative d
 A much smaller model (called the _draft model_) generates drafts.
 A draft model is the most used approach in speculative decoding.
 
-### EA
+### EAGLE-3 (`draft-eagle3`)
+
+EAGLE-3 uses a small draft model that reads the target model's hidden states to predict the next tokens, so it
+reaches higher acceptance than a standalone draft model of the same size. The draft is a one-layer transformer
+trained for a specific target model; it shares the target model's tokenizer and, optionally, uses a reduced draft
+vocabulary with its own `lm_head`, which is mapped back using a `d2t` table.
+
+Convert the EAGLE-3 checkpoint with `--target-model-dir` so it inherits the target's tokenizer and the layer
+indices to read. Both the SpecForge `LlamaForCausalLMEagle3` and the vLLM/AngelSlim `Eagle3LlamaForCausalLM`
+checkpoint formats are supported (for example [`AngelSlim/Qwen3-4B_eagle3`](https://huggingface.co/AngelSlim/Qwen3-4B_eagle3)
+for `Qwen/Qwen3-4B`):
+
+```bash
+python convert_hf_to_gguf.py AngelSlim/Qwen3-4B_eagle3 \
+    --target-model-dir Qwen/Qwen3-4B --outtype bf16 --outfile Qwen3-4B-eagle3.gguf
+
+llama-server -m Qwen3-4B.gguf -md Qwen3-4B-eagle3.gguf --spec-type draft-eagle3
+```
+
+Supported EAGLE-3 draft models include:
+
+- [yuhuili/EAGLE3-LLaMA3.1-Instruct-8B](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B)
+- [yuhuili/EAGLE3-LLaMA3.3-Instruct-70B](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.3-Instruct-70B)
+- [RedHatAI/gemma-4-31B-it-speculator.eagle3](https://huggingface.co/RedHatAI/gemma-4-31B-it-speculator.eagle3)
+- [RedHatAI/gemma-4-26B-A4B-it-speculator.eagle3](https://huggingface.co/RedHatAI/gemma-4-26B-A4B-it-speculator.eagle3)
+- [Tengyunw/qwen3_8b_eagle3](https://huggingface.co/Tengyunw/qwen3_8b_eagle3)
+- [Tengyunw/qwen3_30b_moe_eagle3](https://huggingface.co/Tengyunw/qwen3_30b_moe_eagle3)
+- [AngelSlim/Qwen3-1.7B_eagle3](https://huggingface.co/AngelSlim/Qwen3-1.7B_eagle3)
+- [AngelSlim/Qwen3-4B_eagle3](https://huggingface.co/AngelSlim/Qwen3-4B_eagle3)
+- [AngelSlim/Qwen3-8B_eagle3](https://huggingface.co/AngelSlim/Qwen3-8B_eagle3)
+- [AngelSlim/Qwen3-14B_eagle3](https://huggingface.co/AngelSlim/Qwen3-14B_eagle3)
+- [AngelSlim/Qwen3-32B_eagle3](https://huggingface.co/AngelSlim/Qwen3-32B_eagle3)
+- [AngelSlim/Qwen3-a3B_eagle3](https://huggingface.co/AngelSlim/Qwen3-a3B_eagle3)
+- [RedHatAI/gpt-oss-20b-speculator.eagle3](https://huggingface.co/RedHatAI/gpt-oss-20b-speculator.eagle3)
+- [lmsys/EAGLE3-gpt-oss-120b-bf16](https://huggingface.co/lmsys/EAGLE3-gpt-oss-120b-bf16)
+- [nvidia/gpt-oss-120b-Eagle3-long-context](https://huggingface.co/nvidia/gpt-oss-120b-Eagle3-long-context)
+
+For the full and up-to-date list of supported models, see #18039.
+
+### DFlash (`draft-dflash`)
+
+DFlash produces an entire block of draft tokens in a single forward pass (block diffusion) and
+injects the target model's hidden states into the draft model's attention, instead of drafting one
+token at a time. This keeps the draft model small while making drafting GPU-friendly. Unlike EAGLE-3
+(a single-layer autoregressive draft), the DFlash draft uses several transformer layers but emits a
+whole block per draft step.
+
+The draft is a small block-diffusion model trained for a specific target (for example
+`z-lab/Qwen3-4B-DFlash` for `Qwen/Qwen3-4B`). Convert it with `--target-model-dir` so it inherits the
+target's tokenizer and token embeddings:
+
+```bash
+python convert_hf_to_gguf.py z-lab/Qwen3-4B-DFlash \
+    --target-model-dir Qwen/Qwen3-4B --outtype bf16 --outfile Qwen3-4B-DFlash.gguf
+
+llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
+    --spec-type draft-dflash --spec-draft-n-max 15 -fa on --jinja
+```
+
+`--spec-draft-n-max` is clamped to the draft model's trained block size.
+
+See:
+
+- #22105
+
+### DSpark (`draft-dspark`)
+
+DSpark extends DFlash with a semi-autoregressive _Markov head_: the draft still emits a whole
+block per forward pass, but each block position's logits are biased by a low-rank term keyed on
+the previous token, chained in-graph across the block. This keeps drafting at one decode per
+block while recovering some of the left-to-right signal that pure block diffusion loses.
+
+The draft is a small DeepSpec checkpoint trained for a specific target (for example
+[`deepseek-ai/dspark_qwen3_4b_block7`](https://huggingface.co/deepseek-ai/dspark_qwen3_4b_block7)
+for `Qwen/Qwen3-4B`). Convert it with `--target-model-dir` so it inherits the target's tokenizer
+and token embeddings:
+
+```bash
+python convert_hf_to_gguf.py deepseek-ai/dspark_qwen3_4b_block7 \
+    --target-model-dir Qwen/Qwen3-4B --outtype bf16 --outfile Qwen3-4B-DSpark.gguf
+
+llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
+    --spec-type draft-dspark --spec-draft-n-max 7 -fa on --jinja
+```
+
+`--spec-draft-n-max` is clamped to the draft model's trained block size.
+
+`--spec-draft-conf-min P` truncates each drafted block at the first position whose predicted
+acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
+
+Currently only drafts with a Qwen3 backbone are supported; support for other backbones
+(e.g. Gemma4) is planned.
+
+DSpark drafts exported in the [speculators](https://github.com/vllm-project/speculators) format
+(for example [`RedHatAI/gemma-4-31B-it-speculator.dspark`](https://huggingface.co/RedHatAI/gemma-4-31B-it-speculator.dspark))
+convert the same way.
+
+See:
+
+- #25173
+
+### n-gram Cache (`ngram-cache`)
+
+An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
+A draft is computed using probabilities derived from these statistics. External statistics can also be loaded from files for improved accuracy.
+
+See:
+
+- #5479, #6828, #6848
+
+### n-gram Map (`ngram-simple`, `ngram-map-*`)
+
+These implementations search the token history for patterns and use matching sequences as draft candidates.
+They require no additional model but rely on patterns that have already appeared in the generated text.
+An example to use this approach can be the rewriting of source code by a LLM.
+
+#### n-gram Map (`ngram-simple`)
+
+This implementation looks for the last n-gram in history that matches the current n-gram and creates a draft using the m tokens following the matched n-gram. It is the simplest self-speculative approach with minimal overhead.
+
+```
+llama-server [...] --spec-type ngram-simple --spec-draft-n-max 64
+```
+
+#### n-gram Map Key (`ngram-map-k`)
+
+This implementation looks for the current n-gram of size n (called the _key_) in the token history. If the key n-gram is followed by the same m tokens (called the _mgram_) multiple times, it creates a draft using these m tokens. This approach requires a minimum number of occurrences (argument `--spec-ngram-map-k-min-hits`, default is 1) before generating drafts.
+
+The number of accepted tokens is stored for each used n-gram.
+
+**Example:**
+```
+llama-server [...] --spec-type ngram-map-k --spec-draft-n-max 64
+```
+
+#### n-gram Map Key-4-Values (`ngram-map-k4v`)
+
+This experimental implementation looks for the current n-gram of size n (called the _key_) in the token history. For each key, up to four _values_ (n-grams of size m, called _mgrams_) are tracked. An internal statistic counts the occurrences of each mgram after the key n-gram. If one mgram is significantly more frequent than the others, it is used as the draft.
+
+The number of accepted tokens is stored for each used n-gram.
+
+**Example:** Server options to be used if there are a lot of longer repetitions.
+```
+llama-server [...] --spec-type ngram-map-k4v --spec-ngram-map-k4v-size-n 8 --spec-ngram-map-k4v-size-m 8 --spec-ngram-map-k4v-min-hits 2 --spec-draft-n-max 64
+```
+
+### n-gram Mod (`ngram-mod`)
+
+Add basic ngram hasher for speculative decoding:
+
+- For each ngram, compute a hash using LCG
+- For each computed hash, store the next token
+- During speculation, iteratively compute the rolling hash of the last n tokens and pick the next token from the storage
+
+Some characteristics:
+
+- Lightweight (~16 MB)
+- Constant memory and complexity
+- Can generate variable draft lengths (i.e. m is not fixed)
+
+Currently, a single hash pool is shared across all server slots, so different requests can benefit from each other.
+
+**Sample usage:**
+
+```
+# notes:
+# - small `n` are not recommended
+# - MoEs require long drafts
+# - dense models: can reduce `--spec-ngram-mod-n-min` and `--spec-ngram-mod-n-max`
+
+llama-server ... --spec-type ngram-mod --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64
+```
+
+Applications:
+
+- Iterating over a block of text/code (e.g. in llama.vim)
+- Reasoning models (when they have to repeat their thinking in the final answer)
+- Summarization
+
+Example Video:
+
+- See #19164
+
+### Differences between ngram-simple, ngram-map and ngram-mod
+
+- ngram-simple looks for a previous matching n-gram and inserts the following m-gram.
+- ngram-map-k looks for a previous matching n-gram and inserts the following m-gram but uses an internal hash-map of n-grams in the current context window.
+- ngram-mod uses a hash pool which is shared across all server slots. The hash pool is a map from n-gram hash to the next token (not the next m-gram as in ngram-map).
+
+## Command-Line Options
+
+If a draft model is combined with a draftless decoding the draftless decoding has higher precedence.
+
+### Backend Sampling
+
+Use `--backend-sampling` to run supported target-model samplers on the model backend. Draft-model sampling uses the backend by default and can be controlled with `--spec-draft-backend-sampling` and `--no-spec-draft-backend-sampling`.
+
+Unsupported samplers and device layouts fall back to CPU sampling. Tensor split mode does not support backend sampling. A fixed seed produces repeatable random draws, but stochastic CPU and backend sampling can still select different tokens because floating-point operations can differ between implementations and devices. Use greedy sampling when exact output matching is required.
+
+### Synthetic Acceptance
+
+`llama-server` and `llama-cli` can replace normal speculative verification with synthetic decisions for benchmarking. The generated output is not valid model output because accepted draft tokens do not have to match the target model.
+
+Use exactly one of these options:
+
+- `--spec-synth-rates P0,P1,...` sets unconditional per-position acceptance probabilities. Entry `i` is the probability that the first `i+1` draft tokens are all accepted. The number of entries must match the effective maximum draft length. Values must be finite, within `[0, 1]`, and monotonically non-increasing.
+- `--spec-synth-len L` sets the target mean acceptance length, including the target token. For `K` maximum draft tokens, `L` must be within `[1, K+1]`. The server finds a constant conditional probability `p` such that `p + p^2 + ... + p^K = L - 1`, then uses unconditional rates `[p, p^2, ..., p^K]`.
+
+### General Speculative Parameters
+
+```
+--spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dspark|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
+                                        comma-separated list of types of speculative decoding to use
+                                        (default: none)
+                                        (env: LLAMA_ARG_SPEC_TYPE)
+--spec-default                          use default speculative decoding config
+                                        (enables ngram-mod)
+```
+
+### Draft Model Parameters
+
+```
+--spec-draft-model, -md, --model-draft  FNAME
+                                        draft model for speculative decoding (default: unused)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_MODEL)
+--spec-draft-hf, -hfd, -hfrd, --hf-repo-draft  <user>/<model>[:quant]
+                                        HuggingFace repository for the draft model
+                                        (env: LLAMA_ARG_SPEC_DRAFT_HF_REPO)
+--spec-draft-n-max                      N
+                                        number of tokens to draft for speculative decoding (default: 3)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_MAX)
+--spec-draft-n-min                      N
+                                        minimum number of draft tokens to use for speculative decoding (default: 0)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
+--spec-draft-p-split, --draft-p-split   P
+                                        speculative decoding split probability (default: 0.10)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
+--spec-draft-p-min, --draft-p-min       P
+                                        minimum speculative decoding probability (greedy) (default: 0.00)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
+--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft  N
+                                        max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)
+                                        (env: LLAMA_ARG_N_GPU_LAYERS_DRAFT)
+--spec-draft-device, -devd, --device-draft  <dev1,dev2,..>
+                                        comma-separated list of devices to use for offloading the draft model
+                                        (use --list-devices to see available devices)
+```
+
+### Draft Model CPU Scheduling Parameters
+
+```
+--spec-draft-threads, -td, --threads-draft  N
+                                        number of CPU threads to use during generation
+--spec-draft-threads-batch, -tbd, --threads-batch-draft  N
+                                        number of threads to use during batch and prompt processing (default: same as --threads-draft)
+--spec-draft-cpu-mask, -Cd, --cpu-mask-draft  M
+                                        Draft model CPU affinity mask. Complements cpu-range-draft
+--spec-draft-cpu-range, -Crd, --cpu-range-draft  lo-hi
+                                        Ranges of CPUs for affinity. Complements --cpu-mask-draft
+--spec-draft-cpu-strict, --cpu-strict-draft  <0|1>
+                                        Use strict CPU placement for draft model (default: same as --cpu-strict)
+--spec-draft-prio, --prio-draft  N
+                                        set draft process/thread priority : 0-normal, 1-medium, 2-high, 3-realtime
+--spec-draft-poll, --poll-draft  <0|1>
+                                        Use polling to wait for draft model work (default: same as --poll)
+--spec-draft-cpu-mask-batch, -Cbd, --cpu-mask-batch-draft  M
+                                        Draft model CPU affinity mask for batch. Complements cpu-range-batch-draft
+--spec-draft-cpu-range-batch, -Crbd, --cpu-range-batch-draft  lo-hi
+                                        Ranges of CPUs for affinity for batch. Complements --cpu-mask-batch-draft
+--spec-draft-cpu-strict-batch, --cpu-strict-batch-draft  <0|1>
+                                        Use strict CPU placement for draft model batch (default: --cpu-strict-draft)
+--spec-draft-prio-batch, --prio-batch-draft  N
+                                        set draft process/thread priority for batch : 0-normal, 1-medium, 2-high, 3-realtime
+--spec-draft-poll-batch, --poll-batch-draft  <0|1>
+                                        Use polling to wait for draft model work for batch (default: --poll-draft)
+```
+
+### Draft Model KV Cache and Tensor Override Parameters
+
+```
+--spec-draft-type-k, -ctkd, --cache-type-k-draft  TYPE
+                                        KV cache data type for K for the draft model
+                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+                                        (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K)
+--spec-draft-type-v, -ctvd, --cache-type-v-draft  TYPE
+                                        KV cache data type for V for the draft model
+                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+                                        (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V)
+--spec-draft-override-tensor, -otd, --override-tensor-draft  <tensor name pattern>=<buffer type>,...
+                                        override tensor buffer type for draft model
+--spec-draft-cpu-moe, -cmoed, --cpu-moe-draft
+                                        keep all Mixture of Experts (MoE) weights in the CPU for the draft model
+                                        (env: LLAMA_ARG_SPEC_DRAFT_CPU_MOE)
+--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft  N
+                                        keep the MoE weights of the first N layers in the CPU for the draft model
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE)
+```
+
+### n-gram Mod Parameters
+
+```
+--spec-ngram-mod-n-match                N
+                                        ngram-mod lookup length (default: 24)
+--spec-ngram-mod-n-min                  N
+                                        minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48)
+--spec-ngram-mod-n-max                  N
+                                        maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64)
+```
+
+### n-gram Simple Parameters
+
+```
+--spec-ngram-simple-size-n              N
+                                        ngram size N for ngram-simple speculative decoding, length of lookup n-gram (default: 12)
+--spec-ngram-simple-size-m              N
+                                        ngram size M for ngram-simple speculative decoding, length of draft m-gram (default: 48)
+--spec-ngram-simple-min-hits            N
+                                        minimum hits for ngram-simple speculative decoding (default: 1)
+```
+
+### n-gram Map Key Parameters
+
+```
+--spec-ngram-map-k-size-n               N
+                                        ngram size N for ngram-map-k speculative decoding, length of lookup n-gram (default: 12)
+--spec-ngram-map-k-size-m               N
+                                        ngram size M for ngram-map-k speculative decoding, length of draft m-gram (default: 48)
+--spec-ngram-map-k-min-hits             N
+                                        minimum hits for ngram-map-k speculative decoding (default: 1)
+```
+
+### n-gram Map Key-4-Values Parameters
+
+```
+--spec-ngram-map-k4v-size-n             N
+                                        ngram size N for ngram-map-k4v speculative decoding, length of lookup n-gram (default: 12)
+--spec-ngram-map-k4v-size-m             N
+                                        ngram size M for ngram-map-k4v speculative decoding, length of draft m-gram (default: 48)
+--spec-ngram-map-k4v-min-hits           N
+                                        minimum hits for ngram-map-k4v speculative decoding (default: 1)
+```
+
+### `--spec-type TYPE`
+
+Specifies a comma-separated list of speculative decoding types to use.
+
+| Type | Description |
+|------|-------------|
+| `none` | No speculative decoding (default) |
+| `draft-simple` | Use a simple draft model for speculation |
+| `draft-eagle3` | Use an EAGLE-3 draft model that reads the target's hidden states |
+| `draft-dflash` | Use a DFlash block-diffusion draft model that emits a block per step |
+| `draft-dspark` | Use a DSpark draft model (DFlash backbone + semi-autoregressive Markov head) |
+| `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model |
+| `ngram-cache` | Use n-gram cache lookup |
+| `ngram-simple` | Use simple n-gram pattern matching |
+| `ngram-map-k` | Use n-gram pattern matching with n-gram-keys |
+| `ngram-map-k4v` | Use n-gram pattern matching with n-gram-keys and up to four m-gram values (experimental) |
+| `ngram-mod` | Use basic ngram hasher for speculative decoding with shared pool |
+
+**Example:** Server-instance used to refactor source code.
+```bash
+./llama-server [...] --spec-type ngram-simple
+```
+
+**Example:** Multiple speculative implementations.
+```bash
+./llama-server [...] --spec-type ngram-mod,ngram-map-k4v
+```
+
+### `--spec-ngram-*-size-n N`
+
+Sets the size N of the lookup n-gram for n-gram map based speculative decoding.
+The n-gram size N determines how many tokens in a row to look back when searching for matching patterns.
+
+Each n-gram implementation has its own parameter:
+
+- `--spec-ngram-simple-size-n` for `ngram-simple`
+- `--spec-ngram-map-k-size-n` for `ngram-map-k`
+- `--spec-ngram-map-k4v-size-n` for `ngram-map-k4v`
+- `--spec-ngram-mod-n-match` for `ngram-mod`
+
+### `--spec-ngram-*-size-m M`
+
+Sets the size M of the draft m-gram for n-gram map based speculative decoding.
+The m-gram size determines how many tokens to draft when a match is found.
+Larger values can provide more speedup but may reduce acceptance rate.
+
+Each n-gram implementation has its own parameter:
+
+- `--spec-ngram-simple-size-m` for `ngram-simple`
+- `--spec-ngram-map-k-size-m` for `ngram-map-k`
+- `--spec-ngram-map-k4v-size-m` for `ngram-map-k4v`
+
+### `--spec-ngram-*-min-hits H`
+
+This option defines how often a key has to appear in the token history to be used as a draft (default is 1).
+
+Each n-gram implementation has its own parameter:
+
+- `--spec-ngram-simple-min-hits` for `ngram-simple`
+- `--spec-ngram-map-k-min-hits` for `ngram-map-k`
+- `--spec-ngram-map-k4v-min-hits` for `ngram-map-k4v`
+
+## Statistics
+Each speculative decoding implementation prints statistics.
+
+```
+draft acceptance rate = 0.57576 (  171 accepted /   297 generated)
+statistics ngram_simple: #calls = 15, #gen drafts = 5, #acc drafts = 5, #gen tokens = 187, #acc tokens = 73
+statistics draft: #calls = 10, #gen drafts = 10, #acc drafts = 10, #gen tokens = 110, #acc tokens = 98
+```
+
+```
+draft acceptance rate = 0.70312 (   90 accepted /   128 generated)
+statistics ngram_mod: #calls = 810, #gen drafts = 15, #acc drafts = 15, #gen tokens = 960, #acc tokens = 730, dur(b,g,a) = 0.149, 0.347, 0.005 ms
+```
+
+```
+statistics ngram_map_k: #calls(b,g,a) = 6 1690 26, #gen drafts = 26, #acc drafts = 26, #gen tokens = 1248, #acc tokens = 968, dur(b,g,a) = 2.234, 1.427, 0.016 ms
+```
+
+
+- `#calls(b,g,a)`: number of calls of begin (new prompt), generation and accumulation of this implementations
+- `#gen drafts`: number of drafts generated by this implementation
+- `#acc drafts`: number of drafts accepted (partially) by the main model
+- `#gen tokens`: number of tokens generated by this implementation (including rejected tokens)
+- `#acc tokens`: number of tokens accepted by the main model
+- `dur(b,g,a): durations of begin (new prompt), generation and accumulation (process acceptance).
+
+## Benchmarking
+
+To measure the end-to-end effect of speculative decoding (throughput, latency, and draft acceptance) across diverse prompts, see the SPEED-Bench client in [tools/server/bench/speed-bench](../tools/server/bench/speed-bench/README.md).
+It runs against a running `llama-server` and can compare a baseline run against a speculative-decoding run.
+
+# XCFramework
+
+The XCFramework is a precompiled version of the library for iOS, visionOS, tvOS,
+and macOS. It can be used in Swift projects without the need to compile the
+library from source. For example:
+
+```swift
+// swift-tools-version: 5.10
+// The swift-tools-version declares the minimum version of Swift required to build this package.
+
+import PackageDescription
+
+let package = Package(
+    name: "MyLlamaPackage",
+    targets: [
+        .executableTarget(
+            name: "MyLlamaPackage",
+            dependencies: [
+                "LlamaFramework"
+            ]),
+        .binaryTarget(
+            name: "LlamaFramework",
+            url: "https://github.com/ggml-org/llama.cpp/releases/download/b5046/llama-b5046-xcframework.zip",
+            checksum: "c19be78b5f00d8d29a25da41042cb7afa094cbf6280a225abe614b03b20029ab"
+        )
+    ]
+)
+```
+
+The above example is using an intermediate build `b5046` of the library. This can be modified
+to use a different version by changing the URL and checksum.
+
+
+# layernorm
+
+Quick tutorial. Let's look at how LayerNorm is handled, as one example layer in the model. We start with the [PyTorch docs for LayerNorm](https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html). LayerNorm of course comes from this original paper by [Ba et al. 2016](https://arxiv.org/abs/1607.06450), and was incorporated into the Transformer in [Vaswani et al.](https://arxiv.org/abs/1706.03762) famous paper Attention is All You Need. [GPT-2](https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) picked up the same architecture as the Transformer, but the position of the LayerNorm was famously moved into what is now called the pre-normalization version. That is, the residual path of the Transformer is kept clean, and the LayerNorms are now the first layer of each block of the Transformer. This positively improves training stability.
+
+The first thing to note when looking at [PyTorch LayerNorm](https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html) is that you will most likely not be able to find the actual implementation of the equation. That's because it is buried 30 layers deep in the code, behind an inscrutable dynamical dispatcher, in some possibly auto-generated CUDA code (for those who are interested in details, see [layer_norm.cpp](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/layer_norm.cpp) and  [layer_norm_kernel.cu](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/layer_norm_kernel.cu)). This is done because PyTorch really really cares about efficiency, fair enough. For our purposes though, we have to start by first implementing LayerNorm manually using simpler PyTorch operations. This will be a lot less efficient than just forwarding a `LayerNorm` module, but it is algorithmically instructive. So here is the direct implementation of the math of LayerNorm using simpler PyTorch operations:
+
+```python
+import torch
+eps = 1e-5
+
+class LayerNorm:
+
+    @staticmethod
+    def forward(x, w, b):
+        # x is the input activations, of shape B,T,C
+        # w are the weights, of shape C
+        # b are the biases, of shape C
+        B, T, C = x.size()
+        # calculate the mean
+        mean = x.sum(-1, keepdim=True) / C # B,T,1
+        # calculate the variance
+        xshift = x - mean # B,T,C
+        var = (xshift**2).sum(-1, keepdim=True) / C # B,T,1
+        # calculate the inverse standard deviation: **0.5 is sqrt, **-0.5 is 1/sqrt
+        rstd = (var + eps) ** -0.5 # B,T,1
+        # normalize the input activations
+        norm = xshift * rstd # B,T,C
+        # scale and shift the normalized activations at the end
+        out = norm * w + b # B,T,C
+
+        # return the output and the cache, of variables needed later during the backward pass
+        cache = (x, w, mean, rstd)
+        return out, cache
+```
+
+The activation tensors in the residual path of the Transformer during training are 3-dimensional arrays (tensors), of shape `B,T,C`. B is the batch size, T is time, and C is channels. For example, B=8, T=1024, C=768 is one setting you might see, for the smallest (124 million parameter) GPT-2 model.
+
+We can forward this layer with some random numbers:
+
+```python
+B = 2 # some toy numbers here
+T = 3
+C = 4
+x = torch.randn(B, T, C, requires_grad=True)
+w = torch.randn(C, requires_grad=True)
+b = torch.randn(C, requires_grad=True)
+out, cache = LayerNorm.forward(x, w, b)
+```
+
+What we get out is the tensor `out`, also of shape `B,T,C`, where each C-dimensional "fibre" of activations (as we call them) is normalized and then scaled and at the end also shifted by the weights and biases of this layer. Notice that, importantly, we also return a variable `cache`, which is a tuple of the input activations `x`, the weights `w`, the mean `mean`, and the reciprocal standard deviation `rstd`. These are all variables we need during the backward pass.
+
+PyTorch can of course do the backward pass of this layer for us with its Autograd. Let's do that first:
+
+```python
+dout = torch.randn(B, T, C)
+fakeloss = (out * dout).sum()
+fakeloss.backward()
+```
+
+You see here that we created a `fakeloss`, which simply takes a (random) weighted combination of all the outputs of our layernorm. All this is doing is projecting all of the `B,T,C` numbers into a single scalar value (loss), so that we have a single output of our "computational graph". Typically this would be the loss of the model, but here we're just doing a fake loss. We then call `backward()` on this scalar, and PyTorch will compute all the gradients for us on all the inputs to this graph - i.e. the input activations `x`, the weights `w`, and the biases `b`. If you don't know too much about autograd, I'd encourage you to watch my [micrograd](https://www.youtube.com/watch?v=VMj-3S1tku0) video, where we build a tiny autograd engine. So the magic of PyTorch autograd is that after we call `.backward`, it will populate the `.grad` attribute of all the tensors that have `requires_grad=True` with the gradients of the loss with respect to that tensor. These gradients are telling us the slope of the loss for all of the input numbers in x,w,b. Therefore, the shape of `x.grad`, `w.grad`, and `b.grad` are exactly the same as the shape of `x`, `w`, and `b`.
+
+But we don't want to use PyTorch Autograd. We want to do the backward pass manually. So we take out pen and paper and write out the expression for LayerNorm. The forward pass has the following mathematical form:
+
+$\text{LayerNorm}(x) = w \odot \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}} + b$
+
+where $\odot$ is elementwise multiplication, $\mu$ is the mean, $\sigma^2$ is the variance, and $\epsilon$ is a small constant to avoid division by zero. Remembering the rules of differentiation from calculus, we now want to derive the gradients. For this part, my video [Becoming a Backprop Ninja](https://www.youtube.com/watch?v=q8SA3rM6ckI) could be very helpful, as I work through (in detail) a similar layer - the Batch Normalization layer. When you work through the differentiation, you'll notice that the expressions simplify analytically and you can move the terms around and simplify the expression somehwat. So you don't have to manually backward every individual line in the forward pass. In particular, we get:
+
+```python
+    @staticmethod
+    def backward(dout, cache):
+        x, w, mean, rstd = cache
+        # recompute the norm (save memory at the cost of compute)
+        norm = (x - mean) * rstd
+        # gradients for weights, bias
+        db = dout.sum((0, 1))
+        dw = (dout * norm).sum((0, 1))
+        # gradients for input
+        dnorm = dout * w
+        dx = dnorm - dnorm.mean(-1, keepdim=True) - norm * (dnorm * norm).mean(-1, keepdim=True)
+        dx *= rstd
+        return dx, dw, db
+```
+
+So given the gradients on every individual output number stored in `dout`, and the `cache` from the forward pass, we can now backward through this layer into the inputs, to continue the chain rule of the backward pass. So now we can do our own backward pass and see that they match (the errors are tiny):
+
+```python
+dx, dw, db = LayerNorm.backward(dout, cache)
+print("dx error:", (x.grad - dx).abs().max().item())
+print("dw error:", (w.grad - dw).abs().max().item())
+print("db error:", (b.grad - db).abs().max().item())
+```
+
+Notice one more thing. Inside the backward pass we recomputed the variable `norm`. We already calculated this variable in the forward pass but then we threw it away! Couldn't we have made this also be a part of the `cache` and save this recompute? Actually, we very well could and you'd of course get the exact same results. The amount of stuff we save into our `cache` is completely up to us. We didn't even have to save `mean` and `rstd` either, and we could have recomputed them in the backward pass. The difference is that `mean` and `rstd` are very small, only of shape `B,T`, where as `norm` is of shape `B,T,C`. So this is simply a tradeoff between memory and compute. By not keeping `norm` in the cache, we are saving memory, but we are trading it off for a bit of compute later in the backward pass. This is very common in all the layers, and you'll see that different implementations of various layers in deep learning frameworks may all have different "checkpointing settings". Yes, confusingly enough, this is called checkpointing and has nothing to do with saving the model weights to disk. It's about saving intermediate variables in the forward pass to save compute in the backward pass.
+
+Okay so that's the version with PyTorch tensors. Now we have to move this to C and get rid of the Tensor abstraction. Before I give you the full implementation of the forward pass, a brief word on Tensors. What are Tensors? They are 1) a 1D block of memory called Storage that holds the raw data, and 2) a View over that storage that holds its shape. [PyTorch Internals](http://blog.ezyang.com/2019/05/pytorch-internals/) could be helpful here. So for example if we have the 3D tensor:
+
+```python
+torch.manual_seed(42)
+B, T, C = 2, 3, 4
+a = torch.randn(B, T, C)
+print(a)
+
+tensor([[[ 1.9269,  1.4873,  0.9007, -2.1055],
+         [ 0.6784, -1.2345, -0.0431, -1.6047],
+         [ 0.3559, -0.6866, -0.4934,  0.2415]],
+
+        [[-1.1109,  0.0915, -2.3169, -0.2168],
+         [-0.3097, -0.3957,  0.8034, -0.6216],
+         [-0.5920, -0.0631, -0.8286,  0.3309]]])
+```
+
+This is 2x3x4 Tensor, but the underlying memory of it is just one single 1D array of size 2\*3\*4=24. The View is just a shape over this 1D array. So now when we index into this PyTorch tensor, for example `a[1,2,3]`, PyTorch computes the offset into the 1D array as `1*3*4 + 2*4 + 3 = 23`, and return the value at that offset. The general formula is that if you want to retrieve any element `b,t,c`, you compute the offset into Storage as `b*T*C + t*C + c`. So for example:
+
+```python
+b,t,c = 1,2,3
+print(a[b,t,c])
+print(a.view(-1)[b*T*C + t*C + c])
+```
+
+Both of these print 0.3309. So in this way, we know how to access all the individual elements, and how to offset all the pointers. Notice in particular that the channel dimension is the innermost dimension. So as we increase offset by 1, we are traversing the channel dimension. This is important to consider for the memory layout of our C implementation. The equivalent forward pass in C becomes:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+void layernorm_forward(float* out, float* mean, float* rstd,
+                       float* inp, float* weight, float* bias,
+                       int B, int T, int C) {
+    float eps = 1e-5f;
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            // seek to the input position inp[b,t,:]
+            float* x = inp + b * T * C + t * C;
+            // calculate the mean
+            float m = 0.0f;
+            for (int i = 0; i < C; i++) {
+                m += x[i];
+            }
+            m = m/C;
+            // calculate the variance (without any bias correction)
+            float v = 0.0f;
+            for (int i = 0; i < C; i++) {
+                float xshift = x[i] - m;
+                v += xshift * xshift;
+            }
+            v = v/C;
+            // calculate the rstd
+            float s = 1.0f / sqrtf(v + eps);
+            // seek to the output position in out[b,t,:]
+            float* out_bt = out + b * T * C + t * C;
+            for (int i = 0; i < C; i++) {
+                float n = (s * (x[i] - m)); // normalized output
+                float o = n * weight[i] + bias[i]; // scale and shift it
+                out_bt[i] = o; // write
+            }
+            // cache the mean and rstd for the backward pass later
+            mean[b * T + t] = m;
+            rstd[b * T + t] = s;
+        }
+    }
+}
+```
+
+You'll see how I offset the pointer to the `inp[b,t]`, and then you know that the next `C` elements are the channels of that position in (batch, time). And the backward pass:
+
+```c
+void layernorm_backward(float* dinp, float* dweight, float* dbias,
+                        float* dout, float* inp, float* weight, float* mean, float* rstd,
+                        int B, int T, int C) {
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            float* dout_bt = dout + b * T * C + t * C;
+            float* inp_bt = inp + b * T * C + t * C;
+            float* dinp_bt = dinp + b * T * C + t * C;
+            float mean_bt = mean[b * T + t];
+            float rstd_bt = rstd[b * T + t];
+
+            // first: two reduce operations
+            float dnorm_mean = 0.0f;
+            float dnorm_norm_mean = 0.0f;
+            for (int i = 0; i < C; i++) {
+                float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+                float dnorm_i = weight[i] * dout_bt[i];
+                dnorm_mean += dnorm_i;
+                dnorm_norm_mean += dnorm_i * norm_bti;
+            }
+            dnorm_mean = dnorm_mean / C;
+            dnorm_norm_mean = dnorm_norm_mean / C;
+
+            // now iterate again and accumulate all the gradients
+            for (int i = 0; i < C; i++) {
+                float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+                float dnorm_i = weight[i] * dout_bt[i];
+                // gradient contribution to bias
+                dbias[i] += dout_bt[i];
+                // gradient contribution to weight
+                dweight[i] += norm_bti * dout_bt[i];
+                // gradient contribution to input
+                float dval = 0.0f;
+                dval += dnorm_i; // term 1
+                dval -= dnorm_mean; // term 2
+                dval -= norm_bti * dnorm_norm_mean; // term 3
+                dval *= rstd_bt; // final scale
+                dinp_bt[i] += dval;
+            }
+        }
+    }
+}
+```
+
+One additional detail to note is that we always += into the gradients. We never use = and we never use *=. This is important stylistically because if you have one variable used multiple times in a graph, the backward pass gradients always add up. In this repo this is not important because we don't have exotic branching, but it's proper. So during training we always first do `zero_grad` to set all the gradients to zero, and then we accumulate into them during backward pass.
+
+One more note on differences between training and inference. Some of you may have already seen my earlier project [llama2.c](https://github.com/karpathy/llama2.c), which inferences Llama 2 architecture in pure C. Unlike GPT-2, Llama 2 swaps out LayerNorm for the much simpler RMSNorm. You can see the implementation of the [RMSNorm in llama2.c](https://github.com/karpathy/llama2.c/blob/master/run.c#L182), copy pasting it here:
+
+```c
+void rmsnorm(float* o, float* x, float* weight, int size) {
+    // calculate sum of squares
+    float ss = 0.0f;
+    for (int j = 0; j < size; j++) {
+        ss += x[j] * x[j];
+    }
+    ss /= size;
+    ss += 1e-5f;
+    ss = 1.0f / sqrtf(ss);
+    // normalize and scale
+    for (int j = 0; j < size; j++) {
+        o[j] = weight[j] * (ss * x[j]);
+    }
+}
+```
+
+How does this differ to our LayerNorm above?
+
+- First, algorithmically, you'll notice that RMSNorm does not keep track of or subtract the mean, it only normalizes by the norm. Notice: norm, not standard deviation, because we did not subtract the mean. This is a simplification of the layer that has now become very trendy because it works just as well, if not slightly better. Also, the RMSNorm does not have biases, it only has a weight for scaling after normalization. In general, GPT-2 used way too many biases everywhere and it turns out you can remove these - from all the Linear Layers and from LayerNorms. The network can "simulate" biases if it needs them, e.g. by allocating one of the channel dimensions to be constant (data-independent), and then any weight multiplying that constant dimension will effectively work like a bias. This significantly simplies a lot of the code.
+- Second, the inference code has no batch dimension B, i.e. the batch size is assumed to be 1. You could in principle have batched inference as well, especially if you wish to host an LLM that you expect many simultaneous queries to. But if you're just running an LLM locally, chances are you just want to have a single "stream" of generation, so there is no batch size for parallelism that could support multiple streams at once. To keep things simple, llama2.c is not batched, and therefore you won't see any loops that look like `for (int b = 0; b < B; b++)`.
+- Third, this inference code has no time dimension T within this individual layer. During training, we can loop over time inside each layer and calculate the layernorm at all time steps. But during inference, we have to generate one token at a time, feeding the token predicted at time `t` into the forward pass of the Transformer at the next time step `t+1`. So this is why you don't see any loops that look like `for (int t = 0; t < T; t++)` inside individual layers. This loop over time [does exist](https://github.com/karpathy/llama2.c/blob/master/run.c#L747), but it is on the outside of the Transformer forward pass.
+- You'll see that we don't keep track of any intermediate calculations, memory, or cache. That's because during inference, there is no `.backward` pass that will follow. We only need to calculate the output, and we don't need to keep any intermediate variables around. As a result, the memory consumption of inference is significantly lower than that of training. We can afford to just discard activations, and only keep memory for the "activation frontier". Similarly, there is no need to implement the `backward` function for this RMSNorm anywhere, as there is no backward pass.
+
+As a result of all these difference, training is significantly more complex and involved, both algorithmically and computationally, and that's partly why I started by writing inference (llama2.c) before I implemented training (llm.c, here). Finally, I am attaching two helper files to this same directory that have the complete code. First:
+
+```
+python layernorm.py
+```
+
+To write out the reference data from PyTorch. Then compile and run the C version:
+
+```
+gcc layernorm.c -o layernorm -lm
+./layernorm
+```
+
+You'll see that everything matches ok.
+
+This was just the LayerNorm. We go through the exact same process for all the other layers. Most of the other layers are actually easier than LayerNorm. Hope that helps!
+
+# runs profiling with ncu, generates a `profile.ncu-rep` for viewing with NSight Compute, and prints out
+# basic kernel stats.
+# Note: If you run into errors because of missing access rights to performance counters, try
+# https://developer.nvidia.com/nvidia-development-tools-solutions-err_nvgpuctrperm-permission-issue-performance-counters#SolnAdminTag
+
+import subprocess
+import csv
+from collections import defaultdict
+import shutil
+
+# find ncu: Is it on PATH?
+NCU = shutil.which("ncu")
+# otherwise, guess a standard location
+if NCU is None:
+    NCU = "/usr/local/cuda/bin/ncu"
+
+# build the executable
+subprocess.check_call(["make", "profile_gpt2cu", "NO_MULTI_GPU=1", "USE_CUDNN=1"])
+
+# try to see if profiling is allowed for non-root:
+options = subprocess.check_output(["modprobe", "-c", "nvidia"], text=True)
+can_profile = len([l for l in options.splitlines() if "NVreg_RestrictProfilingToAdminUsers=0" in l]) != 0
+
+# record metrics
+# --full and --import-source are entirely superfluous for this script, but you might want to
+# manually inspect `profile.ncu-rep`, so we keep it here
+cmd = [NCU, "--set", "full", "--import-source", "yes", "-o", "profile", "-f", "./profile_gpt2cu"]
+# do we need to run under sudo
+if not can_profile:
+    print("NVreg_RestrictProfilingToAdminUsers=1, running with sudo")
+    cmd = ["sudo"] + cmd
+subprocess.check_call(cmd)
+
+# generate csv
+# https://forums.developer.nvidia.com/t/converting-nsys-rep-file-into-a-csv-file-with-formatting-like-the-summary-page-in-ncu-gui/231717/3
+metrics = [
+    "gpu__time_duration.sum",                   # total time
+    "dram__bytes_read.sum",                     # DRAM reads
+    "dram__bytes_write.sum",                    # DRAM writes
+    "lts__t_sectors_srcunit_tex_op_read.sum",   # L2 reads (sectors -- 32B)
+    "lts__t_sectors_srcunit_tex_op_write.sum",  # L2 writes (sectors -- 32B)
+    "sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_active", # % of peak tensor core utilization
+    "smsp__inst_executed.sum",                  # instructions
+]
+cmd = [NCU, "-i", "profile.ncu-rep", "--csv", "--page", "raw", "--metrics", ",".join(metrics)]
+result = subprocess.check_output(cmd, text=True).strip()
+
+reader = csv.reader(result.splitlines(keepends=True))
+
+# model config
+CLS_START = -1
+CLS_NUM = 6
+N_LAYERS = 12
+
+summaries = defaultdict(lambda: 0.0)
+counts = defaultdict(lambda: 0)
+passes = defaultdict(lambda: 0.0)
+total = defaultdict(lambda: 0.0)
+no_cutlass = 0.0
+CC = ""
+phase = "fwd"
+
+kernel_profile_data = list(enumerate(reader))
+
+for rid, row in kernel_profile_data:
+    if rid <= 2:
+        continue
+    kernel = row[4]
+    kid = rid - 2
+    if "fused_classifier" in kernel:
+        #  classifier: layernorm -> matmul -> fused -> bw matmul (x2) -> bw layernorm
+        CLS_START = kid - 2
+
+assert CLS_START != -1
+
+# Check every kernel to find the maximum DRAM bandwidth and Tensor Core utilisation values
+max_dram_bw = 0.0
+max_tensor = 0.0
+for rid, row in kernel_profile_data:
+    if rid <= 2:
+        continue
+    time = float(row[13])
+    read = float(row[11])
+    write = float(row[12])
+    tensor = float(row[16])
+    dram_bw = (read + write) / (time / 1000.0)
+    max_dram_bw = max(max_dram_bw, dram_bw)
+    max_tensor = max(max_tensor, tensor)
+
+# round the maximum tensor core utilisation to 50% or 100%
+# consumer GPUs can only achieve 50% of peak tensor throughput on this counter
+# and for GPUs without tensor cores, we set the value to 50% to avoid division by zero
+max_tensor = (max_tensor > 50.0) and 100.0 or 50.0
+
+print()
+print("Kernel calls:")
+for rid, row in kernel_profile_data:
+    if rid == 0:
+        #  headings
+        print(  f"id pass    {'name':<40} {'time':>8} {'RAM BW':>8} {'tensor':>8} {'RAM rd':>8} {'RAM wt':>8} {'L2 rd':>8} {'L2 wt':>8} {'inst':>8}")
+        continue
+    if rid == 1:
+        # units
+        units = f"           {'':<40} {'ms':>8} {'GB/s':>8} {'core %':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'GiB':>8} {'MInst':>8}"
+        print(units)
+        print("." * len(units))
+        continue
+    if rid == 2:
+        CC = row[10]
+
+    # actual data
+    kernel = row[4]
+    time = float(row[13])
+    read = float(row[11])
+    write = float(row[12])
+    l2_read = float(row[14])
+    l2_write = float(row[15])
+    tensor = float(row[16])
+    inst = float(row[17]) / 1e6
+    dram_bw = (read + write) / (time / 1000.0)
+
+    kid = rid - 2
+
+    multiplier = 1
+    if "encoder" in kernel:
+        pass_name = "enc"
+        if phase == "bwd":
+            phase = "bwd-enc"
+    elif CLS_START <= kid < CLS_START + CLS_NUM:
+        # the classifier part, counts only once
+        pass_name = "cls"
+        phase = "bwd"
+    elif "adamw" in kernel or "global_norm" in kernel or "copy_and_cast" in kernel:
+        # encoder layer or adam
+        pass_name = "opt"
+    # before the first optimizer run, we create weight copies.
+    # they aren't part of regular processing, so they get a multiplier
+    # of zero
+    elif phase == "bwd-enc":
+        pass_name = "init"
+        multiplier = 0
+    else:
+        pass_name = phase
+        multiplier = N_LAYERS
+        time *= N_LAYERS
+        read *= N_LAYERS
+        write *= N_LAYERS
+        l2_read *= N_LAYERS
+        l2_write *= N_LAYERS
+        inst *= N_LAYERS
+
+    # split at "(" -- argument list
+    fn_name = kernel.split("(")[0]
+    # some names include the return value, others don't?
+    if " " in fn_name:
+        fn_name = fn_name.split(" ")[1]
+    if "<" in fn_name:
+        fn_name = fn_name.split("<")[0]
+
+    # group together matmul kernels
+    if "cutlass" in fn_name:
+        pass
+    elif fn_name.startswith("ampere_bf16"):
+        fn_name = "ampere_bf16"
+    elif fn_name.startswith("cudnn_generated_fort_native_sdpa"):
+        fn_name = "cudnn_generated_fort_native_sdpa"
+    else:
+        no_cutlass += time
+
+    # convert L2 to GiB
+    l2_read = l2_read * 32 / 1024 / 1024 / 1024
+    l2_write = l2_write * 32 / 1024 / 1024 / 1024
+
+    efficiency = max(dram_bw / max_dram_bw, tensor / max_tensor)
+    summaries[fn_name] += time
+    counts[fn_name] += multiplier
+    passes[pass_name] += time
+    if pass_name != "init":
+        total['time'] += time
+        total['read'] += read
+        total['write'] += write
+        total['l2_read'] += l2_read
+        total['l2_write'] += l2_write
+        total['inst'] += inst
+        total['tensor'] += tensor * time # % so multiplied by time
+        total['efficiency'] += efficiency * time
+
+    pass_info = f"{pass_name}×{multiplier}"
+    print(f"{kid:02} {pass_info:7} {fn_name:<40} {time:8.2f} {dram_bw:8.1f} {tensor:8.1f} {read:8.2f} {write:8.2f} {l2_read:8.2f} {l2_write:8.2f} {inst:8.2f}")
+
+
+total_time = total['time']
+avg_dram_bw = (total['read'] + total['write']) / (total_time / 1000.0)
+avg_tensor_util = total['tensor'] / total_time
+print("." * len(units))
+print(f"           {'Total':<40} {total['time']:8.2f} {avg_dram_bw:8.1f} {avg_tensor_util:8.1f} {total['read']:8.2f} {total['write']:8.2f} {total['l2_read']:8.2f} {total['l2_write']:8.2f} {total['inst']:8.2f}")
+
+print()
+print("Kernel type summaries:")
+print(f"  {'name':<40} {'time':>6} {'frac':>6}  {'count':>6}")
+ordered_time = sorted(summaries.items(), key=lambda x: x[1], reverse=True)
+for entry, value in ordered_time:
+    # crop entry to be at most 40 characters
+    if len(entry) > 40:
+        entry_text = entry[:37] + "..."
+    else:
+        entry_text = entry
+    print(f"  {entry_text:<40} {value:6.2f} {100*value / total_time:6.2f}% {counts[entry]:>6d}")
+
+
+ts = total_time / 1000
+summary = f"""
+In total, a training step takes {total_time:.1f}ms, distributed as:
+  {passes['enc']:.1f}ms ({100 * passes['enc'] / total_time:.1f}%) in the encoder,
+  {passes['fwd']:.1f}ms ({100 * passes['fwd'] / total_time:.1f}%) in forward blocks,
+  {passes['cls']:.1f}ms ({100 * passes['cls'] / total_time:.1f}%) in the classifier part,
+  {passes['bwd']:.1f}ms ({100 * passes['bwd'] / total_time:.1f}%) in backward blocks, and
+  {passes['opt']:.1f}ms ({100 * passes['opt'] / total_time:.1f}%) in the optimizer.
+
+We read {total['read']:.1f}GiB ({total['read']/ts:.1f}GB/s) and write {total['write']:.1f}GiB ({total['write']/ts:.1f}GB/s) to DRAM,
+read {total['l2_read']:.1f}GiB ({total['l2_read']/ts:.1f}GB/s) and write {total['l2_write']:.1f}GiB ({total['l2_write']/ts:.1f}GB/s) to L2,
+and execute {total['inst'] / 1000:.1f} billion instructions ({total['inst'] / 1000 / ts:.1f} GInst/s).
+
+Assuming that every kernel should be either fully DRAM bandwidth or tensor core limited,
+with a peak DRAM bandwidth of {max_dram_bw:.1f}GB/s and a peak tensor throughput of {max_tensor:.1f}%,
+our overall efficiency is {(total['efficiency'] * 100.0 / total_time):.1f}%.
+"""
+print(summary)
+# llm.c
+
+LLMs in simple, pure C/CUDA with no need for 245MB of PyTorch or 107MB of cPython. Current focus is on pretraining, in particular reproducing the [GPT-2](https://github.com/openai/gpt-2) and [GPT-3](https://arxiv.org/abs/2005.14165) miniseries, along with a parallel PyTorch reference implementation in [train_gpt2.py](train_gpt2.py). You'll recognize this file as a slightly tweaked [nanoGPT](https://github.com/karpathy/nanoGPT), an earlier project of mine. Currently, llm.c is a bit faster than PyTorch Nightly (by about 7%). In addition to the bleeding edge mainline code in [train_gpt2.cu](train_gpt2.cu), we have a simple reference CPU fp32 implementation in ~1,000 lines of clean code in one file [train_gpt2.c](train_gpt2.c). I'd like this repo to only maintain C and CUDA code. Ports to other languages or repos are very welcome, but should be done in separate repos, and I am happy to link to them below in the "notable forks" section. Developer coordination happens in the [Discussions](https://github.com/karpathy/llm.c/discussions) and on Discord, either the `#llmc` channel on the [Zero to Hero](https://discord.gg/3zy8kqD9Cp) channel, or on `#llmdotc` on [GPU MODE](https://discord.gg/gpumode) Discord.
+
+## quick start
+
+The best introduction to the llm.c repo today is reproducing the GPT-2 (124M) model. [Discussion #481](https://github.com/karpathy/llm.c/discussions/481) steps through this in detail. We can reproduce other models from the GPT-2 and GPT-3 series in both llm.c and in the parallel implementation of PyTorch. Have a look at the [scripts README](scripts/README.md).
+
+debugging tip: when you run the `make` command to build the binary, modify it by replacing `-O3` with `-g` so you can step through the code in your favorite IDE (e.g. vscode).
+
+## quick start (1 GPU, fp32 only)
+
+If you won't be training on multiple nodes, aren't interested in mixed precision, and are interested in learning CUDA, the fp32 (legacy) files might be of interest to you. These are files that were "checkpointed" early in the history of llm.c and frozen in time. They are simpler, more portable, and possibly easier to understand. Run the 1 GPU, fp32 code like this:
+
+```bash
+chmod u+x ./dev/download_starter_pack.sh
+./dev/download_starter_pack.sh
+make train_gpt2fp32cu
+./train_gpt2fp32cu
+```
+
+The download_starter_pack.sh script is a quick & easy way to get started and it downloads a bunch of .bin files that help get you off the ground. These contain: 1) the GPT-2 124M model saved in fp32, in bfloat16, 2) a "debug state" used in unit testing (a small batch of data, and target activations and gradients), 3) the GPT-2 tokenizer, and 3) the tokenized [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset. Alternatively, instead of running the .sh script, you can re-create these artifacts manually as follows:
+
+```bash
+pip install -r requirements.txt
+python dev/data/tinyshakespeare.py
+python train_gpt2.py
+```
+
+## quick start (CPU)
+
+The "I am so GPU poor that I don't even have one GPU" section. You can still enjoy seeing llm.c train! But you won't go too far. Just like the fp32 version above, the CPU version is an even earlier checkpoint in the history of llm.c, back when it was just a simple reference implementation in C. For example, instead of training from scratch, you can finetune a GPT-2 small (124M) to output Shakespeare-like text, as an example:
+
+```bash
+chmod u+x ./dev/download_starter_pack.sh
+./dev/download_starter_pack.sh
+make train_gpt2
+OMP_NUM_THREADS=8 ./train_gpt2
+```
+
+If you'd prefer to avoid running the starter pack script, then as mentioned in the previous section you can reproduce the exact same .bin files and artifacts by running `python dev/data/tinyshakespeare.py` and then `python train_gpt2.py`.
+
+The above lines (1) download an already tokenized [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset and download the GPT-2 (124M) weights, (3) init from them in C and train for 40 steps on tineshakespeare with AdamW (using batch size 4, context length only 64), evaluate validation loss, and sample some text. Honestly, unless you have a beefy CPU (and can crank up the number of OMP threads in the launch command), you're not going to get that far on CPU training LLMs, but it might be a good demo/reference. The output looks like this on my MacBook Pro (Apple Silicon M3 Max):
+
+```
+[GPT-2]
+max_seq_len: 1024
+vocab_size: 50257
+num_layers: 12
+num_heads: 12
+channels: 768
+num_parameters: 124439808
+train dataset num_batches: 1192
+val dataset num_batches: 128
+num_activations: 73323776
+val loss 5.252026
+step 0: train loss 5.356189 (took 1452.121000 ms)
+step 1: train loss 4.301069 (took 1288.673000 ms)
+step 2: train loss 4.623322 (took 1369.394000 ms)
+step 3: train loss 4.600470 (took 1290.761000 ms)
+... (trunctated) ...
+step 39: train loss 3.970751 (took 1323.779000 ms)
+val loss 4.107781
+generating:
+---
+Come Running Away,
+Greater conquer
+With the Imperial blood
+the heaviest host of the gods
+into this wondrous world beyond.
+I will not back thee, for how sweet after birth
+Netflix against repounder,
+will not
+flourish against the earlocks of
+Allay
+---
+```
+
+## datasets
+
+The data files inside `/dev/data/(dataset).py` are responsible for downloading, tokenizing and saving the tokens to .bin files, readable easily from C. So for example when you run:
+
+```bash
+python dev/data/tinyshakespeare.py
+```
+
+We download and tokenize the [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset. The output of this looks like this:
+
+```
+writing 32,768 tokens to ./dev/data/tinyshakespeare/tiny_shakespeare_val.bin
+writing 305,260 tokens to ./dev/data/tinyshakespeare/tiny_shakespeare_train.bin
+```
+
+The .bin files contain a short header (1024 bytes) and then a stream of tokens in uint16, indicating the token ids with the GPT-2 tokenizer. More datasets are available in `/dev/data`.
+
+## test
+
+I am also attaching a simple unit test for making sure our C code agrees with the PyTorch code. On the CPU as an example, compile and run with:
+
+```bash
+make test_gpt2
+./test_gpt2
+```
+
+This now loads the `gpt2_124M_debug_state.bin` file that gets written by train_gpt2.py, runs a forward pass, compares the logits and loss with the PyTorch reference implementation, then it does 10 iterations of training with Adam and makes sure the losses match PyTorch. To test the GPU version we run:
+
+```bash
+# fp32 test (cudnn not supported)
+make test_gpt2cu PRECISION=FP32 && ./test_gpt2cu
+# mixed precision cudnn test
+make test_gpt2cu USE_CUDNN=1 && ./test_gpt2cu
+```
+
+This tests both the fp32 path and the mixed precision path. The test should pass and print `overall okay: 1`.
+
+## tutorial
+
+I attached a very small tutorial here, in [doc/layernorm/layernorm.md](doc/layernorm/layernorm.md). It's a simple, step-by-step guide to implementing a single layer of the GPT-2 model, the layernorm layer. This is a good starting point to understand how the layers are implemented in C.
+
+**flash attention**. As of May 1, 2024 we use the Flash Attention from cuDNN. Because cuDNN bloats the compile time from a few seconds to ~minute and this code path is right now very new, this is disabled by default. You can enable it by compiling like this:
+
+```bash
+make train_gpt2cu USE_CUDNN=1
+```
+
+This will try to compile with cudnn and run it. You have to have cuDNN installed on your system. The [cuDNN installation instructions](https://developer.nvidia.com/cudnn) with apt-get will grab the default set of cuDNN packages. For a minimal setup, the cuDNN dev package is sufficient, e.g. on Ubuntu 22.04 for CUDA 12.x:
+
+```bash
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+sudo apt-get -y install libcudnn9-dev-cuda-12
+```
+
+On top of this you need the [cuDNN frontend](https://github.com/NVIDIA/cudnn-frontend/tree/main), but this is just header files. Simply clone the repo to your disk. The Makefile currently looks for it in either your home directory or the current directory. If you have put it elsewhere, add `CUDNN_FRONTEND_PATH=/path/to/your/cudnn-frontend/include` to the `make` command-line.
+
+## multi-GPU training
+
+Make sure you install MPI and NCCL, e.g. on Linux:
+
+```bash
+sudo apt install openmpi-bin openmpi-doc libopenmpi-dev
+```
+
+For NCCL follow the instructions from the [official website](https://developer.nvidia.com/nccl/nccl-download) (e.g. network installer)
+
+and then:
+
+```bash
+make train_gpt2cu
+mpirun -np <number of GPUs> ./train_gpt2cu
+```
+
+or simply run one of our scripts under `./scripts/`.
+
+## multi-node training
+
+Make sure you've installed `NCCL` following instructions from [multi-GPU](#multi-gpu-training) section.
+
+There are 3 ways we currently support that allow you to run multi-node training:
+1) Use OpenMPI to exchange nccl id and initialize NCCL. See e.g. `./scripts/multi_node/run_gpt2_124M_mpi.sh` script for details.
+2) Use shared file system to init NCCL. See `./scripts/multi_node/run_gpt2_124M_fs.sbatch` script for details.
+3) Use TCP sockets to init NCCL. See `./scripts/multi_node/run_gpt2_124M_tcp.sbatch` script for details.
+
+Note:
+* If you're running in a slurm environment and your slurm doesn't support PMIx (which we assume will be a common situation given that `slurm-wlm` dropped PMIx support) you will have to use FS (2) or TCP (3) approach. To test whether your slurm supports PMIx run: `srun --mpi=list` and see whether you get `pmix` in the output.
+* If you don't have slurm set up, you can kick off a multi-node run using `mpirun` - MPI (1).
+
+None of these 3 methods is superior, we just offer you options so that you can run in your specific environment.
+
+## experiments / sweeps
+
+Just as an example process to sweep learning rates on a machine with 4 GPUs on TinyStories. Run a shell script `sweep.sh` (after you of course `chmod u+x sweep.sh`):
+
+```bash
+#!/bin/bash
+
+learning_rates=(3e-5 1e-4 3e-4 1e-3)
+
+for i in {0..3}; do
+    export CUDA_VISIBLE_DEVICES=$i
+    screen -dmS "tr$i" bash -c "./train_gpt2cu -i data/TinyStories -v 250 -s 250 -g 144 -l ${learning_rates[$i]} -o stories$i.log"
+done
+
+# you can bring these down with
+# screen -ls | grep -E "tr[0-3]" | cut -d. -f1 | xargs -I {} screen -X -S {} quit
+```
+
+This example opens up 4 screen sessions and runs the four commands with different LRs. This writes the log files `stories$i.log` with all the losses, which you can plot as you wish in Python. A quick example of how to parse and plot these logfiles is in [dev/vislog.ipynb](dev/vislog.ipynb).
+
+## repo
+
+A few more words on what I want this repo to be:
+
+First, I want `llm.c` to be a place for education. E.g. our `dev/cuda` folder is a place for a library of kernels for all the layers that are manually hand-written and very well documented, starting from very simple kernels all the way to more complex / faster kernels. If you have a new kernel with various different tradeoffs, please feel free to contribute it here.
+
+That said, I also want `llm.c` to be very fast too, even practically useful to train networks. E.g. to start, we should be able to reproduce the big GPT-2 (1.6B) training run. This requires that we incorporate whatever fastest kernels there are, including the use of libraries such as cuBLAS, cuBLASLt, CUTLASS, cuDNN, etc. I also think doing so serves an educational purpose to establish an expert upper bound, and a unit of measurement, e.g. you could say that your manually written kernels are 80% of cuBLAS speed, etc. Then you can choose to do a super fast run, or you can choose to "drag and drop" whatever manual kernels you wish to use, and run with those.
+
+However, as a constraint, I want to keep the mainline `llm.c` in the root folder simple and readable. If there is a PR that e.g. improves performance by 2% but it "costs" 500 lines of complex C code, and maybe an exotic 3rd party dependency, I may reject the PR because the complexity is not worth it. As a concrete example - making cuBLAS for matmuls the default in the root training loop is a no-brainer: it makes the mainline code much faster, it is a single line of interpretable code, and it is a very common dependency. On the side of this, we can have manual implementations that can compete with cuBLAS in `dev/cuda`.
+
+Lastly, I will be a lot more sensitive to complexity in the root folder of the project, which contains the main / default files of the project. In comparison, the `dev/` folder is a bit more of a scratch space for us to develop a library of kernels or classes and share useful or related or educational code, and some of this code could be ok to be (locally) complex.
+
+## notable forks
+
+- AMD support
+  - [llm.c](https://github.com/anthonix/llm.c) by @[anthonix](https://github.com/anthonix): support for AMD devices, such as the 7900 XTX
+
+- C#
+  - [llm.cs](https://github.com/azret/llm.cs) by @[azret](https://github.com/azret): a C# port of this project
+  - [Llm.cs](https://github.com/nietras/Llm.cs) by @[nietras](https://github.com/nietras): a C# port of this project with focus on easy to get started on any platform. Clone and run ✅
+
+- CUDA C++
+  - [llm.cpp](https://github.com/gevtushenko/llm.c) by @[gevtushenko](https://github.com/gevtushenko): a port of this project using the [CUDA C++ Core Libraries](https://github.com/NVIDIA/cccl)
+     - A presentation this fork was covered in [this lecture](https://www.youtube.com/watch?v=WiB_3Csfj_Q) in the [GPU MODE Discord Server](https://discord.gg/cudamode)
+
+- C++/CUDA
+  - [llm.cpp](https://github.com/zhangpiu/llm.cpp/tree/master/llmcpp) by @[zhangpiu](https://github.com/zhangpiu): a port of this project using the [Eigen](https://gitlab.com/libeigen/eigen), supporting CPU/CUDA.
+
+- WebGPU C++
+  - [gpu.cpp](https://github.com/AnswerDotAI/gpu.cpp) by @[austinvhuang](https://github.com/austinvhuang): a library for portable GPU compute in C++ using native WebGPU. Aims to be a general-purpose library, but also porting llm.c kernels to WGSL.
+  
+- C++
+  - [llm.cpp](https://github.com/GaoYusong/llm.cpp) by @[GaoYusong](https://github.com/GaoYusong): a port of this project featuring a C++ single-header [tinytorch.hpp](https://github.com/GaoYusong/llm.cpp/blob/main/tinytorch.hpp) library
+
+- Go
+  - [llm.go](https://github.com/joshcarp/llm.go) by @[joshcarp](https://github.com/joshcarp): a Go port of this project
+
+- Java
+  - [llm.java](https://github.com/harryjackson/llm.java) by @[harryjackson](https://github.com/harryjackson): a Java port of this project
+
+- Metal
+  - [llm.metal](https://github.com/regrettable-username/llm.metal) by @[regrettable-username](https://github.com/regrettable-username): LLM training in simple, raw C/Metal Shading Language
+
+- Mojo
+  - [llm.🔥](https://github.com/dorjeduck/llm.mojo) by @[dorjeduck](https://github.com/dorjeduck): a Mojo port of this project
+
+- OpenCL
+  - [llm.c](https://github.com/krrishnarraj/llm.c) by @[krrishnarraj](https://github.com/krrishnarraj): an OpenCL port of this project
+
+- Rust
+  -  [llm.rs](https://github.com/yijunyu/llm.rs) by @[Yijun Yu](https://github.com/yijunyu): a Rust rewrite with the aim to have same performance
+  -  [llm.rs](https://github.com/ToJen/llm.rs) by @[ToJen](https://github.com/ToJen): a Rust port of this project
+
+- Swift
+  - [llm.swift](https://github.com/otabuzzman/llm.swift) by @[otabuzzman](https://github.com/otabuzzman): a Swift port of this project
+
+- Zig
+  - [llm.zig](https://github.com/Saimirbaci/llm.zig) by @[saimirbaci](https://github.com/Saimirbaci): a Zig port of this project
+ 
+- Habana Gaudi2
+  - [llm.tpc](https://github.com/abhilash1910/llm.tpc) by @[abhilash1910](https://github.com/abhilash1910): a Habana Gaudi2 port of this project 
+
+- Nim
+  - [llm.nim](https://github.com/Vindaar/llm.nim) by @[Vindaar](https://github.com/Vindaar): a Nim port of this project
+
+## discussions
+
+Ways of organizing development:
+
+- Experiencing a concrete issue with the repo? Use [Issues](https://github.com/karpathy/llm.c/issues).
+- Have some code to contribute? Open a [PR](https://github.com/karpathy/llm.c/pulls)
+- Chat about the repo, ask questions, etc.? Look at [Discussions](https://github.com/karpathy/llm.c/discussions).
+- Something faster? I created a new `#llmc` channel on my [Zero to Hero Discord channel](https://discord.gg/3zy8kqD9Cp).
+
+## license
+
+MIT
+
+"""
+Reference code for GPT-2 training and inference.
+Will save the model weights into files, to be read from C as initialization.
+
+References:
+1) the official GPT-2 TensorFlow implementation released by OpenAI:
+https://github.com/openai/gpt-2/blob/master/src/model.py
+2) huggingface/transformers PyTorch implementation:
+https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+
+Example launches to only benchmark the speed of bfloat16 compiled GPU training:
+1 GPU:
+python train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
+you can also turn on flash-attention by appending --flash=1
+4 GPU:
+torchrun --standalone --nproc_per_node=4 train_gpt2.py --write_tensors=0 --num_iterations=50 --sequence_length=1024 --compile=1 --tensorcores=1 --dtype=bfloat16
+"""
+
+import os
+import math
+import glob
+import struct
+import inspect
+from contextlib import nullcontext
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import torch._inductor.config as config
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed.optim import ZeroRedundancyOptimizer
+import torch.distributed as dist
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the GPT-2 model
+
+class NewGELU(nn.Module):
+    """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
+    def forward(self, input):
+        return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
+
+# using a global to toggle flash-attention
+FLASH = 0
+
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        # regularization
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                     .view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        if FLASH:
+            # flashattention
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # manual implementation of attention
+            # this materializes the large (T,T) matrix for all the queries and keys
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        # output projection
+        y = self.c_proj(y)
+        return y
+
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.gelu    = NewGELU()
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        return x
+
+class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+# -----------------------------------------------------------------------------
+# The main GPT-2 model
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50257
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+
+class GPT(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        # init all weights, use a torch rng object to be very careful
+        self.init_rng = torch.Generator()
+        self.init_rng.manual_seed(42)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # apply special scaled init to the residual projections, per GPT-2 paper
+            std = 0.02 if not hasattr(module, 'LLMC_RESIDUAL_SCALE_FLAG') else 0.02/math.sqrt(2 * self.config.n_layer)
+            # we want to skip initializing lm_head, which shares parameters with wte
+            # and wte was already initialized down below during the Embedding init
+            if not hasattr(module, 'LLMC_SKIP_INIT'):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=std, generator=self.init_rng)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02, generator=self.init_rng)
+
+    def forward(self, idx, targets=None, return_logits=True):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = tok_emb + pos_emb
+
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            loss = None
+
+        # there are performance reasons why not returning logits is prudent, if not needed
+        if not return_logits:
+            logits = None
+
+        return logits, loss
+
+    @classmethod
+    def from_pretrained(cls, model_type):
+        """Loads pretrained GPT-2 model weights from huggingface"""
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained gpt: %s" % model_type)
+
+        # n_layer, n_head and n_embd are determined from model_type
+        config_args = {
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+        }[model_type]
+        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+        # create a from-scratch initialized minGPT model
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+
+        # init a huggingface/transformers model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
+        return model
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print0(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print0(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        print0(f"using fused AdamW: {use_fused}")
+        if zero_stage == 1:
+            print0("using ZeroRedundancyOptimizer")
+            optimizer = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
+                                                lr=learning_rate, betas=betas, fused=use_fused)
+            optimizer.add_param_group(optim_groups[1])
+        else:
+            print0("using regular AdamW")
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
+        return optimizer
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
+# -----------------------------------------------------------------------------
+# Our own simple Distributed Data Loader
+
+def _peek_data_shard(filename):
+    # only reads the header, returns header data
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    if header[0] != 20240520:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        print("---> HINT: Are you passing in a correct file with --input_bin?")
+        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        exit(1)
+    assert header[1] == 1, "unsupported version"
+    ntok = header[2] # number of tokens (claimed)
+    return ntok # for now just return the number of tokens
+
+def _load_data_shard(filename):
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[1] == 1, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    assert len(tokens) == ntok, "number of tokens read does not match header?"
+    return tokens
+
+class DistributedDataLoader:
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+
+        # glob files that match the pattern
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+
+        # load and validate all data shards, count number of tokens in total
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * B * T + 1
+            ntok_total += shard_ntok
+        self.ntok_total = ntok_total
+        print0(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
+
+        # kick things off
+        self.current_shard = None
+        self.reset()
+
+    def reset(self):
+        # we're being a bit clever here: if we already had shard 0 loaded,
+        # then don't do the work to reload it, just reset the pointer
+        if self.current_shard != 0:
+            self.current_shard = 0
+            self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.current_position = self.process_rank * self.B * self.T
+
+    def advance(self): # advance to next data shard
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self):
+        B = self.B
+        T = self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the start pointer in current shard
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds advance the shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.advance()
+        return x, y
+
+# -----------------------------------------------------------------------------
+# Python -> C bridge utilities for saving params/grads/activations to .bin files
+
+def write_fp32(tensor, file):
+    t = tensor.detach().cpu().to(torch.float32)
+    b = t.numpy().tobytes()
+    file.write(b)
+
+def write_bf16(tensor, file):
+    t = tensor.detach().cpu().to(torch.bfloat16)
+    # numpy doesn't have bf16 datatype so we have to trick it
+    t = t.view(torch.int16) # trick: reinterpret as int16
+    b = t.numpy().tobytes()
+    file.write(b)
+
+def write_tensors(model_tensors, L, file, dtype):
+    # writes the GPT-2 model's weights to a binary file
+    assert dtype in {"float32", "bfloat16"}
+    write_fun = write_fp32 if dtype == "float32" else write_bf16
+    write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
+    write_fun(model_tensors["transformer.wpe.weight"], file) # (T, C)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
+    for i in range(L): # (L, 3C, C)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
+    for i in range(L): # (L, 3C)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.bias"], file)
+    for i in range(L): # (L, C, C)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
+    for i in range(L): # (L, 4C, C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
+    for i in range(L): # (L, 4C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
+    for i in range(L): # (L, C, 4C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
+    write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
+    write_fun(model_tensors["transformer.ln_f.bias"], file) # (C, )
+
+@torch.no_grad()
+def pad_vocab(tensor, multiple=128, value=0):
+    """
+    The dimension of the vocab size in GPT-2 is 50,257
+    which is unfortunately a very unfriendly number for a lot of
+    matrix operations on the GPU. So we pad it to the nearest
+    friendlier multiple, e.g. 50,304 if multiple=128 when we
+    export the weights into C land. This is a NOOP algorithmically
+    and is only done to make the tensor operations more efficient.
+    """
+    assert tensor.ndim == 2
+    V, C = tensor.shape
+    assert V == 50257, "just being defensive here"
+    # calculate padded vocab size by rounding up to nearest multiple
+    Vp = ((V + multiple - 1) // multiple) * multiple
+    # pad the tensor
+    pad_rows = Vp - V
+    padded = tensor if pad_rows == 0 else F.pad(tensor, (0, 0, 0, pad_rows), value=value)
+    assert padded.shape == (Vp, C)
+    return padded
+
+def write_model(model, filename, dtype):
+    # everything we need to instantiate the model
+    # 1) header is: version int, GPTConfig ints, padding to 1024 bytes
+    assert dtype in {"float32", "bfloat16"} # float16 todo maybe later
+    version = {
+        "float32": 3, # 3: all tensors are fp32, padded vocab
+        "bfloat16": 5, # 5: all tensors are bf16, padded vocab
+    }[dtype]
+    header = torch.zeros(256, dtype=torch.int32)
+    header[0] = 20240326 # magic
+    header[1] = version # checkpoint version
+    header[2] = model.config.block_size
+    header[3] = model.config.vocab_size
+    header[4] = model.config.n_layer
+    header[5] = model.config.n_head
+    header[6] = model.config.n_embd
+    # 2) the parameters follow the header
+    params = {name: param.cpu() for name, param in model.named_parameters()}
+    # pad the vocab to a multiple of 128 here at export, for efficiency in C
+    wte = params["transformer.wte.weight"] # (V, C)
+    wte_padded = pad_vocab(wte) # (Vp, C)
+    params["transformer.wte.weight"] = wte_padded # (Vp, C)
+    print(f"padded vocab size from {wte.size(0)} to {wte_padded.size(0)}")
+    header[7] = wte_padded.size(0) # padded vocab size store in header
+    # now write to file
+    with open(filename, "wb") as file:
+        file.write(header.numpy().tobytes()) # header
+        write_tensors(params, model.config.n_layer, file, dtype) # params
+    print(f"wrote {filename}")
+
+def write_state(model, x, y, logits, loss, filename):
+    # the state is used for debugging.
+    # it contains information about the input, logits, loss, and the parameter gradients
+    # this can be used for checking the computation correctness in C
+    header = torch.zeros(256, dtype=torch.int32)
+    header[0] = 20240327 # magic
+    header[1] = 2 # run state version = 2 (1 -> 2 for padded vocab changes)
+    header[2] = x.size(0) # batch size of the batch, B
+    header[3] = x.size(1) # temporal extent of the batch, T
+    grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
+    # pad the vocab grads here as well, to mirror write_model
+    wte_grad = grads["transformer.wte.weight"] # (V, C)
+    wte_grad_padded = pad_vocab(wte_grad, value=0) # (Vp, C) # TODO later maybe pad with nan?
+    grads["transformer.wte.weight"] = wte_grad_padded # (Vp, C)
+    print(f"padded vocab size in reference grads from {wte_grad.size(0)} to {wte_grad_padded.size(0)}")
+    with open(filename, "wb") as file:
+        # header
+        file.write(header.numpy().tobytes())
+        # input x
+        file.write(x.cpu().numpy().astype("int32").tobytes()) # (B, T)
+        # targets y
+        file.write(y.cpu().numpy().astype("int32").tobytes()) # (B, T)
+        # logits (result of the model forward pass)
+        write_fp32(logits.cpu(), file)
+        # loss (single float, result of the cross entropy loss)
+        write_fp32(loss.cpu(), file)
+        # gradients
+        write_tensors(grads, model.config.n_layer, file, "float32")
+    print(f"wrote {filename}")
+
+def write_tokenizer(enc, filename):
+    n = enc.max_token_value + 1
+    header = torch.zeros(256, dtype=torch.int32)
+    header[0] = 20240328 # magic
+    header[1] = 2 # tokenizer version = 2 (1 -> 2: includes EOT token)
+    header[2] = n # number of tokens
+    header[3] = enc.eot_token # EOT token
+    with open(filename, "wb") as file:
+        file.write(header.numpy().tobytes())
+        for i in range(n):
+            b = enc.decode_bytes([i])
+            length = len(b)
+            assert length < 256, f"Token length exceeds 255: {length}"
+            file.write(struct.pack("<B", length))  # Write the length as a 1-byte unsigned integer
+            file.write(b)  # Write the actual bytes
+    print(f"wrote {filename}")
+
+# -----------------------------------------------------------------------------
+# int main
+
+def print0(*args, **kwargs):
+    # modified print that only prints from the master process
+    # if this is not a distributed run, it's just a print
+    if int(os.environ.get("RANK", 0)) == 0:
+        print(*args, **kwargs)
+
+if __name__ == "__main__":
+    import time
+    import argparse
+    import tiktoken
+    print0(f"Running pytorch {torch.version.__version__}")
+
+    # default settings will overfit a tiny batch of data
+    # and save model weights and debug state to disk on the first iteration
+    parser = argparse.ArgumentParser()
+    # file system input / output
+    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
+    parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
+    parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
+    parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
+    # token layout for each step of the optimization
+    parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
+    parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
+    parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
+    # workload (number of steps)
+    parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
+    parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
+    # optimization
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="learning rate warmup iterations")
+    parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
+    parser.add_argument("--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
+    # evaluation
+    parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
+    parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
+    parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
+    # debugging
+    parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
+    # numerics
+    parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
+    # memory management
+    parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
+    parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
+    parser.add_argument("--flash", type=int, default=0, help="use flash attention")
+    parser.add_argument("--dtype", type=str, default="float32", help="float32|float16|bfloat16")
+    parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
+    # python -> C bridge
+    parser.add_argument("--write_tensors", type=int, default=1, help="write tensors to disk")
+    args = parser.parse_args()
+
+    # args error checking and convenience variables
+    B, T = args.batch_size, args.sequence_length
+    assert 1 <= T <= 1024
+    assert args.dtype in {"float32", "float16", "bfloat16"}
+    assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl", "d12", "d24", "d36", "d48"}
+
+    # set up DDP (distributed data parallel). torchrun sets this env variable
+    ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+    if ddp:
+        # use of DDP atm demands CUDA, we set the device appropriately according to rank
+        assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+        init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+        seed_offset = 0 # each process gets the exact same seed
+        zero_stage = args.zero_stage
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        zero_stage = 0
+        ddp_world_size = 1
+        master_process = True
+        seed_offset = 0
+        # select the device
+        if args.device:
+            # provided explicitly by the user
+            device = args.device
+        else:
+            # attempt to autodetect the device
+            device = "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+    print(f"using device: {device}")
+    device_type = 'cuda' if 'cuda' in device else 'cpu'
+
+    # calculate gradient accumulation from the desired total batch size and the current run configuration
+    tokens_per_fwdbwd = B * T * ddp_world_size
+    assert args.total_batch_size % tokens_per_fwdbwd == 0
+    grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
+    print0(f"total desired batch size: {args.total_batch_size}")
+    print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+    # set up a context manager following the desired dtype and device
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
+    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
+
+    # rng / reproducibility
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+
+    # set the torch precision mode to use TensorFloat32 (TF32) for matmuls
+    # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
+    if args.tensorcores:
+        torch.set_float32_matmul_precision('high')
+
+    # turn on/off flash attention
+    assert args.flash in {0, 1}
+    FLASH = args.flash
+
+    # init (and write) the tokenizer
+    enc = tiktoken.get_encoding("gpt2")
+    if master_process and args.write_tensors: # tokenizer is technically not tensors but ok
+        write_tokenizer(enc, "gpt2_tokenizer.bin")
+
+    # init the model, either from scratch or from OpenAI pretrained checkpoint
+    if args.model[0] == "d":
+        # from scratch (random weights)
+        model_config = {
+            "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
+            "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
+            "d36": GPTConfig(block_size=1024, vocab_size=50257, n_layer=36, n_head=20, n_embd=1280),
+            "d48": GPTConfig(block_size=1024, vocab_size=50257, n_layer=48, n_head=25, n_embd=1600),
+        }[args.model]
+        model = GPT(model_config)
+    else:
+        # load the GPT-2 model weights
+        model = GPT.from_pretrained(args.model)
+    model.train()
+    model.to(device)
+    if args.compile:
+        if hasattr(config, "coordinate_descent_tuning"):
+            config.coordinate_descent_tuning = True # suggested by @Chillee
+        print0("compiling the model...")
+        model = torch.compile(model)
+
+    # -------------------------------------------------------------------------
+    # Our own version of a simple DistributedDataLoader
+
+    # load tokens
+    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    val_loader = None
+    if args.input_val_bin:
+        val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+
+    # -------------------------------------------------------------------------
+    # PyTorch -> C bridge: save some weights and state for C to load later as reference
+
+    # do one forward pass to generate ground truth for our C tests
+    if master_process and args.write_tensors and (not args.inference_only):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        logits, loss = model(x, y)
+        loss.backward()
+        # save model params, in both float32 and bfloat16
+        model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
+        model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
+        model_size_str = model_to_size[args.model] # e.g. "124M", or "d12"
+        write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
+        write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
+        # save x, y, logits, loss, and parameter gradients, for debugging C
+        # always store these in fp32 to have an accurate reference (?)
+        write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
+        # reset the train_loader for the optimization below
+        train_loader.reset()
+
+    # -------------------------------------------------------------------------
+    # main training loop
+
+    # here we wrap model into DDP container
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+
+    # init the optimizer
+    optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
+                                               learning_rate=args.learning_rate, betas=(0.9, 0.95),
+                                               device_type=device, zero_stage=zero_stage)
+
+    # learning rate decay scheduler (cosine with warmup)
+    def get_lr(it):
+        min_lr = args.learning_rate * args.learning_rate_decay_frac
+        # 1) linear warmup for warmup_iters steps
+        if it < args.warmup_iters:
+            return args.learning_rate * (it+1) / args.warmup_iters
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > args.num_iterations:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+        return min_lr + coeff * (args.learning_rate - min_lr)
+
+    # create the logging directory if it does not exist
+    logfile = None
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        logfile = os.path.join(args.output_dir, "main.log")
+        # create the log file "main.log" inside it, and wipe it clean
+        with open(logfile, "w") as f:
+            pass
+
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    timings = []
+    norm = -1.0   # dummy value to print in inference-only mode
+    for step in range(args.num_iterations + 1):
+        t0 = time.time()
+        last_step = (step == args.num_iterations)
+
+        # once in a while evaluate the validation dataset
+        if (args.val_loss_every > 0 \
+            and (step % args.val_loss_every == 0 or last_step)) \
+            and (val_loader is not None):
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss = 0.0
+                for _ in range(args.val_max_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    _, loss = model(x, y, return_logits=False)
+                    val_loss += loss.item()
+                val_loss /= args.val_max_steps
+            # log to console and to file
+            print0(f"val loss {val_loss}")
+            if master_process and logfile is not None:
+                with open(logfile, "a") as f:
+                    f.write("s:%d tel:%f\n" % (step, val_loss))
+
+        # once in a while perform model inference on the master process
+        if (args.sample_every > 0 \
+            and (step % args.sample_every == 0 or last_step)) \
+            and master_process:
+            model.eval()
+            # before we end, let's also do one round of inference
+            # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
+            start_ids = [enc.eot_token]
+            xg = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+            max_new_tokens = 32
+            temperature = 1.0
+            top_k = 40
+            yg = raw_model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
+            print0('---------------')
+            print0(enc.decode(yg[0].tolist()))
+            print0('---------------')
+
+        # bit confusing: we want to make sure to eval and sample on 0th iteration
+        # but also after the very last iteration. so we loop for step <= num_iterations
+        # instead of just < num_iterations (one extra due to <=), only to do
+        # the validation/sampling one last time, and then we break right here as we're done.
+        if last_step:
+            break
+
+        # --------------- TRAINING SECTION BEGIN -----------------
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        # if we are trying to overfit a single batch, we reset the loader here
+        if args.overfit_single_batch:
+            train_loader.reset()
+        # micro-batch loop where we do gradient accumulation to reach desired total batch size
+        lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
+        for micro_step in range(grad_accum_steps):
+            # fetch a batch
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            if ddp:
+                # we want only the last micro-step to sync grads in a DDP model
+                # the official way to do this is with model.no_sync(), but that is a
+                # context manager that bloats the code, so we just toggle this variable
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+            # forward pass
+            with ctx:
+                _, loss = model(x, y, return_logits=False)
+                # we have to scale the loss to account for gradient accumulation,
+                # because the gradients just add on each successive backward().
+                # addition of gradients corresponds to a SUM in the objective, but
+                # instead of a SUM we want MEAN, so we scale the loss here
+                loss = loss / grad_accum_steps
+                lossf += loss.detach() # keep track of the mean loss
+            # backward pass
+            if not args.inference_only:
+                loss.backward()
+        if ddp:
+            dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
+        lossf = lossf.item()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        # determine and set the learning rate for this iteration
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        # step the optimizer
+        optimizer.step()
+        # --------------- TRAINING SECTION END -------------------
+        # everything that follows now is just diagnostics, prints, logging, etc.
+
+        # wait on the CPU for all device work to end so we get accurate per-iteration timings below
+        if device == "mps":
+            torch.mps.synchronize()
+        elif device == "cuda":
+            torch.cuda.synchronize()
+        # time and print
+        t1 = time.time()
+        # the 0th iteration is often an outlier (much slower) => skip logging it
+        tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
+        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
+        # log to logile
+        if master_process and logfile is not None:
+            with open(logfile, "a") as f:
+                f.write("s:%d trl:%f\n" % (step, lossf))
+
+        # keep track of smooth timings, last 20 iterations
+        if step > 0 and step > args.num_iterations - 20:
+            timings.append(t1-t0)
+
+    # print the average of the last 20 timings, to get something smooth-ish
+    timings = timings[-20:]
+    print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
+    print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+    # -------------------------------------------------------------------------
+    # clean up nice
+    if ddp:
+        destroy_process_group()
+
+"""
+Reference code for LLaMA-3.1 training and inference.
+Will save the model weights into files, to be read from C as initialization.
+
+This code differs from GPT-2 very slightly, there are three main differences:
+1) RoPE: LLaMA uses a different positional encoding scheme called Relative Positional Encoding (RoPE).
+2) GQA: Grouped Query Attention (GQA) is used to reduce the number of attention heads.
+3) SwiGLU: Swish-Gated Linear Unit (SwiGLU) is used as the activation function in the MLP.
+
+References:
+# 1) https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/tokenizer.py
+# 2) https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/model.py
+# 3) https://github.com/meta-llama/llama3/blob/11817d47e1ba7a4959b025eb1ca308572e0e3963/llama/generation.py
+
+Example launches to only benchmark the speed of bfloat16 compiled GPU training:
+TODO: add the actual commands
+"""
+
+import argparse
+import os
+import math
+import glob
+import inspect
+from contextlib import nullcontext
+from dataclasses import dataclass
+from pathlib import Path
+import time
+from typing import (
+    AbstractSet,
+    Collection,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import torch._inductor.config as config
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed.optim import ZeroRedundancyOptimizer
+import torch.distributed as dist
+
+import tiktoken
+from tiktoken.load import load_tiktoken_bpe
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the LLaMA 3.x model
+
+# Used in Grouped Query Attention (GQA), broadcasts the key and value tensors
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
+
+# -----------------------------------------------------------------------------
+# RoPE related
+
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+def apply_scaling(freqs: torch.Tensor):
+    # Values obtained from grid search
+    scale_factor = 8
+    low_freq_factor = 1
+    high_freq_factor = 4
+    old_context_len = 8192  # original llama3 length
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    new_freqs = []
+    for freq in freqs:
+        wavelen = 2 * math.pi / freq
+        if wavelen < high_freq_wavelen:
+            new_freqs.append(freq)
+        elif wavelen > low_freq_wavelen:
+            new_freqs.append(freq / scale_factor)
+        else:
+            assert low_freq_wavelen != high_freq_wavelen
+            smooth = (old_context_len / wavelen - low_freq_factor) / (
+                high_freq_factor - low_freq_factor
+            )
+            new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
+    return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
+
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+def precompute_freqs_cis(
+    dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False
+):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    if use_scaled:
+        freqs = apply_scaling(freqs)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+# -----------------------------------------------------------------------------
+# LLaMA building blocks
+
+# LLaMA reference code explicitly implemented RMSNorm so we copy pasted it
+# (https://github.com/meta-llama/llama-models/blob/main/models/llama3_1/api/model.py)
+# we could also use nn.RMSNorm, it has slightly different numeric properties, but equivalent
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_rep = self.n_head // self.n_kv_head
+        self.hd = config.n_embd // config.n_head
+        self.use_kv = config.use_kv
+        self.flash = config.flash
+
+        self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=False)  # key, query, value projections
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)  # output projection
+
+        # static KV cache - we could alternatively allocate it outside of the model and just pass it in when needed
+        if self.use_kv:
+            self.cache_k = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
+            self.cache_v = torch.zeros((config.max_gen_batch_size, config.block_size, config.n_kv_head, self.hd))
+
+    def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split([self.n_head * self.hd, self.n_kv_head * self.hd, self.n_kv_head * self.hd], dim=-1)
+        q, k, v = map(lambda t: t.view(B, T, -1, self.hd), (q, k, v))  # (B, T, NH, HD)
+
+        q, k = apply_rotary_emb(q, k, freqs_cis=freqs_cis)  # rotate QK (rope)  <-- 1. difference compared to GPT-2
+
+        if self.use_kv and not self.training and start_pos >= 0:  # use kv-caching during inference
+            self.cache_k[:B, start_pos : start_pos + T] = k
+            self.cache_v[:B, start_pos : start_pos + T] = v
+            k = self.cache_k[:B, : start_pos + T]
+            v = self.cache_v[:B, : start_pos + T]
+
+        k = repeat_kv(k, self.n_rep)  # GQA <-- 2. difference compared to GPT-2
+        v = repeat_kv(v, self.n_rep)
+
+        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # (B, NH, T, HD)
+
+        if self.flash:
+            # flashattention
+            # if T == 1 no need to mask, otherwise the function complains
+            # scaled_dot_product_attention expects a mask where value of True indicates that the element should take part in attention
+            # our mask is the opposite, so we need to invert it
+            y = F.scaled_dot_product_attention(q, k, v, mask == 0 if T > 1 else None)
+        else:
+            # manual implementation of attention
+            # this materializes the large (T,T) matrix for all the queries and keys
+            scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.hd))
+            if mask is not None:
+                scores.masked_fill_(mask, torch.finfo(scores.dtype).min)
+            att = F.softmax(scores.float(), dim=-1).type_as(q)
+            y = att @ v # (B, NH, T, T) x (B, NH, T, HD) -> (B, NH, T, HD)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.c_proj(y)
+        return y
+
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        hidden_dim = 4 * config.n_embd
+        hidden_dim = int(2 * hidden_dim / 3)
+        # custom dim factor multiplier
+        if config.ffn_dim_multiplier is not None:
+            hidden_dim = int(config.ffn_dim_multiplier * hidden_dim)
+        hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
+        self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, hidden_dim, bias=False)
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+
+    def forward(self, x):
+        # SwiGLU self.c_proj(F.silu(self.c_fc2(x)) * self.c_fc(x))  <-- 3. difference compared to GPT-2
+        x1 = self.c_fc(x)
+        x2 = self.c_fc2(x)
+        x2 = F.silu(x2)
+        x = x1 * x2
+        x = self.c_proj(x)
+        return x
+
+class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = RMSNorm(config.n_embd, config.norm_eps)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = RMSNorm(config.n_embd, config.norm_eps)
+        self.mlp = MLP(config)
+
+    def forward(self, x, freqs_cis=None, start_pos=None, mask=None):
+        x = x + self.attn(self.ln_1(x), freqs_cis, start_pos, mask)
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+# -----------------------------------------------------------------------------
+# The main LLaMA 3.1 model
+
+@dataclass
+class LlamaConfig:
+    version: str = "3.1"
+    block_size: int = 8192
+    vocab_size: int = 128256
+    n_layer: int = 32
+    n_head: int = 32
+    n_kv_head: int = 8
+    n_embd: int = 4096
+    ffn_dim_multiplier: float = 1.3
+    multiple_of: int = 1024
+    norm_eps: float = 1e-5
+    rope_theta: float = 500000.0
+    use_scaled_rope: bool = True
+    max_gen_batch_size: int = 4
+    use_kv: bool = True
+    flash: bool = False  # use flashattention?
+
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+        assert self.n_kv_head <= self.n_head
+        assert self.n_head % self.n_kv_head == 0
+        assert self.n_embd % self.n_head == 0
+
+class LLaMA(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = RMSNorm(config.n_embd, config.norm_eps),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # init all weights, use a torch rng object to be very careful
+        self.init_rng = torch.Generator()
+        self.init_rng.manual_seed(42)
+
+        self.freqs_cis = precompute_freqs_cis(
+            config.n_embd // config.n_head,
+            config.block_size * 2,
+            config.rope_theta,
+            config.use_scaled_rope,
+        )
+
+    def forward(self, idx, targets=None, return_logits=True, start_pos=0):
+        _, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+
+        # forward the LLaMA model itself
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        freqs_cis = self.freqs_cis[start_pos:start_pos+t]
+
+        mask = torch.triu(torch.ones((t, t), device=next(self.parameters()).device, dtype=torch.bool), diagonal=1)
+
+        for i, block in enumerate(self.transformer.h):
+            x = block(x, freqs_cis, start_pos, mask)
+        x = self.transformer.ln_f(x)
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x).float()
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]).float() # note: using list [-1] to preserve the time dim
+            loss = None
+
+        # there are performance reasons why not returning logits is prudent, if not needed
+        if not return_logits:
+            logits = None
+
+        return logits, loss
+
+    @staticmethod
+    def adapt_llama_state_dict_keys(checkpoint, config: LlamaConfig):
+        # Modify key names from Meta's LLaMA to our LLaMA
+        # our key names are derived from GPT-2's key names
+        checkpoint['transformer.wte.weight'] = checkpoint.pop('tok_embeddings.weight')
+
+        for i in range(config.n_layer):
+            for name in ['attention_norm', 'ffn_norm']:
+                old_key = f'layers.{i}.{name}.weight'  # e.g. layers.x.attention_norm.weight -> transformer.h.x.ln_1.weight
+                new_key = f'transformer.h.{i}.ln_{1 if name == "attention_norm" else 2}.weight'
+                checkpoint[new_key] = checkpoint.pop(old_key)
+
+        for i in range(config.n_layer):
+            for name in ['attention.wq', 'attention.wk', 'attention.wv']:
+                old_key = f'layers.{i}.{name}.weight'
+                new_key = f'transformer.h.{i}.attn.c_attn.weight'
+                if name == 'attention.wq':
+                    checkpoint[new_key] = checkpoint.pop(old_key)
+                else:  # merge 3 weights into transformer.h.x.attn.c_attn.weight
+                    checkpoint[new_key] = torch.cat((checkpoint[new_key], checkpoint.pop(old_key)), dim=0)
+            old_key = f'layers.{i}.attention.wo.weight'
+            new_key = f'transformer.h.{i}.attn.c_proj.weight'
+            checkpoint[new_key] = checkpoint.pop(old_key)
+
+        ffn_map = {'w1': 'c_fc2', 'w2': 'c_proj', 'w3': 'c_fc'}
+        for i in range(config.n_layer):
+            for name in ['feed_forward.w1', 'feed_forward.w2', 'feed_forward.w3']:
+                old_key = f'layers.{i}.{name}.weight'
+                new_key = f'transformer.h.{i}.mlp.{ffn_map[name.split(".")[-1]]}.weight'
+                checkpoint[new_key] = checkpoint.pop(old_key)
+
+        checkpoint['transformer.ln_f.weight'] = checkpoint.pop('norm.weight')
+        checkpoint['lm_head.weight'] = checkpoint.pop('output.weight')
+
+        return checkpoint
+
+    @staticmethod
+    def adapt_llama_state_dict_keys_hf(checkpoint, config: LlamaConfig):
+        # Modify key names from HuggingFace's LLaMA to our LLaMA
+        # our key names are derived from GPT-2's key names
+        checkpoint['transformer.wte.weight'] = checkpoint.pop('model.embed_tokens.weight')
+
+        # We need to unpermute K and V because HF script permuted the original Meta-LLaMA weights
+        # see: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/convert_llama_weights_to_hf.py
+        def unpermute(w, n_heads, dim1, dim2):
+            return w.view(n_heads, 2, dim1 // n_heads // 2, dim2).transpose(1, 2).reshape(dim1, dim2)
+
+        for i in range(config.n_layer):
+            for name in ['input_layernorm', 'post_attention_layernorm']:
+                old_key = f'model.layers.{i}.{name}.weight'  # e.g. layers.x.attention_norm.weight -> transformer.h.x.ln_1.weight
+                new_key = f'transformer.h.{i}.ln_{1 if name == "input_layernorm" else 2}.weight'
+                checkpoint[new_key] = checkpoint.pop(old_key)
+
+        for i in range(config.n_layer):
+            for name in ['self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj']:
+                old_key = f'model.layers.{i}.{name}.weight'
+                new_key = f'transformer.h.{i}.attn.c_attn.weight'
+                if name == 'self_attn.q_proj':
+                    checkpoint[new_key] = unpermute(checkpoint.pop(old_key), config.n_head, config.n_embd, config.n_embd)
+                else:  # merge 3 weights into transformer.h.x.attn.c_attn.weight
+                    tensor = checkpoint.pop(old_key)
+                    if name == 'self_attn.k_proj':
+                        tensor = unpermute(tensor, config.n_kv_head, config.n_kv_head * (config.n_embd // config.n_head), config.n_embd)
+                    checkpoint[new_key] = torch.cat((checkpoint[new_key], tensor), dim=0)
+            old_key = f'model.layers.{i}.self_attn.o_proj.weight'
+            new_key = f'transformer.h.{i}.attn.c_proj.weight'
+            checkpoint[new_key] = checkpoint.pop(old_key)
+
+        ffn_map = {'gate_proj': 'c_fc2', 'down_proj': 'c_proj', 'up_proj': 'c_fc'}
+        for i in range(config.n_layer):
+            for name in ['gate_proj', 'down_proj', 'up_proj']:
+                old_key = f'model.layers.{i}.mlp.{name}.weight'
+                new_key = f'transformer.h.{i}.mlp.{ffn_map[name]}.weight'
+                checkpoint[new_key] = checkpoint.pop(old_key)
+
+        checkpoint['transformer.ln_f.weight'] = checkpoint.pop('model.norm.weight')
+
+        return checkpoint
+
+    @classmethod
+    def from_pretrained_llama3_hf(cls, model_id):
+        """Loads pretrained LLaMA model weights from HuggingFace"""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        assert model_id == "meta-llama/Meta-Llama-3.1-8B", "Only the 8B-base model is supported for now"
+        model_args = LlamaConfig()
+
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        checkpoint = LLaMA.adapt_llama_state_dict_keys_hf(model.state_dict(), model_args)
+
+        original_default_type = torch.get_default_dtype()  # save the default type
+        torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)  # much faster loading
+        model = LLaMA(model_args)
+        model.load_state_dict(checkpoint, strict=False)
+        torch.set_default_tensor_type(torch.tensor([], dtype=original_default_type, device="cpu").type())  # restore default type
+
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer.pad_id = 128004  # this is the pad token id for LLaMA 3.1 base, we need to set this explicitly as our generate func expects it
+        tokenizer.stop_tokens = [tokenizer.eos_token_id]
+        model.tokenizer = tokenizer
+        return model
+
+    @classmethod
+    def from_pretrained_llama3_meta(cls, ckpt_dir, tokenizer_path):
+        """Loads pretrained LLaMA model weights from a checkpoint directory"""
+        model_args = LlamaConfig()
+
+        ckpt_path = sorted(Path(ckpt_dir).glob("*.pth"))[0]
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        checkpoint = LLaMA.adapt_llama_state_dict_keys(checkpoint, model_args)
+
+        original_default_type = torch.get_default_dtype()  # save the default type
+        torch.set_default_tensor_type(torch.cuda.BFloat16Tensor)  # much faster loading
+        model = LLaMA(model_args)
+        model.load_state_dict(checkpoint, strict=False)
+        torch.set_default_tensor_type(torch.tensor([], dtype=original_default_type, device="cpu").type())  # restore default type
+
+        tokenizer = Tokenizer(model_path=tokenizer_path)
+        model.tokenizer = tokenizer
+        return model
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print0(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print0(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        print0(f"using fused AdamW: {use_fused}")
+        if zero_stage == 1:
+            print0("using ZeroRedundancyOptimizer")
+            optimizer = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
+                                                lr=learning_rate, betas=betas, fused=use_fused)
+            optimizer.add_param_group(optim_groups[1])
+        else:
+            print0("using regular AdamW")
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
+        return optimizer
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompt_tokens: List[List[int]],
+        max_gen_len: int,
+        temperature: float = 0.6,
+        top_p: float = 0.9,
+        echo: bool = False,
+    ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
+        """
+        Generate text sequences based on provided prompts using the language generation model.
+
+        Args:
+            prompt_tokens (List[List[int]]): List of tokenized prompts, where each prompt is represented as a list of integers.
+            max_gen_len (int): Maximum length of the generated text sequence.
+            temperature (float, optional): Temperature value for controlling randomness in sampling. Defaults to 0.6.
+            top_p (float, optional): Top-p probability threshold for nucleus sampling. Defaults to 0.9.
+            echo (bool, optional): Flag indicating whether to include prompt tokens in the generated output. Defaults to False.
+
+        Returns:
+            Tuple[List[List[int]], Optional[List[List[float]]]]: A tuple containing generated token sequences.
+
+        Note:
+            This method uses the provided prompts as a basis for generating text. It employs nucleus sampling to produce text with controlled randomness.
+
+        """
+        bsz = len(prompt_tokens)
+        assert bsz <= self.config.max_gen_batch_size, f"Batch size {bsz} exceeds the maximum generation batch size {self.config.max_gen_batch_size}"
+        device = next(self.parameters()).device
+
+        min_prompt_len = min(len(t) for t in prompt_tokens)
+        max_prompt_len = max(len(t) for t in prompt_tokens)
+        assert max_prompt_len <= self.config.block_size, f"Prompt length {max_prompt_len} exceeds the maximum block size {self.config.block_size}"
+        total_len = min(self.config.block_size, max_gen_len + max_prompt_len)
+
+        pad_id = self.tokenizer.pad_id
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device=device)
+        for idx, t in enumerate(prompt_tokens):
+            tokens[idx, : len(t)] = torch.tensor(t, dtype=torch.long, device=device)
+
+        prev_pos = 0
+        eos_reached = torch.tensor([False] * bsz, device=device)
+        input_text_mask = tokens != pad_id
+
+        if min_prompt_len == total_len:
+            logits, _ = self.forward(tokens, start_pos=prev_pos)
+
+        stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens)).to(device)
+
+        for cur_pos in range(min_prompt_len, total_len):
+            logits, _ = self.forward(tokens[:, prev_pos:cur_pos], start_pos=prev_pos)
+            if temperature > 0:
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                next_token = sample_top_p(probs, top_p)
+            else:
+                next_token = torch.argmax(logits[:, -1], dim=-1)
+
+            next_token = next_token.reshape(-1)
+            # only replace token if prompt has already been generated
+            next_token = torch.where(input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token)
+            tokens[:, cur_pos] = next_token
+            eos_reached |= ~input_text_mask[:, cur_pos] & torch.isin(next_token, stop_tokens)
+            prev_pos = cur_pos
+            if all(eos_reached):
+                break
+
+        out_tokens = []
+        for i, toks in enumerate(tokens.tolist()):
+            # cut to max gen len
+            start = 0 if echo else len(prompt_tokens[i])
+            toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
+            # cut to after eos tok if any
+            for stop_token in self.tokenizer.stop_tokens:
+                try:
+                    eos_idx = toks.index(stop_token)
+                    toks = toks[:eos_idx]
+                except ValueError:
+                    pass
+            out_tokens.append(toks)
+        return out_tokens
+
+# -----------------------------------------------------------------------------
+# sampling utils
+
+def sample_top_p(probs, p):
+    """
+    Perform top-p (nucleus) sampling on a probability distribution.
+
+    Args:
+        probs (torch.Tensor): Probability distribution tensor.
+        p (float): Probability threshold for top-p sampling.
+
+    Returns:
+        torch.Tensor: Sampled token indices.
+
+    Note:
+        Top-p sampling selects the smallest set of tokens whose cumulative probability mass
+        exceeds the threshold p. The distribution is renormalized based on the selected tokens.
+    """
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask = probs_sum - probs_sort > p
+    probs_sort[mask] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    next_token = torch.multinomial(probs_sort, num_samples=1)
+    next_token = torch.gather(probs_idx, -1, next_token)
+    return next_token
+
+# -----------------------------------------------------------------------------
+# Llama 3.1 Tokenizer
+
+# The tiktoken tokenizer can handle <=400k chars without
+# pyo3_runtime.PanicException.
+TIKTOKEN_MAX_ENCODE_CHARS = 400_000
+
+# https://github.com/openai/tiktoken/issues/195
+# Here we iterate over subsequences and split if we exceed the limit
+# of max consecutive non-whitespace or whitespace characters.
+MAX_NO_WHITESPACES_CHARS = 25_000
+
+
+class Tokenizer:
+    """
+    Tokenizing and encoding/decoding text using the Tiktoken tokenizer.
+    """
+
+    special_tokens: Dict[str, int]
+
+    num_reserved_special_tokens = 256
+
+    pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"  # noqa: E501
+
+    def __init__(self, model_path: str):
+        """
+        Initializes the Tokenizer with a Tiktoken model.
+
+        Args:
+            model_path (str): The path to the Tiktoken model file.
+        """
+        assert os.path.isfile(model_path), model_path
+
+        mergeable_ranks = load_tiktoken_bpe(model_path)
+        num_base_tokens = len(mergeable_ranks)
+        special_tokens = [
+            "<|begin_of_text|>",
+            "<|end_of_text|>",
+            "<|reserved_special_token_0|>",
+            "<|reserved_special_token_1|>",
+            "<|finetune_right_pad_id|>",
+            "<|step_id|>",
+            "<|start_header_id|>",
+            "<|end_header_id|>",
+            "<|eom_id|>",  # end of message
+            "<|eot_id|>",  # end of turn
+            "<|python_tag|>",
+        ]
+        reserved_tokens = [
+            f"<|reserved_special_token_{2 + i}|>"
+            for i in range(self.num_reserved_special_tokens - len(special_tokens))
+        ]
+        special_tokens = special_tokens + reserved_tokens
+
+        self.special_tokens = {
+            token: num_base_tokens + i for i, token in enumerate(special_tokens)
+        }
+        self.model = tiktoken.Encoding(
+            name=Path(model_path).name,
+            pat_str=self.pat_str,
+            mergeable_ranks=mergeable_ranks,
+            special_tokens=self.special_tokens,
+        )
+
+        self.n_words: int = num_base_tokens + len(special_tokens)
+        # BOS / EOS token IDs
+        self.bos_id: int = self.special_tokens["<|begin_of_text|>"]
+        self.eos_id: int = self.special_tokens["<|end_of_text|>"]
+        self.eot_id: int = self.special_tokens["<|eot_id|>"]
+        self.eom_id: int = self.special_tokens["<|eom_id|>"]
+        self.python_tag_id = self.special_tokens["<|python_tag|>"]
+        self.pad_id: int = self.special_tokens["<|finetune_right_pad_id|>"]
+        # hardcoded stop tokens for the base model
+        self.stop_tokens = [
+            self.special_tokens["<|begin_of_text|>"],
+            self.special_tokens["<|end_of_text|>"],
+        ]
+
+    def encode(
+        self,
+        s: str,
+        *,
+        bos: bool,
+        eos: bool,
+        allowed_special: Optional[Union[Literal["all"], AbstractSet[str]]] = None,
+        disallowed_special: Union[Literal["all"], Collection[str]] = (),
+    ) -> List[int]:
+        """
+        Encodes a string into a list of token IDs.
+
+        Args:
+            s (str): The input string to be encoded.
+            bos (bool): Whether to prepend the beginning-of-sequence token.
+            eos (bool): Whether to append the end-of-sequence token.
+            allowed_tokens ("all"|set[str]): allowed special tokens in string
+            disallowed_tokens ("all"|set[str]): special tokens that raise an error when in string
+
+        Returns:
+            list[int]: A list of token IDs.
+
+        By default, setting disallowed_special=() encodes a string by ignoring
+        special tokens. Specifically:
+        - Setting `disallowed_special` to () will cause all text corresponding
+          to special tokens to be encoded as natural text (insteading of raising
+          an error).
+        - Setting `allowed_special` to "all" will treat all text corresponding
+          to special tokens to be encoded as special tokens.
+        """
+        if allowed_special is None:
+            allowed_special = set()
+        assert type(s) is str
+
+        substrs = (
+            substr
+            for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS)
+            for substr in self._split_whitespaces_or_nonwhitespaces(
+                s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
+            )
+        )
+        t: List[int] = []
+        for substr in substrs:
+            t.extend(
+                self.model.encode(
+                    substr,
+                    allowed_special=allowed_special,
+                    disallowed_special=disallowed_special,
+                )
+            )
+        if bos:
+            t.insert(0, self.bos_id)
+        if eos:
+            t.append(self.eos_id)
+        return t
+
+    def decode(self, t: Sequence[int]) -> str:
+        # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
+        return self.model.decode(cast(List[int], t))
+
+    @staticmethod
+    def _split_whitespaces_or_nonwhitespaces(
+        s: str, max_consecutive_slice_len: int
+    ) -> Iterator[str]:
+        """
+        Splits the string `s` so that each substring contains no more than `max_consecutive_slice_len`
+        consecutive whitespaces or consecutive non-whitespaces.
+        """
+        current_slice_len = 0
+        current_slice_is_space = s[0].isspace() if len(s) > 0 else False
+        slice_start = 0
+
+        for i in range(len(s)):
+            is_now_space = s[i].isspace()
+
+            if current_slice_is_space ^ is_now_space:
+                current_slice_len = 1
+                current_slice_is_space = is_now_space
+            else:
+                current_slice_len += 1
+                if current_slice_len > max_consecutive_slice_len:
+                    yield s[slice_start:i]
+                    slice_start = i
+                    current_slice_len = 1
+        yield s[slice_start:]
+
+# -----------------------------------------------------------------------------
+# Our own simple Distributed Data Loader
+
+def _peek_data_shard(filename):
+    # only reads the header, returns header data
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    if header[0] != 20240801:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        exit(1)
+    assert header[1] == 7, "unsupported version"
+    ntok = header[2] # number of tokens (claimed)
+    return ntok # for now just return the number of tokens
+
+def _load_data_shard(filename):
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        assert header[0] == 20240801, "magic number mismatch in the data .bin file"
+        assert header[1] == 7, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint32)
+    assert len(tokens) == ntok, "number of tokens read does not match header?"
+    return tokens
+
+class DistributedShardedDataLoader:
+    """
+    This DataLoader is both:
+    - distributed (works correctly in case of multiple processes in DDP)
+    - sharded (supports datasets that are broken up into multiple data shards)
+    It is not *permuted*, meaning that it itearates over the data in the order
+    of the dataset on disk, so the user should make sure to shuffle their examples
+    during the creation of their data shards for best performance.
+    """
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+
+        # glob files that match the pattern
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+
+        # load and validate all data shards, count number of tokens in total
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * B * T + 1
+            ntok_total += shard_ntok
+        self.ntok_total = ntok_total
+        print0(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
+
+        # kick things off
+        self.current_shard = None
+        self.reset()
+
+    def reset(self):
+        # we're being a bit clever here: if we already had shard 0 loaded,
+        # then don't do the work to reload it, just reset the pointer
+        if self.current_shard != 0:
+            self.current_shard = 0
+            self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.current_position = self.process_rank * self.B * self.T
+
+    def advance(self): # advance to next data shard
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self):
+        B = self.B
+        T = self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        buf = torch.tensor(buf, dtype=torch.long)
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the start pointer in current shard
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds advance the shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.advance()
+        return x, y
+
+# -----------------------------------------------------------------------------
+# Python -> C bridge utilities for saving params/grads/activations to .bin files
+
+def write_fp32(tensor, file):
+    t = tensor.detach().cpu().to(torch.float32)
+    b = t.numpy().tobytes()
+    file.write(b)
+
+def write_bf16(tensor, file):
+    t = tensor.detach().cpu().to(torch.bfloat16)
+    # numpy doesn't have bf16 datatype so we have to trick it
+    t = t.view(torch.int16) # trick: reinterpret as int16
+    b = t.numpy().tobytes()
+    file.write(b)
+
+def write_tensors(model_tensors, L, file, dtype):
+    # writes LLaMA 3 model's weights to a binary file
+    assert dtype in {"float32", "bfloat16"}
+    write_fun = write_fp32 if dtype == "float32" else write_bf16
+    write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
+    for i in range(L): # (L, 3C, C)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
+    for i in range(L): # (L, C, C)
+        write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.weight"], file)
+    for i in range(L): # (L, C)
+        write_fun(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
+    for i in range(L): # (L, 4C, C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
+    for i in range(L): # (L, 4C, C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc2.weight"], file)
+    for i in range(L): # (L, C, 4C)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
+    write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
+    write_fun(model_tensors["lm_head.weight"], file) # (V, C)
+
+def write_model(model, filename, dtype):
+    # everything we need to instantiate the model
+    # 1) header is: version int, LLaMAConfig ints, padding to 1024 bytes
+    assert dtype in {"float32", "bfloat16"}
+    version = {
+        "float32": 3, # 3: all tensors are fp32
+        "bfloat16": 5, # 5: all tensors are bf16
+    }[dtype]
+    header = torch.zeros(256, dtype=torch.int32)
+    header[0] = 20240803 # magic
+    header[1] = version # checkpoint version
+    header[2] = model.config.block_size
+    header[3] = model.config.vocab_size
+    header[4] = model.config.n_layer
+    header[5] = model.config.n_head
+    header[6] = model.config.n_kv_head
+    header[7] = model.config.n_embd
+    header[8] = model.config.ffn_dim_multiplier
+    header[9] = model.config.multiple_of
+    header[10] = model.config.norm_eps
+    header[11] = model.config.rope_theta
+    header[12] = model.config.use_scaled_rope
+    header[13] = model.config.max_gen_batch_size
+    header[14] = int(model.config.version.split('.')[0]) # major version
+    header[15] = int(model.config.version.split('.')[1]) # minor version
+    # 2) the parameters follow the header
+    params = {name: param.cpu() for name, param in model.named_parameters()}
+    # now write to file
+    with open(filename, "wb") as file:
+        file.write(header.numpy().tobytes()) # header
+        write_tensors(params, model.config.n_layer, file, dtype) # params
+    print(f"wrote {filename}")
+
+def write_state(model, x, y, logits, loss, filename):
+    # the state is used for debugging.
+    # it contains information about the input, logits, loss, and the parameter gradients
+    # this can be used for checking the computation correctness in C
+    header = torch.zeros(256, dtype=torch.int32)
+    header[0] = 20240803 # magic
+    header[1] = x.size(0) # batch size of the batch, B
+    header[2] = x.size(1) # temporal extent of the batch, T
+    grads = {name: param.grad.cpu() for name, param in model.named_parameters()}
+    with open(filename, "wb") as file:
+        # header
+        file.write(header.numpy().tobytes())
+        # input x
+        file.write(x.cpu().numpy().astype("int32").tobytes()) # (B, T)
+        # targets y
+        file.write(y.cpu().numpy().astype("int32").tobytes()) # (B, T)
+        # logits (result of the model forward pass)
+        write_fp32(logits.cpu(), file)
+        # loss (single float, result of the cross entropy loss)
+        write_fp32(loss.cpu(), file)
+        # gradients
+        write_tensors(grads, model.config.n_layer, file, "float32")
+    print(f"wrote {filename}")
+
+# -----------------------------------------------------------------------------
+# int main
+
+def print0(*args, **kwargs):
+    # modified print that only prints from the master process
+    # if this is not a distributed run, it's just a print
+    if int(os.environ.get("RANK", 0)) == 0:
+        print(*args, **kwargs)
+
+if __name__ == "__main__":
+    print0(f"Running pytorch {torch.version.__version__}")
+
+    # default settings will overfit a tiny batch of data
+    # and save model weights and debug state to disk on the first iteration
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--use_hf", type=int, default=1, help="use HuggingFace (default) or use Meta's model")
+    parser.add_argument("--ckpt_dir", type=str, default=None, help="path to llama3 model checkpoint (needed if use_hf=0)")
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="path to llama3 tokenizer (needed if use_hf=0)")
+    # file system input / output
+    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
+    parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
+    parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
+    parser.add_argument("--model", type=str, default="meta-llama/Meta-Llama-3.1-8B", help="chose the llama model")
+    # token layout for each step of the optimization
+    parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
+    parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
+    parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
+    # workload (number of steps)
+    parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
+    parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
+    # optimization
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="learning rate warmup iterations")
+    parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
+    parser.add_argument("--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
+    # evaluation
+    parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
+    parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
+    parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
+    # debugging
+    parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
+    # numerics
+    parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
+    # memory management
+    parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
+    parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
+    parser.add_argument("--dtype", type=str, default="bfloat16", help="float32|float16|bfloat16")
+    parser.add_argument("--zero_stage", type=int, default=0, help="zero redundancy optimizer stage (0/1/2/3)")
+    # python -> C bridge
+    parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
+    args = parser.parse_args()
+
+    # args error checking and convenience variables
+    B, T = args.batch_size, args.sequence_length
+    assert 1 <= T <= 8192, "sequence length must be between 1 and 8192"
+    assert args.dtype in {"float32", "float16", "bfloat16"}
+    assert args.model in {"meta-llama/Meta-Llama-3.1-8B"}  # only 8B base model supported for now
+
+    # create the logging directory if it does not exist
+    logfile = None
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
+        logfile = os.path.join(args.output_dir, "main.log")
+        # create the log file "main.log" inside it, and wipe it clean
+        with open(logfile, "w") as f:
+            pass
+
+    # set up DDP (distributed data parallel). torchrun sets this env variable
+    ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+    if ddp:
+        # use of DDP atm demands CUDA, we set the device appropriately according to rank
+        assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+        init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+        seed_offset = 0 # each process gets the exact same seed
+        zero_stage = args.zero_stage
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        zero_stage = 0
+        ddp_world_size = 1
+        master_process = True
+        seed_offset = 0
+        # select the device
+        if args.device:
+            # provided explicitly by the user
+            device = args.device
+        else:
+            # attempt to autodetect the device
+            device = "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+    device_type = 'cuda' if 'cuda' in device else 'cpu'
+    assert device_type in {'cuda'}, "GPU required to run LLaMA 3"  # we need to load LLaMA as bf16 on CUDA
+    print(f"using device: {device}")
+
+    # calculate gradient accumulation from the desired total batch size and the current run configuration
+    tokens_per_fwdbwd = B * T * ddp_world_size
+    assert args.total_batch_size % tokens_per_fwdbwd == 0
+    grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
+    print0(f"total desired batch size: {args.total_batch_size}")
+    print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+    # set up a context manager following the desired dtype and device
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
+    ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if (device_type == "cuda") else nullcontext()
+
+    # rng / reproducibility
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+
+    # set the torch precision mode to use TensorFloat32 (TF32) for matmuls
+    # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
+    if args.tensorcores:
+        torch.set_float32_matmul_precision('high')
+
+    # init the model
+    if args.use_hf:
+        model = LLaMA.from_pretrained_llama3_hf(args.model)
+    else:  # use Meta's checkpoint
+        assert args.ckpt_dir is not None and os.path.exists(args.ckpt_dir), f"llama3 ckpt dir {args.ckpt_dir} does not exist"
+        assert args.tokenizer_path is not None and os.path.exists(args.tokenizer_path), f"llama3 tokenizer path {args.tokenizer_path} does not exist"
+        model = LLaMA.from_pretrained_llama3_meta(args.ckpt_dir, args.tokenizer_path)
+
+    model.train()
+    if args.compile:
+        if hasattr(config, "coordinate_descent_tuning"):
+            config.coordinate_descent_tuning = True # suggested by @Chillee
+        print0("compiling the model...")
+        model = torch.compile(model)
+
+    # -------------------------------------------------------------------------
+    # Our own version of a simple DistributedDataLoader
+
+    # load tokens
+    train_loader = DistributedShardedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+    val_loader = None
+    if args.input_val_bin:
+        val_loader = DistributedShardedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+
+    # -------------------------------------------------------------------------
+    # PyTorch -> C bridge: save some weights and state for C to load later as reference
+
+    # do one forward pass to generate ground truth for our C tests
+    if master_process and args.write_tensors and (not args.inference_only):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        logits, loss = model(x, y)
+        loss.backward()
+        # save model params, in bfloat16
+        model_to_size = {"meta-llama/Meta-Llama-3.1-8B": "8B"}
+        model_size_str = model_to_size[args.model] # e.g. "8B"
+        write_model(model, os.path.join(args.output_dir, f"llama3.1_{model_size_str}_bf16.bin"), dtype="bfloat16")
+        # save x, y, logits, loss, and parameter gradients, for debugging C
+        # always store these in fp32 to have an accurate reference (?)
+        write_state(model, x, y, logits, loss, os.path.join(args.output_dir, f"llama3_{model_size_str}_debug_state.bin"))
+        # reset the train_loader for the optimization below
+        train_loader.reset()
+
+    # -------------------------------------------------------------------------
+    # main training loop
+
+    # here we wrap model into DDP container
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+
+    # init the optimizer
+    optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
+                                               learning_rate=args.learning_rate, betas=(0.9, 0.95),
+                                               device_type=device, zero_stage=zero_stage)
+
+    # learning rate decay scheduler (cosine with warmup)
+    def get_lr(it):
+        min_lr = args.learning_rate * args.learning_rate_decay_frac
+        # 1) linear warmup for warmup_iters steps
+        if it < args.warmup_iters:
+            return args.learning_rate * (it+1) / args.warmup_iters
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > args.num_iterations:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+       
