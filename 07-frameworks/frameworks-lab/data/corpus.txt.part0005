@@ -1,0 +1,3038 @@
+oops)
+  store_bufs = {x.buf_uop for x in sl if _is_local_store(x) and any(r in x.ranges for r in rngs)}
+  # a load whose buffer matches a local store's buffer is necessarily a local load
+  if not any(x.op is Ops.LOAD and x.src[0].buf_uop in store_bufs for x in sl): return None
+  return end.replace(src=(UOp(Ops.BARRIER, src=(end.src[0],)),)+end.src[1:])
+
+pm_implicit_barriers = PatternMatcher([
+  (UPat(Ops.AFTER, name="after"), add_raw_barrier),
+  (UPat((Ops.END, Ops.BACKEDGE), name="end"), add_war_barrier),
+])
+
+def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
+  if DEBUG >= 5: print(render_ssa(list(ast.toposort())))
+  if SPEC: type_verify(ast, spec_tensor)
+
+  # resolve UNSHARDs (multi-device UNSHARDs are already resolved by the scheduler; this handles in-kernel shards, e.g. fragments)
+  sink = graph_rewrite(ast, multi_pm, name="multi_pm")
+
+  # preprocess
+  sink = graph_rewrite(sink, pm_mops, name="early movement ops", bottom_up=True)
+
+  # first we optimize
+  if optimize:
+    # collapse loads reduce (indexing by a tensor)
+    sink = graph_rewrite(sink, pm_load_collapse, name="load collapse")
+
+    # split ranges
+    sink = graph_rewrite(sink, pm_split_ranges+pm_flatten_range, ctx={}, name="split ranges")
+
+    # symbolic (NOTE: this is a requirement for pm_simplify_ranges to be correct)
+    sink = graph_rewrite(sink, sym+pm_flatten_range, name="initial symbolic")
+
+    # optimize (schedule) the AST
+    sink = graph_rewrite(sink, pm_flatten_range+pm_simplify_ranges, ctx={}, name="simplify ranges")
+
+    # do postrange optimization, BEAM or hand_coded_optimizations
+    sink = apply_opts(sink, ren, beam=ast.arg.beam)
+
+  # ** expander (expand_rewrite) **
+  # reduce_unparented: a REDUCE whose src folded to a CONST (e.g. x*0) has no parented ranges, collapse it before the expander
+  sink = graph_rewrite(sink, sym+pm_move_where_on_load+pm_flatten_range+pm_reduce_unparented+pm_reduce_identity, name="postopt symbolic")
+
+  # expand
+  sink = graph_rewrite(sink, expander, ctx=build_range_map(sink), name="expander")
+
+  slots = itertools.count(max([u.arg.slot+1 for u in sink.toposort() if u.op in {Ops.BUFFER, Ops.ALLOC}], default=0))
+
+  # remove reduce
+  sink = graph_rewrite(sink, mop_cleanup+pm_reduce_local, ctx=slots, name="remove reduces")
+
+  # add locals
+  sink = graph_rewrite(sink, pm_add_local_buffers, ctx=slots, name="add local buffers")
+
+  # group GPU dimensions early so their index arithmetic goes through normal lowering
+  sink = graph_rewrite(sink, pm_group_gpudims, ctx=ren, name="group gpudims", walk=True)
+
+  # **** optimizations are done, now we lower to actual code ****
+
+  sink = graph_rewrite(sink, symbolic_simple+pm_expand_broadcast+pm_add_loads, name="*** expand broadcast / add loads")
+
+  # devectorize
+  sink = graph_rewrite(sink, symbolic_simple+devectorizer2+indexing_simplify, name="devectorize2")
+
+  # some coalescing misses without this
+  sink = graph_rewrite(sink, sym, name="early symbolic")
+
+  # do memory coalescing (late)
+  sink = memory_coalescing(sink, ren)
+  sink = graph_rewrite(sink, symbolic_simple+pm_simplify_add_image, name="add images", ctx=({}, ren), bottom_up=True)
+
+  # extra symbolic before decomp. crashes without this?
+  # NOTE: also run indexing_simplify here, while the index is still weakint and (x+y)*c -> x*c+y*c applies
+  # commit widths minted in this fixpoint before lowering inspects INDEX shapes
+  sink = graph_rewrite(sink, sym+indexing_simplify+pm_commit_weak, name="extra symbolic")
+
+  # the boundary: required compute dtypes settle here; derivable const edges may stay bare
+  # NOTE: we need indexing_simplify to remove the cast to long using the Invalid
+  # NOTE: symbolic must NOT be composed here -- pm_data_invalid pushes the weak result CAST into a gated WHERE, remaking the weak node, and it cycles
+  sink = graph_rewrite(sink, pm_lower_weak+indexing_simplify, name="lower all index dtypes")
+
+  # final symbolic before decomp
+  sink = graph_rewrite(sink, symbolic, name="final symbolic")
+
+  sink = graph_rewrite(sink, pm_cast_float_alu, name="cast float alu operands")
+
+  # **** decomps ****
+
+  # floordiv+mod / dtype decomp (early)
+  supported_ops = tuple(ren.code_for_op.keys())
+  pm_decomp = symbolic_simple+get_simplifying_rewrite_patterns(supported_ops)
+  sink = graph_rewrite(sink, pm_decomp, name="early decompositions")
+
+  # late decomps + move gates from unrenderable INVALID where
+  sink = graph_rewrite(sink, pm_dtype_decomps+pm_commit_weak, ctx=(set(), ren), name="decomp dtypes")
+  pm_decomp = pm_decomp+\
+    get_late_rewrite_patterns(supported_ops, bool(DISABLE_FAST_IDIV))+\
+    get_transcendental_patterns(supported_ops, TRANSCENDENTAL>=2)
+  sink = graph_rewrite(sink, pm_decomp, ctx=ren, name="late decompositions")
+  sink = graph_rewrite(sink, pm_move_gates_from_index, name="move gates from index")
+
+  # final rules for the renderer (without sym)
+  extra_matcher = ren.extra_matcher if ren.extra_matcher is not None else PatternMatcher([])
+  pm_final_rewrite = pm_commit_weak+pm_decomp+extra_matcher+pm_split_ends
+  sink = graph_rewrite(sink, pm_final_rewrite+pm_remove_invalid, ctx=ren, name="final rewrite")
+
+  # commit every const still bare so no renderer reads one
+  sink = graph_rewrite(sink, pm_cast_const, name="cast consts")
+
+  # add implicit barriers (stores/loads through LOCAL memory ordered by AFTER or across loop iterations need workgroup barriers)
+  sink = graph_rewrite(sink, pm_implicit_barriers, name="add implicit barriers")
+
+  # hardware ranges are no longer loops; preserve their already lowered bounds
+  sink = graph_rewrite(sink, pm_range_to_special, name="range to special")
+
+  # this was the linearizer
+  sink = graph_rewrite(sink, pm_add_control_flow, ctx=CFGContext(sink), name="add control flow", bottom_up=True)
+
+  # put the variables in slots
+  num_params = max([x.arg.slot + 1 for x in sink.toposort() if x.op is Ops.PARAM and not x.is_variable], default=0)
+  sink = graph_rewrite(sink, pm_number_params, ctx=(num_params, {}), name="number variables", walk=True)
+
+  if VIZ: graph_rewrite(sink, PatternMatcher([]), name="View Output AST")
+  if SPEC:
+    import os
+    if os.environ.get("DBGTV"):
+      try: type_verify(sink, spec_program)
+      except RuntimeError:
+        print(render_ssa(list(sink.toposort())))
+        raise
+    else: type_verify(sink, spec_program)
+
+  # return the rewritten sink
+  return sink
+
+# inject IF/ENDIF. only needed if device doesn't support gated stores
+pm_linearize_cleanups = PatternMatcher([
+  # if statements are not allowed in the graph
+  (UPat((Ops.IF, Ops.ENDIF)), lambda: panic(RuntimeError, "if not allowed in graph")),
+  # gated STORE becomes IF-STORE-ENDIF. this is the only use of IF-ENDIF
+  (UPat(Ops.STORE, name="u", src=(UPat((Ops.INDEX, Ops.SHRINK)).or_casted(), UPat(), UPat(name="gate", dtype=dtypes.bool))),
+   lambda u, gate: ((st:=u.replace(src=u.src[0:2])), [mif:=UOp(Ops.IF, src=(gate, u.src[0])), st, UOp(Ops.ENDIF, src=(mif,))]))
+])
+
+pm_alloc_to_buf = PatternMatcher([(UPat(Ops.ALLOC, name="x"), lambda x: ((buf:=x.replace(op=Ops.BUFFER)), [buf])),])
+
+# requires lst be toposorted. like graph rewrite, but for lines
+def line_rewrite(lst:list[UOp], pm:PatternMatcher, ctx=None) -> list[UOp]:
+  newlst = []
+  replaced: dict[UOp, UOp] = {}
+  for u in lst:
+    nu = u.replace(src=tuple([replaced.get(x, x) for x in u.src]))
+    ret: tuple[UOp, list[UOp]] = pm.rewrite(nu, ctx) or (nu, [nu])
+    replaced[u] = ret[0]
+    newlst.extend(ret[1])
+  return newlst
+
+pm_lower_calls = PatternMatcher([
+  (UPat(Ops.CALL, src=(UPat(Ops.SINK),), allow_any_len=True, name="call"),
+   lambda ctx,call: call.replace(src=(full_rewrite_to_sink(call.body, ctx, optimize=False),)+call.src[1:])),
+])
+
+pm_call_fixup = PatternMatcher([
+  (UPat(Ops.CALL, src=(UPat(Ops.SINK, name="sink"),), allow_any_len=True, name="call"),
+   lambda call,sink: call.replace(src=(UOp(Ops.LINEAR, src=tuple(line_rewrite(linearize(sink), pm_linearize_cleanups+pm_alloc_to_buf)),
+                                           arg=to_function_name(call.arg.name)),)+call.src[1:])),
+])
+
+def do_linearize(ctx:Renderer, prg:UOp, sink:UOp) -> UOp:
+  if DEBUG >= 3 and sink.arg.applied_opts: print(f"{sink.arg.function_name:<25} opts: {sink.arg.applied_opts}")
+  sink = graph_rewrite(sink, pm_call_fixup, name="call fixup", enter_calls=True)
+  lst = line_rewrite(linearize(sink), pm_linearize_cleanups+pm_alloc_to_buf)
+  prg = prg.replace(src=(lst[-1],))
+  # isa renderers need to allocate registers
+  if isinstance(ctx, ISARenderer):
+    lin_ctx = ctx.linear_ctx_type(ctx)
+    lst = line_rewrite(lst, ctx.pre_regalloc_matcher, lin_ctx)
+    # register definitions (INS without srcs) move to the top so regalloc sees their live ranges span the whole program (callee saved regs)
+    lst = sorted(lst, key=lambda u: u.op is not Ops.INS or bool(u.src))
+    regalloc_ctx = LinearScanRegallocContext(lin_ctx, lst, ctx)
+    lst = line_rewrite(lst, pm_regalloc_rewrite, regalloc_ctx)
+    lst = line_rewrite(lst, ctx.post_regalloc_matcher, lin_ctx)
+    if DEBUG >= 4: print(ctx.asm_str(lst, sink.arg.function_name))
+  return prg.replace(src=prg.src + (UOp(Ops.LINEAR, src=tuple(lst)),))
+
+def do_estimates(prg:UOp, sink:UOp, lin:UOp) -> UOp|None:
+  if sink.arg.estimates is not None: return None
+  return prg.replace(src=(sink.replace(arg=replace(sink.arg, estimates=Estimates.from_uops(lin.src, ignore_indexing=True))),)+prg.src[1:])
+
+def do_assemble(ctx:Renderer, prg:UOp, lin:UOp) -> UOp:
+  src = "\n".join(str(u.arg[0]) for u in lin.src)
+  if DEBUG >= 4: print(src)
+  binary = ctx.asm(prg, lin)
+  return prg.replace(src=prg.src[:2]+(UOp(Ops.SOURCE, arg=src), UOp(Ops.BINARY, arg=binary)))
+
+def do_render(ctx:Renderer, prg:UOp, lin:UOp) -> UOp:
+  src = ctx.render(list(lin.src))
+  return prg.replace(src=prg.src + (UOp(Ops.SOURCE, arg=src),))
+
+def do_compile(ctx:Renderer, prg:UOp, source:UOp) -> UOp|None:
+  if DEBUG >= 4: print(source.arg)
+  lib = ctx.compiler.compile_cached(source.arg)
+  if DEBUG >= 7: ctx.compiler.disassemble(lib)
+  return prg.replace(src=prg.src + (UOp(Ops.BINARY, arg=lib),))
+
+pm_to_program = PatternMatcher([
+  (UPat(Ops.PROGRAM, src=(UPat(Ops.SINK, name="sink"),), name="prg"), do_linearize),
+  (UPat(Ops.PROGRAM, src=(UPat(Ops.SINK, name="sink"), UPat(Ops.LINEAR, name="lin")), name="prg"), do_estimates),
+  (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR, src=UPat(Ops.INS), name="lin")), name="prg"), do_assemble),
+  (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR, name="lin")), name="prg"), do_render),
+  (UPat(Ops.PROGRAM, src=(UPat(), UPat(Ops.LINEAR), UPat(Ops.SOURCE, name="source")), name="prg"), do_compile),
+])
+
+@rewrite_group(name=lambda ast,renderer,ret,**_: TracingKey((k:=ret.src[0].arg).name,(k.function_name, ast, ret.key),ret=renderer), replay=True)
+@Context(ALLOW_DEVICE_USAGE=0)
+def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
+  """
+  Transform an AST into a compiled PROGRAM. May trigger BEAM search.
+
+  Args:
+    ast: The Ops.SINK/Ops.PROGRAM rooted AST
+    renderer: The renderer used to generate the code
+
+  Returns:
+    The Ops.PROGRAM with SINK/LINEAR/SOURCE/BINARY.
+  """
+  if ast.op is Ops.PROGRAM: prg = ast
+  elif ast.op is Ops.SINK:
+    assert isinstance(ast.arg, KernelInfo), "requires KernelInfo on arg to to_program"
+    if VIZ: graph_rewrite(ast, PatternMatcher([]), name="View Base AST")
+    ast = graph_rewrite(ast, pm_lower_calls, ctx=renderer, name="lower calls", walk=True, enter_calls=True)
+    full_sink = full_rewrite_to_sink(ast, renderer, optimize=ast.tag is None)
+    prog_info = ProgramInfo.from_sink(full_sink, renderer.target)
+    # instruction selection
+    if isinstance(renderer, ISARenderer):
+      # Instruction selection replaces LOAD/STORE/ALU with INS, so estimate while their meaning is still available.
+      if full_sink.arg.estimates is None:
+        full_sink = full_sink.replace(arg=replace(full_sink.arg, estimates=Estimates.from_uops(tuple(linearize(full_sink)), ignore_indexing=True)))
+      full_sink = graph_rewrite(full_sink, renderer.pre_isel_matcher, ctx=itertools.count(-1, -1), name="pre instruction selection", bottom_up=True)
+      full_sink = graph_rewrite(full_sink, renderer.isel_matcher, ctx=IselContext(full_sink), name="instruction selection", bottom_up=True)
+    prg = UOp(Ops.PROGRAM, src=(full_sink,), arg=prog_info)
+  else: raise RuntimeError(f"can't call to_program on {ast.op}")
+  if not isinstance(prg.arg, ProgramInfo): prg = prg.replace(arg=ProgramInfo.from_sink(prg.src[0], renderer.target))
+  prg = graph_rewrite(prg, pm_to_program, ctx=renderer, name="linearize/render")
+  if VIZ: graph_rewrite(prg, PatternMatcher([]), name="View Program")
+  return prg
+
+# config affects generated programs and cache keys; context also carries compile-only behavior to workers
+to_program_config = (NOOPT, EMULATED_DTYPES, USE_TC, IMAGE, DISABLE_FAST_IDIV, TRANSCENDENTAL, ALLOW_TF32,
+                     DEFAULT_FLOAT, DEFAULT_INT, TC_SELECT, TC_OPT, TC_MIN_GLOBALS)
+to_program_context = (*to_program_config, SPEC, DEBUG)
+def to_program_key(ast:UOp, renderer:Renderer) -> tuple:
+  return (ast.key, type(renderer), renderer.target, *[x.value for x in to_program_config])
+
+to_program_cache: dict[tuple, UOp] = {}
+def to_program(ast:UOp, renderer:Renderer) -> UOp:
+  if (prg:=to_program_cache.get(key:=to_program_key(ast, renderer))) is None: to_program_cache[key] = prg = do_to_program(ast, renderer)
+  return prg
+
+
+from dataclasses import replace
+from tinygrad.dtype import dtypes, DType, AddrSpace, truncate
+from tinygrad.helpers import flatten, DEBUG, EMULATED_DTYPES
+from tinygrad.uop import GroupOp
+from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, graph_rewrite
+from tinygrad.uop.weak import commit_weak_consts
+from tinygrad.renderer import Renderer
+from tinygrad.codegen.decomp.transcendental import exponent_bias, shl, shr
+
+# ***** long as 2 ints *****
+
+l2i_dt = {dtypes.long: dtypes.int, dtypes.ulong: dtypes.uint}
+def unpack32(v:UOp) -> tuple[UOp, UOp]: return v.bitcast(dtypes.uint) & 0xFFFF, shr(v.bitcast(dtypes.uint), 16)
+def reindex(idx:UOp, off:int, mul=2) -> UOp:
+  if idx.op is Ops.SHRINK:
+    assert mul == 1, "can't reindex SHRINK with mul != 1"
+    return idx.replace(op=Ops.INDEX, src=(idx.src[0], idx.src[1]+off))
+  return idx.replace(src=(idx.src[0], idx.src[1]*mul+off, *idx.src[2:]))
+
+# 4.3.1 is the relevant section in TAOCP
+def l2i(op: Ops, dt: DType, *uops:UOp):
+  zero = UOp.const(0, dt)
+  if len(uops) == 2: a0, a1 = uops
+  elif len(uops) == 3: a0, a1, b0 = uops  # a shift's count is a single word
+  elif len(uops) == 4: a0, a1, b0, b1 = uops
+  match op:
+    case Ops.NEG: return l2i(Ops.SUB, dt, zero, zero, *uops)
+    case Ops.CAST if dt in (dtypes.long, dtypes.ulong) and uops[0].dtype not in dtypes.floats:
+      # the high word is the sign extension, and unsigned and bool sources zero extend
+      x, lo = uops[0], uops[0].cast(l2i_dt[dt])
+      if x.dtype is dtypes.bool or x.dtype in dtypes.uints: return lo, lo.const_like(0)
+      return lo, (x < x.const_like(0)).where(lo.const_like(-1), lo.const_like(0))
+    case Ops.CAST if dt in (dtypes.long, dtypes.ulong):
+      return (lo:=uops[0].cast(l2i_dt[dt])), (uops[0] / 2**32).cast(l2i_dt[dt]) - ((uops[0] < 0) & lo.ne(0))
+    case Ops.CAST if dt in dtypes.floats:
+      small = (a1.eq(0) & (a0 >= 0)) | (a1.eq(-1) & (a0 < 0))
+      cdt = dt if dt == dtypes.float64 else dtypes.float32
+      return small.where(a0.cast(dt), ((a1.cast(cdt) * (2**32)) + a0.bitcast(dtypes.uint).cast(cdt)).cast(dt))
+    case Ops.CAST: return a0.bitcast(dtypes.uint).cast(dt)
+    case Ops.BITCAST: return a0.bitcast(dt), a1.bitcast(dt)
+    case Ops.SHL:
+      a0u, a1u, n = a0.bitcast(dtypes.uint), a1.bitcast(dtypes.uint), (b0 & 31).cast(dtypes.uint)
+      lo, hi = (a0u << n).bitcast(dt), ((a1u << n) | ((a0u >> 1) >> (31 - n))).bitcast(dt)
+      return (b0 >= 32).where(zero, lo), (b0 >= 32).where(lo, hi)
+    case Ops.SHR:
+      a0u, a1u, n = a0.bitcast(dtypes.uint), a1.bitcast(dtypes.uint), (b0 & 31).cast(dtypes.uint)
+      lo, hi = ((a0u >> n) | ((a1u << 1) << (31 - n))).bitcast(dt), a1 >> (b0 & 31)
+      fill = a1 >> 31 if dt == dtypes.int else zero  # vacated high word: sign bits when signed, else 0
+      return (b0 >= 32).where(hi, lo), (b0 >= 32).where(fill, hi)
+    case Ops.ADD: return (low:=a0+b0), a1 + b1 + (low.bitcast(dtypes.uint) < a0.bitcast(dtypes.uint))
+    case Ops.SUB: return a0 - b0, a1 - b1 - (a0.bitcast(dtypes.uint) < b0.bitcast(dtypes.uint))
+    case Ops.MUL:
+      (a00, a01), (b00, b01) = unpack32(a0), unpack32(b0)
+      mid = l2i(Ops.ADD, dt, shl(a00*b01, 16).bitcast(dt), shr(a00*b01, 16).bitcast(dt), shl(a01*b00, 16).bitcast(dt), shr(a01*b00, 16).bitcast(dt))
+      return l2i(Ops.ADD, dt, *mid, (a00*b00).bitcast(dt), (a01*b01).bitcast(dt) + a0*b1 + a1*b0)
+    case Ops.CDIV | Ops.CMOD:
+      # TAOCP Algorithm 4.3.1D could be faster here, but must be parameterized over the width of b
+      if dt == dtypes.int:
+        ua0, ua1, ub0, ub1 = a0.bitcast(dtypes.uint), a1.bitcast(dtypes.uint), b0.bitcast(dtypes.uint), b1.bitcast(dtypes.uint)
+        a0, a1 = (a_neg:=a1 < zero).where((n:=l2i(Ops.NEG, dtypes.uint, ua0, ua1))[0], ua0), a_neg.where(n[1], ua1)
+        b0, b1 = (b_neg:=b1 < zero).where((n:=l2i(Ops.NEG, dtypes.uint, ub0, ub1))[0], ub0), b_neg.where(n[1], ub1)
+      q, r = (z:=UOp.const(0, dtypes.uint), z), (z, z)
+      for i in range(63, -1, -1):
+        r = l2i(Ops.SHL, dtypes.uint, *r, UOp.const(1, dtypes.uint), z)
+        r = (r[0] | l2i(Ops.SHR, dtypes.uint, a0, a1, UOp.const(i, dtypes.uint), z)[0] & 1), r[1]
+        cond = l2i(Ops.CMPLT, dtypes.uint, *r, b0, b1).logical_not()
+        diff = l2i(Ops.SUB, dtypes.uint, *r, b0, b1)
+        q = ((q[0] | shl(cond.cast(dtypes.uint), i % 32), q[1]) if i < 32 else (q[0], q[1] | shl(cond.cast(dtypes.uint), i % 32)))
+        r = l2i(Ops.WHERE, dtypes.uint, cond, *diff, *r)
+      if dt == dtypes.int:
+        (nq0, nq1), (nr0, nr1) = l2i(Ops.BITCAST, dt, *l2i(Ops.NEG, dtypes.uint, *q)), l2i(Ops.BITCAST, dt, *l2i(Ops.NEG, dtypes.uint, *r))
+        (q0, q1), (r0, r1) = l2i(Ops.BITCAST, dt, *q), l2i(Ops.BITCAST, dt, *r)
+        return (a_neg.where(nr0, r0), a_neg.where(nr1, r1)) if op == Ops.CMOD else ((a_neg^b_neg).where(nq0, q0), (a_neg^b_neg).where(nq1, q1))
+      return r if op == Ops.CMOD else q
+    case Ops.CMPLT: return (a1 < b1) | ((a1.eq(b1)) & (a0.bitcast(dtypes.uint) < b0.bitcast(dtypes.uint)))
+    case Ops.CMPEQ: return a0.eq(b0) & a1.eq(b1)
+    case Ops.CMPNE: return a0.ne(b0) | a1.ne(b1)
+    case Ops.XOR | Ops.OR | Ops.AND: return UOp(op, src=(a0, b0)), UOp(op, src=(a1, b1))
+    case Ops.WHERE: return uops[0].where(uops[1], uops[3]), uops[0].where(uops[2], uops[4])
+    case Ops.MAX: return l2i(Ops.WHERE, dt, l2i(Ops.CMPLT, dt, *uops), b0, b1, a0, a1)
+    case _: raise NotImplementedError(f"long decomposition of {op} unsupported")
+
+def l2i_define(x:UOp) -> UOp:
+  # cannot decomp a Variable
+  if x.addrspace == AddrSpace.ALU: raise RuntimeError(f"long decomposition of variable {x.arg.name} unsupported")
+  return UOp(x.op, arg=replace(x.arg, dtype=l2i_dt[x.dtype], size=None if x.arg.size is None else x.arg.size*2), tag=x.tag)
+
+def split_l2i(ctx:dict, op: Ops, dt: DType, *uops:UOp):
+  # l2i does arithmetic on its inputs; rules enter here to split them to 32-bit words first, l2i recurses on itself.
+  # both word halves of a node ask for the same split, so ctx memos it for the pass
+  if (key:=(op, dt, uops)) not in ctx: ctx[key] = l2i(op, dt, *graph_rewrite(UOp.sink(*uops), pm_long_decomp, ctx=ctx, bottom_up=True).src)
+  return ctx[key]
+
+def l2i_rewrite_idx(ctx:dict, idx:UOp) -> UOp: return graph_rewrite(idx, pm_long_decomp, ctx=ctx, bottom_up=True)
+
+# ***** floats *****
+f2f_dt = { f:getattr(dtypes, f"uint{f.bitsize}") for f in dtypes.floats }
+
+def rne(v: UOp, s) -> UOp: return shr(v, s) + ((shr(v, s - 1) & 1) & ((v & ((1 << (s - 1)) - 1)).ne(0) | (shr(v, s) & 1)))
+
+def f2f(v, fr:DType, to:DType, sat=True):
+  fs, fb, (fe, fm), ts, tb, (te, tm) = fr.bitsize, exponent_bias(fr), dtypes.finfo(fr), to.bitsize, exponent_bias(to), dtypes.finfo(to)
+  # NB: denormals are zero!
+  if fe <= te and fm < tm:
+    sign, nosign = shl((v & shl(1, fs-1)).cast(f2f_dt[to]), ts - fs), (v & (shl(1, fs-1) - 1)).cast(f2f_dt[to])
+    exp, norm = shr(nosign, fm), shl(nosign, tm - fm) + shl(tb - fb, tm)
+    nan = shl(nosign, tm - fm) | shl((shl(1, te) - 1), tm)
+    if fr in dtypes.fp8_fnuz:
+      fnuz_nan = sign.ne(0) & nosign.eq(0)
+      qnan = shl(shl(1, te) - 1, tm) | shl(1, tm - 1)
+      return fnuz_nan.where(qnan, sign | exp.eq(0).where(0, norm)).bitcast(to)
+    # fp8e4m3 has only one nan
+    is_nan = (nosign.eq(shl(1, fm + fe) - 1) if fr == dtypes.fp8e4m3 else exp.eq(shl(1, fe) - 1))
+    return (sign | exp.eq(0).where(0, is_nan.where(nan, norm))).bitcast(to)
+  elif fe >= te and fm > tm:
+    v = f2f_clamp(v.bitcast(fr), to, sat).bitcast(f2f_dt[fr])
+    sign, nosign = shr(v, fs - ts) & shl(1, ts - 1), v & (shl(1, fs - 1) - 1)
+    norm = (rne(nosign, fm - tm) - shl(fb - tb, tm)).cast(f2f_dt[to])
+    underflow = (shr(v, fm) & (shl(1, fe) - 1)) < (1 + fb - tb)
+    nan_mantissa = (shl(1, tm) - 1) if to == dtypes.fp8e4m3 else (shr(nosign, fm - tm) & (shl(1, tm) - 1))
+    nan = (sign | nan_mantissa | shl(shl(1, te) - 1, tm)).cast(f2f_dt[to])
+    is_nan = (shr(v, fm) & (shl(1, fe) - 1)).eq(shl(1, fe) - 1)
+    if to in dtypes.fp8_fnuz: return is_nan.where(shl(1, ts - 1), underflow.where(0, sign.cast(f2f_dt[to]) | norm))
+    return is_nan.where(nan, sign.cast(f2f_dt[to]) | underflow.where(0, norm))
+  else: raise NotImplementedError(f"unsupported decomp {fr} -> {to}")
+
+def f2f_clamp(val:UOp, dt:DType, sat=True) -> UOp:
+  e, m = dtypes.finfo(dt)
+  if dt in dtypes.fp8_fnuz: max_exp, max_man = (1 << e) - 1, (1 << m) - 1
+  else: max_exp, max_man = ((1 << e) - 1, (1 << m) - 2) if dt == dtypes.fp8e4m3 else ((1 << e) - 2, (1 << m) - 1)
+  mx = val.const_like(2.0**(max_exp - exponent_bias(dt)) * (1.0 + max_man / (1 << m)))
+  sat = mx if dt in dtypes.fp8s and sat else val.const_like(float('inf'))
+  # FIXME: CMPLT of nan is undefined
+  return val.ne(val).where(val, (val < -mx).where(-sat, (mx < val).where(sat, val)))
+
+def f2f_load(x: UOp, fr:DType, to:DType) -> UOp:
+  storage_idx = graph_rewrite(x.src[0], pm_float_decomp, ctx=(fr, to), bottom_up=True)
+  if (n:=x.max_numel()) == 1: return f2f(storage_idx.load(*x.src[1:]), fr, to)
+  return UOp(Ops.STACK, src=tuple(f2f(reindex(storage_idx, i, 1).load(*x.src[1:]), fr, to) for i in range(n)))
+
+def f2f_store(st, idx, val, fr:DType, to:DType):
+  if (n:=val.max_numel()) == 1: return st.replace(src=(idx, f2f(val.bitcast(f2f_dt[to]), to, fr)))
+  return UOp.group(*(st.replace(src=(reindex(idx, i, 1), f2f(val.index(i).bitcast(f2f_dt[to]), to, fr))) for i in range(n)))
+
+def f2f_rewrite(ctx:tuple, x:UOp) -> UOp: return graph_rewrite(x, pm_float_decomp, ctx=ctx, bottom_up=True)
+
+# tag is the 32-bit word this node becomes - (0 for the low word, 1 for the high, the dtype the consumer wants)
+pm_long_decomp: PatternMatcher = PatternMatcher([
+  # the decomp's own bottom-up rewrite can mint bare consts mid-flight: word splitting commits them at the long sibling's dtype
+  (UPat(GroupOp.All, name='x'), lambda x: commit_weak_consts(x, next((s.dtype for s in x.src if s.dtype in l2i_dt), None))),
+  (UPat(GroupOp.Defines, tuple(l2i_dt.keys()), name="x"), l2i_define),
+  (UPat(Ops.INDEX, tuple(l2i_dt.keys()), name='x'), lambda x:
+   reindex(x, x.tag[0]).replace(tag=None) if x.tag is not None else None),
+  (UPat(Ops.STORE, src=(UPat.var('idx', tuple(l2i_dt.keys())), UPat.var('val')), name='st'), lambda st,idx,val:
+   st.replace(src=(idx.rtag((0, dt:=l2i_dt[idx.dtype])), val.rtag((0, dt)))).group(
+     st.replace(src=(idx.rtag((1, dt)), val.rtag((1, dt))))) if val.tag is None else None),
+  (UPat(GroupOp.Comparison, src=[UPat.var('a', tuple(l2i_dt.keys())), UPat()], name="x"), lambda ctx,a,x:
+   split_l2i(ctx, x.op, dt:=l2i_dt[a.dtype], *flatten((s.rtag((0, dt)), s.rtag((1, dt))) for s in x.src))),
+  (UPat(Ops.CAST, tuple(l2i_dt.keys()), src=(UPat.var('a', tuple(l2i_dt.keys())),), name="x"), lambda ctx,a,x:
+   split_l2i(ctx, Ops.BITCAST, l2i_dt[x.dtype], a.rtag((0, dt:=l2i_dt[a.dtype])), a.rtag((1, dt)))[x.tag[0]]),
+  # a const splits by value; the general CAST arm below would drop its high word
+  (UPat(Ops.CAST, src=(UPat(Ops.CONST, name='c'),), tag={(w, dt) for w in (0, 1) for dt in l2i_dt.values()}, name='x'),
+   lambda x,c: UOp.const(truncate[x.tag[1]](c.val >> (32*x.tag[0])), x.tag[1])),
+  (UPat(Ops.CAST, tuple(l2i_dt.keys()), src=(UPat.var('a'),), name="x"), lambda ctx,a,x:
+   split_l2i(ctx, x.op, x.dtype, a)[x.tag[0]] if x.tag is not None else None),
+  (UPat(Ops.CAST, src=(UPat.var('a', tuple(l2i_dt.keys())),), name="x"), lambda ctx,a,x:
+   split_l2i(ctx, x.op, x.dtype, a.rtag((0, dt:=l2i_dt[a.dtype])), a.rtag((1, dt))) if x.dtype not in l2i_dt and a.tag is None else None),
+  (UPat((Ops.SHL, Ops.SHR), tuple(l2i_dt.keys()), src=(UPat.var('a'), UPat.var('b')), name="x"), lambda ctx,a,b,x:
+   split_l2i(ctx, x.op, dt:=l2i_dt[x.dtype], a.rtag((0, dt)), a.rtag((1, dt)), b.rtag((0, dt)))[x.tag[0]] if x.tag is not None else None),
+  (UPat(Ops.WHERE, tuple(l2i_dt.keys()), src=(UPat.var('c'), UPat.var('a'), UPat.var('b')), name="x"), lambda ctx,a,b,c,x:
+   split_l2i(ctx, x.op, dt:=l2i_dt[x.dtype], c, a.rtag((0, dt)), a.rtag((1, dt)), b.rtag((0, dt)), b.rtag((1, dt)))[x.tag[0]]
+   if x.tag is not None else None),
+  (UPat((*(GroupOp.ALU - GroupOp.Comparison - {Ops.SHL, Ops.SHR, Ops.WHERE}), Ops.BITCAST), tuple(l2i_dt.keys()), name="x"), lambda ctx,x:
+   split_l2i(ctx, x.op, l2i_dt[x.dtype], *flatten((a.rtag((0, l2i_dt[x.dtype])), a.rtag((1, l2i_dt[x.dtype]))) for a in x.src))[x.tag[0]]
+   if x.tag is not None else None),
+  (UPat(Ops.LOAD, tuple(l2i_dt.keys()), src=(UPat.var('idx'),), name='x'), lambda ctx,x,idx:
+   reindex(l2i_rewrite_idx(ctx, idx), x.tag[0]).replace(tag=None).load() if x.tag is not None else None)
+])
+
+# float decomposition patterns - ctx is (fr, to) tuple
+pm_float_decomp: PatternMatcher = PatternMatcher([
+  (UPat(GroupOp.Defines, name="x"), lambda ctx,x:
+   UOp(x.op, src=x.src, arg=replace(x.arg, dtype=f2f_dt[ctx[0]]), tag=ctx[0]) if x.dtype == ctx[0] else None),
+  # INDEX into a LOAD/STACK selects a lane of an already converted value, the load rules below own those
+  (UPat((Ops.INDEX, Ops.SHRINK), src=(UPat(GroupOp.All-{Ops.LOAD, Ops.STACK}),), allow_any_len=True, name="x"), lambda ctx,x:
+   UOp(x.op, src=(f2f_rewrite(ctx, x.src[0]), *x.src[1:]), arg=x.arg, tag=ctx[0])
+   if x.dtype == ctx[0] else None),
+  (UPat(Ops.LOAD, dtypes.floats, name="x"), lambda ctx,x: f2f_load(x, *ctx) if x.dtype == ctx[0] else None),
+  # bitcasted load should just replace load
+  (UPat(Ops.BITCAST, src=(UPat(Ops.LOAD, name="ld"),), name="bc"), lambda ctx,bc,ld:
+   f2f_rewrite(ctx, ld.src[0]).load(*ld.src[1:]).bitcast(bc.dtype) if ld.dtype == ctx[0] else None),
+  # bitcast from
+  (UPat(Ops.BITCAST, src=(UPat.var("x", dtypes.floats),), name="bc"), lambda ctx,bc,x:
+   bc.replace(src=(f2f(x.bitcast(f2f_dt[ctx[1]]), ctx[1], ctx[0]),)) if x.dtype == ctx[1] and bc.dtype.bitsize == ctx[0].bitsize else None),
+  # bitcast to
+  (UPat(Ops.BITCAST, src=(UPat.var("x"),), name="bc"), lambda ctx,bc,x:
+   f2f(x.bitcast(f2f_dt[ctx[0]]), ctx[0], ctx[1]) if bc.dtype == ctx[0] else None),
+  (UPat(Ops.CAST, dtypes.floats, src=(UPat.var("val"),), name="x"), lambda ctx,x,val:
+   f2f_clamp(val.cast(ctx[1]), ctx[0]) if x.dtype == ctx[0] else None),
+  (UPat(GroupOp.ALU|{Ops.STACK, Ops.INDEX}, dtypes.floats, name="x"), lambda ctx,x:
+   UOp(x.op, src=tuple(s.cast(ctx[1]) if s.dtype == ctx[0] else s for s in x.src), arg=x.arg, tag=x.tag) if x.dtype == ctx[0] else None),
+  (UPat(Ops.STORE, src=(UPat.var("idx"), UPat(Ops.BITCAST, dtypes.floats, name="val")), name='st'), lambda ctx,st,idx,val:
+   st.replace(src=(idx, val.src[0].bitcast(f2f_dt[ctx[0]]))) if val.dtype == ctx[0] and idx.tag == ctx[0] else None),
+  (UPat(Ops.STORE, src=(UPat.var("idx").or_casted(), UPat.var("val", dtypes.floats)), name='st'), lambda ctx,st,idx,val:
+   f2f_store(st, idx, val, *ctx) if val.dtype == ctx[1] and idx.tag == ctx[0] else None),
+])
+
+def do_dtype_decomps(sink:UOp, ctx:tuple[set[DType], Renderer]) -> UOp:
+  def _should_emulate(dt): return dt in EMULATED_DTYPES.tolist(dtypes) or dt not in ctx[1].supported_dtypes()
+  for fr in sorted(filter(_should_emulate, ctx[0])):
+    to = dtypes.int if fr == dtypes.long else dtypes.float
+    if DEBUG >= 2: print(f"emulating {fr} as {to}")
+    pm = pm_float_decomp if fr in dtypes.floats else pm_long_decomp
+    sink = graph_rewrite(sink, pm, name=f"decomp {fr} -> {to}", ctx={} if pm is pm_long_decomp else (fr, to), bottom_up=True)
+  ctx[0].clear()
+  return sink
+
+pm_dtype_decomps = PatternMatcher([
+  # detect dtypes to decompose
+  (UPat(GroupOp.All, (*dtypes.fp8s, dtypes.bfloat16, dtypes.half, dtypes.long, dtypes.ulong), name="x"), lambda x,ctx:
+   ctx[0].add({dtypes.ulong:dtypes.long}.get(dt:=x.dtype, dt))),
+  # do the rewrites
+  (UPat(Ops.SINK, name="sink"), do_dtype_decomps),
+])
+
+from typing import Callable
+import functools
+from tinygrad.dtype import dtypes
+from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher
+from tinygrad.renderer import Renderer
+
+# *** integer division ***
+
+@functools.lru_cache(None)
+def magicgu(vmax:int, d:int) -> tuple[int,int]:
+  # calculate m,s such that x//d == (x*m) >> s for all 0 <= x <= vmax, d>0; adapted from Hacker's Delight, Chapter 10
+  nc = (vmax+1)//(d) * d - 1
+  nbits = vmax.bit_length()
+  for s in range(0, 2*nbits + 1):
+    if 2**s > nc*(d - 1 - (2**s - 1) % d):
+      m = (2**s + d - 1 - (2**s - 1) % d)//d
+      return m, s
+  assert False
+
+def fast_idiv(ren: Renderer, x: UOp, d: int, dont_cast=False) -> UOp|None:
+  if d <= 0 or x.vmin < 0: return None
+  if (vmax:=min(x.vmax, x.dtype.max)) < d: return x.const_like(0)
+  m,s = magicgu(vmax, d)
+  if m*vmax <= x.dtype.max: return (x*m) >> s
+  # before we try casting to a larger dtype (slow), we see if there are powers of two in d we can shift to make x smaller
+  if (k := (d & -d).bit_length()-1) > 0:
+    if (ret:=fast_idiv(ren, x >> k, d >> k, dont_cast=True)) is not None: return ret
+  if dont_cast: return None
+  # the next integer width that holds x*m
+  widen = {dtypes.int8:dtypes.int16, dtypes.int16:dtypes.int32, dtypes.int32:dtypes.int64, dtypes.int64:dtypes.uint64,
+           dtypes.uint8:dtypes.uint16, dtypes.uint16:dtypes.uint32, dtypes.uint32:dtypes.uint64}
+  if (next_dtype := widen.get(x.dtype)) is not None and next_dtype in ren.supported_dtypes():
+    if m*vmax <= next_dtype.max: return ((x.cast(next_dtype)*m) >> s).cast(x.dtype)
+  return None
+
+# ***** threefry *****
+
+def threefry2x32(x: UOp, key: UOp):
+  # split x and key from uint64 to two uint32
+  x0, x1 = x.cast(dtypes.uint32), (x >> 32).cast(dtypes.uint32)
+  key0, key1 = key.cast(dtypes.uint32), (key >> 32).cast(dtypes.uint32)
+
+  rotations = [[13, 15, 26, 6], [17, 29, 16, 24]]
+  ks = [key1, key0 ^ key1 ^ 0x1BD11BDA, key0]
+  xr:list[UOp] = [x0 + ks[-1], x1 + ks[0]]
+  for i in range(5):
+    for r in rotations[i % 2]: xr[0], xr[1] = (x0 := xr[0] + xr[1]), x0 ^ ((xr[1] << r) + (xr[1] >> (32 - r)))
+    xr = [(xr[0] + ks[i % 3]), (xr[1] + ks[(i + 1) % 3] + i + 1)]
+
+  return (xr[1].cast(dtypes.uint64) << 32) | xr[0].cast(dtypes.uint64)
+
+# ***** decomposition patterns *****
+
+def floordiv_to_idiv(a:UOp, b:UOp) -> UOp:
+  if (a.vmin >= 0 and b.vmin >= 0) or (a.vmax <= 0 and b.vmax <= 0): return a.alu(Ops.CDIV, b)
+  return a.alu(Ops.CDIV, b) - (a.alu(Ops.CMOD, b).ne(0) & (a<0).ne(b<0))
+
+def floormod_to_mod(a:UOp, b:UOp) -> UOp:
+  if (a.vmin >= 0 and b.vmin >= 0) or (a.vmax <= 0 and b.vmax <= 0): return a.alu(Ops.CMOD, b)
+  r = a.alu(Ops.CMOD, b)
+  # use where instead of mul to avoid being fused into MULACC (which int64 long-decomp doesn't handle)
+  return r + (r.ne(0) & (a<0).ne(b<0)).where(b, b.const_like(0))
+
+powers_of_two: dict[int, int] = {2**i:i for i in range(64)}
+@functools.cache
+def get_simplifying_rewrite_patterns(ops:tuple[Ops, ...]) -> PatternMatcher:
+  # these are rewrites that make things simpler
+  pat: list[tuple[UPat, Callable]] = []
+  # FLOORDIV by 2**y -> x >> y (an arithmetic shift is exactly floor division for any sign); fires before floordiv_to_idiv
+  if Ops.SHR in ops: pat.append((UPat.var("x", dtypes.ints)//UPat.cvar("c"),
+    lambda x,c: x >> v if (v:=powers_of_two.get(c.val, 0)) else None))
+  pat.append((UPat.var("a")//UPat.var("b"), floordiv_to_idiv))
+  # FLOORMOD by 2**y -> x & (2**y-1) (correct floor mod for any sign in two's complement); fires before floormod_to_mod
+  if Ops.AND in ops: pat.append((UPat.var("x", dtypes.ints)%UPat.cvar("c"), lambda x,c: x & (c.val-1) if c.val in powers_of_two else None))
+  pat.append((UPat.var("a")%UPat.var("b"), floormod_to_mod))
+  # no real hardware supports THREEFRY, but NullRenderer does
+  if Ops.THREEFRY not in ops: pat.append((UPat(Ops.THREEFRY, src=(UPat.var("x"), UPat.var("key"))), threefry2x32))
+  return PatternMatcher(pat)
+
+@functools.cache
+def get_late_rewrite_patterns(ops:tuple[Ops, ...], disable_fast_idiv:bool) -> PatternMatcher:
+  pat: list[tuple[UPat, Callable]] = []
+  # MAX can be rewritten as CMPLT + WHERE (max function is annoying on many cstyle backends). late: WHERE loses the bound MAX carries
+  if Ops.MAX not in ops and Ops.CMPLT in ops: pat += [(UPat(Ops.MAX, name="m"), lambda m: (m.src[0] < m.src[1]).where(m.src[1], m.src[0]))]
+  if Ops.OR in ops: pat += [(UPat.var("x", dtypes.bool).logical_not()&UPat.var("y", dtypes.bool).logical_not(),
+    lambda x,y: (x | y).logical_not())]
+  # rewrite MUL/CDIV to SHL+SHR: x*(2**y) -> shl(x,y) and x//(2**y) -> shr(x,y)
+  if Ops.SHL in ops: pat += [(UPat.var("x", dtypes.ints)*UPat.cvar("c"), lambda c,x: x << v if (v:=powers_of_two.get(c.val, 0)) else None)]
+  if Ops.SHR in ops:
+    # uint CDIV by 2**v -> x >> v (FLOORDIV is lowered to CDIV by the rule above before reaching here)
+    pat += [(UPat(Ops.CDIV, src=(UPat.var("x", dtypes.uints), UPat.cvar("c"))),
+      lambda x,c: x >> v if (v:=powers_of_two.get(c.val, 0)) else None)]
+    # signed CDIV (trunc) by 2**v -> (x + (x<0 ? c-1 : 0)) >> v
+    pat += [(UPat(Ops.CDIV, src=(UPat.var("x", dtypes.ints), UPat.cvar("c"))),
+      lambda x,c: (x+(l.const_like(l.vmin) if (l:=(x<0)).vmin==l.vmax else l).where(c-1, 0)) >> v
+        if (v:=powers_of_two.get(c.val, 0)) else None)]
+    if not disable_fast_idiv:
+      # fast_idiv handles non-pow2 divisors on non-negative inputs
+      pat += [(UPat(Ops.CDIV, src=(UPat.var("x", dtypes.ints), UPat.cvar("d"))), lambda ctx, x, d: fast_idiv(ctx, x, d.val))]
+      # rewrite raw CMOD -> x - d*fast_idiv(x,d), only when fast_idiv can actually divide;
+      # avoids disturbing floormod_to_mod's general-path output (which uses a trunc Ops.CMOD as an implementation detail)
+      pat += [(UPat(Ops.CMOD, src=(UPat.var("x", dtypes.ints), UPat.cvar("d"))),
+        lambda ctx, x, d: x - d * q if (q:=fast_idiv(ctx, x, d.val)) is not None else None)]
+  if Ops.NEG in ops:
+    pat += [(UPat.var('x')*-1, lambda ctx,x: x.alu(Ops.NEG))]
+    if Ops.SUB in ops: pat += [(UPat.var('x')+UPat.var('y').alu(Ops.NEG), lambda ctx,x,y: x.alu(Ops.SUB, y))]
+  if Ops.CMPLT in ops:
+    # These are late rewrites because simplex expects equalities to be a certain format
+    pat += [
+      ((UPat.var("x", dtypes.sints) < UPat.cvar("c")).logical_not(), lambda x,c: c-1<x),
+      ((UPat.cvar("c") < UPat.var("x", dtypes.sints)).logical_not(), lambda x,c: x<c+1),
+      (UPat.var("x", dtypes.sints)*-1 < UPat.var("y", dtypes.sints)*UPat.cvar("c"), lambda x,y,c: y*(-c)<x),
+      (UPat.var("x", dtypes.sints)*-1 < UPat.cvar("c"), lambda x,c:-c<x),
+      ((UPat.cvar("c1")<UPat.var("x", dtypes.sints)) & (UPat.var("x", dtypes.sints)<UPat.cvar("c2")),
+        lambda x,c1,c2: x.eq(c1+1) if c1.val+1==c2.val-1 else None),  # (c-1)<x & x<(c+1) -> x==c
+    ]
+  if Ops.CMPEQ in ops: pat += [(UPat.var('x').ne(UPat.var('y')).logical_not(), lambda x,y: x.alu(Ops.CMPEQ, y))]
+  if Ops.MULACC in ops:
+    pat += [(UPat.var('a')*UPat.var('b')+UPat.var('c'), lambda a,b,c: a.alu(Ops.MULACC, b, c))]
+    # also fuse (x << n) + c → MULACC(x, 2^n, c) since MUL→SHL may run first
+    if Ops.SHL in ops: pat += [(UPat.var('x').alu(Ops.SHL, UPat.cvar('n'))+UPat.var('c'), lambda x,n,c: x.alu(Ops.MULACC, x.const_like(1<<n.val), c))]
+  # some backends emit FDIV for RECIP, in that case: a*(1/b) -> a/b
+  if Ops.FDIV in ops:
+    pat += [(UPat.var("x").reciprocal(), lambda x: UOp.const(1.0).alu(Ops.FDIV, x))]
+    pat += [(UPat.var("a") * UPat(Ops.FDIV, dtypes.floats, src=(UPat.const(1), UPat.var("b"))), lambda a,b: a.alu(Ops.FDIV, b))]
+  return PatternMatcher(pat)
+
+from typing import Callable
+import math, functools
+from tinygrad.dtype import dtypes, DType
+from tinygrad.helpers import polyN
+from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher
+
+TRANSCENDENTAL_DTYPES = (dtypes.float16, dtypes.float32, dtypes.float64)
+
+def _lazy_map_numbers(x:UOp, inf:UOp, _inf:UOp, nan:UOp, ratio:UOp):
+  """replace inf -> inf, -inf -> _inf, nan -> nan, otherwise -> ratio"""
+  return x.ne(math.inf).where(x.ne(x).where(nan, x.ne(-math.inf).where(ratio, _inf)), inf)
+
+# *** helper functions for bit manipulation ***
+def mantissa_bits(d:DType) -> int: return dtypes.finfo(d)[1]
+def exponent_bias(d:DType) -> int: return (1 << (dtypes.finfo(d)[0] - 1)) - (0 if d in dtypes.fp8_fnuz else 1)
+def exponent_mask(d:DType) -> int: return (1 << dtypes.finfo(d)[0]) - 1
+
+# **** utils ****
+def shr(x:UOp|int, y:UOp|int) -> UOp: return x // (2**(y.simplify().val) if isinstance(y, UOp) else 2**y)
+def shl(x:UOp|int, y:UOp|int) -> UOp: return x * (2**(y.simplify().val) if isinstance(y, UOp) else 2**y)
+
+def rintk(d:UOp) -> UOp:
+  """round d:float to int away from 0"""
+  out_dtype = {dtypes.float64: dtypes.int64, dtypes.float32: dtypes.int32, dtypes.float16: dtypes.int16}[d.dtype]
+  return (d + (d<0.0).where(d.const_like(-0.5), d.const_like(0.5))).cast(out_dtype)
+
+def pow2if(q:UOp, float_dtype:DType):
+  """cast(2^q, float_dtype) where q is any integer in the range of [-126, 127]"""
+  out_dtype = {dtypes.int64: dtypes.float64, dtypes.int32: dtypes.float32, dtypes.int16: float_dtype}[q.dtype]
+  return shl(q + exponent_bias(out_dtype), mantissa_bits(out_dtype)).bitcast(out_dtype)
+
+def ilogb2k(d:UOp) -> UOp:
+  """calculate the integer part of log2(d), where d is normalized fp value in the range of [0, +inf)."""
+  assert d.dtype in TRANSCENDENTAL_DTYPES
+  dint = d.bitcast({dtypes.float64: dtypes.int64, dtypes.float32: dtypes.int32, dtypes.float16: dtypes.int16}[d.dtype])
+  # -1 <= ilog2bk(d) <= 128
+  return (shr(dint, mantissa_bits(d.dtype)) & exponent_mask(d.dtype)) - exponent_bias(d.dtype)
+
+def ldexp3k(d:UOp, e:UOp) -> UOp:
+  """d*2^e. e is a number obtained by casting an integer in the range [-127, 127] to a float. d is any float number."""
+  assert d.dtype in TRANSCENDENTAL_DTYPES and e.dtype in TRANSCENDENTAL_DTYPES
+  dtype = {dtypes.float64: dtypes.int64, dtypes.float32: dtypes.int32, dtypes.float16: dtypes.int16}[d.dtype]
+  m1 = d.bitcast(dtype)
+  m2 = shl(e.cast(dtype), mantissa_bits(d.dtype))
+  return (m1 + m2).bitcast(d.dtype)
+
+def ldexp2k(d:UOp, e:UOp) -> UOp:
+  """d*2^e. much faster than ldexp3k but risky. d > 0 and d is not denormal."""
+  assert d.dtype in TRANSCENDENTAL_DTYPES and e.dtype in (dtypes.int16, dtypes.int32, dtypes.int64)
+  return (d * pow2if(shr(e, 1), d.dtype)) * pow2if(e - shr(e, 1), d.dtype)
+
+def frexp(v:UOp) -> tuple[UOp, UOp]:
+  """frexp(v) -> (mantissa, exponent) assuming v != 0"""
+  assert v.dtype in TRANSCENDENTAL_DTYPES
+  # m1 = masks for mantissa, m2 = masks to normalize the mantissa.
+  m1 = {dtypes.float64: 0x000FFFFFFFFFFFFF, dtypes.float32: 0x807FFFFF, dtypes.float16: 0x83FF}[v.dtype]
+  m2 = {dtypes.float64: 0x3FE0000000000000, dtypes.float32: 0x3F000000, dtypes.float16: 0x3800}[v.dtype]
+  bits = v.bitcast({dtypes.float64: dtypes.uint64, dtypes.float32: dtypes.uint32, dtypes.float16: dtypes.uint16}[v.dtype])
+  exponent = shr(bits, mantissa_bits(v.dtype)) & exponent_mask(v.dtype)
+  # Set the exponent bits appropriately to normalize the mantissa into the range of [0.5, 1.0).
+  mantissa = ((bits & m1) | m2).bitcast(v.dtype)
+  exp = exponent - exponent_bias(v.dtype) + 1
+  return mantissa, exp
+
+# *** reduction algorithms for sine ***
+def payne_hanek_reduction(d:UOp) -> tuple[UOp, UOp]:
+  """
+  Performs Payne-Hanek Reduction: computes the remainder of `d` modulo pi/2 for the values `d` where
+    39800.0 <= d <= +Inf
+  Returns a tuple of `(r, q)`:
+  - `r`[d.dtype] is the reminder value corresponding to `round_to_nearest(x % pi/2)`.
+  - `q`[int32] is an integer, and q % 4 is corresponding to the quadrant of the original angle `d`.
+  """
+  assert d.dtype in TRANSCENDENTAL_DTYPES
+  # https://stackoverflow.com/questions/30463616/payne-hanek-algorithm-implementation-in-c/30465751#30465751
+  # 190 bits of 2/pi for Payne-Hanek style argument reduction
+  two_over_pi_f = [0x00000000, 0x28be60db, 0x9391054a, 0x7f09d5f4, 0x7d4d3770, 0x36d8a566, 0x4f10e410]
+
+  intermediate_dtype = dtypes.float32 if d.dtype == dtypes.float16 else d.dtype
+
+  f, e = frexp(d)
+  ia = (f.cast(intermediate_dtype) * 4.294967296e9).cast(dtypes.uint64)
+  # extract 96 relevant bits of 2/pi based on magnitude of argument
+  i = shr(e.cast(dtypes.uint64), 5)
+  e = e.cast(dtypes.int32) & 31
+  offset = 32 - e
+
+  def _take(an:UOp, offset:int, count:int=0) -> UOp:
+    """an = two_over_pi_f[i+offset]"""
+    if count+offset < len(two_over_pi_f) - 1:
+      an = i.ne(count).where(_take(an, offset, count=count+1), an.const_like(two_over_pi_f[count+offset]))
+    return an
+  def _shl_lazy(x:UOp, y:UOp): return (x.cast(dtypes.uint64) << y.cast(dtypes.uint64)).cast(dtypes.uint32)
+  def _shr_lazy(x:UOp, y:UOp): return (x.cast(dtypes.uint64) >> y.cast(dtypes.uint64)).cast(dtypes.uint32)
+
+  a = [_take(UOp.const(0, dtypes.uint32), i) for i in range(4)]
+  #  (two_over_pi_f[Int(i) + n] << e) | (two_over_pi_f[Int(i) + n+1] >> (nbits - e))
+  # Note: e >= 1 for all numbers d >= 1.0. assume e != 0
+  hi = _shl_lazy(a[0], e) | _shr_lazy(a[1], offset)
+  mi = _shl_lazy(a[1], e) | _shr_lazy(a[2], offset)
+  lo = _shl_lazy(a[2], e) | _shr_lazy(a[3], offset)
+
+  def _hp_mul(x:UOp, y:UOp) -> UOp: return x.cast(dtypes.uint64) * y.cast(dtypes.uint64)
+  # compute x * 2/pi
+  p = shl(_hp_mul(ia, hi), 32) + _hp_mul(ia, mi) + shr(_hp_mul(ia, lo), 32)
+
+  # round quotient to nearest
+  q = shr(p, 62).cast(dtypes.int32)
+  p = p & 0x3fffffffffffffff
+  r = (p.cast(intermediate_dtype) * (3.4061215800865545e-19)).cast(d.dtype)
+
+  # if fraction >= 0.5, r -= pi/2, q += 1
+  return (f<0.5).where(r, r - math.pi/2), (f<0.5).where(q, q + 1)
+
+def cody_waite_reduction(d:UOp) -> tuple[UOp, UOp]:
+  """
+  Performs Cody-Waite Reduction: computes the reminder of `d` modulo pi/2 for the values `d` where
+      0 <= abs(d) <= 39800.0
+  Returns a tuple of `(r, q)`, where the output format is the same as that of `payne_hanek_reduction`.
+  """
+  def _reduce_d(x:UOp, q:UOp):
+    # https://github.com/shibatch/sleef/blob/4e08851f59fc2b545f9c393c6a23dfd311a26308/src/libm/sleefdp.c#L789-L823
+    if x.dtype == dtypes.float64:
+      # https://github.com/shibatch/sleef/blob/f6d8a841fbfddd26ce712834d4da220cd76048fb/src/common/misc.h#L77
+      PI_A, PI_B, PI_C, PI_D = 3.1415926218032836914, 3.1786509424591713469e-08, 1.2246467864107188502e-16, 1.2736634327021899816e-24
+      d = qdh * -PI_A + x
+      d = q * -PI_A + d
+      d = qdh * -PI_B + d
+      d = q * -PI_B + d
+      d = qdh * -PI_C + d
+      d = q * -PI_C + d
+      d = (qdh + q) * -PI_D + d
+    elif x.dtype == dtypes.float16:
+      # [FIXME] when reducing `d`, FP16 needs FP32 precision to achieve 1.0 ULP precision.
+      d = _reduce_d(x.cast(dtypes.float32), q.cast(dtypes.float32)).cast(dtypes.float16)
+    else:
+      # https://github.com/shibatch/sleef/blob/4e08851f59fc2b545f9c393c6a23dfd311a26308/src/libm/sleefsp.c#L464-L503
+      d = q * -3.1414794921875 + x
+      d = q * -0.00011315941810607910156 + d
+      d = q * -1.9841872589410058936e-09 + d
+      d = q * -1.2154201256553420762e-10 + d
+    return d
+
+  m_1_pi = 0.318309886183790671537767526745028724
+  qdh = (d * (m_1_pi / 2.0**24)).cast(dtypes.int64).cast(d.dtype) * (2.0**24)
+  quadrant = rintk(d * m_1_pi -qdh) if d.dtype == dtypes.float64 else rintk(d * m_1_pi)
+  return _reduce_d(d, quadrant.cast(d.dtype)), quadrant.cast(dtypes.int32)
+
+# *** approximate sine on small angle. ***
+def trig_poly(d:UOp, coeff32, coeff64): return d * (polyN(d*d, coeff64) if d.dtype == dtypes.float64 else polyN(d*d, coeff32))
+# approximate sine on [-pi/2, pi/2]
+def sin_poly(d:UOp) -> UOp:
+  return trig_poly(d, [2.6083159809786593541503e-06, -0.0001981069071916863322258, 0.00833307858556509017944336, -0.166666597127914428710938, 1.0],
+                      [-7.97255955009037868891952e-18, 2.81009972710863200091251e-15, -7.64712219118158833288484e-13, 1.60590430605664501629054e-10,
+                       -2.50521083763502045810755e-08, 2.75573192239198747630416e-06, -0.000198412698412696162806809, 0.00833333333333332974823815,
+                       -0.166666666666666657414808,    1.0])
+
+def _ifand(q:UOp, n:int): return (q & n).ne(0)
+
+def sin_poly_small(d:UOp, q:UOp) -> UOp:
+  r = sin_poly(d)
+  return r * _ifand(q, 1).where(r.const_like(-1), r.const_like(1))
+
+def sin_poly_large(d:UOp, q:UOp) -> UOp:
+  r = sin_poly(d + _ifand(q, 1).where(d.const_like(math.pi / 2), d.const_like(0)))
+  return r * _ifand(q, 2).where(r.const_like(-1), r.const_like(1))
+
+# *** toplevel functions for xsin/xlog2/xexp2 ***
+
+def xsin(d:UOp, fast:bool=False, switch_over:float=30.0) -> UOp:
+  """
+  Implements a 1.0 ULP approximation for Ops.SIN.
+  - fast=True assumes x <= switch_over.
+  - switch_over is the threshold for switching to payne_hanek_reduction.
+  """
+  assert d.dtype in TRANSCENDENTAL_DTYPES
+  # mask +-inf/nan as zero
+  x = _lazy_map_numbers(d, d.const_like(0.0), d.const_like(0.0), d.const_like(0.0), d)
+  # x_sign = sign(x)
+  x_sign = x.ne(0).where((x<0).where(x.const_like(-1), x.const_like(1)), x.const_like(0))
+  x_abs = x * x_sign
+  r, q = (cody_waite_reduction if fast else payne_hanek_reduction)(x_abs)
+  if fast: result = sin_poly_small(r, q)
+  else:
+    # Payne Hanek Reduction assumes abs(x) >= pi/4, so for smaller values, use cody_waite_reduction.
+    r_small, q_small = cody_waite_reduction(x_abs)
+    result = (x_abs<switch_over).where(sin_poly_small(r_small, q_small), sin_poly_large(r, q))
+  # adjusts the sign for abs(x)
+  result = result * x_sign
+  # sin(Inf) = NaN, sin(-Inf) = NaN, sin(NaN) = NaN
+  return _lazy_map_numbers(d, d.const_like(math.nan), d.const_like(math.nan), d.const_like(math.nan), result)
+
+def xexp2(d:UOp) -> UOp:
+  """
+  Implements a 1.0 ULP approximation for Ops.EXP2
+  - Paper: https://arxiv.org/pdf/2001.09258
+  """
+  assert d.dtype in TRANSCENDENTAL_DTYPES
+  # mask +=inf/nan as zero.
+  x = _lazy_map_numbers(d, d.const_like(0.0), d.const_like(0.0), d.const_like(0.0), d)
+  q = rintk(x)
+  # s = d - round(d)
+  s = x - q
+  # a polynomial approximation with 13 non-zero terms in the range of [−(log 2)/2,(log 2)/2].
+  if d.dtype == dtypes.float64:
+    u = polyN(s, [0.4434359082926529454e-9, 0.7073164598085707425e-8, 0.1017819260921760451e-6, 0.1321543872511327615e-5, 0.1525273353517584730e-4,
+                  0.1540353045101147808e-3, 0.1333355814670499073e-2, 0.9618129107597600536e-2, 0.5550410866482046596e-1, 0.2402265069591012214e+0,
+                  0.6931471805599452862e+0, 0.1000000000000000000e+1])
+  else: u = polyN(s, [0.1535920892e-3, 0.1339262701e-2, 0.9618384764e-2, 0.5550347269e-1, 0.2402264476e+0, 0.6931471825e+0, 1.0])
+  u = ldexp2k(u, q) # u*2^q
+  upper, lower = {dtypes.float64: (1024, -2000), dtypes.float32: (128, -150), dtypes.float16: (23, -22)}[d.dtype]
+  # Replace x >= upper with +inf
+  u = (d >= upper).where(d.const_like(math.inf), u)
+  # Replace x < lower with zero.
+  u = (d<lower).where(d.const_like(0.0), u)
+  # exp2(NaN) = NaN
+  return d.ne(d).where(d.const_like(math.nan), u)
+
+def xlog2(d:UOp) -> UOp:
+  """
+  Implements a 1.0 ULP approximation for Ops.LOG2
+  Paper: https://arxiv.org/pdf/2001.09258 5.5
+  """
+  assert d.dtype in TRANSCENDENTAL_DTYPES
+  # float16 uses 2^10 for denormal scaling (2^64 overflows), float32/64 use 2^64
+  denormal_exp = 10 if d.dtype == dtypes.float16 else 64
+  FLT_MIN = d.const_like({dtypes.float16: 6.1e-5, dtypes.float32: 1e-4, dtypes.float64: 1e-4}[d.dtype])
+  is_denormal = d<FLT_MIN
+  a = is_denormal.where(d * (2.0 ** denormal_exp), d)
+
+  e = ilogb2k(a * (1.0 / 0.75)).cast(a.dtype)
+  m = ldexp3k(a, -e)
+  e = is_denormal.where(e - denormal_exp, e)
+
+  x = (m - 1.0) / (m + 1.0)
+  x2 = x * x
+  if d.dtype == dtypes.float64:
+    t = polyN(x2, [0.2211941750456081490e+0, 0.2200768693152277689e+0, 0.2623708057488514656e+0, 0.3205977477944495502e+0,
+                   0.4121985945485324709e+0, 0.5770780162997058982e+0, 0.96179669392608091449])
+    r = t * (x * x2) + e + x * 2.885390081777926774
+  else:
+    t = polyN(x2, [0.4374550283e+0, 0.5764790177e+0, 0.9618012905120])
+    # s_lo term (x*3.27e-08) only for float32 - underflows in float16
+    r = t * (x * x2) + e + x * 2.8853900432586669922 + (x * 3.2734474483568488616e-08 if d.dtype == dtypes.float32 else 0)
+
+  # log2(Inf) = Inf
+  r = d.ne(math.inf).where(r, r.const_like(math.inf))
+  # log2(0) = -Inf (handle both +0.0 and -0.0)
+  r = d.ne(0.0).where(r, r.const_like(-math.inf))
+  # log2(x) = NaN for x < 0
+  r = (d<-0.0).where(r.const_like(math.nan), r)
+  # log2(NaN) = NaN
+  r = d.ne(d).where(r.const_like(math.nan), r)
+  # log2(-0.0) = -Inf. In certain devices like PTX, x == -0.0 won't be true. so making reciprocal.
+  return d.reciprocal().ne(-math.inf).where(r, r.const_like(-math.inf))
+
+def xpow(base:UOp, exponent:UOp) -> UOp:
+  # start with b ** e = exp2(e * log2(b))
+  ret = (base < 0).where(-base, base).log2().mul(exponent).exp2()
+  # negative base: nan for non-integer exponent, negate for odd integer exponent. -inf is never nan, it stays |base| ** exponent
+  non_int = exponent != exponent.cast(dtypes.int32).cast(exponent.dtype)
+  is_odd = (exponent < 0).where(-exponent, exponent).cast(dtypes.int32).mod(2).cast(dtypes.bool)
+  neg_base = non_int.where(base.ne(-math.inf).where(ret.const_like(math.nan), ret), is_odd.where(-ret, ret))
+  # x ** 0 = 1, including 0 ** 0 and inf ** 0
+  return exponent.eq(0).where(ret.const_like(1), (base < 0).where(neg_base, ret))
+
+@functools.cache
+def get_transcendental_patterns(ops:tuple[Ops, ...], force_transcendental:bool) -> PatternMatcher:
+  pat: list[tuple[UPat, Callable]] = []
+  for op,f in ((Ops.EXP2, xexp2), (Ops.LOG2, xlog2), (Ops.SIN, xsin)):
+    if op not in ops or force_transcendental:
+      pat += [(UPat(op, dtype=TRANSCENDENTAL_DTYPES, src=(UPat.var("d"),)), f),
+              (UPat(op, dtype=tuple(dt for dt in dtypes.floats if dt not in TRANSCENDENTAL_DTYPES), src=(UPat.var("d"),), name="x"),
+                lambda x,d: d.cast(dtypes.float32).alu(x.op).cast(x.dtype))]
+  # rewrite SQRT to xpow 0.5
+  if Ops.SQRT not in ops or force_transcendental: pat.append((UPat(Ops.SQRT, src=UPat.var("d")), lambda d: xpow(d, d.const_like(0.5))))
+  return PatternMatcher(pat)
+
+import math
+from tinygrad.uop.ops import UOp, Ops, sint, PatternMatcher, UPat, ssimplify, AxisType
+from tinygrad.codegen.late.linearizer import pm_split_ends
+from tinygrad.dtype import AddrSpace
+from tinygrad.renderer import Renderer
+
+def _dim_max(d:sint) -> int: return d if isinstance(d, int) else int(d.vmax)
+
+def _group_dims(dims:tuple[sint, ...], max_sizes:tuple[int, ...]):
+  while len(dims) > len(max_sizes) or any(_dim_max(d) > m for d,m in zip(dims, max_sizes)):
+    for i,m in enumerate(max_sizes):
+      if i < (len(dims)-1) and _dim_max(dims[i]) * _dim_max(dims[i+1]) <= m:
+        dims = dims[:i] + (dims[i]*dims[i+1],) + dims[i+2:]
+        break
+    else: return None
+  return dims
+
+def _split_dims(dims, max_sizes):
+  if all(d <= m for d,m in zip(dims, max_sizes)): return dims
+  _dims = list(dims) + [1]*(3-len(dims))
+  for i in range(len(_dims)):
+    while _dims[i] > max_sizes[i]:
+      div = next((d for d in range(2, math.ceil(math.sqrt(_dims[i])) + 1) if (_dims[i] % d) == 0), 1)
+      if div == 1: raise RuntimeError(f"cannot limit dim {dims=}, {max_sizes=}")
+      _dims[i], _dims[(i+1)%len(_dims)] = _dims[i]//div, _dims[(i+1)%len(_dims)]*div
+  return tuple(_dims[:2] if _dims[2] == 1 else _dims)
+
+def get_grouped_dims(prefix, dims:tuple[sint, ...], max_sizes:tuple[int, ...]|None, reverse=False) -> list[UOp]:
+  if reverse: return get_grouped_dims(prefix, dims[::-1], max_sizes)[::-1]
+  if max_sizes is None: limited = dims
+  else:
+    # try to group first: (a, b, c, d) -> (ab, c, d)
+    limited = grouped if (grouped := _group_dims(dims, max_sizes)) else dims
+    # check if grouping failed
+    if len(limited) > len(max_sizes): raise RuntimeError(f"cannot limit dim {dims=}, {max_sizes=}")
+    # try to split up dims: (a,) -> (b, c)
+    if limited == dims: limited = _split_dims(dims, max_sizes)
+  # Keep hardware axes as ranges through index lowering. The axis id is the hardware dimension.
+  axis_type = AxisType.GLOBAL if prefix == "gidx" else AxisType.LOCAL
+  raw_idxs = [UOp.range(s, i, axis_type) for i,s in enumerate(limited)]
+  flat = sum(idx * math.prod(limited[i+1:]) for i,idx in enumerate(raw_idxs))
+  return [ssimplify(flat // math.prod(dims[i+1:])) if i == 0 else ssimplify((flat // math.prod(dims[i+1:])) % dims[i]) for i in range(len(dims))]
+
+def group_gpudims(ctx:Renderer, s:UOp):
+  if s.arg is None: return None
+  s_topo = list(s.toposort())
+  if any(x.op is Ops.SPECIAL for x in s_topo): return None
+
+  # get ranges
+  all_ranges = {x.arg:x for x in s_topo if x.op is Ops.RANGE}
+
+  # extract global/local dims
+  global_dims = sorted([x.arg for x in all_ranges.values() if x.axis_type is AxisType.GLOBAL])
+  # WARP maps to hardware dimension zero, independently of nesting order.
+  local_dims = [x.arg for x in sorted((x for x in all_ranges.values() if x.axis_type in (AxisType.WARP, AxisType.LOCAL)),
+                                    key=lambda x: (x.axis_type is not AxisType.WARP, x.axis_id))]
+  if not global_dims and not local_dims: return None
+
+  # get global and local shape
+  global_shape = tuple(ssimplify(all_ranges[r].src[0]) for r in global_dims)
+  local_shape = tuple(ssimplify(all_ranges[r].src[0]) for r in local_dims)
+
+  # define indexes for GPU-like execution
+  # if we got a WARP, set the local_max to it so it does not fold with other dims
+  local_max = (local_shape[0],)+ctx.local_max[1:] if ctx.local_max is not None and local_dims and \
+    all_ranges[local_dims[0]].axis_type is AxisType.WARP else ctx.local_max
+  local_idxs = get_grouped_dims("lidx", local_shape, local_max)
+  hw_local = [_dim_max(u.src[0]) for u in local_idxs if u.op is Ops.RANGE]
+  global_max = ctx.global_max if ctx.global_prod_max is None else \
+    tuple(min(gm, pm//l) for gm,pm,l in zip(ctx.global_max or ctx.global_prod_max, ctx.global_prod_max, hw_local+[1]*3))
+  idxs = get_grouped_dims("gidx", global_shape, global_max, reverse=True) + local_idxs
+
+  # apply to multiple ranges
+  subs, masks = {}, {}
+  for r in s_topo:
+    # look for local INDEXes that are not used in the GLOBAL store, then add them as an INVALID
+    if r.op is Ops.STORE and len((idx := r.src[0]).src) and idx.src[0].addrspace == AddrSpace.GLOBAL:
+      missing_locals = [all_ranges[rng] for rng in local_dims if all_ranges[rng] not in idx.ranges]
+      if len(missing_locals):
+        assert len(idx.src) == 2, "index has 2 sources"
+        mask: UOp = UOp.uprod(*[x.eq(0) for x in missing_locals])
+        masks[idx] = idx.replace(src=(idx.src[0], idx.src[1].valid(mask)))
+    if r.op is not Ops.RANGE: continue
+    try:
+      ii = (global_dims+local_dims).index(r.arg)
+      subs[r] = idxs[ii]
+    except ValueError: continue
+  # Hardware ids may coincide with logical ids: replace ranges simultaneously, including those in the new masks.
+  return s.substitute(masks).substitute(subs, walk=True)
+
+pm_device_to_var = PatternMatcher([
+  # the DEVICE axis is not a program axis, it's bound per device at launch. lower it to the _device_num variable (like SPECIAL for devices)
+  (UPat(Ops.RANGE, name="r"),
+   lambda r: UOp.variable("_device_num", 0, r.vmax, dtype=r.dtype) if r.axis_type is AxisType.DEVICE else None),
+  # ENDs that closed a DEVICE range no longer close it
+  (UPat(Ops.END, name="e"), lambda e: e.replace(src=(e.src[0],)+tuple(s for s in e.src[1:] if s.op is not Ops.PARAM))
+   if any(s.op is Ops.PARAM and s.arg.name == '_device_num' for s in e.src[1:]) else None),
+])
+
+# Run once: grouping creates new GLOBAL/LOCAL ranges, which must not be grouped again.
+pm_group_gpudims = PatternMatcher([(UPat(Ops.SINK, name="s"), group_gpudims)])+pm_device_to_var
+
+pm_range_to_special = PatternMatcher([
+  (UPat(Ops.RANGE, name="r"), lambda r: r.replace(op=Ops.SPECIAL, arg=f"{'g' if r.axis_type is AxisType.GLOBAL else 'l'}idx{r.axis_id[-1]}")
+   if r.axis_type in (AxisType.GLOBAL, AxisType.LOCAL) else None),
+])+pm_split_ends
+
+
+import itertools, functools
+from collections import defaultdict
+from dataclasses import replace
+from tinygrad.dtype import dtypes, AddrSpace, Invalid, DType
+from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat, GroupOp, graph_rewrite
+from tinygrad.uop.symbolic import uop_given_valid, parse_valid, invalid_gate, sym
+from tinygrad.helpers import getenv, IMAGE, OSX, ceildiv, is_image_shape
+from tinygrad.renderer import Renderer
+
+# ***** image load valid simplification *****
+
+@functools.cache
+def _drop_valid_stmts(valid:UOp, idx:UOp, height:int, width:int) -> list[UOp]:
+  # can drop valid if idx is out of bound when valid is False
+  drop_stmt = []
+  for i,stmt in enumerate(valid.split_uop(Ops.AND)):
+    if (res:=parse_valid(stmt)) is None: continue
+    X, is_upper_bound, c = res
+
+    # for X0 + X1 + ... >= 1, check if it's out of bound when Xi = 0 for all i
+    if not is_upper_bound and c == 1 and all(u.op in GroupOp.Irreducible and u.vmin == 0 for u in X.split_uop(Ops.ADD)):
+      testidx = functools.reduce(lambda nowidx,u: nowidx.substitute({u:u.const_like(0)}), X.split_uop(Ops.ADD), idx)
+      if testidx.index(0).vmax < 0 or testidx.index(1).vmax < 0:
+        drop_stmt.append(stmt)
+        continue
+
+    # check if idx is out of bound when X is on the wrong side of the bound: X in [c+1, vmax] or [vmin, c-1]
+    lo, hi = (c + 1, X.vmax) if is_upper_bound else (X.vmin, c - 1)
+    if lo <= hi:
+      fake = UOp.variable(f"fake{i}", lo, hi, X.dtype)
+      subs = [{X: fake}]
+      # idx may not have X itself, so also substitute a term of X: v -> fake - (X - v)
+      terms = list(X.split_uop(Ops.ADD))
+      v = next((u for u in terms if u.op in GroupOp.Irreducible and u.op is not Ops.CONST), None)
+      if v is not None and (rest:=[u for u in terms if u is not v]): subs.append({v: fake - UOp.usum(*rest)})
+      if any((testidx:=graph_rewrite(coord.substitute(sub), sym)).vmin >= b or testidx.vmax < 0
+             for sub in subs for coord,b in zip(idx.src, (width, height))):
+        drop_stmt.append(stmt)
+  return drop_stmt
+
+def simplify_valid_load(buf:UOp, start_idx:UOp, valid:UOp) -> UOp|None:
+  idx = uop_given_valid(valid, start_idx)
+  return None if idx is start_idx or idx is start_idx.simplify() else buf.index(idx.valid(valid))
+
+def simplify_valid_image_load(buf:UOp, idx_y:UOp, idx_x:UOp, valid:UOp) -> UOp|None:
+  if not is_image_shape(buf._shape): return None
+  if idx_x.dtype != idx_y.dtype: idx_x, idx_y = idx_x.cast(dtypes.int), idx_y.cast(dtypes.int)
+  start_idx = idx_x.stack(idx_y)
+  idx = uop_given_valid(valid, start_idx)
+  drop_stmt = _drop_valid_stmts(valid, idx, buf._shape[0], buf._shape[1])
+
+  if not drop_stmt and idx is start_idx: return None
+  new_valid = UOp.uprod(*ss) if (ss:=[s for s in valid.split_uop(Ops.AND) if s not in drop_stmt]) else None
+  idx_y, idx_x = idx.index(1), idx.index(0)
+  if new_valid is not None: return buf.index(idx_y.valid(new_valid), idx_x.valid(new_valid))
+  return buf.index(idx_y, idx_x)
+
+indexing_simplify = PatternMatcher([
+  # image load valid idx simplification
+  (UPat(Ops.INDEX, src=(UPat.var("buf"), invalid_gate)), lambda buf,x,i,cond: simplify_valid_load(buf, x, cond)),
+  (UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("valid").where(UPat.var("idx_y"), UPat(arg=Invalid)),
+                                         UPat.var("valid").where(UPat.var("idx_x"), UPat(arg=Invalid)))), simplify_valid_image_load),
+])
+
+# get list of (height, width) that do not require pitch padding
+def image_valid_dims(base:DType, size:int, arch:str) -> list[tuple[int,int]]:
+  if (ALIGN:=next((int(p.split('=')[1]) for p in arch.split(',') if p.startswith("IMAGE_PITCH_ALIGNMENT=")), 0)) == 0: return []
+  MAXW, pxls = 16384, size // 4
+  if base not in (dtypes.half, dtypes.float) or size > 4*MAXW*MAXW: return []
+  # height=1 images just need to abide by alignment requirements in bytes, not pixels!
+  if size % (ALIGN * 4) != 0: return [] if (base.itemsize * size) % (64 if OSX else ALIGN) != 0 or pxls > MAXW else [(1, pxls)]
+  return [(pxls//ALIGN//k, ALIGN*k) for k in range(ceildiv(pxls//ALIGN, MAXW), min(pxls//ALIGN, MAXW//ALIGN)+1) if (pxls//ALIGN)%k == 0]
+
+def transform_to_image(ctx, buf:UOp, x:UOp) -> UOp|None:
+  shapes, ren = ctx
+  if not IMAGE or ren.target.device not in {"QCOM", "CL", "PYTHON", "NULL"}: return None
+  valid, x = x.get_valid(), x.get_idx()
+  # search for dims that drop the most valid statements
+  best_drop, cands = -1, []
+  for ch, cw in [shapes[buf.arg.slot]] if buf.arg.slot in shapes else image_valid_dims(buf.dtype, buf.max_numel(), ren.target.arch):
+    cidx = uop_given_valid(valid, ((x//4)%cw).stack(x//(4*cw)))
+    dropped = len(_drop_valid_stmts(valid, cidx, ch, cw))
+    if dropped > best_drop: best_drop, cands = dropped, [(ch, cw, cidx)]
+    elif dropped == best_drop: cands.append((ch, cw, cidx))
+  # if no candidates, we don't rewrite
+  if len(cands) == 0: return None
+  # and tiebreak with indexing complexity (ie. number of nodes)
+  h, w, cidx = cands[0] if len(cands) == 1 else min(cands, key=lambda cand: len(cand[2].index(1).simplify().backward_slice))
+  # the image dims are stored in the param's arg, the size stays the flat buffer len
+  buf = buf.replace(arg=replace(buf.arg, image=(h, w)))
+  shapes[buf.arg.slot] = (h, w)
+  if valid.op is not Ops.CONST or valid.val is not True:
+    return buf.index(cidx.src[1].valid(valid), cidx.src[0].valid(valid))
+  else:
+    return buf.index(cidx.src[1], cidx.src[0])
+
+def store_image(x:UOp, d:UOp) -> UOp:
+  # image load/store is always float, a half image converts on store
+  def as_float(s:UOp):
+    return s.src[0] if x.src[0].dtype is dtypes.half and s.op is Ops.CAST and s.src[0].dtype is dtypes.float else s.cast(dtypes.float)
+  lanes = d.src if d.op is Ops.STACK else tuple(d.index(i) for i in range(d.shape[0]))
+  return x.store(UOp.stack(*[as_float(s) for s in lanes]))
+
+pm_simplify_add_image = PatternMatcher([
+  (UPat(Ops.SHRINK, src=(UPat(Ops.PARAM, name="buf"), UPat(name="x"), UPat(arg=4))), transform_to_image),
+  (UPat(Ops.INDEX, dtype=dtypes.float, name="x").store(UPat(name="d", dtype=dtypes.half)), store_image),
+])
+
+def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
+  if getenv("DMC"): return sink
+
+  # collect
+  memory: defaultdict[tuple[Ops, UOp, UOp|str, UOp, object], dict[int, list[UOp]]] = defaultdict(dict)
+  for u in sink.toposort(enter_calls=False):
+    # TODO: this should handle images too, it's just memory coalescing
+    if u.op in {Ops.LOAD, Ops.STORE}:
+      assert len(u.src) == (2 if u.op is Ops.STORE else 1), "memory coalescing does not support gated loads/stores"
+      assert u.src[0].op is Ops.INDEX, f"memory coalescing should be on INDEX, not {u.src[0].op}"
+      buf, idx_u = u.src[0].src
+      if buf.addrspace == AddrSpace.REG: continue
+      if buf.buf_uop.op is Ops.PARAM and buf.buf_uop.arg.volatile: continue # volatile accesses never merge
+      idx, valid = idx_u.get_idx(), idx_u.get_valid()
+      if idx.is_invalid: continue
+      root_src: UOp|str
+      if idx.op is Ops.ADD and idx.src[1].op is Ops.CONST: root_src, arg = idx.src[0], idx.src[1].val
+      elif idx.op is Ops.ADD and idx.src[0].op is Ops.CONST: root_src, arg = idx.src[1], idx.src[0].val
+      elif idx.op is Ops.CONST: root_src, arg = "CONST", idx.val
+      else: root_src, arg = idx, 0
+      # loads/stores only coalesce with others carrying the same arg (e.g. the nontemporal flag)
+      memory[(u.op, buf, root_src, valid, u.arg)].setdefault(arg, []).append(u)
+
+  # build replacements
+  replacements = {}
+  for (op,buf,base,valid,ld_arg),offsets in memory.items():
+    # allowed lengths (copied in)
+    lengths = []
+    must_divide = True
+    if ctx.target.device == "DSP":
+      lengths = [128,64,32,16,8,4]
+      must_divide = False
+    elif is_image_shape(buf._shape):
+      lengths = [4]
+    elif buf.dtype in (dtypes.float, dtypes.half, dtypes.int, dtypes.uint, *dtypes.fp8s) and ctx.supports_float4:
+      # TODO: a better way to get this than ctx
+      lengths = [8,4,2] if buf.dtype == dtypes.half and getenv("ALLOW_HALF8") else [4,2]
+    lengths.append(1)  # worst case, it's not folded
+    # do the grouping
+    grouped_offsets = [[x for _,x in group] for _,group in itertools.groupby(enumerate(sorted(offsets.keys())), lambda x: x[1]-x[0])]
+    for full_grp in grouped_offsets:
+      while len(full_grp):
+        offset = (base+full_grp[0]) if isinstance(base, UOp) else UOp.const(full_grp[0])
+        length = [l for l in lengths if l <= len(full_grp) and (not must_divide or offset.divides(l) is not None)][0]
+        grp, full_grp = full_grp[:length], full_grp[length:]
+        # NOTE: we apply the valid again after we determine the length
+        offset = offset.valid(valid)
+        idx = UOp(Ops.SHRINK, src=(buf, offset, UOp.const(length))) if length > 1 else buf.index(offset)
+        if op == Ops.STORE:
+          assert all(len(offsets[g]) == 1 for g in grp), "attempting multiple stores"
+          datas = [offsets[g][0].src[1] for g in grp]
+          store = idx.store(UOp.stack(*datas) if length > 1 else datas[0])
+          for g in grp: replacements[offsets[g][0]] = store
+        else:
+          ld = idx.load(arg=ld_arg)
+          for i,g in enumerate(grp):
+            for oo in offsets[g]: replacements[oo] = ld.index(i) if length > 1 else ld
+
+  # apply
+  return sink.substitute(replacements, name="memory coalescing")
+
+# this is a temporary intermediate step while we remove this index style
+from tinygrad.uop.ops import PatternMatcher, UPat, Ops
+from tinygrad.dtype import Invalid, dtypes
+
+def move_where_load(gate, l, a, w):
+  return l.replace(src=(l.src[0], l.vconst_like(0) if a.is_invalid else l.const_like(a.val) if a.op is Ops.CONST else
+    a.src[0] if a.op is Ops.CAST and a.src[0].dtype == l.dtype else a.cast(l.dtype), l.src[2])).cast(w.dtype)
+
+pm_move_gates_from_index = PatternMatcher([
+  # for image idx (must be first)
+  (UPat.var("buf").index(UPat.var("gate").where(UPat.var("idx_y"), UPat(arg=Invalid)),
+                         UPat.var("gate").where(UPat.var("idx_x"), UPat(arg=Invalid))).load(name="l"),
+   lambda buf,gate,idx_y,idx_x,l: buf.index(idx_y, idx_x).load(l.vconst_like(0), gate)),
+  (UPat.var("buf").index(UPat.var("gate").where(UPat.var("idx_y"), UPat(arg=Invalid)),
+                         UPat.var("gate").where(UPat.var("idx_x"), UPat(arg=Invalid))).store(UPat.var("data")),
+   lambda buf,gate,idx_y,idx_x,data: buf.index(idx_y, idx_x).store(data, gate)),
+
+  # here we create the alt value for load to be 0s and remove the where Invalid
+  (UPat((Ops.INDEX, Ops.SHRINK), src=(UPat(), UPat.var("gate").where(UPat.var("idx"), UPat(arg=Invalid)),), name="mop", allow_any_len=True) \
+   .load(name="l"), lambda mop,gate,idx,l: mop.replace(src=(mop.src[0],idx)+mop.src[2:]).load(l.vconst_like(0), gate)),
+  (UPat((Ops.INDEX, Ops.SHRINK), src=(UPat(), UPat.var("gate").where(UPat.var("idx"), UPat(arg=Invalid)),), name="mop", allow_any_len=True) \
+   .store(UPat.var("data")), lambda mop,gate,idx,data: mop.replace(src=(mop.src[0],idx)+mop.src[2:]).store(data, gate)),
+
+  # Where after gated load becomes alt value
+  (UPat.var("gate").where(UPat().load(UPat(), UPat.var("gate", dtype=dtypes.bool), name="l").or_casted(), UPat.var("a")).named("w"),
+   move_where_load),
+  (UPat.var("gate").where(UPat.var("a"), UPat().load(UPat(), ~UPat.var("gate", dtype=dtypes.bool), name="l").or_casted()).named("w"),
+   move_where_load),
+])
+
+import heapq
+from typing import Any
+from collections import defaultdict
+from tinygrad.uop.ops import PatternMatcher, UOp, Ops, UPat, multirange_str
+from tinygrad.dtype import AddrSpace
+from tinygrad.helpers import prod, getenv, dedup, TUPLE_ORDER
+
+def linearize(sink:UOp) -> list[UOp]:
+  # this is a toposort with priority
+  lst = list(sink.toposort(enter_calls=False))
+  out_degree:defaultdict[UOp, int] = defaultdict(int)
+  priorities:dict[UOp, tuple[int, int, Any]] = {}
+
+  # get consumers and assign priorities
+  # NOTE: this requires the lst be locally toposorted
+  for u in reversed(lst):
+    for s in u.src_without_body: out_degree[s] += 1
+
+    # we place UOps with higher run_counts later
+    run_count = prod([int(r.vmax)+1 for r in u.ranges])
+
+    # simple priority override. this is all bottom up now, smaller numbers will be closer to the top
+    extra = None
+    match u.op:
+      # the order and placement of these defines is important
+      case Ops.PARAM: priority, extra = -20, u.arg.slot
+      case Ops.BUFFER | Ops.ALLOC: priority = -17 if u.addrspace == AddrSpace.LOCAL else -18
+      case Ops.LOAD: priority = -1    # place loads early
+      case Ops.STORE: priority = 1    # place stores late
+      case Ops.RANGE: priority = 5    # placing RANGE is good
+      case Ops.END | Ops.BACKEDGE: priority = -5     # placing loop exits is bad
+      case _: priority = 0            # everything else has priority 0
+    priorities[u] = (run_count, priority, extra)
+
+  # number the uops in "ideal" order
+  nkey = {u:i for i,u in enumerate(sorted(lst, key=lambda x: priorities[x]+(x.tuplize if TUPLE_ORDER else ())))}
+
+  # then force them to be toposorted in as close to the ideal order as possible
+  heap = [(-nkey[sink], sink)]
+  newlst = []
+  while heap:
+    newlst.append(u:=heapq.heappop(heap)[1])
+    for v in u.src_without_body:
+      out_degree[v] -= 1
+      if out_degree[v] == 0: heapq.heappush(heap, (-nkey[v],v))
+  newlst = newlst[::-1]
+
+  if getenv("DEBUG_LINEARIZE"):
+    for i,u in enumerate(newlst):
+      print(f"{i:4d} {str(u.op):20s} {multirange_str(u.ranges, color=True, pad=10)} {priorities[u]}")
+  return newlst
+
+class CFGContext:
+  def __init__(self, sink:UOp):
+    # there are 3 relationships between ranges:
+    # nested, meaning endrange y is a dependency of endrange x and range x is a dependency of endrange y
+    # dependent, meaning endrange y is a dependency of endrange x and range x is not a dependency of endrange y
+    # independent, endrange y is not a dependency of endrange x
+    # everything is nested inside the sink
+    deps: dict[UOp, dict[UOp, None]] = {}
+    nesting: dict[UOp, UOp] = {}
+    for u in sink.toposort():
+      # get the deps from the src
+      deps[u] = {}
+      for s in u.src: deps[u] |= deps[s]
+
+      if u.op in (Ops.END, Ops.BACKEDGE, Ops.SINK):
+        nesting |= {x:u for x in deps[u] if x.op in (Ops.END, Ops.BACKEDGE) and (u.op is Ops.SINK or u.src[1] in deps[x]) and x not in nesting}
+      if u.op in (Ops.RANGE, Ops.END, Ops.BACKEDGE): deps[u][u] = None
+
+    self.edges: dict[UOp, UOp] = {}
+    siblings: dict[UOp, list[UOp]] = {}
+    for k,vv in nesting.items(): siblings.setdefault(vv, []).append(k)
+    for k,v in siblings.items():
+      # ranges that have dependencies on other siblings need to be scheduled after them
+      order = sorted(v, key=lambda x: len([u for u in v if u in deps[x]]))
+      zipped = zip(order, order[1:]) if k.op is Ops.SINK else zip([k.src[1]] + order, order)
+      for x,y in zipped:
+        # TODO: this can happen! it causes infinite loop in shufflenet
+        assert y.src[1] not in x.backward_slice_with_self
+        self.edges[y.src[1]] = x
+
+pm_add_control_flow = PatternMatcher([
+  (UPat(Ops.RANGE, name="x"), lambda ctx,x: x.replace(src=x.src+(y,)) if (y:=ctx.edges.get(x)) is not None else None),
+])
+
+def do_split_ends(e:UOp):
+  ret = e.src[0]
+  rngs = dedup(r for s in e.src[1:] for r in ((s,) if s.op is Ops.RANGE else s.ranges))
+  for r in sorted(rngs, key=lambda x: x.arg, reverse=True): ret = ret.end(r)
+  return ret
+
+pm_split_ends = PatternMatcher([
+  # split the ends
+  (UPat(Ops.END, name="e"), do_split_ends),
+])
+
+import itertools
+from tinygrad.helpers import dedup
+from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat
+from tinygrad.renderer.isa import ISARenderer, Register, rdef, LinearContext
+from typing import Any
+from dataclasses import replace
+
+PSEUDO_OPS = {Ops.CONST, Ops.CAST, Ops.BITCAST, Ops.NOOP, Ops.AFTER, Ops.BARRIER, Ops.GROUP, Ops.STACK}
+
+class LinearScanRegallocContext:
+  # returns the uop that defines the virtual register
+  def vdef(self, v:Register) -> UOp: return self.uops[self.live_range[v][0]]
+  def __init__(self, ctx:LinearContext, uops:list[UOp], ren:ISARenderer):
+    self.uops = uops
+    self.ren = ren
+    self.idx = itertools.count()
+
+    # compute live ranges
+    self.live_range: dict[Register, list[int]] = {}
+    lr = self.live_range
+    loops: dict[int, int] = {} # the interval of each loop, from its RANGE to the last uop that reads that RANGE
+    for idx,u in reversed(list(enumerate(uops))):
+      if u.op in PSEUDO_OPS: continue
+      defs = u.tag if isinstance(u.tag, tuple) else ()
+      for v in defs + tuple(rdef(s) for s in dedup(u.src)):
+        if isinstance(v, Register): lr.setdefault(v, []).insert(0, idx)
+      for v in defs:
+        if v in lr and (n:=max((e for s,e in loops.items() if s <= lr[v][-1] < e), default=None)): lr[v].append(n)
+      if u.op is Ops.RANGE: loops[idx] = max(j for j,x in enumerate(uops) if u in x.src)
+
+    # allocate registers
+    self.spills: dict[Register, Any] = {} # mapping from virtual to arbitrary spill slot
+    self.reals: dict[int, dict[Register, Register]] = {} # mapping from virtual to real at each program point
+    self.insert_before: dict[int, list[tuple[Register, Register]]] = {} # fills to be inserted at each program point
+    live: dict[Register, Register] = {} # mapping from virtual to real that's currently assigned to it
+    live_ins: list[dict[Register, Register]] = [] # mapping from virtual to real at loop entry
+
+    def alloc(cons:tuple[Register, ...], i:int) -> Register:
+      live_inv = {v:k for k,v in live.items()}
+      # allocate the best register. Registers not in live or not used again are free and have priority,
+      # otherwise pick the one with the furthest next use. Regs that appear first in cons have priority in case of a tie
+      reg,vreg = max(((r,live_inv.get(r)) for r in cons),
+                    key=lambda rv: next((j-i for j in ([] if rv[1] is None else lr[rv[1]]) if j >= i), len(uops)))
+      return live.pop(vreg) if vreg is not None else reg
+
+    # assign register to spilled virtual and record load to be emitted before current uop, also assign it a stack slot
+    def fill(v:Register, i:int, cons:tuple[Register, ...]|None=None) -> Register:
+      if v not in self.spills:
+        self.spills[v] = ctx.assign_spill_slot(v, self.vdef(v))
+      r = alloc(cons if cons is not None else v.cons, i)
+      self.insert_before.setdefault(i, []).append((v, r))
+      return r
+
+    for i,u in enumerate(uops):
+      if u.op in PSEUDO_OPS: continue
+      # allocate uses
+      for s in u.src:
+        # HACK: cause of later hacks to lower range
+        if u.op in (Ops.END, Ops.BACKEDGE): continue
+        if not isinstance(v:=rdef(s), Register): continue
+        if v not in live: live[v] = fill(v, i)
+        self.reals.setdefault(i, {})[v] = live[v]
+
+      # allocate defs
+      if isinstance(u.tag, tuple):
+        for j,v in enumerate(u.tag):
+          # register should only be defined once
+          assert isinstance(v, Register) and lr[v][0] == i
+          cons = v.cons
+          # two address instructions (src is reused by def) can only coalesce reused src. reused src goes first to get priority in case of a tiebreak
+          if ren.is_two_address(u) and j == 0:
+            uses = tuple(live.get(rdef(s)) for s in u.src)
+            cons = ((uses[0],) if uses[0] in cons else ()) + tuple(r for r in cons if r not in uses)
+          # HACK: cause the range is missing the comparison
+          live[v] = alloc(cons, i+1 if u.op is not Ops.RANGE else i)
+          self.reals.setdefault(i, {})[v] = live[v]
+
+      # loop prologue, avoid loading inside the loop
+      if u.op is Ops.RANGE:
+        # we move to registers vars used in the loop sorted by next use, vars not used in the loop will not be reloaded in the epilogue
+        used_in_loop = [v for v in live.keys() | self.spills.keys() if any(i <= l < loops[i] for l in lr[v])]
+        sorted_uses = sorted(used_in_loop, key=lambda k: (next(l-i for l in lr[k] if l >= i), lr[k][0], k.name, k.index))
+        live_in: dict[Register, Register] = {}
+        for v in sorted_uses:
+          # if all the possible registers are already in live_in there's no space for this var
+          if set(v.cons).issubset(live_in.values()): continue
+          if v not in live: live[v] = fill(v, i)
+          live_in[v] = live[v]
+        live_ins.append(live_in)
+
+      # loop epilogue, reload registers that were live at loop entry
+      if u.op in (Ops.END, Ops.BACKEDGE):
+        # TODO: if a uop is in a different reg in live out vs live in move between registers instead of loading
+        # TODO: don't reload if first use in loop is a load
+        for v,r in live_ins.pop().items():
+          if v not in live or live[v] != r: live[v] = fill(v, i, (r,))
+
+def regalloc_rewrite(ctx:LinearScanRegallocContext, x:UOp):
+  i = next(ctx.idx)
+  if x.op in PSEUDO_OPS: return None
+  nsrc = []
+  for j,s in enumerate(x.src):
+    # v here is the virtual defined by the original s as s is the rewritten version
+    if i in ctx.reals and (v:=rdef(ctx.uops[i].src[j])) in ctx.spills:
+      nsrc.append(ctx.ren.fill(ctx.spills[v], ctx.vdef(v), replace(ctx.reals[i][v], size=v.size)))
+    else: nsrc.append(s)
+  ndefs = tuple(replace(ctx.reals[i][v], size=v.size) for v in x.tag) if isinstance(x.tag, tuple) else x.tag
+  nx = x.replace(src=tuple(nsrc), tag=ndefs)
+
+  before = [ctx.ren.fill(ctx.spills[v], ctx.vdef(v), replace(r, size=v.size)) for v,r in ctx.insert_before.get(i, [])]
+  after = [ctx.ren.spill(ctx.spills[v], nx) for v in x.tag if v in ctx.spills] if isinstance(x.tag, tuple) else []
+
+  return nx, before + [nx] + after
+
+pm_regalloc_rewrite = PatternMatcher([
+  (UPat({Ops.INS, Ops.RANGE, Ops.END, Ops.BACKEDGE, Ops.BUFFER, Ops.PARAM, Ops.SPECIAL} | PSEUDO_OPS, name="x"), regalloc_rewrite),
+])
+
+# opt opinionatedly transforms an ast into an optimized ast using either heuristics or beam search
+from __future__ import annotations
+from enum import Enum, auto
+from dataclasses import dataclass
+
+class OptOps(Enum):
+  TC = auto(); SPLIT = auto(); PADTO = auto(); SWAP = auto() # noqa: E702
+  def __lt__(self, x:OptOps): return self.value < x.value
+
+@dataclass(frozen=True, order=True)
+class Opt:
+  op: OptOps
+  axis: int|None = None
+  arg: int|tuple|None = None
+  def __repr__(self): return f"Opt(op={self.op}, axis={self.axis}, arg={self.arg})"
+
+class KernelOptError(Exception): pass
+def check(cond:bool, msg:str=""):
+  if not cond: raise KernelOptError(msg)
+
+import itertools
+from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.helpers import getenv, DEBUG, prod, TC_OPT, TC_SELECT, TC_MIN_GLOBALS, USE_TC, IMAGE
+from tinygrad.uop.ops import Ops, resolve, AxisType
+from tinygrad.codegen.late.coalesce import image_valid_dims
+from tinygrad.codegen.opt.postrange import Scheduler
+
+def hand_coded_optimizations(k:Scheduler) -> Scheduler:
+  # first try the tensor cores
+  """ Attempts to apply a tensor core optimization to the kernel. If one exists and applies properly, return true, otherwise return false.
+  Tensor cores are optimized instructions that matrix multiply-accumulate across a wave of threads: D(M, N) = A(M, K) * B(K, N) + C(M, N).
+
+  ContextVars:
+  USE_TC -- controls how tensor cores are applied (default 1)
+    0: will disable any tensor core matching
+    1: enable tensor cores
+    2: apply tensor core shape but don't use UOp.WMMA
+  TC_SELECT -- specifies which tensor core(s) to use for optimization (default -1)
+    -1: iterates through all available tensor cores in order and uses the first one that matches the requirements (dims and dtypes)
+    [0-N]: uses only the n'th tensor core available; useful for search
+  TC_OPT -- controls which kinds of kernels may be eligible for tensor cores application (default 2 during BEAM, 0 otherwise)
+    0: applies to only kernels with a single reduce axis and direct Ops.LOAD into Ops.MUL
+    1: allows kernels with multiple reduce axes and also multiplication of Ops.CAST'd buffers
+    2: allows kernels with M, N, K axes that are not multiples of the tensor core dimensions by applying padding those axes as needed
+  TC_MIN_GLOBALS -- do not upcast N when it would drop the specified global count
+  """
+  # NOTE: unless TC_OPT is > 0, we only trigger tensor cores if there's only one reduce axis
+  if USE_TC > 0 and (len(k.axes_of(reduce=True)) == 1 or (TC_OPT.value >= 1)):
+    for axis in range(3):
+      tk = k.copy()
+      # check TC first and apply hand-coded opts if successful
+      try: rngs = tk.apply_opt(Opt(OptOps.TC, axis, (TC_SELECT.value, TC_OPT.value, USE_TC.value)))
+      except KernelOptError: continue
+      def split(idx, size, atype): rngs[idx] = tk.apply_opt(Opt(OptOps.SPLIT, tk.rngs.index(rngs[idx]), (size, atype)))[0]
+      if TC_MIN_GLOBALS: # attempt to upcast M, local N, upcast N, skipping upcast N if we'd end up with too few globals
+        if (size:=next(filter(lambda sz: rngs[1].src[0].divides(sz) is not None, [5,4,3,2]), None)) is not None: split(1, size, AxisType.UPCAST)
+        if (size:=next(filter(lambda sz: rngs[0].src[0].divides(sz) is not None, [4,2]), None)) is not None: split(0, size, AxisType.LOCAL)
+        if ((size:=next(filter(lambda sz: rngs[0].src[0].divides(sz) is not None, [5,4,3,2]), None)) is not None and
+            resolve(prod(tk.full_shape[i] for i in tk.axes_of(AxisType.GLOBAL)) >= size*TC_MIN_GLOBALS.value, False)): split(0, size, AxisType.UPCAST)
+      else: # attempt to upcast M, N, local N
+        for i in [1,0]:
+          if (size:=next(filter(lambda sz: rngs[i].src[0].divides(sz) is not None, [5,4,3,2]), None)) is not None: split(i, size, AxisType.UPCAST)
+        if (size:=next(filter(lambda sz: rngs[0].src[0].divides(sz) is not None, [4,2]), None)) is not None: split(0, size, AxisType.LOCAL)
+      return tk
+
+  # make a copy so it does not mutate the input
+  k = k.copy()
+
+  # upcast float4 images, this must be early so we don't accidentally add locals before the upcast
+  if IMAGE:
+    for buf_index,buf in enumerate(k.bufs):
+      if image_valid_dims(buf.src[0].dtype, buf.src[0].max_numel(), k.ren.target.arch):
+        idx = k.bufs[buf_index].src[1]
+        # IMAGE upcasts require one validity shared by all four unit-stride lanes so memory_coalescing can combine them into one vector read.
+        unit_stride_axes_mul_4 = [k.rngs.index(c) for c in idx.get_idx().split_uop(Ops.ADD) if
+          c.op is Ops.RANGE and (c.vmax+1)%4 == 0 and c not in idx.get_valid().backward_slice]
+        if unit_stride_axes_mul_4 and (axis:=unit_stride_axes_mul_4[0]) in k.upcastable_dims(reduce=None):
+          k.apply_opt(Opt(OptOps.SPLIT, axis, (4, AxisType.UPCAST)))
+
+  # should use matvec - TODO: adjust/tune based on the wide vs tall/large vs small mat
+  MV_BLOCKSIZE, MV_THREADS_PER_ROW, MV_ROWS_PER_THREAD = getenv("MV_BLOCKSIZE", 4), getenv("MV_THREADS_PER_ROW", 8), getenv("MV_ROWS_PER_THREAD", 4)
+  if k.ren.has_local and getenv("MV",1) != 0 and (MV_BLOCKSIZE > 1 or MV_THREADS_PER_ROW > 1 or MV_ROWS_PER_THREAD > 1) and  \
+    k.reduceop is not None and k.reduceop.arg[0] is Ops.ADD and len(k.full_shape) >= 2 and k.ren.has_shared and \
+    (mulop:=k.reduceop.src[0]).op is Ops.MUL and mulop.src[0].op is Ops.INDEX and mulop.src[1].op is Ops.INDEX:
+    idx0, idx1 = mulop.src[0].src[1].get_idx(), mulop.src[1].src[1].get_idx()
+    if reduce_axes:=k.axes_of(AxisType.WEAK, reduce=True):
+      first_reduce_rng = k.rngs[reduce_axes[0]]
+      if any(u is first_reduce_rng for u in idx0.split_uop(Ops.ADD)) and all(r in idx1.ranges for r in idx0.ranges):
+        for global_idx in k.axes_of(AxisType.GLOBAL):
+          if first_reduce_rng.src[0].divides(MV_THREADS_PER_ROW) is not None and k.full_shape[global_idx]%(MV_BLOCKSIZE*MV_ROWS_PER_THREAD) == 0:
+            if DEBUG >= 3:
+              print(f"MATVEC: {k.full_shape=} {first_reduce_rng.render()} {MV_BLOCKSIZE=} {MV_THREADS_PER_ROW=} {MV_ROWS_PER_THREAD=}")
+            try:
+              if MV_THREADS_PER_ROW > 1: k.apply_opt(Opt(OptOps.SPLIT, reduce_axes[0], (MV_THREADS_PER_ROW, AxisType.LOCAL)))
+            except KernelOptError: pass
+            if MV_BLOCKSIZE > 1: k.apply_opt(Opt(OptOps.SPLIT, global_idx, (MV_BLOCKSIZE, AxisType.LOCAL)))
+            if MV_ROWS_PER_THREAD > 1: k.apply_opt(Opt(OptOps.SPLIT, global_idx, (MV_ROWS_PER_THREAD, AxisType.UPCAST)))
+            return k
+
+  # are we grouping? (requires local shape support)
+  if resolve(prod(k.full_shape[i] for i in k.upcastable_dims()) <= (240 if k.ren.target.device == "QCOM" else 2048), False):
+    for axis in k.axes_of(AxisType.WEAK, reduce=True)[:3]:
+      try:
+        k.apply_opt(Opt(OptOps.SPLIT, axis, (16, AxisType.LOCAL, True)))
+        break
+      except KernelOptError: pass
+
+  # no more opt if we are grouping
+  if k.group_for_reduces: return k
+
+  # **** below this line need to be optional and benchmarked ****
+
+  # if there are small dims with lots of valid masks, upcast them (they might be from Tensor.stack)
+  to_upcast: list[int] = []
+  where_gate_rngs = {r for u in k.ast.backward_slice if u.op is Ops.WHERE for r in u.src[0].ranges}
+  # upcast leading axes first (hack-ish for winograd; we actually want to upcast masked axes with low stride first)
+  for axis in k.upcastable_dims():
+    # for Schedule, we check if the range is used in INDEX gates or WHERE gates
+    is_masked = k.rngs[axis] in where_gate_rngs
+    if k.full_shape[axis] <= 7 and is_masked and prod(k.full_shape[j] for j in to_upcast) * k.full_shape[axis] <= 7 * 7:
+      # upcasting a masked global axis moves that range out of the launch grid into each work-item
+      # under IMAGE, skip the upcast unless enough global work-items remain after it to hide memory latency
+      if IMAGE and k.axis_types[axis] is AxisType.GLOBAL:
+        global_upcast = prod(k.full_shape[i] for i in to_upcast if k.axis_types[i] is AxisType.GLOBAL) * k.full_shape[axis]
+        global_items_after = prod(k.full_shape[i] for i in k.axes_of(AxisType.GLOBAL)) // global_upcast
+        if resolve(global_items_after < getenv("OCCUPANCY_FLOOR", 4096), False): continue
+      if DEBUG >= 4: print(f"upcasting masked axis : {axis}")
+      to_upcast.append(axis)
+  for axis in to_upcast[::-1]: k.apply_opt(Opt(OptOps.SPLIT, axis, (0, AxisType.UPCAST)))
+
+  # potentially do more upcasts of non reduce axes based on a heuristic
+  is_dsp = k.ren.target.device == "DSP"
+  upcasted_axis: set[int] = set()
+  while resolve(prod(k.full_shape[i] for i in k.upcastable_dims()) >= 1024) and (k.upcast_size() < 32):
+    xb_choices = []
+    # consider all upcastable axes with 3 or 4 upcast (128 on the DSP)
+    for axis, upcast_amount in itertools.product(k.upcastable_dims(), ([128] if not len(upcasted_axis) else []) if is_dsp else [3,4]):
+      # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
+      if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
+      rng = k.rngs[axis]
+      if any(rng not in b.src[1].get_idx().backward_slice and all(k.rngs[a] in b.src[1].get_idx().backward_slice
+          for a in k.axes_of(AxisType.UPCAST)) for b in k.bufs):
+        num_strides, sum_strides = 0, 0
+        for b in k.bufs:
+          idx = b.src[1].get_idx()
+          if rng in idx.backward_slice: num_strides += 1
+          for c in idx.split_uop(Ops.ADD):
+            if c is rng: sum_strides += 1
+            if c.op is Ops.MUL and c.src[0] is rng and c.src[1].op is Ops.CONST: sum_strides += c.src[1].val
+            if c.op is Ops.MUL and c.src[1] is rng and c.src[0].op is Ops.CONST: sum_strides += c.src[0].val
+        xb_choices.append((num_strides, sum_strides, axis, upcast_amount))
+    if xb_choices:
+      xb_choices = sorted(xb_choices)
+      if DEBUG >= 4: print(f"more upcast axis : {xb_choices}")
+      k.apply_opt(Opt(OptOps.SPLIT, xb_choices[0][2], (xb_choices[0][3], AxisType.UPCAST)))
+      upcasted_axis.add(xb_choices[0][2])
+    else: break
+
+  # if last reduce dim is small(ish), loop unroll the reduce
+  # NOTE: this can fail on multireduce with mismatching dimensions, this is okay
+  try:
+    if (axes:=k.upcastable_dims(reduce=True)) and (k.upcast_size() <= 4 or not k.axes_of(AxisType.UPCAST, reduce=True)) and k.upcast_size() < 64:
+      if (s:=k.full_shape[axes[-1]]) <= 32:
+        k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (0, AxisType.UPCAST)))
+        # if it's small, upcast a second reduce dimension too
+        if (axes:=k.upcastable_dims(reduce=True)) and s <= 3 and k.full_shape[axes[-1]] <= 3:
+          k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (0, AxisType.UPCAST)))
+      elif k.full_shape[axes[-1]] % 4 == 0:
+        k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (4, AxisType.UPCAST)))
+  except KernelOptError: pass
+
+  # if nothing at all is upcasted and it's easy to, do an upcast
+  if not k.axes_of(AxisType.UPCAST) and (axes:=k.upcastable_dims()) and k.full_shape[axes[-1]] % 4 == 0:
+    k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (4, AxisType.UPCAST)))
+
+  # **** local groups ****
+
+  if k.ren.has_local:
+    if k.ren.target.device == "QCOM":
+      # for openpilot: use 32..128 threads per workgroup, at most 8 on the innermost axis
+      # apply innermost global axes first so the leading hardware local dims hold the trailing global axes, like gidx
+      workgroup = 1
+      opts: list[tuple[int, int]] = []
+      for axis in [a for a in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False) if k.rngs[a].src[0].op is Ops.CONST][-3:][::-1]:
+        if (sz:=max(x for x in range(1, min(int(k.full_shape[axis]), 128 // workgroup if opts else 8) + 1) if int(k.full_shape[axis]) % x == 0)) > 1:
+          opts.append((axis, sz))
+          workgroup *= sz
+      if opts and workgroup < 32:  # fill at least one wave: grow the innermost local as much as possible
+        axis, sz = opts[0]
+        opts[0] = axis, max(x for x in range(1, min(int(k.full_shape[axis]), 128 * sz // workgroup) + 1) if int(k.full_shape[axis]) % x == 0)
+      for axis, sz in opts: k.apply_opt(Opt(OptOps.SPLIT, axis, (sz, AxisType.LOCAL)))
+    else:
+      # prioritize making expand axes local
+      local_axis_ranking = [(any(k.rngs[axis] not in b.src[1].get_idx().backward_slice for b in k.bufs), axis) \
+                              for axis in k.axes_of(AxisType.GLOBAL, AxisType.WEAK, reduce=False) if k.rngs[axis].src[0].op is Ops.CONST]
+      to_local: list[tuple[int, int]] = []
+      for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
+        local_size = prod(sz for _, sz in to_local)
+        local_sz: int|None = next((x for x in ([32] * (axis == 0) + [16,8,4,3,2]) if k.full_shape[axis] % x == 0 and local_size * x <= 128), None)
+        if local_sz is not None: to_local.append((axis, local_sz))
+      deleted_shape = 0
+      for axis, local_sz in sorted(to_local[:3]):
+        axis = axis - deleted_shape
+        will_delete_shape = local_sz == k.full_shape[axis]
+        k.apply_opt(Opt(OptOps.SPLIT, axis, (local_sz, AxisType.LOCAL)))
+        if will_delete_shape: deleted_shape += 1
+
+  return k
+
+from __future__ import annotations
+import itertools
+from typing import cast
+from tinygrad.uop.ops import Ops, UOp, KernelInfo, graph_rewrite, AxisType, ssimplify, identity_element
+from tinygrad.uop.ops import axis_colors
+from tinygrad.device import Buffer
+from tinygrad.dtype import dtypes
+from tinygrad.helpers import colored, getenv, DEBUG, NOOPT, round_up, prod, get_single_element
+from tinygrad.helpers import ALLOW_TF32, count, Context
+from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, check
+from tinygrad.codegen.simplify import pm_flatten_range
+from tinygrad.renderer import Renderer
+
+split_targets = {AxisType.UPCAST: (AxisType.GLOBAL, AxisType.LOCAL, AxisType.WEAK),
+                 AxisType.LOCAL: (AxisType.GLOBAL, AxisType.WEAK)}
+
+class Scheduler:
+  def __init__(self, ast:UOp, ren:Renderer):
+    self.ast, self.ren = graph_rewrite(ast, pm_flatten_range), ren
+    self.applied_opts = list(self.ast.arg.applied_opts) if self.ast.arg is not None else []
+    self.opt_range = count(start=max([x.axis_id[0] for x in self.ast.backward_slice if x.op is Ops.RANGE], default=0)+1)
+
+  @property
+  def rngs(self):
+    # Keep serial/vectorized reduction axes last, deriving their role from REDUCE rather than the axis type.
+    # void RANGEs are loops, not opt axes. the DEVICE axis is launched, not an opt axis
+    red = self.reduce_ranges
+    return sorted([u for u in self.ast.backward_slice if u.op is Ops.RANGE and u.dtype is not dtypes.void and u.vmax > 0
+                   and u.axis_type is not AxisType.DEVICE],
+                  key=lambda x: (x in red and x.axis_type in (AxisType.WEAK, AxisType.UPCAST), x.arg))
+  @property
+  def shape_len(self) -> int: return len(self.rngs)
+  @property
+  def full_shape(self): return [ssimplify(x.src[0]) for x in self.rngs]
+  @property
+  def axis_types(self) -> list[AxisType]: return [x.axis_type for x in self.rngs]
+
+  def copy(self) -> Scheduler:
+    ret = Scheduler(self.ast, self.ren)
+    ret.applied_opts = self.applied_opts[:]
+    return ret
+
+  def get_optimized_ast(self, name_override:str|None=None) -> UOp:
+    if name_override is not None: name = name_override
+    else:
+      k_type = "r" if self.reduceop is not None else "E"
+      special_uops = sorted([x for x in self.ast.backward_slice if x.op is Ops.SPECIAL], key=lambda x: x.arg)
+      special_ops = [colored(str(x.vmax+1), "blue" if x.arg[0] == "g" else "cyan") for x in special_uops]
+      name = k_type + colored('_', 'BLACK').join(['']+special_ops+[colored(x.src[0].render(), color) for x,color in zip(self.rngs, self.colors())])
+    return self.ast.replace(arg=KernelInfo(name=name, applied_opts=tuple(self.applied_opts)), tag=1)
+
+  def convert_loop_to_global(self) -> None:
+    if not self.ren.has_local: return
+    red = self.reduce_ranges
+    rngs = [r for s in self.ast.src if s.op is Ops.END for r in s.src[1:] if r.axis_type is AxisType.WEAK and r not in red]
+    # exclude any output ranges from global that don't appear in all BUFFERIZE
+    for x in self.ast.backward_slice:
+      if x.op is Ops.STAGE:
+        rngs = [r for r in rngs if r in x.ranges]
+    self.ast = self.ast.substitute({r:r.replace(arg=(AxisType.GLOBAL,)+r.axis_id) for r in self.rngs if r in rngs})
+
+  def colors(self) -> list[str]: return [axis_colors[t] for t in self.axis_types]
+  def colored_shape(self) -> str: return ' '.join([colored(f'{x.src[0].render():>4s}', color) for x,color in zip(self.rngs, self.colors())])
+
+  def shift_to(self, rng:UOp, amount:int, new_type:AxisType, top:bool=False, input_new_rng:UOp|None=None):
+    check(rng.axis_type in split_targets[new_type], f"{new_type} is from {split_targets[new_type]}, not {rng.axis_type}")
+    if (old_sz:=rng.src[0].divides(amount)) is None:
+      raise KernelOptError(f"{amount} can't divide {rng.src[0]} in {self.colored_shape()}")
+    new_rng = UOp.range(amount, next(self.opt_range), new_type, dtype=rng.dtype) if input_new_rng is None else input_new_rng
+    replaced_rng = rng.replace(src=(old_sz,))
+    sub_axis = (new_rng * old_sz + replaced_rng) if top else (replaced_rng * amount + new_rng)
+    self.ast = self.ast.substitute({rng:sub_axis}, extra_pm=pm_flatten_range, name=f"shift {rng.axis_id} {amount} {new_type.name.lower()}")
+    return replaced_rng, new_rng
+
+  def axes_of(self, *axis_type:AxisType, reduce:bool|None=None) -> list[int]:
+    red = self.reduce_ranges
+    return [i for i,r in enumerate(self.rngs) if (not axis_type or r.axis_type in axis_type) and (reduce is None or (r in red) == reduce)]
+
+  @property
+  def reduce_ranges(self) -> set[UOp]: return {r for u in self.reduceops for r in u.src[1:]}
+
+  def upcast_size(self): return prod(self.full_shape[a] for a in self.axes_of(AxisType.UPCAST))
+
+  def upcastable_dims(self, reduce:bool|None=False) -> list[int]:
+    return [i for i in self.axes_of(*split_targets[AxisType.UPCAST], reduce=reduce) if isinstance(self.full_shape[i], int)]
+
+  def apply_opt(self, opt:Opt, append_opt:bool=True):
+    if opt.op is OptOps.TC: rng = UOp(Ops.NOOP)
+    else:
+      check(type(opt.axis) is int and 0 <= opt.axis < self.shape_len, f"invalid axis on {opt.axis=} {opt.op=} {self.shape_len=}")
+      rng = self.rngs[cast(int, opt.axis)]
+
+    ret = None
+    if opt.op is OptOps.SPLIT:
+      check(isinstance(opt.arg, tuple) and len(opt.arg) in (2, 3), f"split arg is (amt, target) or (amt, target, top), not {opt.arg}")
+      amt, new_type, top = (*cast(tuple, opt.arg), False)[0:3]
+      check(type(amt) is int and (amt == 0 or amt > 1) and isinstance(new_type, AxisType) and new_type in split_targets and isinstance(top, bool),
+            f"invalid split arg {opt.arg}")
+      if new_type is AxisType.LOCAL: check(self.ren.has_local, "locals needed for opt")
+
+      if amt == 0: amt = int(rng.vmax+1)
+      is_reduce = rng in self.reduce_ranges
+      if new_type is AxisType.UPCAST:
+        if is_reduce: check(amt <= 32, "don't unroll more than 32")
+        else: check(self.ren.target.device == "DSP" or amt <= 16, "don't upcast more than 16")
+      # prevents METAL compiler hangs
+      if self.reduceop is not None and ((new_type is AxisType.LOCAL and is_reduce) or self.group_for_reduces):
+        upcast_local_sz = prod([self.full_shape[a] for a in self.axes_of(AxisType.UPCAST, reduce=False)+self.axes_of(AxisType.WARP, AxisType.LOCAL)])
+        smem_sz = amt*upcast_local_sz*self.reduceop.dtype.itemsize
+        check(smem_sz <= self.ren.shared_max, f"exceeds maximum shared memory size: needs {smem_sz}, max {self.ren.shared_max}")
+      if is_reduce and new_type is AxisType.LOCAL:
+        reduces = [u for u in self.reduceops if rng in u.src[1:]]
+        # We currently don't support a group within another reduce, TODO: fix if-contexts
+        check(not any(u in self.reduce_ranges and u.axis_type is AxisType.WEAK for u in reduces[0].ranges),
+              "cannot have a group inside another reduce")
+      ret = self.shift_to(rng, amt, new_type, top=top)
+    elif opt.op is OptOps.TC:
+      check(len(self.applied_opts) == 0, "tensor core opts must be first") # TODO: remove the need for this by having warps
+      check(opt.axis is not None and opt.axis >= 0, "tensor core opts must have an axis")
+      check(opt.arg is not None and isinstance(opt.arg, tuple) and len(opt.arg) == 3, "tensor core opts must have valid arg")
+      check(-1 <= (tc_select:=cast(tuple, opt.arg)[0]) < len(self.ren.tensor_cores), "tensor core opts must have valid tc_select")
+      check(0 <= (tc_opt:=cast(tuple, opt.arg)[1]) <= 2, "tensor core opts must have valid tc_opt")
+      check(0 < (use_tensor_cores:=cast(tuple, opt.arg)[2]) <= 2, "use_tensor_cores value is not valid")
+      try: ret = self._apply_tc_opt(use_tensor_cores, cast(int, opt.axis), tc_select, tc_opt)
+      except ValueError as e: raise KernelOptError(str(e))
+      check(ret is not None, "no tensor core available")
+    elif opt.op is OptOps.PADTO:
+      check(type(opt.arg) is int and opt.arg > 1, f"padto arg is a multiple > 1, not {opt.arg}")
+      check(rng.src[0].op is Ops.CONST, "only pad const axes")
+      # TODO: upcasted is only wrong for a range pinned in WMMA tc_upcast_axes
+      check(rng.axis_type not in {AxisType.UPCAST, AxisType.WARP}, "cannot pad upcasted or warp")
+      new_sz = round_up(int(rng.vmax+1), cast(int, opt.arg))
+      check(rng.vmax+1 > new_sz//4, "pad adds more than quadruple the work")
+      replaced_rng = rng.replace(src=(rng.src[0].const_like(new_sz),))
+      replaces = {rng:replaced_rng}
+      valid = replaced_rng < rng.vmax+1
+      for b in self.bufs:
+        if rng in (i:=b.src[1]).ranges: replaces[b] = b.replace(src=(b.src[0], i.get_idx().valid(valid&i.get_valid())))
+      for r in self.reduceops:
+        if rng in r.src[1:]:
+          replaces[r] = r.replace(src=(valid.where(r.src[0], UOp.const(identity_element(r.arg[0], r.dtype), r.dtype)),)+r.src[1:])
+      self.ast = self.ast.substitute(replaces, f"padto {rng.axis_id} {opt.arg}")
+      ret = replaced_rng
+    elif opt.op is OptOps.SWAP:
+      check(type(opt.arg) is int and 0 <= opt.arg < self.shape_len, f"invalid swap axis on {opt.arg=} {self.shape_len=}")
+      altrng:UOp = self.rngs[cast(int, opt.arg)]
+      check(rng.axis_type == AxisType.GLOBAL and altrng.axis_type == AxisType.GLOBAL, "swap only for globals")
+      self.ast = self.ast.substitute({rng:rng.replace(arg=(rng.axis_type, *altrng.axis_id)),
+                                      altrng:altrng.replace(arg=(altrng.axis_type, *rng.axis_id))},
+                                      name=f"swap {rng.axis_id} {altrng.axis_id}", walk=True)
+    else:
+      raise KernelOptError(f"unsupported opt {opt.op}")
+
+    if append_opt: self.applied_opts.append(opt)
+    return ret
+
+  def _apply_tc_opt(self, use_tensor_cores:int, axis:int, tc_select:int, opt_level:int) -> None|list[UOp]:
+    if not (reduceops := self.reduceops): raise KernelOptError("no reduce ops for TensorCore")
+    reduceop = reduceops[0]
+    if reduceop.arg[0] is Ops.ADD:
+      mul = reduceop.src[0] if reduceop.src[0].op is not Ops.CAST else reduceop.src[0].src[0]
+      if mul.op is not Ops.MUL: return None
+      in0, in1 = mul.src
+      for tc in self.ren.tensor_cores if tc_select == -1 else [self.ren.tensor_cores[tc_select]]:
+        if self.ren.target.device in ("CUDA", "NV") and tc.dtype_in == dtypes.float and not ALLOW_TF32: continue
+        if tc.dtype_in == in0.dtype and tc.dtype_in == in1.dtype and tc.dtype_out == reduceop.dtype:
+          # tensor cores have three ranges. X, Y, and REDUCE
+          in0_ranges = sorted([u for u in in0.ranges if u not in in1.ranges], key=lambda x: x.arg, reverse=True)
+          in1_ranges = sorted([u for u in in1.ranges if u not in in0.ranges], key=lambda x: x.arg, reverse=True)
+          red_ranges = sorted(reduceop.src[1:], key=lambda x: x.arg, reverse=True)
+          if DEBUG >= 3:
+            print(f"TC({axis}): {[(x.axis_id,x.vmax+1) for x in in0_ranges]}",
+                              f"{[(x.axis_id,x.vmax+1) for x in in1_ranges]} {[(x.axis_id,x.vmax+1) for x in red_ranges]}")
+          if not len(in0_ranges) or not len(in1_ranges) or not len(red_ranges): continue
+
+          # pick ranges
+          # NOTE: in1 and in0 are switched because tc.dims is (N, M, K)
+          axis_choices = list(itertools.product(in1_ranges, in0_ranges, red_ranges))
+          if not (axis < len(axis_choices)): continue
+          axes = list(axis_choices[axis])
+          check(not any(r in self.reduce_ranges for r in axes[:2]), "tensor core N and M can't be contracted")
+
+          # do optimizations and save the ranges
+          ast, warp, ne = self.ast, UOp.range(tc.threads, -1, AxisType.WARP), {}
+          try:
+            for i,a in enumerate(axes):
+              if (a.vmax+1) % tc.dims[i] != 0:
+                if opt_level < 2: raise KernelOptError("tc padding requires opt_level >= 2")
+                axes[i] = self.apply_opt(Opt(OptOps.PADTO, self.rngs.index(a), tc.dims[i]), append_opt=False) # PADTO might fail
+            # we create the warp as a whole thing, in case some of these ranges are moved/removed later
+            for c in tc.axis_coords():
+              d = "nmk".index(c[0])
+              if c in tc.frag_c[0]: axes[d], ne[c] = self.shift_to(axes[d], 2, AxisType.LOCAL, input_new_rng=warp//2**tc.frag_c[0].index(c)%2)
+              else: axes[d], ne[c] = self.shift_to(axes[d], 2, AxisType.UPCAST)
+          except KernelOptError:
+            self.ast = ast
+            continue
+
+          if use_tensor_cores != 2:
+            reduceop = get_single_element([x for x in self.reduceops if axes[2] in x.src[1:]])
+            gate, mul = (r0.src[0], r0.src[1]) if (r0:=reduceop.src[0]).op is Ops.WHERE else (None, r0)
+            if mul.op is Ops.CAST: mul = mul.src[0]
+            ins = mul.src if gate is None else tuple(gate.where(x, UOp.const(0, x.dtype)) for x in mul.src)
+            srcs = [x.substitute({ne[a]: ne[b] for a,b in rl.items()}, walk=True) for x,rl in zip(ins, tc.relabel())]
+
+            # get upcast axes for the tensor cores
+            base_upcast_axes = [ne[c].arg for c in tc.base_upcast_axes()]
+            upcast_cnt = [len(f[1]) for f in (tc.frag_a, tc.frag_b, tc.frag_c)]
+            # each operand upcasts its first upcast_cnt axes, the axes only A or B upcast are size 1 so the operands broadcast
+            tc_upcast_axes = tuple([tuple([(a, 2 if j < cnt else 1) for j,a in enumerate(base_upcast_axes[:max(cnt, *upcast_cnt[:2])])])
+                                    for cnt in upcast_cnt])
+
+            # construct the op
+            # TODO: remove tc_upcast_axes from the arg
+            tc_uop = UOp.wmma(srcs[0], srcs[1], UOp.const((0.0,)*2**upcast_cnt[2], tc.dtype_out),
+                              tc.dims, tc.threads, tc_upcast_axes=tc_upcast_axes)
+
+            # preserve extra reduces
+            reduce_ranges = [x for x in reduceop.src[1:] if x not in [ne[c] for c in ne if c[0] == "k"]]
+            if len(reduce_ranges): tc_uop = UOp(Ops.REDUCE, src=(tc_uop,)+tuple(reduce_ranges), arg=(Ops.ADD, 0))
+            self.ast = self.ast.substitute({reduceop: tc_uop})
+          return axes
+    return None
+
+  # helpers for hand_coded_optimizations
+  @property
+  def reduceops(self) -> list[UOp]: return [x for x in self.ast.backward_slice if x.op is Ops.REDUCE]
+  @property
+  def reduceop(self) -> UOp|None: return red[0] if (red:=self.reduceops) else None
+  @property
+  def bufs(self) -> list[UOp]: return [x for x in self.ast.backward_slice if x.op is Ops.INDEX][::-1]
+  @property
+  def group_for_reduces(self) -> int: return len(self.axes_of(AxisType.WARP, AxisType.LOCAL, reduce=True))
+
+def args_from_ast(ast:UOp, dname:str) -> tuple[list[Buffer], dict[str, int]]:
+  glbls = sorted([x for x in ast.backward_slice if x.op is Ops.PARAM and x.arg.slot >= 0], key=lambda x: x.arg.slot)
+  return [Buffer(dname, x.max_numel(), x.dtype) for x in glbls], {k.expr:int(k.vmax+k.vmin)//2 for k in ast.variables()}
+
+def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
+  if ast.tag is not None: return ast
+  k = Scheduler(ast, ren)
+  k.convert_loop_to_global()
+  if ast.arg is not None and ast.arg.opts_to_apply is not None:
+    for opt in ast.arg.opts_to_apply: k.apply_opt(opt)
+  elif beam >= 1:
+    from tinygrad.codegen.opt.search import beam_search
+    rawbufs, var_vals = args_from_ast(ast, ren.target.device)
+    # beam search may open devices
+    with Context(ALLOW_DEVICE_USAGE=1):
+      k = beam_search(k, rawbufs, var_vals, beam, bool(getenv("BEAM_ESTIMATE", 1)))
+  elif not NOOPT and (ast.arg is None or ast.arg.applied_opts == ()):
+    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
+    # NOTE: hand_coded_optimizations doesn't support multiblock opts yet
+    if not any(u.op is Ops.STAGE for u in ast.backward_slice):
+      k = hand_coded_optimizations(k)
+  return k.get_optimized_ast(name_override=ast.arg.name if ast.arg is not None and ast.arg.name != "test" else None)
+
+import math, time, traceback, signal
+from dataclasses import replace
+from tinygrad.uop.ops import sym_infer, AxisType, UOp, Ops
+from tinygrad.uop.render import pyrender
+from tinygrad.device import Device, Buffer
+from tinygrad.dtype import AddrSpace
+from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, colored, time_to_str
+from tinygrad.helpers import IGNORE_BEAM_CACHE
+from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
+from tinygrad.engine.realize import time_call
+from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
+from tinygrad.codegen import to_program
+from tinygrad.codegen.opt.postrange import Scheduler
+
+actions = [Opt(op=OptOps.SPLIT, axis=axis, arg=(amt, AxisType.UPCAST)) for amt in [0,2,3,4,5,7] for axis in range(10)]
+actions += [Opt(op=OptOps.SPLIT, axis=axis, arg=(amt, AxisType.LOCAL)) for amt in [0,2,3,4,8,13,16,29] for axis in range(8)]
+actions += [Opt(op=OptOps.SPLIT, axis=axis, arg=(amt, AxisType.LOCAL, True)) for amt in [13,16,28,29,32,49,64,256] for axis in range(8)]
+if getenv("BEAM_PADTO", 0): actions += [Opt(op=OptOps.PADTO, axis=axis, arg=amt) for amt in [32] for axis in range(7)]
+actions += [Opt(op=OptOps.SPLIT, axis=0, arg=(32, AxisType.LOCAL))]
+actions += [Opt(op=OptOps.TC, axis=0, arg=(-1, 0, getenv("TC", 1)))]
+# covers resnet kernels (3 global * 3 reduce)
+actions += [Opt(op=OptOps.TC, axis=axis, arg=(-1, getenv("TC_OPT", 2), getenv("TC", 1))) for axis in range(9)]
+actions += [Opt(op=OptOps.SWAP, axis=axis_0, arg=axis_1) for axis_0 in range(5) for axis_1 in range(axis_0+1, 5)]
+
+def get_test_global_size(global_size, max_global_size, var_vals):
+  test_global_size = [sym_infer(sz, var_vals) for sz in global_size]
+  input_size = prod(test_global_size)
+  while prod(test_global_size) > max_global_size:
+    for j in range(len(global_size)-1,-1,-1):
+      if test_global_size[j] > 16:
+        test_global_size[j] //= 2
+        break
+  return test_global_size, input_size / prod(test_global_size)
+
+def _time_program(prg:UOp, var_vals:dict[str, int], rawbufs:list[Buffer], early_stop:float|None=None,
+                  allow_test_size:int=True, max_global_size:int|None=65536, clear_l2=False, cnt=3, name="test", dev_timeout=False) -> list[float]:
+  timeout = int(early_stop * 1e3) if dev_timeout and early_stop is not None and early_stop < math.inf else None
+  factor = 1
+  if allow_test_size and max_global_size is not None:
+    global_size, factor = get_test_global_size(prg.arg.global_size, max_global_size, var_vals)
+    prg = prg.replace(arg=replace(prg.arg, global_size=tuple(global_size)))
+  call = prg.call(*[UOp.from_buffer(b) for b in rawbufs])
+  tms, timer = [], time_call(call, var_vals, timeout=timeout, clear_l2=clear_l2)
+  for _ in range(cnt):
+    try: tms.append(next(timer) * factor)
+    except AssertionError: return [math.inf] * cnt
+    if early_stop is not None and early_stop < min(tms): break
+  return tms
+
+class TimeoutException(Exception): pass
+def timeout_handler(signum, frame):
+  if DEBUG >= 2: print("*** BEAM COMPILE TIMEOUT")
+  raise TimeoutException()
+
+def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None]:
+  if hasattr(signal, "alarm"):
+    signal.signal(getattr(signal, 'SIGALRM'), timeout_handler)
+    # set timeout
+    signal.alarm(getenv("BEAM_TIMEOUT_SEC", 10))
+  ret = None
+  try:
+    st = time.perf_counter()
+    ast, dev = x[1].copy().get_optimized_ast(name_override="test"), x[1].ren.target.device
+    prg = to_program(ast.substitute({p: p.replace(arg=replace(p.arg, device=dev)) for p in ast.toposort()
+                                     if p.op is Ops.PARAM and p.addrspace is not AddrSpace.ALU}), x[1].ren)
+    et = time.perf_counter() - st
+    uops = prg.src[1].src
+    if len(uops) >= (uops_max:=getenv("BEAM_UOPS_MAX", 3000)) > 0:
+      if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too many uops. {len(uops)=}, {uops_max=}")
+      raise RuntimeError("too many uops")
+    ret = (prg, et)
+  except RuntimeError:
+    if DEBUG >= 4: traceback.print_exc()
+  except Exception as e:
+    if getenv("BEAM_STRICT_MODE"): raise e
+  finally:
+    if hasattr(signal, "alarm"): signal.alarm(0)
+  return x[0], ret
+
+def _ensure_buffer_alloc(bufs:list[Buffer]) -> list[Buffer]: return [buf.ensure_allocated() if buf is not None else buf for buf in bufs]
+
+# *** external API ***
+
+# get dictionary of all possible actions
+def get_kernel_actions(s:Scheduler, include_0=True, max_up:int|None=None) -> dict[int, Scheduler]:
+  acted, max_up, max_lcl = {0:s} if include_0 else {}, getenv("BEAM_UPCAST_MAX", 256) if max_up is None else max_up, getenv("BEAM_LOCAL_MAX", 1024)
+  for i,a in enumerate(actions):
+    if a.axis is not None and a.op is not OptOps.TC:
+      if (a.axis >= s.shape_len) or (a.op is OptOps.SPLIT and isinstance(arg:=a.arg, tuple) and s.full_shape[a.axis] == arg[0]
+                                     and replace(a, arg=(0,)+arg[1:]) in actions): continue
+    s2 = s.copy()
+    try:
+      s2.apply_opt(a)
+      up, lcl, tc_up = 1, 1, next((prod(u.arg[0])//u.arg[2] for u in s2.ast.backward_slice if u.op is Ops.WMMA), 1)
+      for x,t in zip(s2.full_shape, s2.axis_types):
+        if t is AxisType.UPCAST: up *= x
+        elif t in (AxisType.WARP, AxisType.LOCAL): lcl *= x
+      if up//tc_up > max_up or lcl > max_lcl:
+        if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too many upcast/local. {up//tc_up=}, {max_up=}, {lcl=}, {max_lcl=}")
+        continue
+      acted[i+1] = s2
+    except KernelOptError: pass
+  return acted
+
+BEAM_DEBUG = getenv("BEAM_DEBUG")
+def beam_search(s:Scheduler, rawbufs:list[Buffer], var_vals:dict[str,int], amt:int, allow_test_size=True):
+  key = {"ast": s.ast.key, "amt": amt, "allow_test_size": allow_test_size, "device": s.ren.target.device, "suffix": s.ren.suffix}
+  if not IGNORE_BEAM_CACHE and CACHELEVEL >= 1 and (val:=diskcache_get("beam_search", key)) is not None:
+    ret = s.copy()
+    for o in val[len(s.applied_opts):]: ret.apply_opt(o)
+    return ret
+
+  beam: list[tuple[Scheduler, float]] = [(s, float("inf"))]
+  seen_libs = set()
+
+  pool = get_worker_pool()
+
+  min_progress = getenv("BEAM_MIN_PROGRESS", 0.01)/1e6
+  if BEAM_DEBUG:
+    print("BEAM_SEARCH:")
+    print(pyrender(s.ast.replace(arg=None)))
+  if DEBUG >= 2: print(f"   0.00s:                from   1 ->   1 actions {s.colored_shape()}")
+
+  try:
+    rawbufs = _ensure_buffer_alloc(rawbufs)
+    exiting, st = False, time.perf_counter()
+    dev = Device[s.ren.target.device]
+    while not exiting:
+      candidates: list[Scheduler] = flatten([get_kernel_actions(si, include_0=False).values() for si,_ in beam])
+      timed: list[tuple[Scheduler, float]] = []
+      least_compute_ops = math.inf
+      for i, proc in ((map if pool is None else pool.imap_unordered)(_try_compile, enumerate(candidates))):
+        if proc is None: continue
+        prg, compile_et = proc
+        if (lib:=prg.src[3].arg) in seen_libs: continue
+        # filter out kernels that use 1000x more compute than the smallest
+        estimates = prg.src[0].arg.estimates
+        least_compute_ops = min(this_compute_ops:=sym_infer(estimates.ops if estimates is not None else 0, var_vals), least_compute_ops)
+        if least_compute_ops*1000 < this_compute_ops:
+          if getenv("BEAM_LOG_SURPASS_MAX"): print(f"too much compute. {this_compute_ops} when least is {least_compute_ops}")
+          continue
+        seen_libs.add(lib)
+        try: tms = _time_program(prg, var_vals, rawbufs, early_stop=beam[0][1]*3 if len(beam) else 1.0,
+                                 allow_test_size=allow_test_size, clear_l2=hasattr(dev, 'invalidate_caches'),
+                                 dev_timeout=getenv("BEAM_DEV_TIMEOUT", 1))
+        except Exception as e:
+          if BEAM_DEBUG: print(f"BEAM failed for opts: {candidates[i].applied_opts}\n{e}")
+          if isinstance(e, RuntimeError): continue
+          raise
+        timed.append((candidates[i], min(tms)))
+        if BEAM_DEBUG > 1:
+          print(f"{time.perf_counter() - st:7.2f}s: {i:5d} {len(prg.src[1].src):5d} uops",
+                f"{time_to_str(compile_et, w=12)} compile/{time_to_str(timed[-1][1], w=12)} run",
+                f"      {len(timed):4d}/{len(candidates):4d}         {timed[-1][0].colored_shape()}")
+        elif DEBUG >= 2:
+          print(f"\r{time.perf_counter() - st:7.2f}s: {time_to_str(timed[-1][1], w=12)}",
+                f"      {len(timed):4d}/{len(candidates):4d}         {timed[-1][0].colored_shape()}\033[K", end="")
+
+      # done
+      opts = sorted(timed, key=lambda x: x[1])
+      exiting = len(opts) == 0 or (opts[0][1] < min_progress) or (len(beam) > 0 and ((beam[0][1]-opts[0][1]) < min_progress))
+      if not exiting: beam = opts[:amt]
+      elif len(opts) > 0 and opts[0][1] < beam[0][1]: beam = opts[:1]
+      if DEBUG >= 2:
+        print(f"\r{time.perf_counter() - st:7.2f}s:", colored(time_to_str(beam[0][1], w=12), "green" if exiting else None),
+              f"from {len(candidates):3d} -> {len(opts):3d} actions\033[K", beam[0][0].colored_shape())
+  except KeyboardInterrupt as e:
+    terminate_worker_pool()
+    raise e
+
+  if CACHELEVEL >= 1: diskcache_put("beam_search", key, beam[0][0].applied_opts)
+  if BEAM_DEBUG: print(f"BEAM_SEARCH: final tm={time_to_str(beam[0][1], w=0)}, applied_opts={beam[0][0].applied_opts}")
+  return beam[0][0]
+
+import itertools
+from typing import Callable
+from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, graph_rewrite, _substitute, range_start, AxisType
+from tinygrad.uop.symbolic import symbolic
+from tinygrad.helpers import partition, dedup
+from tinygrad.dtype import dtypes
+
+def flatten_range(r:UOp) -> UOp|None:
+  off = range_start[r.op]
+  rngs = r.src[off:]
+  if not len(rngs): return None
+  return r.replace(src=r.src[:off]+tuple(dedup(x for s in rngs for x in ((s,) if s.op is Ops.RANGE else s.ranges))))
+
+pm_flatten_range = PatternMatcher([
+  # real ranges only
+  (UPat((Ops.REDUCE, Ops.END), name="r"), flatten_range),
+])
+
+# index/range arithmetic uses FLOORDIV/FLOORMOD prior to late rewrite
+def count_divmod(x:UOp) -> int: return sum(u.op in {Ops.FLOORDIV, Ops.FLOORMOD} for u in x.backward_slice)
+def simplify_merge_adjacent(u:UOp) -> UOp|None:
+  reduce_ranges = [x.ranges for x in u.backward_slice_with_self if x.op is Ops.REDUCE]
+  # on END we only want to merge adjacent ranges, on REDUCE we want to try all combinations
+  for r0, r1 in (zip(u.ended_ranges, u.ended_ranges[1:]) if u.op is Ops.END else itertools.permutations(u.ended_ranges, 2)):
+    # check same type
+    if r0.axis_type == r1.axis_type:
+      # check if the ranges to merge are in the same reduces
+      if all((r0 in rngs) == (r1 in rngs) for rngs in reduce_ranges):
+        s0, s1 = r0.src[0], r1.src[0]
+        # do the merge
+        new_range = r0.replace(src=(s0*s1,))
+        nidx = graph_rewrite(u, _substitute+symbolic+pm_flatten_range, ctx={r0:new_range//s1, r1:new_range%s1},
+                             name=f"check_merge_{r0.axis_id}_{r1.axis_id}")
+
+        # check if it simplifies. return after one merge so the next rewrite uses the new ranges,
+        # rather than continuing with stale pairs from the original ended_ranges.
+        if count_divmod(nidx) <= count_divmod(u): return nidx
+  return None
+
+def mark_gated(ctx, idx):
+  if len(idx.src) > 1 and idx.src[1].op is Ops.WHERE:
+    x, cond = idx.src[1].get_idx(), idx.src[1].get_valid()
+    # get all ranges r with guards "r < c" for some const c
+    guards = {r:c for v in cond.split_uop(Ops.AND) if v.op is Ops.CMPLT and (r:=v.src[0]).op is Ops.RANGE and (c:=v.src[1]).op is Ops.CONST}
+  else: x, guards = idx, {}
+  # ensure that we choose max(c_i) for all i where r < c_i
+  ctx |= {r:c for r,c in guards.items() if (r not in ctx or ctx[r].vmax < c.val)}
+  # but if a range is ever ungated, we cannot shrink it
+  ctx |= {r:r.src[0] for r in x.ranges if r not in guards}
+
+def do_substitute(ctx:dict, x: UOp, sub_fxn:Callable[[UOp, UOp], UOp]) -> UOp|None:
+  # Only the kernel root: rewriting a nested SINK would leave its enclosing END's binders unchanged.
+  if x.arg is None: return None
+  ret = x.substitute({k:sub_fxn(k,v) for k,v in ctx.items() if v is not None})
+  ctx.clear()
+  return None if ret is x else ret.simplify()
+
+pm_simplify_ranges = PatternMatcher([
+  (UPat((Ops.END, Ops.REDUCE), name="u"), simplify_merge_adjacent),
+  (UPat(Ops.INDEX, name="idx"), mark_gated),
+  # reduce ranges can't be shrunk
+  (UPat(Ops.REDUCE, name="red"), lambda ctx, red: ctx.update({r:r.src[0] for r in red.src[1:]})),
+  (UPat(Ops.SINK, name="x"), lambda ctx, x: do_substitute(ctx, x, lambda r,c: r.replace(src=(c,)))),
+])
+
+def mark_range_mod(ctx:dict[UOp, UOp|None], r:UOp, c:UOp) -> None:
+  # ranges that aren't looped over can't be split
+  if r not in ctx and r.axis_type not in {AxisType.WARP, AxisType.DEVICE} \
+    and r.src[0].op is Ops.CONST and r.src[0].divides(c.val) is not None: ctx[r] = c
+
+pm_split_ranges = PatternMatcher([
+  (UPat(Ops.RANGE, name="r")%UPat.cvar("c"), mark_range_mod),
+  (UPat(Ops.SINK, name="x"), lambda ctx, x: do_substitute(ctx, x,
+    lambda k,v: k.replace(src=(k.src[0]//v,), arg=k.arg+(0,))*v + k.replace(src=(v,), arg=k.arg+(1,)))),
+])
+
+# **** reduce simplification ****
+
+def no_range(u:UOp) -> bool: return not u.op_in_backward_slice_with_self(Ops.RANGE)
+
+def reduce_unparented(red:UOp) -> UOp|None:
+  if red.arg[0] not in {Ops.ADD, Ops.MAX, Ops.MUL}: return None
+  assert all(x.op is Ops.RANGE for x in red.src[1:]), "some reduce srcs aren't ranges"
+  reduce_parented, reduce_unparented = partition(red.src[1:], lambda x: x in red.src[0].ranges)
+  if len(reduce_unparented) == 0: return None
+  ret = red.replace(src=(red.src[0],)+tuple(reduce_parented)) if len(reduce_parented) else red.src[0]
+  if red.arg[0] is Ops.ADD:
+    for r in reduce_unparented: ret = ret * r.src[0]
+  if red.arg[0] is Ops.MUL:
+    for r in reduce_unparented: ret = ret ** r.src[0]
+  return ret
+
+pm_reduce_unparented = PatternMatcher([
+  # remove any ranges from a REDUCE that aren't referenced in the reduce source
+  (UPat(Ops.REDUCE, name="red"), reduce_unparented),
+])
+
+pm_reduce_collapse = pm_reduce_unparented + PatternMatcher([
+  # lift x+y out of reduce on lt
+  ((UPat.var("x")+UPat.var("y")) < UPat.var("c"), lambda x,y,c: (x < (c-y)) if no_range(y) and no_range(c) else None),
+  # lift x*y out of reduce
+  ((UPat.var("x")*UPat.var("y")) < UPat.var("c"),
+   lambda x,y,c: (x < ((c+y-1) // y)) if no_range(y) and no_range(c) and dtypes.is_int(y.dtype) and y.vmin > 0 else None),
+  # sum over r in [0,N) of [lower<=r<upper]*val -> max(min(upper,N) - max(lower,0), 0) * val
+  (UPat.any(
+    (UPat(Ops.RANGE, name="r") < UPat.var("upper")).where(UPat.var("val"), 0),
+    (UPat(Ops.RANGE, name="r") < UPat.var("lower")).where(0, UPat.var("val")),
+    ((UPat.var("r")<UPat.var("lower")).logical_not()&(UPat(Ops.RANGE, name="r")<UPat.var("upper"))).where(UPat.var("val"), 0),
+  ).reduce(UPat.var("r"), arg=Ops.ADD), lambda r,val,lower=None,upper=None:
+    ((upper.minimum(r.src[0]) if upper is not None else r.src[0]) -
+     (lower.maximum(0) if lower is not None else r.const_like(0))).maximum(0) * val if no_range(val) else None),
+  ((UPat.var("x")+UPat.var("y")).reduce(arg=Ops.ADD, allow_any_len=True, name="r"),
+   lambda x,y,r: x.reduce(*r.src[1:], arg=Ops.ADD) + y.reduce(*r.src[1:],arg=Ops.ADD)),
+  # AND on WHERE
+  ((UPat(Ops.PARAM, name="x") & UPat.var("y")).where(UPat.var("c"), 0).reduce(arg=Ops.ADD, allow_any_len=True, name="r"),
+    lambda x,y,c,r: y.where(c, 0).reduce(*r.src[1:], arg=Ops.ADD)*x),
+  # MUL casted bool
+  ((UPat.var("x") * UPat.var("gate", dtype=dtypes.bool).cast()), lambda x,gate: gate.where(x, 0)),
+])+symbolic
+
+pm_reduce_load_collapse = pm_reduce_collapse + PatternMatcher([
+  # lift x+y out of reduce on ne
+  ((UPat.var("x")+UPat.var("y")).or_casted() != UPat.var("c"), lambda x,y,c: (x != (c.cast(y.dtype)-y)) if no_range(y) and no_range(c) else None),
+  # reduce on gated load becomes can substitute the range and remove the reduce
+  ((UPat.var("idx")!=(UPat(Ops.RANGE, name="r").or_casted())).where(0, UPat.var("expr")).reduce(UPat.var("r"), arg=Ops.ADD),
+   lambda r,idx,expr: (v:=(idx.cast(r.dtype) >= 0) & (idx.cast(r.dtype) < r.src[0])).where(expr.substitute({r:idx.cast(r.dtype).valid(v)}),0)),
+])
+
+def reduce_collapse(red:UOp, u:UOp, pm:PatternMatcher=pm_reduce_collapse) -> UOp|None:
+  for r in red.src[1:]:
+    included = u.toposort(gate=lambda x: r in x.ranges)
+    if any(x.op in {Ops.STORE, Ops.REDUCE} for x in included): return None
+    replaces: dict[UOp, UOp] = {}
+    for u in included:
+      for s in u.src:
+        if s in included or s in replaces or s.op in {Ops.CONST, Ops.PARAM, Ops.BUFFER, Ops.ALLOC}: continue
+        replaces[s] = UOp.variable(f'in{len(replaces)}', s.vmin, s.vmax, s.dtype)
+    collapse_fxn = u.substitute(replaces).reduce(r, arg=Ops.ADD)
+    sink = graph_rewrite(collapse_fxn, pm, name="reduce_collapse")
+    if not no_range(sink): return None
+    u = sink.substitute({v:k for k,v in replaces.items()})
+  return u
+
+def reduce_load_collapse(red:UOp, u:UOp) -> UOp|None: return reduce_collapse(red, u, pm=pm_reduce_load_collapse)
+
+# remove REDUCE without loads (generic arange opt / indexing).
+pm_reduce_simplify = pm_reduce_unparented + PatternMatcher([
+  (UPat(Ops.REDUCE, src=(UPat.var("u"),), allow_any_len=True, arg=(Ops.ADD, 0), name="red"), reduce_collapse),
+])
+# remove REDUCE on load, comes from indexing a tensor with another tensor
+def no_load(u:UOp) -> bool: return not u.op_in_backward_slice_with_self(Ops.INDEX)
+pm_load_collapse = PatternMatcher([
+  (UPat(Ops.REDUCE, arg=(Ops.ADD, 0), src=(UPat.var("u"), UPat()), name="red"), reduce_load_collapse),
+  # we want to make sure we dont do math on a loaded index since that can cause overflow, this undoes the rule in pm_reduce_load_collapse
+  ((UPat.var("x", dtypes.weakint)+UPat.var("y"))<UPat.var("c"), lambda x,y,c: x < c-y if no_load(y) and no_load(c) and not no_load(x) else None),
+])
+
+from __future__ import annotations
+from dataclasses import dataclass, replace, field
+from collections import defaultdict
+from typing import Any, Callable, Generic, TypeVar, Iterator, Generator, Self, TYPE_CHECKING
+import importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct, mmap, time, statistics
+from tinygrad.helpers import mv_address, LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, PROFILE, temp, colored
+from tinygrad.helpers import Context, CCACHE, ALLOW_DEVICE_USAGE, MAX_BUFFER_SIZE, cpu_events, ProfileEvent, ProfilePointEvent, suppress_finalizing
+from tinygrad.helpers import select_by_name, select_first_inited, DEV, TracingKey, size_to_str, pluralize, Target, unwrap, round_up, is_numpy_ndarray
+from tinygrad.helpers import cpu_profile, perf_counter_us, to_name, HCQ_RUNTIME_DEV
+from tinygrad.dtype import dtypes, DType, _to_np_dtype
+from tinygrad.runtime.support.memory import BumpAllocator, MMIOInterface
+if TYPE_CHECKING:
+  from tinygrad.renderer import Renderer
+  from tinygrad.uop.ops import UOp
+
+# **************** Device ****************
+
+ALL_DEVICES = ["METAL", "AMD", "NV", "CUDA", "QCOM", "CL", "CPU", "DSP", "WEBGPU"]
+class _Device:
+  def __init__(self) -> None:
+    self._devices = [x.stem[len("ops_"):].upper() for x in (pathlib.Path(__file__).parent/"runtime").iterdir() if x.stem.startswith("ops_")]
+    self._opened_devices:set[str] = set()
+  @functools.cache  # this class is a singleton, pylint: disable=method-cache-max-size-none
+  def _canonicalize(self, device:str) -> str: return re.sub(r":0$", "", (d:=device.split(":", 1)[0].upper()) + device[len(d):])
+  # NOTE: you can't cache canonicalize in case Device.DEFAULT changes
+  def canonicalize(self, device:str|None) -> str: return self._canonicalize(device if device is not None else Device.DEFAULT)
+  def __getitem__(self, ix:str) -> Compiled:
+    ix = self.canonicalize(ix)
+    assert ALLOW_DEVICE_USAGE or ix.split(":")[0] in ["DISK", "NPY", "PYTHON"], f"usage of device {ix} disallowed"
+    return self.__get_canonicalized_item(ix)
+  @functools.cache  # this class is a singleton, pylint: disable=method-cache-max-size-none
+  def get_class(self, ix:str):
+    base = (__package__ or __name__).split('.')[0]  # tinygrad
+    x = ix.split(":")[0].lower()
+    return [cls for cname, cls in inspect.getmembers(importlib.import_module(f'{base}.runtime.ops_{x}')) if (cname.lower() == x + "device")][0]
+  @functools.cache  # this class is a singleton, pylint: disable=method-cache-max-size-none
+  def __get_canonicalized_item(self, ix:str) -> Compiled:
+    ret = self.get_class(ix)(ix)
+    if DEBUG >= 1: print(f"opened device {ix} from pid:{os.getpid()}")
+    self._opened_devices.add(ix)
+    return ret
+  @property
+  def default(self) -> Compiled: return self[self.DEFAULT]
+  def get_available_devices(self) -> Iterator[str]:
+    for device in ALL_DEVICES:
+      with contextlib.suppress(Exception): yield self[device].device
+  @property
+  def DEFAULT(self) -> str: return DEV.device or self._select_device
+  @DEFAULT.setter
+  def DEFAULT(self, v): raise AttributeError(f'setting Device.DEFAULT is deprecated, use "with Context(DEV={v!r})" or "DEV.value = {v!r}"')
+  @functools.cached_property
+  def _select_device(self) -> str:
+    assert (dev:=next((d for d in self._devices if d not in ["DISK", "NPY"] and getenv(d) == 1), None)) is None, \
+      f"{dev}=1 is deprecated, use DEV={dev} instead"
+    try:
+      device = next(self.get_available_devices())
+      os.environ["DEV"] = device   # we set this in environment for spawned children
+      return device
+    except StopIteration as exc: raise RuntimeError("no usable devices") from exc
+Device: _Device = _Device()
+atexit.register(lambda: [Device[dn].finalize() for dn in tuple(Device._opened_devices)])
+
+def canonicalize_device(device:str|tuple|list|None) -> str|tuple[str, ...]:
+  if not isinstance(device, (tuple, list)): return Device.canonicalize(device)
+  return canonical[0] if len(canonical:=tuple(Device.canonicalize(d) for d in device)) == 1 else canonical
+
+def is_disk_device(device:str|tuple[str, ...]) -> bool:
+  return any(d.split(":", 1)[0].upper() == "DISK" for d in ((device,) if isinstance(device, str) else device))
+
+# **************** Profile ****************
+
+@dataclass(frozen=True)
+class ProfileDeviceEvent(ProfileEvent): device:str; tdiff:decimal.Decimal=decimal.Decimal(0); props:dict[str,Any]|None=None # noqa: E702
+
+@dataclass(frozen=True)
+class ProfileProgramEvent(ProfileEvent): device:str; name:str; lib:bytes|None; base:int|None; tag:int|None=None; profile_key:bytes|None=None # noqa: E702
+
+@dataclass(frozen=True)
+class ProfileGraphEntry: device:str; name:str|TracingKey; st_id:int; en_id:int; profile_key:bytes|None=None # noqa: E702
+
+@dataclass(frozen=True)
+class ProfileGraphEvent(ProfileEvent): ents:list[ProfileGraphEntry]; deps:list[list[int]]; sigs:list[decimal.Decimal] # noqa: E702
+
+# **************** Buffer + Allocators ****************
+
+@dataclass(frozen=True, eq=True)
+class BufferSpec:
+  # TODO: move device, size, dtype here?
+  uncached: bool = False
+  cpu_access: bool = False
+  host: bool = False
+  nolru: bool = False
+  external_ptr: int|None = None
+
+class MultiBuffer:
+  def __init__(self, device:tuple[str, ...], size:int, dtype:DType):
+    self.bufs = [Buffer(d, size, dtype) for d in device]
+  @property
+  def device(self): return tuple(x.device for x in self.bufs)
+  @property
+  def size(self): return self.bufs[0].size
+  @property
+  def dtype(self): return self.bufs[0].dtype
+  def is_allocated(self): return all(x.is_allocated() for x in self.bufs)
+  def __repr__(self): return f"<multibuf real:{self.is_allocated()} device:{tuple(x.device for x in self.bufs)} size:{self.size} dtype:{self.dtype}>"
+
+@dataclass(frozen=True)
+class BufferStorage: buf:Any; meta:Any=None; host:MMIOInterface|None=None; maps:dict[Compiled, BufferStorage]=field(default_factory=dict) # noqa: E702
+
+class Buffer:
+  profile_events:list[ProfileEvent] = []
+  def __init__(self, device:str, size:int, dtype:DType, opaque:Any=None, options:BufferSpec|None=None,
+               initial_value:bytes|pickle.PickleBuffer|None=None, base:Buffer|None=None, offset:int=0, preallocate=False,
+               allocator:Allocator|None=None):
+    assert isinstance(dtype, DType)
+    self.device, self.size, self.dtype, self.offset, self.allocated_views, self._base = Device.canonicalize(device), size, dtype, offset, 0, base
+    if allocator is not None: self.allocator = allocator
+    self.options = options if options is not None else BufferSpec()
+    self._storage:BufferStorage|None = None
+    if base is None:
+      assert offset == 0, "base buffers can't have offset"
+      if opaque is not None: self.allocate(opaque)
+      if initial_value is not None:
+        self.allocate()
+        if (host:=self.get_storage().host) is not None: host[:] = memoryview(initial_value).cast('B')
+        else: self.copy_from(Buffer("PYTHON", self.size, self.dtype, opaque=memoryview(bytearray(initial_value))))
+        if isinstance(initial_value, pickle.PickleBuffer): initial_value.release()
+    else:
+      assert base._base is None, "base can't have a base"
+      assert self.device == base.device, "base must have the same device"
+    if preallocate: self.allocate()
+
+  @suppress_finalizing
+  def __del__(self): self._storage is None or self.deallocate()
+
+  def __repr__(self):
+    return f"<buf real:{self.is_allocated()} device:{self.device} size:{self.size} dtype:{self.dtype}" + \
+           (f" offset:{self.offset}" if self._base is not None else "") + (f" {self.options=}" if self.options != BufferSpec() else "") + ">"
+
+  @property
+  def base(self) -> Buffer: return self._base if self._base is not None else self
+  @functools.cached_property
+  def allocator(self) -> Allocator: return self.base.allocator if self._base is not None else Device[self.device].allocator
+  @property
+  def _buf(self) -> Any: return self.get_storage().buf
+  @property
+  def host(self) -> MMIOInterface: return unwrap(self.get_storage().host)
+  @property
+  def meta(self) -> Any: return self.get_storage().meta
+  @property
+  def nbytes(self): return self.size * self.dtype.itemsize
+
+  def get_storage(self, device:str|None=None) -> BufferStorage:
+    storage = unwrap(self.ensure_allocated()._storage)
+    device = Device.canonicalize(device) if device is not None else self.device
+    if device == self.device: return storage
+    if (dev:=Device[device]) not in storage.maps:
+      alloc = dev.allocator
+      storage.maps[dev] = BufferStorage(alloc._offset(self.base.get_buf(device), self.nbytes, self.offset)) if self._base else alloc.map(self)
+    if storage.maps[dev].host is not storage.host: storage.maps[dev] = replace(storage.maps[dev], host=storage.host)
+    return storage.maps[dev]
+
+  def get_buf(self, device:str) -> Any: return self.get_storage(device).buf
+
+  def is_allocated(self) -> bool: return self._storage is not None and (self._base is None or self._base_storage is self.base._storage)
+  def ensure_allocated(self) -> Buffer: return self.allocate() if not self.is_allocated() else self
+  def allocate(self, opaque=None, external_ptr=None) -> Buffer:
+    assert not self.is_allocated(), "can't allocate already allocated buffer"
+    if DEBUG >= 7: print(f"buffer: allocate {self.nbytes} bytes on {self.device}")
+    if not self.device.startswith("NULL") and self.size > MAX_BUFFER_SIZE > 0 and self.options.external_ptr is None:
+      raise RuntimeError(f"buffer of size {self.size/1e6:.2f}M is too large")
+    if external_ptr is not None: self.options = replace(self.options, external_ptr=external_ptr)
+    if self._base is not None:
+      storage = replace(self.base.get_storage(), buf=self.allocator._offset(self.base._buf, self.nbytes, self.offset), maps={})
+    elif opaque is not None:
+      self.options = replace(self.options, nolru=True)
+      if is_numpy_ndarray(opaque):
+        if not opaque.flags.c_contiguous: opaque = opaque.copy(order='C')
+        opaque = BufferStorage(addr:=opaque.ctypes.data, memoryview(opaque), MMIOInterface(addr, self.nbytes))
+      elif isinstance(opaque, memoryview):
+        opaque = BufferStorage(addr:=mv_address(opaque) if self.nbytes else 0, opaque, MMIOInterface(addr, self.nbytes))
+      storage = opaque if isinstance(opaque, BufferStorage) else BufferStorage(opaque)
+    else: storage = self.allocator.alloc(self.nbytes, self.options)
+    storage = replace(storage, host=storage.host.view(self.offset, self.nbytes, fmt='B') if storage.host is not None else None)
+    if self._base is None:
+      if not self.device.startswith("DISK") and self.options.external_ptr is None:
+        GlobalCounters.mem_used += self.nbytes
+        GlobalCounters.mem_used_per_device[self.device] += self.nbytes
+      if PROFILE: Buffer.profile_events.append(ProfilePointEvent(self.device, "alloc", self.trace_num, {"dtype":self.dtype, "sz":self.size}))
+    elif self._storage is None: self.base.allocated_views += 1
+    self._storage, self._base_storage = storage, self.base._storage if self._base else None
+    return self
+
+  def deallocate(self):
+    assert self._storage is not None, "buffer must be allocated to deallocate"
+    if DEBUG is not None and DEBUG >= 7: print(f"buffer: deallocate {self.nbytes} bytes on {self.device}")
+    if self._base is None:
+      if GlobalCounters is not None and not self.device.startswith("DISK") and self.options.external_ptr is None:
+        GlobalCounters.mem_used -= self.nbytes
+        GlobalCounters.mem_used_per_device[self.device] -= self.nbytes
+      if PROFILE: Buffer.profile_events.append(ProfilePointEvent(self.device, "free", self.trace_num))
+      self.allocator.free(self._storage, self.nbytes, self.options)
+    else: self.base.allocated_views -= 1
+    self._storage, self._base_storage = None, None
+
+  def __reduce_ex__(self, protocol):
+    buf:bytearray|pickle.PickleBuffer|None = None
+    if self._base is not None:
+      return self.__class__, (self.device, self.size, self.dtype, None, None, None, self.base, self.offset, self.is_allocated())
+    if self.device == "NPY":
+      import numpy as np
+      arr = np.frombuffer(self.meta, _to_np_dtype(self.dtype)) # over the storage itself, so an out-of-band pickle buffer keeps it alive
+      return self.__class__, (self.device, self.size, self.dtype, arr, self.options, None)
+    if self.is_allocated():
+      buf = pickle.PickleBuffer(self.as_memoryview()) if protocol >= 5 else bytearray(self.as_memoryview())
+    return self.__class__, (self.device, self.size, self.dtype, None, self.options, buf)
+
+  @property
+  def trace_num(self) -> int:
+    if not hasattr(self, '_trace_num'): self._trace_num = len(Buffer.profile_events)
+    return self._trace_num
+
+  def _host_mv(self) -> memoryview|None:
+    if self.is_allocated() and hasattr(host:=self.get_storage().host, 'mv'): return unwrap(host).view(fmt='B').mv
+    if self.is_allocated() and hasattr(self.allocator, '_as_buffer'): return self.allocator._as_buffer(self._buf)
+    return None
+
+  def as_memoryview(self, allow_zero_copy=False) -> memoryview:
+    if (mv:=self._host_mv()) is not None:
+      self.allocator.dev.synchronize()
+      if allow_zero_copy: return mv
+      with cpu_profile(f"{self.device} -> TINY", f"{self.device}:COPY"): return memoryview(bytearray(mv))
+    Buffer("PYTHON", self.size, self.dtype, opaque=(mv:=memoryview(bytearray(self.nbytes)))).copy_from(self)
+    return mv
+
+  def numpy(self) -> 'np.ndarray': # type: ignore [name-defined] # noqa: F821
+    import numpy as np
+    assert _to_np_dtype(self.dtype) is not None, f"no np dtype for {self.dtype}"
+    return np.frombuffer(self.as_memoryview(), dtype=_to_np_dtype(self.dtype))
+
+  def copy_from(self, src:Buffer) -> Buffer:
+    assert self.nbytes == src.nbytes, f"copy size mismatch, {self.nbytes} != {src.nbytes}"
+    assert self.is_allocated() and src.is_allocated(), "copy requires allocated buffers"
+    from tinygrad.engine.realize import run_linear
+    from tinygrad.uop.ops import UOp, Ops
+    du, su = UOp.from_buffer(self), UOp.from_buffer(src)
+    run_linear(UOp(Ops.LINEAR, src=(du.store_call(su),)), update_stats=False)
+    return self
+
+  def view(self, size:int, dtype:DType, offset:int) -> Buffer:
+    assert offset < self.nbytes, "offset must be less than nbytes"
+    return Buffer(self.device, size, dtype, base=self.base, offset=self.offset+offset)
+
+DeviceType = TypeVar('DeviceType', bound='Compiled')
+
+# TODO: size, dest, src are the same type. can we enforce this?
+class Allocator(Generic[DeviceType]):
+  lru = True
+
+  def __init__(self, dev:DeviceType, supports_copy_from_disk:bool=True, supports_transfer:bool=True):
+    self.dev: DeviceType = dev
+    self.default_buffer_spec: BufferSpec = BufferSpec()
+    self.cache:dict[tuple[int, BufferSpec|None], list[BufferStorage]] = defaultdict(list)
+    self.supports_copy_from_disk, self.supports_transfer = supports_copy_from_disk, supports_transfer
+
+  def alloc(self, size:int, options:BufferSpec|None=None) -> BufferStorage:
+    assert size > 0, f"alloc size must be positive, getting {size}"
+    if len(c:=self.cache[(size, options)]): return c.pop()
+    spec = options if options is not None else self.default_buffer_spec
+    try: return self._alloc(size, spec)
+    except (RuntimeError, MemoryError): self.free_cache()
+    try: return self._alloc(size, spec)
+    except (RuntimeError, MemoryError) as e: raise MemoryError(f"Allocation of {size_to_str(size)} failed on {self.dev.device}. "
+                                                            f"Used: {size_to_str(GlobalCounters.mem_used_per_device[self.dev.device])}") from e
+
+  def free(self, storage:BufferStorage, size:int, options:BufferSpec|None=None):
+    spec = options if options is not None else self.default_buffer_spec
+    if LRU and self.lru and not spec.nolru and spec.external_ptr is None: self.cache[(size, options)].append(storage)
+    else: self.do_free(storage, spec)
+
+  def free_cache(self):
+    for (_, options), storages in self.cache.items():
+      for storage in storages: self.do_free(storage, options if options is not None else self.default_buffer_spec)
+      storages.clear()
+
+  def do_free(self, storage:BufferStorage, options:BufferSpec):
+    for dev in storage.maps: dev.synchronize()
+    for dev, mb in storage.maps.items(): dev.allocator._unmap(mb)
+    if options.external_ptr is None: self._free(storage, options)
+
+  def map(self, buf:Buffer) -> BufferStorage: return self._map(buf.ensure_allocated())
+
+  # implemented by the runtime
+  def _alloc(self, size:int, options:BufferSpec) -> BufferStorage: raise NotImplementedError("need alloc")
+  def _free(self, storage:BufferStorage, options:BufferSpec): pass  # if opaque is a Python object, you don't need a free
+  def _copyin(self, dest, src:memoryview): raise NotImplementedError("need copyin")
+  def _copyout(self, dest:memoryview, src): raise NotImplementedError("need copyout")
+  def _map(self, buf) -> BufferStorage: raise NotImplementedError("need map")
+  def _unmap(self, mb): pass  # default no-op; override if _map allocates iface-side state
+  def _offset(self, buf, size:int, offset:int): raise NotImplementedError("need offset")
+  # def _transfer(self, dest, src, sz:int, src_dev, dest_dev):
+
+class HostAllocator(Allocator):
+  def __init__(self, dev): super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
+  def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
+    if options.external_ptr is not None: view, meta = self._view(options.external_ptr, size), None
+    elif (remote:=getattr(self.dev, "remote", None)) is not None: view, meta = remote.alloc_sysmem(round_up(size, mmap.PAGESIZE))
+    else: view = self._view(mv_address(meta:=mmap.mmap(-1, size, access=mmap.ACCESS_WRITE)), size)
+    return BufferStorage(view.addr, meta, view)
+
+  def _free(self, storage:BufferStorage, options:BufferSpec):
+    if (remote:=getattr(self.dev, "remote", None)) is not None:
+      self.dev.synchronize()
+      remote.free_sysmem(storage.host)
+
+  def _view(self, addr:int, size:int) -> MMIOInterface:
+    return remote.cpu_view(addr, size) if (remote:=getattr(self.dev, "remote", None)) is not None else MMIOInterface(addr, size, fmt='B')
+
+  def _copyin(self, dest:int, src:memoryview):
+    self.dev.synchronize()
+    with cpu_profile(f"TINY -> {self.dev.device}", f"{self.dev.device}:COPY"): self._view(dest, src.nbytes)[:] = src.cast('B')
+  def _copyout(self, dest:memoryview, src:int):
+    self.dev.synchronize()
+    with cpu_profile(f"{self.dev.device} -> TINY", f"{self.dev.device}:COPY"): dest[:] = self._view(src, dest.nbytes)[:]
+  def _map(self, buf:Buffer) -> BufferStorage:
+    if Device[buf.device].host != self.dev.host: raise RuntimeError(f"host memory is not on the node of {self.dev.device}")
+    return BufferStorage(buf.host.addr)
+  def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
+
+# **************** for Compiled Devices ****************
+
+class CompileError(Exception): pass
+
+class Compiler:
+  def __init__(self, cachekey:str|None=None): self.cachekey = cachekey if CCACHE else None
+  def compile(self, src:str) -> bytes: return src.encode()   # NOTE: empty compiler is the default
+  def compile_cached(self, src:str) -> bytes:
+    if self.cachekey is None or (lib := diskcache_get(self.cachekey, src)) is None:
+      assert not getenv("ASSERT_COMPILE"), f"tried to compile with ASSERT_COMPILE set\n{src}"
+      lib = self.compile(src)
+      if self.cachekey is not None: diskcache_put(self.cachekey, src, lib)
+    return lib
+  def disassemble(self, lib:bytes): pass
+  def server(self, cmd:str, arch:str, *args) -> subprocess.Popen:
+    argv = f"{cmd} {pathlib.Path(__file__).parent}/runtime/support/compileserver.py {type(self).__module__}:{type(self).__name__} {arch}"
+    return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
+  def compile_server(self, src:str, proc:subprocess.Popen) -> bytes:
+    unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
+    if (lib:=unwrap(proc.stdout).read(struct.unpack("I", unwrap(proc.stdout).read(4))[0])): return lib
+    raise CompileError("Compilation Error")
+
+
+@dataclass
+class TinyELF:
+  lib: bytes
+  name: str
+  target: Target
+  # tuple of (name, slot, dtype, shape)
+  signature: tuple[tuple[str|None, int, DType, tuple], ...]
+  profile_key: bytes|None = None
+
+  @staticmethod
+  def iter_sig(signature:tuple[tuple[str|None, int, DType, tuple], ...], offset:int=0) -> Generator[tuple[int, DType], None, None]:
+    for _,_,dt,_ in signature:
+      yield (offset:=round_up(offset, dt.itemsize)), dt
+      offset += dt.itemsize
+
+class Program(Generic[DeviceType]):
+  def __init__(self, dev:DeviceType, obj:TinyELF): pass
+  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(),
+               wait=False) -> float|None: pass
+
+class Compiled:
+  ifaces:list[Callable] = []
+  profile_events:list[ProfileEvent] = [ProfileDeviceEvent("CPU")] # NOTE: CPU is the default device.
+
+  timestamp_divider: float = 1000.0
+  wait_timeout_ms: float = 30000.0
+  sleep_timeout_ms: int|None = None
+  can_recover:bool = False
+  rtalloc_size:int = 64<<20 # the pool every per-linear buffer is carved out of
+  var_vals: dict[str, int] = {}
+
+  # hcq2
+  pm_batch:Any = None
+  pm_encode:Any = None
+  pm_lower:Any = None
+  pm_bufferize:Any = None # one for all devices: each adds the rules of the placeholders it owns, its tags start with its name
+
+  def __init__(self, device:str, allocator:Allocator, renderers:list[type[Renderer]], runtime:type[Program[Self]]|None, arch=None):
+    from tinygrad.renderer import Renderer
+
+    self.device, self.allocator, self.runtime_t, self.renderers = device, allocator, runtime, renderers or [Renderer]
+    self.device_id, self.arch = (int(idx) if ":" in device and (idx:=device.split(":")[1]).isdigit() else 0), arch
+    self.peer_group = getattr(getattr(self, 'iface', None), 'peer_group', device.split(":")[0])
+    self.cached_renderer:dict[Any, Renderer] = {}
+    self.pending:dict[Compiled, int] = {} # timeline values of the devices that touched our memory
+
+    # profiling
+    self.prog_bufs:dict[UOp, Buffer] = {} # cache bufferized for programs
+    self.prof_ents:dict[tuple[Buffer, int], ProfileGraphEntry] = {} # (a batch's timestamps, start slot) -> entry, read at synchronize
+
+  @property
+  def has_copy_queue(self) -> bool: return True
+
+  @property
+  def host(self) -> str: return f"CPU:{self.peer_group[7:]}" if self.peer_group.startswith("remote:") else HCQ_RUNTIME_DEV.value
+
+  @property
+  def renderer(self) -> Renderer: return self._select_renderer()
+
+  @property
+  def compiler(self) -> Compiler: return self.renderer.compiler
+
+  def runtime(self, obj:TinyELF) -> Program[Self]: return unwrap(self.runtime_t)(self, obj)
+
+  @functools.cache
+  def rt_allocator(self, spec:BufferSpec) -> BumpAllocator: return BumpAllocator(self.rtalloc_size)
+
+  @functools.cache
+  def rt_buffer(self, spec:BufferSpec) -> Buffer:
+    return Buffer(self.device, self.rt_allocator(spec).size, dtypes.uint8, options=spec, preallocate=True)
+
+  def tag(self, *parts:str) -> str: return to_name(self.device, *parts) # of the placeholders it owns
+  def program_buffer(self, b:UOp) -> Buffer:
+    return self.prog_bufs.setdefault(b, Buffer(self.device, b.max_numel(), b.dtype, options=BufferSpec(cpu_access=True, nolru=True)))
+
+  @functools.cached_property
+  def timeline(self) -> Buffer: # [the signal, the value the last submitted batch signals]
+    return Buffer(self.device, 2, dtypes.uint64, options=BufferSpec(host=True, uncached=True, cpu_access=True), initial_value=bytes(16))
+
+  @functools.cached_property
+  def error_state(self) -> Buffer: return Buffer(self.host, 1, dtypes.int64, options=BufferSpec(nolru=True), preallocate=True)
+
+  def _wait_signal(self, sig:MMIOInterface|memoryview, value:int, timeout:int|None=None):
+    timeout = timeout if timeout is not None and self.can_recover else None
+    st, done, err = time.perf_counter(), sig[0], self.error_state.host.view(fmt='q')
+    while done < value and not err[0]:
+      if done != (done:=sig[0]): st = time.perf_counter()
+      elif (elapsed:=time.perf_counter() - st) > (timeout or self.wait_timeout_ms) / 1000: raise RuntimeError(f"{self.device} signal wait timed out")
+      elif self.sleep_timeout_ms is not None and elapsed > self.sleep_timeout_ms / 1000: self.on_sleep()
+    if err[0]: raise RuntimeError(f"{self.device} failed with {err[0]}")
+
+  def synchronize(self, timeout:int|None=None):
+    for d in [*self.pending]: d._wait_signal(d.timeline.host.view(fmt='Q'), self.pending.pop(d), timeout) # a failed peer raises its own error, once
+    for dn in Device._opened_devices: Device[dn].pending.pop(self, None) # waited (or failed) here, the peers need not
+    try: self._wait_signal(tl:=self.timeline.host.view(fmt='Q'), tl[1], timeout)
+    except RuntimeError:
+      self.on_device_hang()
+      raise
+    if self.prof_ents: self.collect_prof()
+
+  def count(self) -> int:
+    """
+    Returns the number of physical accelerators available to the runtime.
+    """
+    return self.iface.count if hasattr(self, 'iface') else 1
+
+  def on_device_hang(self): raise RuntimeError(f"{self.device} hang detected")
+
+  def on_sleep(self):
+    if (iface:=getattr(self, "iface", None)) is not None and hasattr(iface, "sleep"): iface.sleep(self.sleep_timeout_ms)
+
+  def device_props(self) -> dict[str,Any]: return {} # to be overridden if needed. dict keys are backend dependent.
+
+  def finalize(self):
+    """
+    Called at the end of process lifetime to allow the device to finalize.
+    """
+    try: self.synchronize() # try to finalize the device in any case
+    except RuntimeError as e: print(f"{self.device} synchronization failed before finalizing: {e}")
+    if hasattr(self, 'iface') and hasattr(self.iface, 'device_fini'): self.iface.device_fini()
+
+  # helpers
+
+  def _renderer_name(self, r:type[Renderer]) -> str:
+    return r.__name__.upper().removesuffix("RENDERER").removeprefix(devname:=self.device.split(':')[0].upper()) or devname
+
+  def _select_renderer(self) -> Renderer:
+    assert (rn:=next((self._renderer_name(r) for r in self.renderers if getenv(f"{self.device}_{self._renderer_name(r)}")), None)) is None, \
+      f"{self.device}_{rn}=1 is deprecated, use DEV={self.device}:{rn} instead"
+    t = DEV.target(self.device.split(':')[0], **({"arch":self.arch} if self.arch else {}))
+    return select_first_inited(select_by_name(self.renderers, self._renderer_name, t.renderer, f"{self.device} has no renderer {t.renderer!r}"),
+                               f"No renderer for {self.device} is available", self.cached_renderer, t)
+
+  def _select_iface(self, device:str):
+    self.device_id = int(device.split(":")[1]) if ":" in device else 0
+    assert (v:=getenv(k:=f'{type(self).__name__[:-6].upper()}_IFACE', "")) == "",  \
+      f"{k}={v} is deprecated, use DEV={replace(DEV.target(type(self).__name__[:-6]), interface=v)} instead"
+    t = DEV.target(dev:=type(self).__name__[:-6])
+    filtered = select_by_name(self.ifaces, lambda i: i.__name__[:-5], t.interface, f"{dev} has no interface {t.interface!r}")
+    filtered = [i for i in filtered if t.interface.startswith("MOCK") or not i.__name__[:-5].startswith("MOCK")] # never fallback to mock ifaces
+    return select_first_inited([functools.partial(iface, self, self.device_id) for iface in filtered],
+                               f"No interface for {dev}:{self.device_id} is available")
+
+  # profiling
+
+  def collect_prof(self):
+    if PROFILE:
+      es = list(self.prof_ents.items())
+      sigs = [buf.host.view(fmt='Q')[i]/decimal.Decimal(self.timestamp_divider) for (buf, _), e in es for i in (e.st_id, e.en_id)]
+      Compiled.profile_events.append(ProfileGraphEvent([replace(e, st_id=2*i, en_id=2*i+1) for i,(_, e) in enumerate(es)], [], sigs))
+    self.prof_ents.clear()
+
+  def _at_profile_finalize(self):
+    if not self.pm_encode.patterns: return
+    from tinygrad.tensor import Tensor
+    tdiffs = []
+    for _ in range(5):
+      with Context(DEBUG=0, BEAM=0, TRACK_MATCH_STATS=0): Tensor.ones(1, device=self.device).contiguous().realize()
+      if not (ents:=list(self.prof_ents.items())): return
+      self.prof_ents.clear()
+      st = perf_counter_us()
+      self.synchronize()
+      gpu = max(buf.host.view(fmt='Q')[e.en_id] for (buf, _), e in ents)/decimal.Decimal(self.timestamp_divider)
+      tdiffs.append((st+perf_counter_us())/2 - gpu)
+    Compiled.profile_events.append(ProfileDeviceEvent(self.device, statistics.median(tdiffs), self.device_props()))
+
+if PROFILE:
+  @atexit.register
+  def finalize_profile():
+    devs = [Device[d] for d in Device._opened_devices]
+    for dev in devs: dev.synchronize()
+    for dev in devs: dev._at_profile_finalize()
+
+    with open(fn:=temp("profile.pkl", append_user=True), "wb") as f: pickle.dump(cpu_events+Compiled.profile_events+Buffer.profile_events, f)
+
+    PROFILE.value = 0
+    from tinygrad.uop.ops import launch_viz
+    launch_viz("PROFILE", fn)
+
+def enumerate_devices_str() -> Generator[str, None, None]:
+  from tinygrad import Tensor, Device
+
+  for device in ALL_DEVICES:
+    ren_results, iface_results = [], []
+    try:
+      d = Device[device]
+      for iface in [i for i in d.ifaces if not i.__name__.startswith("MOCK")]:
+        try:
+          name = iface.__name__[:-5]
+          default_text, count = ("(default)", d.count()) if type(d.iface) is iface else (f"(DEV={name}+{device} to make default)", iface(d, 0).count) # type: ignore
+          iface_results.append(f"{colored('+', 'green')} {name}: {pluralize('device', count)} {default_text}")
+        except Exception as e: iface_results.append(f"{colored('-', 'red')} {iface.__name__[:-5]}: {e}")
+      for r in d.renderers:
+        try:
+          with Context(CACHELEVEL=0, DEV=f"{device}:{d._renderer_name(r)}"): test = (Tensor([1,2,3], device=device) * 2).tolist()
+          if test != [2,4,6]: raise ValueError(f"got {test} instead of [2, 4, 6]")
+          default_text = '(default)' if type(d.renderer) is r else f'(DEV={device}:{d._renderer_name(r)} to make default)'
+          ren_results.append(f"{colored('+', 'green')} {d._renderer_name(r)} {default_text}")
+        except Exception as e: ren_results.append(f"{colored('-', 'red')} {d._renderer_name(r)}: {e}")
+      result = (colored('PASS', 'green') + ("\n"+" "*12+"interfaces:\n" if iface_results else "") + '\n'.join([" "*13+x for x in iface_results]) +
+                (("\n"+" "*12+"renderers:\n") + '\n'.join([" "*13+x for x in ren_results]) if len(ren_results) > 1 else ""))
+    except Exception as e: result = f"{colored('FAIL', 'red')} {e}"
+    yield f"{'*' if device == Device.DEFAULT else ' '} {device:8s}: {result}"
+
+if __name__ == "__main__":
+  for s in enumerate_devices_str(): print(s)
+
+from __future__ import annotations
+from typing import Final, ClassVar, Callable, Literal
+import math, struct, ctypes, functools
+from dataclasses import dataclass, fields
+from tinygrad.helpers import getenv, DEFAULT_FLOAT, DEFAULT_INT
+from enum import IntEnum, auto
+
+class ConstFloat(float):
+  """Float subclass that distinguishes -0.0 from 0.0 and where nan == nan."""
+  __slots__ = ('bits',)
+  bits: int
+  def __new__(cls, v:float):
+    obj = super().__new__(cls, v)
+    obj.bits = struct.unpack('<Q', struct.pack('<d', v))[0]
+    return obj
+  def __eq__(self, other):
+    if self is other: return True
+    if isinstance(other, float) and math.isnan(self) and math.isnan(other): return True
+    return float.__eq__(self, other)
+  def __ne__(self, other): return res if (res:=self.__eq__(other)) is NotImplemented else not res  # float.__ne__ disagrees with __eq__ on nan
+  def __hash__(self): return hash(self.bits)
+  def __repr__(self): return f"ConstFloat({float.__repr__(self)})"
+  def __str__(self): return float.__repr__(self)
+
+class InvalidType:
+  _instance: ClassVar[InvalidType|None] = None
+  def __new__(cls):
+    if cls._instance is None: cls._instance = object.__new__(cls)
+    return cls._instance
+  def __eq__(self, other): return self is other if isinstance(other, InvalidType) else NotImplemented  # foreign types get the reflected eq
+  def __hash__(self): return id(self)
+  def __repr__(self): return "Invalid"
+  def __reduce__(self): return (InvalidType, ())  # unpickle returns the singleton
+  def __format__(self, spec): return "Invalid"
+
+Invalid = InvalidType()
+
+PyConst = float|int|bool
+ConstType = PyConst|InvalidType
+
+FmtStr = Literal['?', 'b', 'B', 'h', 'H', 'i', 'I', 'q', 'Q', 'e', 'f', 'd']
+
+# all DTypes should only be created once
+class DTypeMetaClass(type):
+  dcache: dict[tuple, DType] = {}
+  def __call__(cls, *args, **kwargs):
+    if (ret:=DTypeMetaClass.dcache.get(args, None)) is not None: return ret
+    DTypeMetaClass.dcache[args] = ret = super().__call__(*args)
+    return ret
+
+class AddrSpace(IntEnum):
+  def __str__(self): return repr(self)
+  def __repr__(self): return f"{self.__class__.__name__}.{self.name}"
+  GLOBAL = auto(); LOCAL = auto(); REG = auto(); ALU = auto()  # noqa: E702
+
+@dataclass(frozen=True, eq=False)
+class DType(metaclass=DTypeMetaClass):
+  priority: int  # this determines when things get upcasted
+  bitsize: int
+  name: str
+  fmt: FmtStr|None
+  @property
+  def itemsize(self) -> int: return (self.bitsize + 7) // 8
+  @staticmethod
+  def new(priority:int, bitsize:int, name:str, fmt:FmtStr|None): return DType(priority, bitsize, name, fmt)
+  def __reduce__(self): return type(self), tuple(getattr(self, f.name) for f in fields(self))
+  def __repr__(self): return f"dtypes.{self.name}"
+  def __lt__(self, o:DType): return (self.priority, self.bitsize, self.name, self.fmt) < (o.priority, o.bitsize, o.name, o.fmt)
+  @functools.cached_property
+  def min(self):
+    if dtypes.is_int(self): return 0 if dtypes.is_unsigned(self) else -2**(self.bitsize-1)
+    return -self.max if dtypes.is_float(self) else False
+  @functools.cached_property
+  def max(self):
+    if dtypes.is_int(self): return 2**(self.bitsize)-1+self.min
+    # e4m3 and the fnuz fp8s have no inf: their largest value is the largest normal
+    if self in dtypes.fp8s and self is not dtypes.fp8e5m2: return fp8_to_float(_fp8_cfg[self][5], self)
+    return float("inf") if dtypes.is_float(self) else True
+  def const(self, val: ConstType):
+    if isinstance(val, InvalidType): return val
+    # NOTE: float('nan') != float('nan'), so we canonicalize here
+    if isinstance(val, float) and math.isnan(val): val = math.nan
+    # int is the default. wrap floats in ConstFloat to distinguish -0.0 from 0.0 in cache
+    return ConstFloat(truncate.get(self, float)(float(val))) if dtypes.is_float(self) else bool(val) if dtypes.is_bool(self) else int(val)
+
+
+class DTypes:
+  @staticmethod
+  @functools.cache
+  def is_float(x: DType) -> bool: return x in (dtypes.floats + (dtypes.weakfloat,))
+  @staticmethod # static methods on top, or bool in the type info will refer to dtypes.bool
+  @functools.cache
+  def is_int(x: DType) -> bool: return x in (dtypes.ints + (dtypes.weakint,))
+  @staticmethod
+  @functools.cache
+  def is_unsigned(x: DType) -> bool: return x in dtypes.uints
+  @staticmethod
+  def is_bool(x: DType) -> bool: return x == dtypes.bool
+  @staticmethod
+  def from_py(x) -> DType:
+    # NOTE: isinstance(True, int) is True, so bool must be checked before int
+    if isinstance(x, (bool, InvalidType)): return dtypes.bool
+    if isinstance(x, float): return dtypes.weakfloat
+    if isinstance(x, int): return dtypes.weakint
+    # put this in the last is faster because there are more items than lists/tuples to check
+    if isinstance(x, (list, tuple)):
+      dt = max(dtypes.from_py(xi) for xi in x) if x else dtypes.weakfloat
+      if dt is not dtypes.weakint: return strong_dtype(dt)
+      ints = [xi for xi in x if isinstance(xi, int)]  # a vconst also holds Invalid
+      return commit_int(min(ints), max(ints))
+    raise RuntimeError(f"Could not infer dtype of {x} with type {type(x)}")
+  @staticmethod
+  def finfo(dtype:DType) -> tuple[int, int]:
+    """(exponent, mantissa)"""
+    if not dtypes.is_float(dtype): raise ValueError(f"{dtype} is not a floating point type")
+    return {dtypes.float16: (5, 10), dtypes.bfloat16: (8, 7), dtypes.float32: (8, 23), dtypes.float64: (11, 52),
+            dtypes.fp8e4m3: (4, 3), dtypes.fp8e5m2: (5, 2), dtypes.fp8e4m3fnuz: (4, 3), dtypes.fp8e5m2fnuz: (5, 2)}[dtype]
+  void: Final[DType] = DType.new(-1, 0, "void", None)
+  weakint: Final[DType] = DType.new(0, 800, "weakint", None)  # the weak int position in the promo lattice
+  bool: Final[DType] = DType.new(0, 1, "bool", '?')
+  i8: Final[DType] = DType.new(1, 8, "i8", 'b')
+  u8: Final[DType] = DType.new(2, 8, "u8", 'B')
+  i16: Final[DType] = DType.new(3, 16, "i16", 'h')
+  u16: Final[DType] = DType.new(4, 16, "u16", 'H')
+  i32: Final[DType] = DType.new(5, 32, "i32", 'i')
+  u32: Final[DType] = DType.new(6, 32, "u32", 'I')
+  i64: Final[DType] = DType.new(7, 64, "i64", 'q')
+  u64: Final[DType] = DType.new(8, 64, "u64", 'Q')
+  weakfloat: Final[DType] = DType.new(9, 800, "weakfloat", None)
+  fp8e4m3: Final[DType] = DType.new(10, 8, "fp8e4m3", None)
+  fp8e5m2: Final[DType] = DType.new(11, 8, "fp8e5m2", None)
+  fp8e4m3fnuz: Final[DType] = DType.new(10, 8, "fp8e4m3fnuz", None)
+  fp8e5m2fnuz: Final[DType] = DType.new(11, 8, "fp8e5m2fnuz", None)
+  f16: Final[DType] = DType.new(12, 16, "f16", 'e')
+  bf16: Final[DType] = DType.new(13, 16, "bf16", None)
+  f32: Final[DType] = DType.new(14, 32, "f32", 'f')
+  f64: Final[DType] = DType.new(15, 64, "f64", 'd')
+
+  # legacy dtype aliases
+  float16 = half = f16; bfloat16 = bf16; float32 = float = f32; float64 = double = f64 # noqa: E702
+  uint8 = uchar = u8; uint16 = ushort = u16; uint32 = uint = u32; uint64 = ulong = u64 # noqa: E702
+  int8 = char = i8; int16 = short = i16; int32 = int = i32; int64 = long = i64 # noqa: E702
+
+  @property
+  def default_float(self) -> DType: return to_dtype(DEFAULT_FLOAT.value)
+  @property
+  def default_int(self) -> DType: return to_dtype(DEFAULT_INT.value)
+
+  fp8_ocp = (fp8e4m3, fp8e5m2)
+  fp8_fnuz = (fp8e4m3fnuz, fp8e5m2fnuz)
+  fp8s = fp8_ocp + fp8_fnuz
+  floats = fp8s + (float16, bfloat16, float32, float64)
+  int8s = (uint8, int8)
+  int16s = (uint16, int16)
+  int32s = (uint32, int32)
+  int64s = (uint64, int64)
+  uints = (uint8, uint16, uint32, uint64)
+  sints = (int8, int16, int32, int64)
+  ints = uints + sints
+  weaks = (weakint, weakfloat)
+  all = floats + ints + (bool,) # noqa: A003
+
+dtypes = DTypes()
+
+DTypeLike = str|DType
+def to_dtype(dtype:DTypeLike) -> DType: return dtype if isinstance(dtype, DType) else getattr(dtypes, dtype.lower())
+assert dtypes.is_float(dtypes.default_float), f"{DEFAULT_FLOAT.value} is not a float dtype"
+assert dtypes.is_int(dtypes.default_int), f"{DEFAULT_INT.value} is not an int dtype"
+def strong_dtype(dtype:DType) -> DType:
+  return {dtypes.weakint: dtypes.default_int, dtypes.weakfloat: dtypes.default_float}.get(dtype, dtype)
+def commit_int(lo:int|float, hi:int|float, default_int:DType|None=None) -> DType:
+  if lo == hi and not dtypes.long.min <= lo <= dtypes.ulong.max: raise OverflowError(f"{lo} does not fit any int")
+  ladder = (dtypes.default_int if default_int is None else default_int, dtypes.int, dtypes.long, dtypes.ulong)
+  return next((dt for dt in ladder if dt.min <= lo and hi <= dt.max), dtypes.long)
+def weak_dtype(dtype:DType) -> DType:
+  return dtypes.weakfloat if dtypes.is_float(dtype) else dtypes.weakint if dtypes.is_int(dtype) else dtype
+
+# https://jax.readthedocs.io/en/latest/jep/9407-type-promotion.html
+# we don't support complex type
+promo_lattice = { dtypes.bool: [dtypes.weakint], dtypes.weakint: [dtypes.int8, dtypes.uint8],
+  dtypes.int8: [dtypes.int16], dtypes.int16: [dtypes.int32], dtypes.int32: [dtypes.int64],
+  dtypes.int64: [dtypes.weakfloat], dtypes.uint8: [dtypes.int16, dtypes.uint16], dtypes.uint16: [dtypes.int32, dtypes.uint32],
+  dtypes.uint32: [dtypes.int64, dtypes.uint64], dtypes.uint64: [dtypes.weakfloat],
+  dtypes.weakfloat: [dtypes.fp8e4m3, dtypes.fp8e5m2, dtypes.fp8e4m3fnuz, dtypes.fp8e5m2fnuz],
+  dtypes.fp8e4m3: [dtypes.float16, dtypes.bfloat16], dtypes.fp8e5m2: [dtypes.float16, dtypes.bfloat16],
+  dtypes.fp8e4m3fnuz: [dtypes.float16, dtypes.bfloat16], dtypes.fp8e5m2fnuz: [dtypes.float16, dtypes.bfloat16],
+  dtypes.float16: [dtypes.float32], dtypes.bfloat16: [dtypes.float32], dtypes.float32: [dtypes.float64], }
+
+@functools.cache
+def _get_recursive_parents(dtype:DType) -> set[DType]:
+  return set.union(*[_get_recursive_parents(d) for d in promo_lattice[dtype]], {dtype}) if dtype != dtypes.float64 else {dtypes.float64}
+@functools.cache
+def least_upper_dtype(*ds:DType) -> DType:
+  return min(set.intersection(*[_get_recursive_parents(d) for d in ds]))
+def least_upper_float(dt:DType) -> DType:
+  return dtypes.weakfloat if dt is dtypes.weakint else dt if dtypes.is_float(dt) else least_upper_dtype(dt, dtypes.default_float)
+
+DTYPES_DICT = {k: v for k, v in DTypes.__dict__.items() if isinstance(v, DType) and not k.startswith(("void", "weak", "_"))}
+
+@functools.cache
+def can_lossless_cast(dt0:DType, dt1:DType) -> bool:
+  # return if dt1 preserves value of dt0
+  # similar to https://numpy.org/doc/stable/reference/generated/numpy.can_cast.html
+  if dt0 == dt1 or dt0 == dtypes.bool: return True
+  match dt1:
+    case dtypes.weakint: return dt0 in dtypes.ints
+    case dtypes.double: return dt0 in (dtypes.float, dtypes.half, dtypes.bfloat16, *dtypes.fp8s,
+      dtypes.uint32, dtypes.uint16, dtypes.uint8, dtypes.int32, dtypes.int16, dtypes.int8)
+    case dtypes.float: return dt0 in (dtypes.half, dtypes.bfloat16, *dtypes.fp8s, dtypes.uint16, dtypes.uint8, dtypes.int16, dtypes.int8)
+    case dtypes.half: return dt0 in (*dtypes.fp8s, dtypes.uint8, dtypes.int8)
+    case dtypes.uint64: return dt0 in (dtypes.uint32, dtypes.uint16, dtypes.uint8)
+    case dtypes.uint32: return dt0 in (dtypes.uint16, dtypes.uint8)
+    case dtypes.uint16: return dt0 in (dtypes.uint8,)
+    case dtypes.int64: return dt0 in (dtypes.uint32, dtypes.uint16, dtypes.uint8, dtypes.int32, dtypes.int16, dtypes.int8)
+    case dtypes.int32: return dt0 in (dtypes.uint16, dtypes.uint8, dtypes.int16, dtypes.int8)
+    case dtypes.int16: return dt0 in (dtypes.uint8, dtypes.int8)
+    case _: return False
+
+def sum_acc_dtype(dt:DType):
+  # default acc dtype for sum
+  if dtypes.is_unsigned(dt): return least_upper_dtype(dt, dtypes.uint)
+  if dtypes.is_int(dt) or dt == dtypes.bool: return least_upper_dtype(dt, dtypes.int)
+  return least_upper_dtype(dt, to_dtype(getenv("SUM_DTYPE", "float32")))
+
+def float_to_fp16(x):
+  try: return struct.unpack('e', struct.pack('e', float(x)))[0]
+  except OverflowError: return math.copysign(math.inf, x)
+
+def float_to_bf16(x):
+  if not math.isfinite(x): return x
+  u = struct.unpack('I', struct.pack('f', truncate[dtypes.float](x)))[0]
+  u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
+  return struct.unpack('f', struct.pack('I', u))[0]
+
+# fp8-float conversions based on https://gitlab.com/nvidia/headers/cuda-individual/cudart/-/blob/main/cuda_fp8.hpp
+# (bias, sig_bits, mant_mask, min_denorm_half, ovf_threshold, max_norm, min_norm)
+_fp8_cfg = {
+  dtypes.fp8e4m3: (7, 4, 0x7, 0x3F50000000000000, 0x407D000000000000, 0x7E, 0x3F90000000000000),
+  dtypes.fp8e5m2: (15, 3, 0x3, 0x3EE0000000000000, 0x40EE000000000000-1, 0x7B, 0x3F10000000000000),
+  dtypes.fp8e4m3fnuz: (8, 4, 0x7, 0x3F40000000000000, 0x406F000000000000-1, 0x7F, 0x3F80000000000000),
+  dtypes.fp8e5m2fnuz: (16, 3, 0x3, 0x3ED0000000000000, 0x40EE000000000000-1, 0x7F, 0x3F00000000000000),
+}
+
+def float_to_fp8(x: float, dtype: DType) -> int:
+  assert dtype in dtypes.fp8s, "Only for fp8s"
+  if dtype in dtypes.fp8_fnuz and not math.isfinite(x): return 0x80
+  # e4m3 don't support inf, return 0x7f(+NaN) and 0xff(-NaN) to match jax
+  # NaN is unordered, can't compare with zero, use math.copysign to get sign
+  if dtype == dtypes.fp8e4m3 and not math.isfinite(x): return 0x7f if math.copysign(1, x) > 0 else 0xff
+  if dtype == dtypes.fp8e5m2 and not math.isfinite(x): return (0 if math.copysign(1, x) > 0 else 0x80) | (0x7c if math.isinf(x) else 0x7f)
+  bias, sig_bits, mant_mask, min_denorm_half, ovf_threshold, max_norm, min_norm = _fp8_cfg[dtype]
+  xbits, = struct.unpack('Q', struct.pack('d', x))
+  half_ulp = 1 << (52 - sig_bits)
+  sign, exp, mantissa, absx = ((xbits>>63)&1)<<7, ((xbits>>52)&0x7FF)-1023+bias, (xbits>>(53-sig_bits))&mant_mask, xbits&0x7FFFFFFFFFFFFFFF
+  if absx <= min_denorm_half: res = 0
+  elif absx > ovf_threshold: res = max_norm
+  elif absx >= min_norm:
+    res, round_bits = (exp << (sig_bits - 1)) | mantissa, xbits & ((half_ulp << 1) - 1)
+    if round_bits > half_ulp or (round_bits == half_ulp and mantissa & 1): res += 1
+  else:
+    shift = 1 - exp
+    mantissa |= 1 << (sig_bits - 1)
+    res, half = mantissa >> shift, half_ulp << shift
+    round_bits = (xbits | (1 << 52)) & ((half << 1) - 1)
+    if round_bits > half or (round_bits == half and res & 1): res += 1
+  return 0 if dtype in dtypes.fp8_fnuz and res == 0 else res | sign  # fnuz has no negative zero
+
+def fp8_to_float(x: int, dtype: DType) -> float:
+  assert dtype in dtypes.fp8s, "Only for fp8s"
+  if dtype in dtypes.fp8_fnuz and x == 0x80: return math.nan
+  if (x & 0x7F) == 0: return -0.0 if x & 0x80 e
