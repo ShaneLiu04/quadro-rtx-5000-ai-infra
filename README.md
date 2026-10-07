@@ -128,6 +128,9 @@ GGUF 量化推理、nanoGPT 训练，到 bitsandbytes / tinygrad 框架拆解与
 
 > **实验产物全部入库**：`figs/`（56 张 300 DPI 图）、`data/`（语料与 token）、
 > `*.pt` / `*.gguf`（训练 checkpoint 与导出模型）均随仓库分发，克隆即得完整结果。
+> 其中 3 个 >17MB 的大文件（`e1_checkpoint.pt` / AR007 `corpus.txt` /
+> `tokens.npy`）以 `.partNNNN` 分片形式入库（受上传通道单次 ≤76KB 限制），
+> 运行 `python tools/reassemble_artifacts.py` 一键重组并 SHA256 校验。
 > 同时它们也是可再生产物（`plot_results.py` / `corpus_prep.py` / `charlm.py`
 > 一键复原），可与 `results/*.json` 原始数据互相印证。
 

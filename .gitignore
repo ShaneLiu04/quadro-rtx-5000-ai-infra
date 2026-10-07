@@ -6,3 +6,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# 大文件以 .partNNNN 分片入库（tools/reassemble_artifacts.py 一键还原）
+# 本地再生/重组出的原始大文件不入库（分片即数据本体）
+06-training/nanogpt-lab/results/e1_checkpoint.pt
+07-frameworks/frameworks-lab/data/corpus.txt
+07-frameworks/frameworks-lab/data/tokens.npy
