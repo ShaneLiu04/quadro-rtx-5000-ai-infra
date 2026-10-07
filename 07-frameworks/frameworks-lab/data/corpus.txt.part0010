@@ -1,0 +1,2773 @@
+iler = QCOMCompiler(target.arch)
+
+  # QCOM compiler is flaky with half
+  def supported_dtypes(self):
+    return {d for d in Renderer.supported_dtypes(self)
+            if (d != dtypes.float16 or (bool(IMAGE) and bool(FLOAT16))) and d not in dtypes.fp8s+(dtypes.bfloat16,dtypes.double)}
+
+  # QCOM's load vectorizer emits invalid IR for vectorized bool loads ("Range types must match load type"), type bool buffers as uchar
+  def _render_dtype(self, dtype:DType, sz:int=1, addrspace=AddrSpace.ALU, mutable=True, override_ptr=False, shape=None):
+    if dtype == dtypes.bool and addrspace == AddrSpace.GLOBAL: dtype = dtypes.uint8
+    return super()._render_dtype(dtype, sz, addrspace, mutable, override_ptr, shape)
+
+from __future__ import annotations
+import itertools
+from dataclasses import dataclass, field
+from tinygrad.renderer import Renderer
+from tinygrad.uop.ops import PatternMatcher, UOp, Ops
+from typing import Any
+
+@dataclass(frozen=True)
+class Register:
+  name: str
+  index: int
+  _cons: tuple[Register, ...] = field(default_factory=tuple)
+  # vreg size represents the area an instructions output occupies, not necessarily the entire register
+  size: int = 8
+  @property
+  def cons(self): return self._cons or (self,)
+  def __repr__(self): return self.name
+
+class IselContext:
+  def __init__(self, sink:UOp):
+    self.reg_n = itertools.count()
+    def arg_key(u:UOp): return (1, u.arg) if u.op is Ops.SPECIAL else (0, u.arg.slot)
+    self.func_args = sorted([u for u in sink.toposort() if u.op in {Ops.PARAM, Ops.SPECIAL}], key=arg_key)
+
+  def vreg(self, cons:tuple[Register, ...]|Register, size:int=0):
+    cons = cons if isinstance(cons, tuple) else (cons,)
+    return Register(f"v{next(self.reg_n)}", 0, cons, size or cons[0].size)
+
+def rdef(u:UOp):
+  if u.op in {Ops.NOOP, Ops.AFTER, Ops.BITCAST} and u.src: return rdef(u.src[0])
+  return u.tag[0] if isinstance(u.tag, tuple) else u.tag
+
+class LinearContext:
+  def __init__(self, ren:ISARenderer):
+    self.ren, self.stack_size = ren, 0
+    self.loop_label: dict[UOp, str] = {}
+  def assign_spill_slot(self, r:Register, u:UOp) -> Any: raise NotImplementedError("arch specific")
+
+class ISARenderer(Renderer):
+  pre_isel_matcher: PatternMatcher
+  isel_matcher: PatternMatcher
+  pre_regalloc_matcher: PatternMatcher
+  post_regalloc_matcher: PatternMatcher
+  linear_ctx_type: type = LinearContext
+
+  def is_two_address(self, x:UOp) -> bool: return False
+  def spill(self, spill_slot:Any, x:UOp) -> UOp: raise NotImplementedError("arch specific")
+  def fill(self, spill_slot:Any, x:UOp, reg:Register) -> UOp: raise NotImplementedError("arch specific")
+  def asm_str(self, uops:list[UOp], function_name:str) -> str: raise NotImplementedError("arch specific")
+
+from __future__ import annotations
+# flake8: noqa: E702
+# allow semicolons to put multiple ops on one line
+import sys, struct, functools
+from typing import cast
+from tinygrad.dtype import dtypes, DType, truncate, AddrSpace
+from tinygrad.uop import FastEnum, auto, Ops, GroupOp
+from tinygrad.uop.ops import UOp, UPat, PatternMatcher, promo_dtype
+from tinygrad.renderer.isa import ISARenderer, IselContext, Register, LinearContext, rdef
+from tinygrad.helpers import unwrap, Target
+
+# ***** X86 Ops *****
+
+class X86Ops(FastEnum):
+  # NOTE: X86Ops with i suffix are variants that take an immediate, m suffix are variants that can write to memory instead of read from
+  # these aren't real instructions, DEFINE is a register placeholder that defines a register without emitting an instruction
+  FRAME_INDEX = auto(); LABEL = auto(); DEFINE = auto(); LOOP_CMP = auto()
+  # index
+  LEA = auto()
+  # register / memory / immediate moves
+  MOV = auto(); MOVm = auto(); MOVi = auto(); MOVABS = auto()
+  VMOVSS = auto(); VMOVSD = auto(); VMOVUPS = auto()
+  VMOVSSm = auto(); VMOVSDm = auto(); VMOVUPSm = auto()
+  # casts
+  MOVZX = auto(); MOVSX = auto(); MOVSXD = auto()
+  VCVTPH2PS = auto(); VCVTPS2PH = auto()
+  VCVTSS2SD = auto(); VCVTSD2SS = auto(); VCVTSI2SS = auto(); VCVTSI2SD = auto()
+  VCVTTSS2SI = auto(); VCVTTSD2SI = auto()
+  # bitcasts
+  VMOVD = auto(); VMOVQ = auto(); VMOVDm = auto(); VMOVQm = auto()
+  # comparisons
+  VCMPSS = auto(); VCMPSD = auto()
+  SETNE = auto(); SETE = auto(); SETL = auto(); SETB = auto()
+  # where
+  CMOVNE = auto(); CMOVE = auto(); CMOVL = auto(); CMOVB = auto()
+  VBLENDVPS = auto(); VBLENDVPD = auto()
+  # jumps
+  JNE = auto(); JE = auto(); JL = auto(); JB = auto(); JGE = auto(); JMP = auto()
+  # vectorize / gep
+  VINSERTPS = auto(); VPSRLDQ = auto()
+  VPEXTRW = auto(); VPEXTRD = auto()
+  VPINSRW = auto(); VPINSRD = auto()
+  # int binary
+  IDIV = auto(); DIV = auto()
+  ADD = auto(); ADDi = auto(); SUB = auto(); SUBi = auto(); IMUL = auto(); IMULi = auto()
+  AND = auto(); ANDi = auto(); XOR = auto(); XORi = auto(); OR = auto(); ORi = auto()
+  SHL = auto(); SHLi = auto(); SHR = auto(); SHRi = auto(); SAR = auto(); SARi = auto(); CMP = auto(); CMPi = auto()
+  # float unary (sometimes not unary)
+  VROUNDSS = auto(); VROUNDSD = auto(); VSQRTSS = auto(); VSQRTSD = auto()
+  # float binary
+  VADDSS = auto(); VADDSD = auto(); VSUBSS = auto(); VSUBSD = auto(); VMULSS = auto(); VMULSD = auto(); VDIVSS = auto(); VDIVSD = auto()
+  # return
+  RET = auto()
+
+class X86GroupOp:
+  Copy = {X86Ops.MOV, X86Ops.CMOVB, X86Ops.CMOVE, X86Ops.CMOVNE, X86Ops.CMOVL}
+  # X86Ops whose first src is also the destination
+  TwoAddress = {X86Ops.ADD, X86Ops.ADDi, X86Ops.AND, X86Ops.ANDi, X86Ops.XOR, X86Ops.XORi, X86Ops.OR, X86Ops.ORi, X86Ops.IMUL,
+                X86Ops.SUB, X86Ops.SUBi, X86Ops.SHL, X86Ops.SHLi, X86Ops.SHR, X86Ops.SHRi, X86Ops.SAR, X86Ops.SARi,
+                X86Ops.IDIV, X86Ops.DIV, X86Ops.CMOVNE, X86Ops.CMOVE, X86Ops.CMOVL, X86Ops.CMOVB}
+
+  # X86Ops whose second src is the rm field, so that src is what can be a memory operand
+  Rm2nd = {X86Ops.ADD, X86Ops.SUB, X86Ops.AND, X86Ops.OR, X86Ops.XOR, X86Ops.IMUL, X86Ops.CMP,
+           X86Ops.VADDSS, X86Ops.VADDSD, X86Ops.VSUBSS, X86Ops.VSUBSD, X86Ops.VMULSS, X86Ops.VMULSD, X86Ops.VDIVSS, X86Ops.VDIVSD,
+           X86Ops.VBLENDVPS, X86Ops.VBLENDVPD, X86Ops.VCMPSS, X86Ops.VCMPSD, X86Ops.VROUNDSS, X86Ops.VROUNDSD, X86Ops.VSQRTSS, X86Ops.VSQRTSD,
+           X86Ops.VINSERTPS, X86Ops.VPINSRW, X86Ops.VPINSRD, X86Ops.CMOVNE, X86Ops.CMOVE, X86Ops.CMOVL, X86Ops.CMOVB,
+           X86Ops.VCVTSI2SS, X86Ops.VCVTSI2SD, X86Ops.VCVTSS2SD, X86Ops.VCVTSD2SS, X86Ops.IDIV, X86Ops.DIV}
+
+  # X86Ops that can write to memory
+  WriteMem = {X86Ops.MOVm, X86Ops.MOVi, X86Ops.VMOVSSm, X86Ops.VMOVSDm, X86Ops.VMOVUPSm, X86Ops.VMOVDm, X86Ops.VMOVQm,
+              X86Ops.ADDi, X86Ops.SUBi, X86Ops.ANDi, X86Ops.ORi, X86Ops.XORi, X86Ops.SHL, X86Ops.SHLi, X86Ops.SHR, X86Ops.SHRi, X86Ops.SAR,
+              X86Ops.SARi, X86Ops.SETNE, X86Ops.SETE, X86Ops.SETL, X86Ops.SETB,
+              X86Ops.VCVTPS2PH, X86Ops.VPEXTRW, X86Ops.VPEXTRD}
+
+  # X86Ops that read flags
+  ReadFlags = {X86Ops.CMOVB, X86Ops.CMOVL, X86Ops.CMOVE, X86Ops.CMOVNE, X86Ops.SETB, X86Ops.SETL, X86Ops.SETE, X86Ops.SETNE, X86Ops.JB, X86Ops.JL,
+               X86Ops.JE, X86Ops.JNE, X86Ops.JGE}
+
+  # X86Ops that write flags or can modify flags to undefined values
+  WriteFlags = {X86Ops.CMP, X86Ops.CMPi, X86Ops.ADD, X86Ops.ADDi, X86Ops.SUB, X86Ops.SUBi, X86Ops.IMUL, X86Ops.IMULi, X86Ops.IDIV, X86Ops.DIV,
+                X86Ops.SHL, X86Ops.SHLi, X86Ops.SHR, X86Ops.SHRi, X86Ops.SAR, X86Ops.SARi, X86Ops.AND, X86Ops.ANDi, X86Ops.XOR, X86Ops.XORi,
+                X86Ops.OR, X86Ops.ORi}
+
+  # X86Ops whose first src is the rm field. a TwoAddress op drops its first src post regalloc, so its Rm2nd src ends up first
+  Rm1st = {X86Ops.MOV, X86Ops.VMOVSS, X86Ops.VMOVSD, X86Ops.VMOVUPS, X86Ops.MOVZX, X86Ops.MOVSX, X86Ops.MOVSXD, X86Ops.VMOVD, X86Ops.VMOVQ,
+           X86Ops.VCVTTSS2SI, X86Ops.VCVTTSD2SI, X86Ops.VCVTPH2PS, X86Ops.CMPi, X86Ops.IMULi, X86Ops.LEA, X86Ops.VPSRLDQ} | (Rm2nd & TwoAddress)
+
+# ***** X86 legalization *****
+
+extra_matcher = PatternMatcher([
+  # bool CMPNE is XOR, bool CMPEQ is XOR+XOR, bool CMPLT is XOR+AND
+  (UPat.var('x', dtypes.bool).ne(UPat.var('y')), lambda x,y: x^y),
+  (UPat.var('x', dtypes.bool).alu(Ops.CMPEQ, UPat.var('y')), lambda x,y: (x^y)^True),
+  (UPat.var('x', dtypes.bool)<UPat.var('y'), lambda x,y: (x^True)&y),
+  # can't cast from float16 to ints/float64 directly and vice versa
+  (UPat.var("y", dtypes.float16).cast((dtypes.float64,)+dtypes.ints, name="x"), lambda y,x: y.cast(dtypes.float32).cast(x.dtype)),
+  (UPat.var("y", (dtypes.float64,)+dtypes.ints).cast(dtypes.float16, name="x"), lambda y,x: y.cast(dtypes.float32).cast(x.dtype)),
+  # can't cast from float to int8/16 directly and vice versa
+  (UPat.var("y", dtypes.floats).cast(dtypes.int8s+dtypes.int16s, name="x"), lambda y,x: y.cast(dtypes.int32).cast(x.dtype)),
+  (UPat.var("y", (dtypes.bool,)+dtypes.int8s+dtypes.int16s).cast(dtypes.floats, name="x"), lambda y,x: y.cast(dtypes.int32).cast(x.dtype)),
+  # int/float casts only for signed int
+  (UPat.var("y", dtypes.uint32).cast(dtypes.floats, name="x"), lambda y,x: y.cast(dtypes.int64).cast(x.dtype)),
+  # casting uint64 to float requires special handling
+  (UPat.var("y", dtypes.uint64).cast(dtypes.floats, name="x"), lambda y,x:
+   (y >> 1).cast(dtypes.int64).cast(x.dtype) * 2 + (y & 1).cast(dtypes.int64).cast(x.dtype)),
+  # no int8 mul or cmove, cast to int16
+  (UPat.var("a", dtypes.int8s) * UPat.var("b"), lambda a,b: (a.cast(dtypes.int16) * b.cast(dtypes.int16)).cast(a.dtype)),
+  (UPat.var("m").where(UPat.var("a", (dtypes.bool,)+dtypes.int8s), UPat.var("b")),
+   lambda m,a,b: m.where(a.cast(dtypes.int16), b.cast(dtypes.int16)).cast(a.dtype)),
+  # float16 alus are done in float32
+  (UPat(GroupOp.ALU, dtypes.float16, name="x"), lambda x: UOp(x.op,
+   src=tuple(s.cast(dtypes.float) if s.dtype != dtypes.bool else s for s in x.src)).cast(x.dtype)),
+  (UPat(GroupOp.Comparison, src=[UPat(dtype=dtypes.float16), UPat()], name="x"),
+   lambda x: UOp(x.op, src=tuple(s.cast(dtypes.float32) for s in x.src)).cast(x.dtype)),
+  # a float WHERE blends at the width of its value, so it needs a comparison at that width to make the mask
+  (UPat.var("m", dtypes.bool).where(UPat.var("a", dtypes.floats+(dtypes.weakfloat,)), UPat.var("b")).named("w"),
+   lambda m,a,b,w: m.cast(w.dtype).ne(0).where(a, b) if w.dtype in dtypes.floats and promo_dtype(m.src) is not w.dtype else None),
+  # rewrite -x -> 0 - x
+  (UPat(Ops.NEG, name="x"), lambda x: UOp(Ops.SUB, src=(x.const_like(0),) + x.src)),
+  # TODO: add support for mod, requires support for accessing the 2nd+ reg of a multi output instruction
+  (UPat(Ops.CMOD, src=(UPat.var("x"), UPat.var("y"))), lambda x,y: x - y * x.alu(Ops.CDIV, y)),
+])
+
+# ***** X86 pre instruction selection *****
+
+def scratch_buffer(elem_dt:DType, count:int, slot:int) -> UOp:
+  return UOp.placeholder((count,), elem_dt, slot, AddrSpace.LOCAL)
+
+def gated_load(ctx, addr:UOp, alt:UOp, gate:UOp, x:UOp):
+  local = scratch_buffer(addr.src[0].dtype, x.max_numel(), next(ctx))
+  local_idx = local.index(UOp.cconst(0, dtypes.int32))
+  # the AFTER orders the load after the scratch store
+  sel = gate.where(addr, local_idx)
+  return UOp(Ops.AFTER, src=(sel, (local_idx if x.max_numel() == 1 else local).store(alt))).load()
+
+def gated_store(addr:UOp, gate:UOp, val:UOp):
+  local = scratch_buffer(addr.src[0].dtype, val.max_numel(), -1)
+  sel = gate.where(addr, local.index(UOp.cconst(0, dtypes.int32)))
+  return UOp(Ops.AFTER, src=(sel,)).store(val)
+
+# a gate the flags can be picked with, or the bool compared to zero that replaces one they can't: only an integer
+# comparison sets the flags, see cmp. NOTE: the 0 is int so the bool zero-extends and compares as int (a byte compare renders
+# different kernels)
+def flag_gate(m:UOp) -> UOp|None:
+  return None if m.op in GroupOp.Comparison and m.src[0].dtype not in dtypes.floats else m.ne(UOp.cconst(0, dtypes.int))
+
+# legalize the new style graph for isel. NOTE: this runs after the spec is verified, some of these rewrites violate it
+pre_isel_matcher = PatternMatcher([
+  # widening a uint32 is free, the 32bit write that produced it already zeroed the upper half
+  (UPat(dtype=dtypes.uint32).cast(dtypes.int64s, name="x"), lambda x: x.replace(op=Ops.BITCAST)),
+  (UPat.var("y", dtypes.ints+(dtypes.bool,)).cast(dtypes.ints, name="x"),
+   lambda y,x: x.replace(op=Ops.BITCAST) if x.dtype.itemsize == y.dtype.itemsize else None),
+  # gated load/store become a conditional move on the address, the load/store are unconditional
+  (UPat((Ops.INDEX, Ops.SHRINK), name="addr").load(UPat.var("alt"), UPat.var("gate"), name="x"), gated_load),
+  (UPat((Ops.INDEX, Ops.SHRINK), name="addr").store(UPat.var("val"), UPat.var("gate")), gated_store),
+  # a conditional backedge picks with the flags, and so does the cmove, which is legalized in isel
+  (UPat(Ops.BACKEDGE, src=(UPat(), UPat(), UPat.var("m", dtypes.bool)), name="x"),
+   lambda m,x: x.replace(src=x.src[:2]+(g,)) if (g:=flag_gate(m)) is not None else None),
+])
+
+# ***** X86 registers *****
+def def_reg(reg:Register) -> UOp: return UOp(Ops.INS, arg=(X86Ops.DEFINE, dtypes.void), tag=(reg,))
+# undefined operand, used for VEX instructions
+def undef(): return UOp(Ops.NOOP)
+
+RAX = Register("rax", 0)
+RCX = Register("rcx", 1)
+RDX = Register("rdx", 2)
+RBX = Register("rbx", 3)
+RSP = Register("rsp", 4)
+RBP = Register("rbp", 5)
+RSI = Register("rsi", 6)
+RDI = Register("rdi", 7)
+GPR = (RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI) + tuple(Register(f"r{i}", i) for i in range(8, 16))
+XMM = tuple(Register(f"xmm{i}", i, size=16) for i in range(16))
+# gprs you can write to
+WGPR = tuple(r for r in GPR if r != RSP)
+
+CALLEE_SAVED = (RBX, RBP, GPR[12], GPR[13], GPR[14], GPR[15]) + ((RSI, RDI) + XMM[6:16] if sys.platform == "win32" else ())
+
+reg_strs = {"rax": {4:"eax", 2:"ax", 1:"al"}, "rcx": {4:"ecx", 2:"cx", 1:"cl"}, "rdx": {4:"edx", 2:"dx", 1:"dl"}, "rbx": {4:"ebx", 2:"bx", 1:"bl"},
+        "rsp": {4:"esp", 2:"sp", 1:"spl"}, "rbp": {4:"ebp", 2:"bp", 1:"bpl"}, "rsi": {4:"esi", 2:"si", 1:"sil"}, "rdi": {4:"edi", 2:"di", 1:"dil"},
+        **{f"r{i}": {4:f"r{i}d", 2:f"r{i}w", 1:f"r{i}b"} for i in range(8, 16)}}
+
+stack_pointer = def_reg(RSP)
+
+# ***** X86 instruction selection *****
+def base(x:UOp, i:int) -> UOp: return s.src[0] if (s:=x.src[i]).op is Ops.INDEX else s
+def lane(x:UOp, i:int) -> int: return s.src[1].src[0].val if (s:=x.src[i]).op is Ops.INDEX else 0
+def to_int(dt:DType): return {dtypes.float16: dtypes.int16, dtypes.float32: dtypes.int32, dtypes.float64: dtypes.int64}[dt]
+def imm(dt:DType, v:int) -> UOp: return UOp.cconst(truncate[dt](v), dt).rtag()
+def to_imm(c:UOp) -> UOp|None:
+  if not (c.op is Ops.CAST and (v:=c.src[0]).op is Ops.CONST): return None
+  if c.dtype in dtypes.int64s: return imm(dtypes.int32, v.val) if not v.overflows(dtypes.int32) else None
+  if c.dtype in dtypes.ints+(dtypes.bool,): return imm(c.dtype, v.val)
+  return None
+# the flag path, which only an integer comparison can take: an x86 float compare sets carry, zero and parity together when an
+# operand is NaN, so a NaN reads as "below" and as "equal", and it clears sign and overflow, so nothing reads as "less"
+def cmp(x:UOp) -> UOp:
+  if x.src[0].dtype in dtypes.floats: raise RuntimeError(f"no flag compare for {x.src[0].dtype}, a float gate must be a mask")
+  return x.ins(X86Ops.CMP, dtype=dtypes.void) if (i:=to_imm(x.src[1])) is None else x.ins(X86Ops.CMPi, dtype=dtypes.void, src=(x.src[0], i))
+# comparisons that produce masks, the mask has the width of the operands
+def mask(x:UOp) -> UOp:
+  dt, v = x.src[0].dtype, imm(dtypes.uint8, {Ops.CMPLT: 1, Ops.CMPNE: 4, Ops.CMPEQ: 0}[x.op])
+  return x.ins(X86Ops.VCMPSS if dt is dtypes.float32 else X86Ops.VCMPSD, dtype=dt, src=x.src + (v,))
+
+# vinsertps xmm2, xmm0, xmm1, imm
+# inserts any 32 bit element in xmm1 into any position in xmm0 according to immm, result is written to xmm2
+# this is the fallback slow case for when you can't match more a powerful shuffle
+def vinsertps(x:UOp) -> UOp:
+  def _insert(ret:UOp, i:int) -> UOp:
+    s, v = base(x, i), lane(x, i)
+    return x.ins(X86Ops.VINSERTPS, src=(ret, s, imm(dtypes.uint8, v << 6 | i << 4)))
+  return functools.reduce(_insert, range(len(x.src)), undef())
+
+# vpinsrd xmm2, xmm0, eax, imm
+# inserts the element in eax into any position in xmm0, result is written to xmm2 according to imm
+def vpins(x:UOp, srcs:tuple[UOp, ...]) -> UOp:
+  op = {2: X86Ops.VPINSRW, 4: X86Ops.VPINSRD}[x.dtype.itemsize]
+  return functools.reduce(lambda ret,i: x.ins(op, src=(ret, srcs[i], imm(dtypes.uint8, i))), range(len(srcs)), undef())
+
+# we don't call ctx.vreg on the srcs to avoid duplicates, a rewrite will assign the tuple of valid registers to a vreg
+def idiv(ctx:IselContext, x:UOp) -> UOp:
+  op = X86Ops.DIV if x.dtype in dtypes.uints else X86Ops.IDIV
+  # for >8bit need to zero/sign extend rax to rdx
+  if x.dtype in dtypes.int8s: ext = []
+  elif x.dtype in dtypes.uints: ext = [x.ins(X86Ops.MOVi, src=(imm(min(dtypes.uint32, x.dtype), 0),), tag=(RDX,))]
+  else: ext = [x.ins(X86Ops.SARi, src=(x.src[0], imm(dtypes.uint8, x.dtype.itemsize * 8 - 1)), tag=(RDX,))]
+  # for 8bit need to zero/sign extend al to ah
+  if x.dtype is dtypes.uint8: dividend = UOp(Ops.INS, arg=(X86Ops.MOVZX, dtypes.int16), src=(x.src[0],), tag=(RAX,))
+  elif x.dtype is dtypes.int8: dividend = UOp(Ops.INS, arg=(X86Ops.MOVSX, dtypes.int16), src=(x.src[0],), tag=(RAX,))
+  else: dividend = x.ins(X86Ops.MOV, src=(x.src[0],), tag=(RAX,))
+  # divisor can't be in rax or rdx
+  divisor = x.ins(X86Ops.MOV, src=(x.src[1],), tag=tuple(r for r in WGPR if r not in (RAX, RDX)))
+  # for >8bit both rax and rdx are written to
+  defs = (ctx.vreg(RAX, x.dtype.itemsize),) if x.dtype in dtypes.int8s else (ctx.vreg(RAX, x.dtype.itemsize), ctx.vreg(RDX, x.dtype.itemsize))
+  idiv = x.ins(op, src=(dividend, divisor) + tuple(ext), tag=defs)
+  # this move "cleanses" the register constraints (rax/rdx) of idiv as that only applies on definition and not on the uses of idiv
+  return x.ins(X86Ops.MOV, src=(idiv,))
+
+# a variable shift count implicitly reads cl so it goes in rcx, the shifted value can't be in rcx
+def shift(x:UOp, op:X86Ops) -> UOp:
+  val = x.ins(X86Ops.MOV, src=(x.src[0],), tag=tuple(r for r in WGPR if r is not RCX))
+  return x.ins(op, src=(val, x.ins(X86Ops.MOV, src=(x.src[1],), tag=(RCX,))))
+
+# a memory address operand is (base, index, displacement). the element size of the base pointer scales the index and is the memory operand width
+def fold_address(x:UOp) -> tuple[UOp, UOp, UOp]:
+  def _disp(v:int) -> UOp: return imm(dtypes.int32 if abs(v) > dtypes.int8.max else dtypes.int8, v)
+  def _cast(v:UOp) -> UOp: return v.cast(dtypes.int64) if v.vmin < 0 else v.cast(dtypes.uint32) if v.dtype.itemsize < 4 else v
+  if x.op not in {Ops.INDEX, Ops.SHRINK}: return (x, UOp(Ops.NOOP), _disp(0))
+  base, idx = x.src[0], x.src[1]
+  # buffers are indexed by element, everything else (the stack pointer) by byte
+  scale = base.dtype.itemsize if base.op in {Ops.PARAM, Ops.BUFFER, Ops.ALLOC, Ops.AFTER} else 1
+  if idx.op is Ops.ADD and (c:=idx.src[1]).op is Ops.CAST and c.src[0].op is Ops.CONST:
+    return (base, _cast(idx.src[0]), _disp(c.src[0].val * scale))
+  if idx.op is Ops.CAST and idx.src[0].op is Ops.CONST: return (base, UOp(Ops.NOOP), _disp(idx.src[0].val * scale))
+  return (base, _cast(idx), _disp(0))
+
+# the value of a BUFFER is its address, it moves through registers and the stack as a 64bit int
+def lea(x:UOp) -> UOp: return x.ins(X86Ops.LEA, src=fold_address(x))
+def is_address(x:UOp):
+  if x.op in {Ops.BUFFER, Ops.ALLOC} or (x.op is Ops.PARAM and x.addrspace is AddrSpace.GLOBAL) \
+    or (x.op is Ops.INS and x.arg[0] in {X86Ops.LEA, X86Ops.DEFINE}): return True
+  if x.op is Ops.INS and x.arg[0] is X86Ops.MOV: return (len(x.src) == 1 or x.src[0] is stack_pointer) and is_address(x.src[0])
+  return x.op is Ops.INS and x.arg[0] in X86GroupOp.Copy and is_address(x.src[0])
+
+def abi(ctx:IselContext, x:UOp) -> UOp|None:
+  if isinstance(x.tag, tuple): return None
+  i = ctx.func_args.index(x)
+  # the shape srcs of a PARAM are not values, tag them so they aren't materialized into registers
+  def _reg_arg(r:Register) -> tuple[UOp, ...]: return (x.replace(src=tuple(s.rtag() for s in x.src), tag=(r,)),)
+  def _stack_arg(disp:int):
+    return (stack_pointer, UOp(Ops.NOOP), UOp(Ops.INS, arg=(X86Ops.FRAME_INDEX, dtypes.int32), src=(imm(dtypes.int32, disp),)))
+  if sys.platform == "win32": src = _reg_arg((RCX, RDX, GPR[8], GPR[9])[i]) if i < 4 else _stack_arg((i-3)*8+32)
+  else: src = _reg_arg((RDI, RSI, RDX, RCX, GPR[8], GPR[9])[i]) if i < 6 else _stack_arg((i-5)*8)
+  # this move "cleanses" the abi register constraint
+  return x.ins(X86Ops.MOV, src=src)
+
+GPR_DEST_OPS = {X86Ops.VPEXTRW, X86Ops.VPEXTRD, X86Ops.VCVTTSS2SI, X86Ops.VCVTTSD2SI, X86Ops.VMOVDm, X86Ops.VMOVQm}
+XMM_OPS = {op for op in X86Ops if op.name.startswith('V')} - GPR_DEST_OPS
+
+def _is_vec_xmm(y: UOp) -> bool:
+  return (y.op is Ops.INS and y.arg[0] in XMM_OPS) or (y.op not in (Ops.BUFFER, Ops.ALLOC, Ops.PARAM, Ops.AFTER, Ops.INS) and y.max_numel() > 1)
+
+def _xmm_sz(x: UOp) -> X86Ops:
+  bits = x.max_numel() * x.dtype.itemsize
+  if bits >= 16: return X86Ops.VMOVUPS
+  if bits >= 8: return X86Ops.VMOVSD
+  return X86Ops.VMOVSS
+
+def _xmm_sz_m(x: UOp) -> X86Ops:
+  bits = x.max_numel() * x.dtype.itemsize
+  if bits >= 16: return X86Ops.VMOVUPSm
+  if bits >= 8: return X86Ops.VMOVSDm
+  return X86Ops.VMOVSSm
+
+def alloc_vregs(ctx:IselContext, x:UOp) -> UOp|None:
+  # register placeholders with real registers
+  if x.op is Ops.INS and x.arg[0] in {X86Ops.DEFINE, X86Ops.LOOP_CMP, X86Ops.FRAME_INDEX}: return None
+  # no register definition
+  if x.dtype is dtypes.void: return None
+  # already allocated vregs
+  if isinstance(x.tag, tuple) and x.tag[0]._cons: return None
+  defs = []
+  if isinstance(x.tag, tuple): defs = [ctx.vreg(x.tag, x.dtype.itemsize)]
+  elif is_address(x): defs = [ctx.vreg(WGPR, 8)]
+  elif x.op is Ops.INS and x.arg[0] in XMM_OPS: defs = [ctx.vreg(XMM)]
+  else: defs = [ctx.vreg(WGPR, x.dtype.itemsize)]
+  # TODO: add this once the scheduler can track register pressure
+  # if x.arg[0] in X86GroupOp.WriteFlags: defs.append(ctx.vreg(RFLAGS))
+  # the size src of a BUFFER is not a value, tag it so it isn't materialized into a register
+  if x.op in {Ops.BUFFER, Ops.ALLOC}: return x.replace(src=tuple(s.rtag() for s in x.src), tag=tuple(defs))
+  return x.replace(tag=tuple(defs))
+
+isel_matcher = PatternMatcher([
+  # **** Op -> Op ****
+  # range is lowered to acc, cmp, jmp after regalloc
+  (UPat(Ops.RANGE, src=(UPat.cvar("c").cast(),), allow_any_len=True, name="x"), lambda c,x: x.replace(src=(imm(x.dtype, c.val),) + x.src[1:])),
+  # BACKEDGE becomes a conditional jump referencing the RANGE start label
+  (UPat(Ops.BACKEDGE, src=(UPat(), UPat(), UPat(GroupOp.Comparison, name="cond")), name="x"),
+    lambda x,cond: cond.ins(X86Ops.LOOP_CMP, tag=cond.op, src=cond.src + x.src[:2])),
+  # **** Op -> X86Op ****
+  # add callee saved registers to the RET, these will be scheduled at the top of the kernel and will be saved/restored if they are used in regalloc
+  # so regalloc builds the prologue/epilogue naturally
+  (UPat(Ops.SINK, name="x"), lambda x:
+   x.replace(src=(x.ins(X86Ops.RET, src=x.src + (stack_pointer,) + tuple(def_reg(r) for r in CALLEE_SAVED)),))
+    if not x.src or x.src[0].op is not Ops.INS or x.src[0].arg[0] is not X86Ops.RET else None),
+  # function abi constraints
+  (UPat((Ops.PARAM, Ops.SPECIAL), name="x"), abi),
+  # conditional moves between addresses, lea both srcs
+  (UPat.var("m").where(UPat((Ops.INDEX, Ops.SHRINK), name="a"), UPat((Ops.INDEX, Ops.SHRINK), name="b")), lambda m,a,b:
+   m.where(lea(a), lea(b)) if not _is_vec_xmm(a.src[0]) else None),
+  # constants that can't be immediates, move them to registers
+  (UPat.cvar("c").cast(dtypes.int64s, name="x"), lambda c,x: x.ins(X86Ops.MOVABS, src=(imm(x.dtype, c.val),)) if not x.tag else None),
+  (UPat.cvar("c").cast(dtypes.ints+(dtypes.bool,), name="x"), lambda c,x: x.ins(X86Ops.MOVi, src=(imm(x.dtype, c.val),)) if not x.tag else None),
+  (UPat.cvar("c").cast(dtypes.floats, name="x"), lambda c,x:
+   UOp.cconst(struct.unpack((dt:=to_int(x.dtype)).fmt, struct.pack(x.dtype.fmt, c.val))[0], dt).bitcast(x.dtype) if not x.tag else None),
+  # conditional moves that use masks, the mask has the width of the values
+  (UPat(GroupOp.Comparison, src=(UPat(dtype=dtypes.float32), UPat()), name="m").where(UPat.var("a", dtypes.float32), UPat.var("b")), lambda m,a,b:
+   a.ins(X86Ops.VBLENDVPS, src=(b, a, mask(m))) if not is_address(a) else None),
+  (UPat(GroupOp.Comparison, src=(UPat(dtype=dtypes.float64), UPat()), name="m").where(UPat.var("a", dtypes.float64), UPat.var("b")), lambda m,a,b:
+   a.ins(X86Ops.VBLENDVPD, src=(b, a, mask(m))) if not is_address(a) else None),
+  # in this case we have a mask producing comparison whose user expects a bool, so we convert to bool
+  (UPat(GroupOp.Comparison, src=(UPat.var("y", (dtypes.float32, dtypes.float64)), UPat()), name="x"), lambda y,x:
+   UOp(Ops.AND, src=(mask(x).bitcast(dt:=to_int(y.dtype)), UOp.cconst(1, dt))).bitcast(dtypes.bool)),
+  # conditional moves that use flags
+  # TODO: remove this once we allow all flag producing ops in cmove
+  # the blends took every float gate a mask can serve, so a gate that is still not an integer comparison becomes one here
+  (UPat.var("m", dtypes.bool).where(UPat.var("a"), UPat.var("b")), lambda m,a,b: g.where(a, b) if (g:=flag_gate(m)) is not None else None),
+  (UPat(Ops.CMPLT, src=(UPat(dtype=dtypes.sints), UPat()), name="m").where(UPat.var("a"), UPat.var("b")), lambda m,a,b:
+   a.ins(X86Ops.CMOVL, src=(b, a, cmp(m)))),
+  (UPat(Ops.CMPLT, name="m").where(UPat.var("a"), UPat.var("b")), lambda m,a,b: a.ins(X86Ops.CMOVB, src=(b, a, cmp(m)))),
+  (UPat(Ops.CMPEQ, name="m").where(UPat.var("a"), UPat.var("b")), lambda m,a,b: a.ins(X86Ops.CMOVE, src=(b, a, cmp(m)))),
+  (UPat(Ops.CMPNE, name="m").where(UPat.var("a"), UPat.var("b")), lambda m,a,b: a.ins(X86Ops.CMOVNE, src=(b, a, cmp(m)))),
+  # jumps, use flags
+  (UPat(Ops.IF, src=(UPat(Ops.CMPLT, src=(UPat(dtype=dtypes.uints), UPat()), name="y"),), name="x"), lambda y,x: x.ins(X86Ops.JB, src=(cmp(y),))),
+  (UPat(Ops.IF, src=(UPat(Ops.CMPLT, name="y"),), name="x"), lambda y,x: x.ins(X86Ops.JL, src=(cmp(y),))),
+  (UPat(Ops.IF, src=(UPat(Ops.CMPEQ, name="y"),), name="x"), lambda y,x: x.ins(X86Ops.JE, src=(cmp(y),))),
+  (UPat(Ops.IF, src=(UPat(Ops.CMPNE, name="y"),), name="x"), lambda y,x: x.ins(X86Ops.JNE, src=(cmp(y),))),
+  # comparisons whose user doesn't use the flag, move flag result to register
+  (UPat(Ops.CMPLT, src=(UPat(dtype=dtypes.uints), UPat()), name="x"), lambda x: x.ins(X86Ops.SETB, src=(cmp(x),))),
+  (UPat(Ops.CMPLT, name="x"), lambda x: x.ins(X86Ops.SETL, src=(cmp(x),))),
+  (UPat(Ops.CMPEQ, name="x"), lambda x: x.ins(X86Ops.SETE, src=(cmp(x),))),
+  (UPat(Ops.CMPNE, name="x"), lambda x: x.ins(X86Ops.SETNE, src=(cmp(x),))),
+  # float unary
+  (UPat.var("y", dtypes.float32).sqrt().named("x"), lambda y,x: x.ins(X86Ops.VSQRTSS, src=(y, y))),
+  (UPat.var("y", dtypes.float64).sqrt().named("x"), lambda y,x: x.ins(X86Ops.VSQRTSD, src=(y, y))),
+  (UPat.var("y", dtypes.float32).trunc().named("x"), lambda y,x: x.ins(X86Ops.VROUNDSS, src=(y, y, imm(dtypes.uint8, 3)))),
+  (UPat.var("y", dtypes.float64).trunc().named("x"), lambda y,x: x.ins(X86Ops.VROUNDSD, src=(y, y, imm(dtypes.uint8, 3)))),
+  # for float16 we route the srcs through gprs, this is suboptimal for values in xmms, in that case we want vpunpcklwd
+  (UPat(Ops.STACK, dtypes.float16, name="x"), lambda x: vpins(x, tuple(s.bitcast(dtypes.int16) for s in x.src))),
+  (UPat(Ops.STACK, dtypes.float32, name="x"), vinsertps),
+  (UPat(Ops.STACK, dtypes.int32s, name="x"), lambda x: vpins(x, x.src)),
+  # INDEX on a vector register value extracts a single element
+  (UPat.var("y", dtypes.int32s).index(UPat.cvar("c").cast(), name="x"),
+   lambda y,c,x: x.ins(X86Ops.VPEXTRD, src=(y, imm(dtypes.uint8, c.val))) if _is_vec_xmm(y) else None),
+  (UPat.var("y", dtypes.floats).index(UPat.cvar("c").cast(), name="x"),
+   lambda y,c,x: x.ins(X86Ops.VPSRLDQ, src=(y, imm(dtypes.uint8, c.val * x.dtype.itemsize))) if _is_vec_xmm(y) else None),
+  # int binary
+  ((UPat(dtype=dtypes.ints).alu(Ops.CDIV, UPat())).named("x"), idiv),
+  # int binary with immediate
+  (UPat.var("a", dtypes.ints) << UPat.cvar("c").cast(), lambda a,c: a.ins(X86Ops.SHLi, src=(a, imm(dtypes.uint8, c.val)))),
+  (UPat.var("a", dtypes.uints) >> UPat.cvar("c").cast(), lambda a,c: a.ins(X86Ops.SHRi, src=(a, imm(dtypes.uint8, c.val)))),
+  (UPat.var("a", dtypes.sints) >> UPat.cvar("c").cast(), lambda a,c: a.ins(X86Ops.SARi, src=(a, imm(dtypes.uint8, c.val)))),
+  (UPat.var("a", dtypes.ints) + UPat.cvar().cast(name="c"), lambda a,c: a.ins(X86Ops.ADDi, src=(a, i)) if (i:=to_imm(c)) is not None else None),
+  (UPat.var("a", dtypes.ints) * UPat.cvar().cast(name="c"), lambda a,c: a.ins(X86Ops.IMULi, src=(a, i)) if (i:=to_imm(c)) is not None else None),
+  (UPat.var("a", dtypes.ints+(dtypes.bool,)) & UPat.cvar().cast(name="c"),
+   lambda a,c: a.ins(X86Ops.ANDi, src=(a, i)) if (i:=to_imm(c)) is not None else None),
+  (UPat.var("a", dtypes.ints+(dtypes.bool,)) | UPat.cvar().cast(name="c"),
+   lambda a,c: a.ins(X86Ops.ORi, src=(a, i)) if (i:=to_imm(c)) is not None else None),
+  (UPat.var("a", dtypes.ints+(dtypes.bool,)) ^ UPat.cvar().cast(name="c"),
+   lambda a,c: a.ins(X86Ops.XORi, src=(a, i)) if (i:=to_imm(c)) is not None else None),
+  (UPat(Ops.SUB, dtypes.ints, (UPat.var("a"), UPat.cvar().cast(name="c"))),
+   lambda a,c: a.ins(X86Ops.SUBi, src=(a, i)) if (i:=to_imm(c)) is not None else None),
+  # int binary with register
+  ((UPat(dtype=dtypes.ints) << UPat()).named("x"), lambda x: shift(x, X86Ops.SHL)),
+  ((UPat(dtype=dtypes.uints) >> UPat()).named("x"), lambda x: shift(x, X86Ops.SHR)),
+  ((UPat(dtype=dtypes.sints) >> UPat()).named("x"), lambda x: shift(x, X86Ops.SAR)),
+  (UPat.var("a", dtypes.ints) + UPat.var("b"), lambda a,b: a.ins(X86Ops.ADD, src=(a, b))),
+  (UPat.var("a", dtypes.ints) * UPat.var("b"), lambda a,b: a.ins(X86Ops.IMUL, src=(a, b))),
+  (UPat.var("a", dtypes.ints+(dtypes.bool,)) & UPat.var("b"), lambda a,b: a.ins(X86Ops.AND, src=(a, b))),
+  (UPat.var("a", dtypes.ints+(dtypes.bool,)) | UPat.var("b"), lambda a,b: a.ins(X86Ops.OR, src=(a, b))),
+  (UPat.var("a", dtypes.ints+(dtypes.bool,)) ^ UPat.var("b"), lambda a,b: a.ins(X86Ops.XOR, src=(a, b))),
+  (UPat(Ops.SUB, dtypes.ints, (UPat.var("a"), UPat.var("b"))), lambda a,b: a.ins(X86Ops.SUB, src=(a, b))),
+  # float binary
+  ((UPat(dtype=dtypes.float32) + UPat()).named("x"), lambda x: x.ins(X86Ops.VADDSS)),
+  ((UPat(dtype=dtypes.float64) + UPat()).named("x"), lambda x: x.ins(X86Ops.VADDSD)),
+  ((UPat(dtype=dtypes.float32) * UPat()).named("x"), lambda x: x.ins(X86Ops.VMULSS)),
+  ((UPat(dtype=dtypes.float64) * UPat()).named("x"), lambda x: x.ins(X86Ops.VMULSD)),
+  (UPat(Ops.SUB, dtypes.float32, name="x"), lambda x: x.ins(X86Ops.VSUBSS)),
+  (UPat(Ops.SUB, dtypes.float64, name="x"), lambda x: x.ins(X86Ops.VSUBSD)),
+  (UPat(Ops.FDIV, dtypes.float32, name="x"), lambda x: x.ins(X86Ops.VDIVSS)),
+  (UPat(Ops.FDIV, dtypes.float64, name="x"), lambda x: x.ins(X86Ops.VDIVSD)),
+  # casts
+  (UPat(dtype=dtypes.float32).cast(dtypes.float16, name="x"), lambda x: x.ins(X86Ops.VCVTPS2PH, src=x.src + (imm(dtypes.uint8, 4),))),
+  (UPat(dtype=dtypes.float16).cast(dtypes.float32, name="x"), lambda x: x.ins(X86Ops.VCVTPH2PS)),
+  (UPat(dtype=dtypes.float32).cast(dtypes.int32s+dtypes.int64s, name="x"), lambda x: x.ins(X86Ops.VCVTTSS2SI)),
+  (UPat(dtype=dtypes.float64).cast(dtypes.int32s+dtypes.int64s, name="x"), lambda x: x.ins(X86Ops.VCVTTSD2SI)),
+  (UPat.var("y", dtypes.float32).cast(dtypes.float64, name="x"), lambda y,x: x.ins(X86Ops.VCVTSS2SD, src=(y, y))),
+  (UPat.var("y", dtypes.float64).cast(dtypes.float32, name="x"), lambda y,x: x.ins(X86Ops.VCVTSD2SS, src=(y, y))),
+  (UPat.var("y", (dtypes.int32, dtypes.int64)).cast(dtypes.float32, name="x"), lambda y,x: x.ins(X86Ops.VCVTSI2SS, src=(undef(), y))),
+  (UPat.var("y", (dtypes.int32, dtypes.int64)).cast(dtypes.float64, name="x"), lambda y,x: x.ins(X86Ops.VCVTSI2SD, src=(undef(), y))),
+  (UPat(dtype=(dtypes.uint8, dtypes.uint16, dtypes.bool)).cast(dtypes.ints, name="x"), lambda x:
+   x.ins(X86Ops.MOVZX) if x.src[0].dtype.itemsize < x.dtype.itemsize else None),
+  (UPat(dtype=dtypes.int32).cast(dtypes.int64s, name="x"), lambda x: x.ins(X86Ops.MOVSXD)),
+  (UPat(dtype=dtypes.sints).cast(dtypes.ints, name="x"), lambda x: x.ins(X86Ops.MOVSX) if x.src[0].dtype.itemsize < x.dtype.itemsize else None),
+  (UPat(dtype=dtypes.ints).cast(dtypes.ints, name="x"), lambda x: x.ins(X86Ops.MOV)),
+  # bitcasts between scalar floats and ints
+  (UPat.var("y", dtypes.float16).bitcast(dtypes.int16s).named("x"), lambda y,x: x.ins(X86Ops.VPEXTRW, src=(y, imm(dtypes.uint8, 0)))),
+  (UPat(dtype=dtypes.int16s).bitcast(dtypes.float16).named("x"), lambda x: vpins(x, x.src)),
+  (UPat(dtype=dtypes.int32s).bitcast(dtypes.float32).named("x"), lambda x: x.ins(X86Ops.VMOVD)),
+  (UPat(dtype=dtypes.int64s).bitcast(dtypes.float64).named("x"), lambda x: x.ins(X86Ops.VMOVQ)),
+  (UPat(dtype=dtypes.float32).bitcast(dtypes.int32s).named("x"), lambda x: x.ins(X86Ops.VMOVDm)),
+  (UPat(dtype=dtypes.float64).bitcast(dtypes.int64s).named("x"), lambda x: x.ins(X86Ops.VMOVQm)),
+  # index on a buffer (or the stack pointer) computes an address, addresses are 64bit values
+  (UPat((Ops.INDEX, Ops.SHRINK), name="x"), lambda x: lea(x) if not _is_vec_xmm(x.src[0]) else None),
+  # TODO: fuse stores, very few cases -- store cmp becomes setcc, store gep int becomes vpextr, store bitcast to int becomes vmovd/q
+  # load, store
+  (UPat(Ops.LOAD, dtypes.floats, src=(UPat(name="a"),), name="x"), lambda x,a:
+   x.ins(X86Ops.VPINSRW, src=(undef(),) + fold_address(a) + (imm(dtypes.uint8, 0),)) if x.max_numel() * x.dtype.itemsize == 2 else
+   x.ins(_xmm_sz(x), src=fold_address(a))),
+  (UPat(Ops.LOAD, dtypes.ints+(dtypes.bool,), src=(UPat(name="a"),), name="x"), lambda x,a:
+   x.ins(X86Ops.MOV, src=fold_address(a)) if x.max_numel() == 1 else x.ins(_xmm_sz(x), src=fold_address(a))),
+  (UPat.var("a").store(UPat.var("b", dtypes.floats), name="x"), lambda a,b,x:
+   x.ins(X86Ops.VPEXTRW, src=fold_address(a) + (b, imm(dtypes.uint8, 0))) if b.max_numel() * b.dtype.itemsize == 2 else
+   x.ins(_xmm_sz_m(b), src=fold_address(a) + (b,))),
+  (UPat.var("a").store(UPat.var("b", dtypes.ints+(dtypes.bool,)), name="x"), lambda a,b,x:
+   x.ins(_xmm_sz_m(b), src=fold_address(a) + (b,)) if b.max_numel() > 1 else
+   x.ins(X86Ops.MOVm, src=fold_address(a) + (b,)) if (i:=to_imm(b)) is None else x.ins(X86Ops.MOVi, src=fold_address(a) + (i,))),
+  # allocate virtual registers
+  (UPat((Ops.INS, Ops.BUFFER, Ops.ALLOC, Ops.RANGE), name="x"), alloc_vregs),
+])
+
+# ***** pre register allocation *****
+# the flags belong to the last instruction that wrote them. x86 has no good way to store/restore them (then regalloc would
+# handle it), so a consumer that no longer owns its compare re-emits it. Unlike a regalloc rematerialization this is not
+# optional, there is no fallback load from stack
+def flag_rematerialize(ctx:X86LinearContext, x:UOp):
+  if x.op in (Ops.RANGE, Ops.END, Ops.BACKEDGE) or x.arg[0] in X86GroupOp.WriteFlags: ctx.lock = x
+  elif x.arg[0] in X86GroupOp.ReadFlags and ctx.lock is not (flag_def:=x.src[-1]):
+    ctx.lock = flag_def
+    return (x, [flag_def, x])
+  return None
+
+# the address of a stack buffer keeps the buffer's dtype so the element size of loads and stores through it is known
+def alloc_buffer(ctx:X86LinearContext, x:UOp):
+  nx = UOp(Ops.INS, src=fold_address(stack_pointer.index(UOp.cconst(ctx.stack_size, dtypes.uint32))), arg=(X86Ops.LEA, x.dtype), tag=x.tag)
+  ctx.stack_size += x.max_numel() * x.dtype.itemsize
+  return nx, [nx]
+
+pre_regalloc_matcher = PatternMatcher([
+  (UPat(Ops.BUFFER, name="x"), alloc_buffer),
+  (UPat((Ops.INS, Ops.RANGE, Ops.END, Ops.BACKEDGE), name="x"), flag_rematerialize),
+])
+
+# ***** post register allocation *****
+# TODO: control flow should be overhauled so that this isn't necessary
+def lower_range(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
+  loop_label = "_".join(str(i) for i in x.axis_id)
+  label = UOp(Ops.INS, arg=(X86Ops.LABEL, dtypes.void), tag=f".LOOP_{loop_label}")
+  # loop, cmp on backedge all we need is a jmp tag
+  if x.dtype is dtypes.void: return (label, [label])
+  else:
+    acc = x.ins(X86Ops.MOVi, src=(imm(x.dtype, 0),) + x.src[1:])
+    cmp = UOp(Ops.INS, arg=(X86Ops.CMPi if x.src[0].op is Ops.CAST else X86Ops.CMP, dtypes.void), src=(acc, x.src[0]))
+    jump_out = UOp(Ops.INS, arg=(X86Ops.JGE, dtypes.void), src=(cmp,), tag=f".LOOP_OUT_{loop_label}")
+    ctx.loop_label[acc] = loop_label
+    return (acc, [acc, label, cmp, jump_out])
+
+def lower_end(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
+  end_label = UOp(Ops.INS, arg=(X86Ops.LABEL, dtypes.void), tag=f".LOOP_OUT_{ctx.loop_label[x.src[1]]}")
+  jmp = UOp(Ops.INS, arg=(X86Ops.JMP, dtypes.void), tag=f".LOOP_{ctx.loop_label[x.src[1]]}")
+  inc = x.src[1].ins(X86Ops.ADDi, src=(imm(x.src[1].dtype, 1),))
+  return (inc, [inc, jmp, end_label])
+
+def lower_loop(ctx, x:UOp) -> tuple[UOp, list[UOp]]:
+  cond = x.replace(op=x.tag, src=x.src[:2])
+  jmp = isel_matcher.rewrite(UOp(Ops.IF, src=(cond,)))
+  return (jmp.src[0], [jmp.src[0], jmp.replace(tag=x.src[3].tag)])
+
+def alloc_stack(ctx:X86LinearContext, x:UOp):
+  if not ctx.stack_size or ctx.stack_allocated or x.arg[0] is not X86Ops.DEFINE: return None
+  ctx.stack_allocated = True
+  return x, [stack_pointer.ins(X86Ops.SUBi, src=(imm(dtypes.int32, ctx.stack_size),)), x]
+
+# final rewrite to match the isa spec
+post_regalloc_matcher = PatternMatcher([
+  # allocate the frame before any callee saves, regardless of the order of register definitions, and free it before RET
+  (UPat(Ops.INS, name="x"), alloc_stack),
+  (UPat(Ops.INS, name="x"), lambda ctx,x: (x, [stack_pointer.ins(X86Ops.ADDi, src=(imm(dtypes.int32, ctx.stack_size),)), x])
+    if ctx.stack_size and x.arg[0] is X86Ops.RET else None),
+  # rewrite FRAME_INDEX to IMM now that the stack size is known
+  (UPat(Ops.INS, src=(UPat.cvar("disp").cast(),), name="x"), lambda ctx,disp,x:
+    (nx:=UOp.cconst(ctx.stack_size + disp.val, x.dtype), [nx]) if x.arg[0] is X86Ops.FRAME_INDEX else None),
+  # expand the cmp here so we can preserve rng src edge to get label from ctx
+  (UPat(Ops.INS, name="x"), lambda ctx,x: lower_loop(ctx, x) if x.arg[0] is X86Ops.LOOP_CMP else None),
+  # rewrite RANGE to ACC = 0 -> LABEL -> JUMP if ACC >= loop bound
+  (UPat(Ops.RANGE, name="x"), lower_range),
+  # rewrite END to ACC + 1 -> JUMP -> LABEL, also add the out of loop JUMP to the src so this becomes the jump target
+  (UPat(Ops.END, name="x"), lower_end),
+  # rewrite two address instructions to two address form, if reused src wasn't coalesced insert a move
+  (UPat(Ops.INS, name="x"), lambda ctx,x: (nx:=x.replace(src=x.src[1:]),
+   [ctx.ren.copy(x.src[0], rdef(x)), nx] if rdef(x) != rdef(x.src[0]) else [nx]) if x.arg[0] in X86GroupOp.TwoAddress else None),
+])
+
+# ***** X86 instruction encoding *****
+
+def encode(x:UOp, opc:int, reg:int|None=None, pp:int=0, sel:int=0, we:int=0) -> bytes|None:
+  def _encode(reg_uop:UOp|None, rm_uop:UOp, idx_uop:UOp|None=None, disp_uop:UOp|None=None,
+              vvvv_uop:UOp|None=None, imm_uop:UOp|None=None) -> bytes:
+    nonlocal reg, opc
+    # get the encoding values of the different fields
+    reg = cast(int, cast(Register, rdef(reg_uop)).index if reg_uop is not None else reg)
+    rm = cast(Register, rdef(rm_uop)).index
+    idx = cast(Register, rdef(idx_uop)).index if idx_uop is not None and rdef(idx_uop) is not None else 4
+    # TODO: shouldn't rely on bitcast to convey encoding info
+    def _sz(x:UOp): return x.dtype.itemsize if x.op is Ops.BITCAST else rdef(x).size
+    # for a memory operand the rm size is the element size of the base pointer, otherwise it's the size of the value in the register
+    rm_sz = rm_uop.dtype.itemsize if disp_uop is not None else _sz(rm_uop)
+    reg_sz = _sz(reg_uop) if reg_uop is not None else 0
+    sz = reg_sz or rm_sz
+
+    # encode instruction
+    inst = bytes([])
+    assert 0 <= reg <= 15 and 0 <= idx <= 15 and 0 <= rm <= 15
+    # r extends reg field, x extends index field, b extends rm or base field
+    r, _x, b = reg >> 3, idx >> 3, rm >> 3
+    if sel: # VEX bytes
+      vvvv = (vd.index if isinstance(vd := rdef(vvvv_uop), Register) else reg) if vvvv_uop is not None else 0
+      if sel == 1 and _x == b == we == 0: inst += bytes([0xC5, (~r & 0b1) << 7 | (~vvvv & 0b1111) << 3 | pp])
+      else: inst += bytes([0xC4, (~r & 0b1) << 7 | (~_x & 0b1) << 6 | (~b & 0b1) << 5 | sel, we << 7 | (~vvvv & 0b1111) << 3 | pp])
+    else: # optional PREFIX and REX bytes
+      # PREFIX byte signaling 16 bit variant of instruction
+      if sz == 2: inst += bytes([0x66])
+      # bit signaling 64 bit variant of instruction
+      w = sz == 8
+      # legacy 8bit opcode is 1 less than 16-64bit variants
+      demote = (rm_sz == 1 or reg_sz == 1) and x.arg[0] not in X86GroupOp.ReadFlags | {X86Ops.LEA}
+      # REX byte is required when 64 bit or an extended reg is used (index 8 - 15) or lower 8 bits of (rsp, rbp, rsi, rdi) are accessed
+      if w | r | _x | b | (reg_sz == 1 & reg >> 2) | (rm_sz == 1 & rm >> 2) | (demote and disp_uop is None and rm >= 4):
+        inst += bytes([0b0100 << 4 | w << 3 | r << 2 | _x << 1 | b])
+      if demote: opc -= 1
+    # OPCODE byte
+    inst += opc.to_bytes((opc.bit_length() + 7) // 8, 'big')
+    # MODRM byte
+    # now we only care about the lower 3 bits
+    idx, rm, reg = idx & 0b111, rm & 0b111, reg & 0b111
+    # 0b00 -- signals memory access with no displacement
+    # 0b01 -- signals memory access with 8bit displacement
+    # 0b10 -- signals memory access with 32bit displacement
+    # 0b11 -- signals no memory access
+    if disp_uop is not None:
+      assert disp_uop.op is Ops.CAST, "displacement must be a const"
+      assert disp_uop.dtype in (dtypes.int8, dtypes.int32), "displacement can only be 1 or 4 byte signed int"
+      # rbp/r13 always require a displacement
+      if disp_uop.src[0].val != 0 or rm == 0b101: mod = 0b01 if disp_uop.dtype.itemsize == 1 else 0b10
+      else: mod = 0b00
+    else: mod = 0b11
+    # x 0b0 and idx 0b100 means rsp which means no index exists
+    # rm 0b100 (rsp/r12) signals a sib byte is required, rm then is encoded in the base field of SIB
+    _rm = rm if idx == 0b100 and _x == 0b0 else 0b100
+    inst += bytes([mod << 6 | reg << 3 | _rm])
+    # SIB byte
+    if _rm == 0b100 and mod != 0b11:
+      scale = {1: 0b00, 2: 0b01, 4: 0b10, 8: 0b11}[1 if idx == 0b100 and _x == 0b0 else rm_sz]
+      inst += bytes([scale << 6 | idx << 3 | rm])
+    # DISP byte
+    if mod == 0b01 or mod == 0b10:
+      assert disp_uop is not None
+      inst += struct.pack(unwrap(disp_uop.dtype.fmt), disp_uop.src[0].val)
+    # IMM byte
+    if imm_uop is not None:
+      if imm_uop.op is Ops.CAST: inst += struct.pack(unwrap(imm_uop.dtype.fmt), imm_uop.src[0].val)
+      elif isinstance(rdef(imm_uop), Register): inst += bytes([(rdef(imm_uop).index & 0b1111) << 4 | 0b0000])
+    return inst
+
+  # get the encoding structure of the uop
+  # when a uop writes to memory it takes the form of a store, dtype is void, no definition
+  address:tuple[UOp|None, ...]
+  if x.arg[0] in X86GroupOp.WriteMem:
+    if len(x.src) > 3: address, rest = x.src[:3], x.src[3:]
+    else: address, rest = (x, None, None), x.src
+    imm_uop = rest[:1] if rest and rest[0].op is Ops.CAST else (None,)
+    return _encode(rest[0], *address, *(None, *rest[1:])) if reg is None else _encode(None, *address, *(None, *imm_uop))
+
+  if x.arg[0] in X86GroupOp.Rm1st:
+    if len(x.src) > 2: address, rest = x.src[:3], x.src[3:]
+    else: address, rest = (x.src[0], None, None), x.src[1:]
+    imm_uop = rest[:1] if rest and rest[0].op is Ops.CAST else (None,)
+    return _encode(x, *address, *(None, *imm_uop)) if reg is None else _encode(None, *address, *(x if sel else None, *imm_uop))
+
+  if x.arg[0] in X86GroupOp.Rm2nd:
+    if len(x.src) > 3: address, rest = x.src[1:4], x.src[:1] + x.src[4:]
+    else: address, rest = (x.src[1], None, None), x.src[:1] + x.src[2:]
+    # cmp reg, rm doesn't define a new register
+    return _encode(x, *address, *rest) if x.dtype is not dtypes.void else _encode(rest[0], *address)
+
+  return None
+
+# https://www.felixcloutier.com/x86/
+# legacy version -> VEX version
+# prefix field: None -> 0 | 66 -> 1 | F3 -> 2 | F2 -> 3
+# opcode map select: 0F -> 1 | 0F38 -> 2 | 0F3A -> 3
+encodings = {
+  # moves
+  X86Ops.MOVABS: lambda x:
+   bytes([0b0100 << 4 | 0b1 << 3 | 0b00 << 2 | rdef(x).index >> 3, 0xB8 + (rdef(x).index & 0b111)]) + struct.pack(x.dtype.fmt, x.src[0].src[0].val),
+  X86Ops.MOV: lambda x: encode(x, 0x8B), X86Ops.MOVi: lambda x: encode(x, 0xC7, reg=0),
+  X86Ops.MOVm: lambda x: encode(x, 0x89), X86Ops.LEA: lambda x: encode(x, 0x8D),
+  X86Ops.VMOVSS: lambda x: encode(x, 0x10, pp=2, sel=1), X86Ops.VMOVSSm: lambda x: encode(x, 0x11, pp=2, sel=1),
+  X86Ops.VMOVSD: lambda x: encode(x, 0x10, pp=3, sel=1), X86Ops.VMOVSDm: lambda x: encode(x, 0x11, pp=3, sel=1),
+  X86Ops.VMOVUPS: lambda x: encode(x, 0x10, pp=0, sel=1), X86Ops.VMOVUPSm: lambda x: encode(x, 0x11, pp=0, sel=1),
+  X86Ops.VMOVD: lambda x: encode(x, 0x6E, pp=1, sel=1), X86Ops.VMOVQ: lambda x: encode(x, 0x6E, pp=1, sel=1, we=1),
+  X86Ops.VMOVDm: lambda x: encode(x, 0x7E, pp=1, sel=1), X86Ops.VMOVQm: lambda x: encode(x, 0x7E, pp=1, sel=1, we=1),
+  # casts
+  X86Ops.MOVZX: lambda x: encode(x, 0x0FB7),
+  X86Ops.MOVSX: lambda x: encode(x, 0x0FBF), X86Ops.MOVSXD: lambda x: encode(x, 0x63),
+  X86Ops.VCVTSS2SD: lambda x: encode(x, 0x5A, pp=2, sel=1), X86Ops.VCVTSD2SS: lambda x: encode(x, 0x5A, pp=3, sel=1),
+  X86Ops.VCVTPH2PS: lambda x: encode(x, 0x13, pp=1, sel=2), X86Ops.VCVTPS2PH: lambda x: encode(x, 0x1D, pp=1, sel=3),
+  # the int src is the 2nd src (the rm field), its width picks the 32 or 64 bit form
+  X86Ops.VCVTSI2SS: lambda x: encode(x, 0x2A, pp=2, sel=1, we=x.src[1].dtype.itemsize == 8),
+  X86Ops.VCVTSI2SD: lambda x: encode(x, 0x2A, pp=3, sel=1, we=x.src[1].dtype.itemsize == 8),
+  X86Ops.VCVTTSS2SI: lambda x: encode(x, 0x2C, pp=2, sel=1, we=x.dtype.itemsize == 8),
+  X86Ops.VCVTTSD2SI: lambda x: encode(x, 0x2C, pp=3, sel=1, we=x.dtype.itemsize == 8),
+  # int division
+  X86Ops.IDIV: lambda x: encode(x, 0xF7, reg=7), X86Ops.DIV: lambda x: encode(x, 0xF7, reg=6),
+  # scalar int binary
+  X86Ops.SHL: lambda x: encode(x, 0xD3, reg=4), X86Ops.SHLi: lambda x: encode(x, 0xC1, reg=4),
+  X86Ops.SHR: lambda x: encode(x, 0xD3, reg=5), X86Ops.SHRi: lambda x: encode(x, 0xC1, reg=5),
+  X86Ops.SAR: lambda x: encode(x, 0xD3, reg=7), X86Ops.SARi: lambda x: encode(x, 0xC1, reg=7),
+  X86Ops.ADD: lambda x: encode(x, 0x03), X86Ops.ADDi: lambda x: encode(x, 0x81, reg=0),
+  X86Ops.SUB: lambda x: encode(x, 0x2B), X86Ops.SUBi: lambda x: encode(x, 0x81, reg=5),
+  X86Ops.AND: lambda x: encode(x, 0x23), X86Ops.ANDi: lambda x: encode(x, 0x81, reg=4),
+  X86Ops.XOR: lambda x: encode(x, 0x33), X86Ops.XORi: lambda x: encode(x, 0x81, reg=6),
+  X86Ops.OR: lambda x: encode(x, 0x0B), X86Ops.ORi: lambda x: encode(x, 0x81, reg=1),
+  X86Ops.CMP: lambda x: encode(x, 0x3B), X86Ops.CMPi: lambda x: encode(x, 0x81, reg=7),
+  X86Ops.IMUL: lambda x: encode(x, 0x0FAF), X86Ops.IMULi: lambda x: encode(x, 0x69),
+  X86Ops.SETB: lambda x: encode(x, 0x0F92, reg=0), X86Ops.SETL: lambda x: encode(x, 0x0F9C, reg=0),
+  X86Ops.SETE: lambda x: encode(x, 0x0F94, reg=0), X86Ops.SETNE: lambda x: encode(x, 0x0F95, reg=0),
+  # unary
+  X86Ops.VSQRTSS: lambda x: encode(x, 0x51, pp=2, sel=1), X86Ops.VSQRTSD: lambda x: encode(x, 0x51, pp=3, sel=1),
+  X86Ops.VROUNDSS: lambda x: encode(x, 0x0A, pp=1, sel=3), X86Ops.VROUNDSD: lambda x: encode(x, 0x0B, pp=1, sel=3),
+  # float binary
+  X86Ops.VADDSS: lambda x: encode(x, 0x58, pp=2, sel=1), X86Ops.VADDSD: lambda x: encode(x, 0x58, pp=3, sel=1),
+  X86Ops.VSUBSS: lambda x: encode(x, 0x5C, pp=2, sel=1), X86Ops.VSUBSD: lambda x: encode(x, 0x5C, pp=3, sel=1),
+  X86Ops.VMULSS: lambda x: encode(x, 0x59, pp=2, sel=1), X86Ops.VMULSD: lambda x: encode(x, 0x59, pp=3, sel=1),
+  X86Ops.VDIVSS: lambda x: encode(x, 0x5E, pp=2, sel=1), X86Ops.VDIVSD: lambda x: encode(x, 0x5E, pp=3, sel=1),
+  X86Ops.VCMPSS: lambda x: encode(x, 0xC2, pp=2, sel=1), X86Ops.VCMPSD: lambda x: encode(x, 0xC2, pp=3, sel=1),
+  # ternary
+  X86Ops.CMOVB: lambda x: encode(x, 0x0F42), X86Ops.CMOVL: lambda x: encode(x, 0x0F4C),
+  X86Ops.CMOVE: lambda x: encode(x, 0x0F44), X86Ops.CMOVNE: lambda x: encode(x, 0x0F45),
+  X86Ops.VBLENDVPS: lambda x: encode(x, 0x4A, pp=1, sel=3), X86Ops.VBLENDVPD: lambda x: encode(x, 0x4B, pp=1, sel=3),
+  # shuffles
+  X86Ops.VPSRLDQ: lambda x: encode(x, 0x73, reg=3, pp=1, sel=1),
+  X86Ops.VPINSRW: lambda x: encode(x, 0xC4, pp=1, sel=1), X86Ops.VPINSRD: lambda x: encode(x, 0x22, pp=1, sel=3),
+  X86Ops.VINSERTPS: lambda x: encode(x, 0x21, pp=1, sel=3),
+  # extract
+  X86Ops.VPEXTRW: lambda x: encode(x, 0x15, pp=1, sel=3), X86Ops.VPEXTRD: lambda x: encode(x, 0x16, pp=1, sel=3),
+  # jumps are encoded with a placeholder which gets patched later once the real offset is known
+  X86Ops.JE: lambda x: bytes([0x0F, 0x84]) + int(0).to_bytes(4),
+  X86Ops.JNE: lambda x: bytes([0x0F, 0x85]) + int(0).to_bytes(4),
+  X86Ops.JL: lambda x: bytes([0x0F, 0x8C]) + int(0).to_bytes(4),
+  X86Ops.JB: lambda x: bytes([0x0F, 0x82]) + int(0).to_bytes(4),
+  X86Ops.JGE: lambda x: bytes([0x0F, 0x8D]) + int(0).to_bytes(4),
+  X86Ops.JMP: lambda x: bytes([0xE9]) + int(0).to_bytes(4),
+  X86Ops.RET: lambda x: bytes([0xC3]),
+}
+
+class X86LinearContext(LinearContext):
+  def __init__(self, ren:X86Renderer):
+    super().__init__(ren)
+    self.lock: UOp|None = None
+    self.stack_allocated = False
+  def assign_spill_slot(self, r:Register, u:UOp) -> int:
+    sz = r.cons[0].size
+    offset = self.stack_size + (sz - self.stack_size % sz) %sz
+    self.stack_size = offset + sz
+    return offset
+
+class X86Renderer(ISARenderer):
+  device = "CPU"
+  has_local = False
+  global_max = (1, 0, 0)
+  extra_matcher = extra_matcher
+  pre_isel_matcher = pre_isel_matcher
+  isel_matcher = isel_matcher
+  pre_regalloc_matcher = pre_regalloc_matcher
+  post_regalloc_matcher = post_regalloc_matcher
+  code_for_op = {x: lambda: None for x in (Ops.SQRT, Ops.AND, Ops.OR, Ops.SHL, Ops.SHR, Ops.NEG, Ops.SUB, Ops.FDIV, Ops.CMPLT, Ops.CMPEQ)}
+  linear_ctx_type = X86LinearContext
+  def __init__(self, target:Target):
+    if target.arch.split(",")[0] != "x86_64": raise RuntimeError(f"X86Renderer only supports x86_64, got {target.arch}")
+    super().__init__(target)
+    from tinygrad.runtime.support.compiler_cpu import X86Compiler
+    self.compiler = X86Compiler()
+  def is_two_address(self, x:UOp) -> bool: return x.op is Ops.INS and x.arg[0] in X86GroupOp.TwoAddress
+  def copy(self, x:UOp, reg:Register) -> UOp: return x.ins(X86Ops.MOV, src=(x,), tag=reg)
+
+  def spill(self, spill_slot:int, x:UOp) -> UOp:
+    op = X86Ops.VMOVUPSm if rdef(x).cons[0] in XMM else X86Ops.MOVm
+    disp = UOp.cconst(spill_slot, dtypes.int32)
+    return UOp(Ops.INS, src=fold_address(stack_pointer.index(disp)) + (x,), arg=(op, dtypes.void), tag=x.tag)
+
+  def fill(self, spill_slot:int, x:UOp, reg:Register) -> UOp:
+    disp = UOp.cconst(spill_slot, dtypes.int32)
+    return UOp(Ops.INS, src=fold_address(stack_pointer.index(disp)), arg=(X86Ops.VMOVUPS if reg.cons[0] in XMM else X86Ops.MOV, x.dtype), tag=(reg,))
+
+  def asm_str(self, uops:list[UOp], function_name:str) -> str:
+    def _format_op(x:UOp) -> str: return f"    {(o[7:-1] if (o:=str(x.arg[0]))[-1] in ('i', 'm') else o[7:]).lower():7s}"
+    def _format_operands(x:UOp) -> str:
+      def _format(src:tuple[UOp, ...]) -> list[str]:
+        return [str(s.src[0].val) if s.op is Ops.CAST else reg_strs[o].get(rdef(s).size, o) if \
+                (o:=str(rdef(s))) in reg_strs else o for s in src if rdef(s) is not None]
+      def _mem_adress(base:UOp, idx:UOp, disp:UOp) -> list[str]:
+        return [f"[{rdef(base)}" + (f" + {rdef(idx)}*{base.dtype.itemsize}" if rdef(idx) else "") + (f" + {d}" if (d:=disp.src[0].val) else "") + "]"]
+
+      if len(x.src) > 3 and x.arg[0] in X86GroupOp.WriteMem: ret = _mem_adress(*x.src[:3]) + _format(x.src[3:])
+      elif len(x.src) > 2 and x.arg[0] in X86GroupOp.Rm1st: ret = _format((x,)) + _mem_adress(*x.src[:3]) + _format(x.src[3:])
+      elif len(x.src) > 3 and x.arg[0] in X86GroupOp.Rm2nd: ret = _format((x, x.src[0])) + _mem_adress(*x.src[1:4]) + _format(x.src[4:])
+      else: ret = _format((x,) + x.src)
+      return ", ".join(ret)
+
+    asm = [f".{function_name}:"]
+    for u in uops:
+      if u.op is not Ops.INS or u.arg[0] is X86Ops.DEFINE: continue
+      if u.arg[0] is X86Ops.LABEL: asm.append(f"{str(u.tag)}:")
+      elif u.arg[0] is X86Ops.RET: asm.append(_format_op(u))
+      else: asm.append(_format_op(u) + " " + _format_operands(u))
+    return "\n".join(asm)
+
+  def render(self, uops:list[UOp]) -> str:
+    targets: dict[str, int] = {}
+    jumps: dict[UOp, int] = {}
+    binary = bytearray()
+    for u in uops:
+      if u.op is not Ops.INS or u.arg[0] is X86Ops.DEFINE: continue
+      if u.arg[0] is X86Ops.LOOP_CMP: continue
+      if u.arg[0] is X86Ops.LABEL:
+        targets[u.tag] = len(binary)
+        continue
+      if u.arg[0] not in encodings or (l:=encodings[u.arg[0]](u)) is None:
+        raise RuntimeError(f"failed to encode {u.arg[0]} with {u.dtype} srcs {[x.dtype for x in u.src]}")
+      binary.extend(l)
+      if u.arg[0] in (X86Ops.JL, X86Ops.JB, X86Ops.JE, X86Ops.JNE, X86Ops.JGE, X86Ops.JMP): jumps[u] = len(binary)
+    # fixup jump targets now that encoding size is known
+    for u in uops:
+      if (t:=jumps.get(u)) is not None: binary[t-4:t] = (targets[u.tag] - t).to_bytes(4, 'little', signed=True)
+    return binary.hex()
+
+  def supported_dtypes(self): return {d for d in super().supported_dtypes() if d not in dtypes.fp8s+(dtypes.bfloat16,)}
+
+import math, struct, sys
+from tinygrad.renderer import tc
+from tinygrad.renderer import Renderer
+from tinygrad.renderer.cstyle import HIPRenderer, create_non_native_float_pats, pm_manual_bf16_cast, fp8_index, amd_fp8s
+from tinygrad.codegen.decomp.transcendental import xexp2, xlog2
+from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, GroupOp, range_str
+from tinygrad.dtype import dtypes, float_to_fp8, DType, truncate, AddrSpace
+from tinygrad.helpers import prod, Target, OSX
+
+def is_volatile(u:UOp) -> bool: return (buf:=u.buf_uop).op is Ops.PARAM and buf.arg.volatile
+
+def ldt(dt:DType, count=1, ptr=False):
+  if ptr: return ldt(dt, count) + "*"
+  if count > 1: return f"<{count} x {ldt(dt, 1, ptr)}>"
+  return {dtypes.void: "void", dtypes.bool: "i1", dtypes.int8: "i8", dtypes.int16: "i16", dtypes.int32: "i32", dtypes.int64: "i64",
+          dtypes.uint8: "i8", dtypes.uint16: "i16", dtypes.uint32: "i32", dtypes.uint64: "i64", **{d: "i8" for d in dtypes.fp8s},
+          dtypes.float16: "half", dtypes.bfloat16: "bfloat", dtypes.float32: "float", dtypes.float64: "double"}[dt]
+
+def lconst(x, dtype:DType):
+  if dtype in dtypes.floats:
+    if dtype in dtypes.fp8s: return float_to_fp8(x, dtype)
+    if math.isinf(x) or math.isnan(x): return "0x%02X%02X%02X%02X%02X%02X%02X%02X" % tuple(struct.pack("d",x)[::-1])
+    return truncate[dtype](x)
+  return int(x)
+
+def lcast(input_type:DType, output_type:DType):
+  if dtypes.is_float(input_type):
+    if dtypes.is_float(output_type): return 'fpext' if output_type.itemsize > input_type.itemsize else 'fptrunc'
+    if dtypes.is_int(output_type): return 'fptoui' if dtypes.is_unsigned(output_type) else 'fptosi'
+  if dtypes.is_unsigned(input_type) or dtypes.is_bool(input_type):
+    if dtypes.is_float(output_type): return 'uitofp'
+    if dtypes.is_int(output_type): return 'trunc' if output_type.itemsize < input_type.itemsize else 'zext'
+  if dtypes.is_int(input_type):
+    if dtypes.is_float(output_type): return 'sitofp'
+    if dtypes.is_int(output_type): return 'trunc' if output_type.itemsize < input_type.itemsize else 'sext'
+  raise NotImplementedError(f"cast from {input_type} -> {output_type} not implemented")
+
+def render_wmma_amd(ctx, wmma: UOp, cdna=False, rdna4=False) -> str:
+  dt_map = {dtypes.half: "f16", dtypes.float: "f32", dtypes.ushort: "bf16.1k" if cdna else "bf16", dtypes.bfloat16: "bf16.1k" if cdna else "bf16",
+            **{d: (".fp8.fp8", ".bf8.bf8")[fp8_index(d)] for d in dtypes.fp8s}, dtypes.int8: "iu8", dtypes.int32: "i32"}
+  # https://github.com/llvm/llvm-project/blob/main/clang/test/CodeGenOpenCL/builtins-amdgcn-mfma.cl
+  N,M,K = wmma.arg[0]
+  if cdna:
+    if K == 32: dt_map.update({dtypes.half: ".f16", dtypes.bfloat16: ".bf16"})
+    scaled = K == 128
+    args = [f"{ldt(w.dtype, w.max_numel())} {ctx[w]}" for w in wmma.src]
+    # scaled mfma call require E8M0 scale args, byte = 0x7F = 127, scale = 2^(127 - 127) = 1.0
+    if scaled:
+      _fmt = { dtypes.fp8e5m2:1, dtypes.fp8e4m3:0 }
+      # (a_fp8_fmt, b_fp8_fmt, opsel, scale_a, opsel, scale_b)
+      args.extend([f"i32 {_fmt[wmma.arg[1]]}", f"i32 {_fmt[wmma.arg[1]]}", "i32 0", "i32 127", "i32 0", "i32 127"])
+    else: args.extend(["i32 0", "i32 0", "i32 0"]) # (cbsz, blgp, ?)
+
+    scale = "scale." if scaled else ""
+    dt_in = dt_map[wmma.arg[1]] if not scaled else ".f8f6f4"
+    return f"  {ctx[wmma]} = call {ldt(wmma.dtype, wmma.max_numel())} @llvm.amdgcn.mfma.{scale}{dt_map[wmma.src[-1].dtype]}" + \
+           f".{N}x{M}x{K}{dt_in}(" + ", ".join(args) + ")"
+  # https://github.com/llvm/llvm-project/blob/main/llvm/test/CodeGen/AMDGPU/GlobalISel/llvm.amdgcn.wmma_32.ll
+  # example: %wmma0 = call <8 x float> @llvm.amdgcn.wmma.f32.16x16x16.f16(<16 x half> %v99,<16 x half> %v100,<8 x float> %v101)
+  args = [f"{ldt(w.dtype, w.max_numel())} {ctx[w]}" for w in wmma.src]
+  if wmma.arg[1] == dtypes.int8: args = ["i1 true", args[0], "i1 true", args[1], args[2]]  # iu8 flags A/B signed
+  if wmma.dtype != dtypes.float: args.append("i1 false") # opsel
+  suffix = f".v{wmma.max_numel()}{dt_map[wmma.dtype]}.v{wmma.src[0].max_numel()}{dt_map[wmma.arg[1]]}" if rdna4 else ""
+  return f"  {ctx[wmma]} = call {ldt(wmma.dtype, wmma.max_numel())} @llvm.amdgcn.wmma.{dt_map[wmma.src[-1].dtype]}.16x16x16." + \
+    f"{dt_map[wmma.arg[1]]}{suffix}(" + ", ".join(args) + ")"
+
+# llvm ops, lop[<dtype>][<op>]
+unsigned_lop = { Ops.ADD: "add", Ops.MUL: "mul", Ops.CDIV: "udiv", Ops.CMOD: "urem",
+                 Ops.CMPLT: "icmp ult", Ops.CMPNE: "icmp ne", Ops.CMPEQ: "icmp eq", Ops.OR: "or", Ops.AND: "and", Ops.XOR: "xor",
+                 Ops.SHL: "shl", Ops.SHR: "lshr",}
+signed_lop = {**unsigned_lop, Ops.ADD: "add nsw", Ops.CMPLT: "icmp slt", Ops.CDIV: "sdiv", Ops.CMOD: "srem", Ops.SHR: "ashr"}
+flags = " nsz arcp contract afn"
+float_lop = {Ops.ADD: "fadd"+flags, Ops.MUL: "fmul"+flags, Ops.CMPLT: f"fcmp{flags} olt",
+    Ops.CMPNE: f"fcmp{flags} une", Ops.CMPEQ: f"fcmp{flags} oeq", Ops.FDIV: "fdiv"+flags}
+lop = {**{x:unsigned_lop for x in (dtypes.bool,)+dtypes.uints}, **{x:signed_lop for x in dtypes.sints}, **{x:float_lop for x in dtypes.floats}}
+
+base_rewrite = PatternMatcher([
+  # memory load/store
+  (UPat((Ops.INDEX, Ops.SHRINK), src=(UPat((Ops.BUFFER, Ops.PARAM, Ops.AFTER)),), allow_any_len=True, name="x"), lambda ctx,x:
+   f"  {ctx[x]} = getelementptr inbounds {ldt(x.dtype)}, {ldt(x.dtype, ptr=True)} {ctx[x.src[0]]}, {ldt(x.src[1].dtype)} {ctx[x.src[1]]}"),
+  # register index
+  (UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.cvar("c").cast()), name="x"), lambda ctx,buf,c,x:
+   f"  {ctx[x]} = extractelement {ldt(buf.dtype, buf.max_numel())} {ctx[buf]}, i32 {c.val}" if buf.addrspace == AddrSpace.ALU else None),
+
+  # load/store
+  (UPat(Ops.LOAD, src=(UPat.var("idx"), UPat.var("alt"), UPat.var("mask")), name="x"),
+   lambda ctx,x,idx,alt,mask:
+   f"  br label {ctx[x]}_entry\n{ctx[x][1:]}_entry:\n"
+   f"  br i1 {ctx[mask]}, label {ctx[x]}_load, label {ctx[x]}_exit\n{ctx[x][1:]}_load:\n"
+   f"  {ctx[x]}_yes = load {'volatile ' if is_volatile(idx) else ''}{ldt(idx.dtype, idx.max_numel())}, "
+   f"{ldt(idx.dtype, idx.max_numel(), True)} {ctx[idx]}\n"
+   f"  br label {ctx[x]}_exit\n{ctx[x][1:]}_exit:\n"
+   f"  {ctx[x]} = phi {ldt(x.dtype, x.max_numel())} [{ctx[x]}_yes, {ctx[x]}_load], [{ctx[alt]}, {ctx[x]}_entry]"),
+  (UPat.var('idx').load(name="x"), lambda ctx,x,idx:
+   f"  {ctx[x]} = load {'volatile ' if is_volatile(idx) else ''}{ldt(idx.dtype, idx.max_numel())}, "
+   f"{ldt(idx.dtype, idx.max_numel(), True)} {ctx[idx]}"),
+  (UPat.var('idx').store(UPat.var("var")), lambda ctx,idx,var:
+   f"  store {'volatile ' if is_volatile(idx) else ''}{ldt(var.dtype, idx.max_numel())} {ctx[var]}, "
+   f"{ldt(idx.dtype, idx.max_numel(), True)} {ctx[idx]}"),
+
+  # GEP/VECTORIZE/CAST for float4 support
+  (UPat(Ops.STACK, name="x"), lambda ctx,x:
+   "\n".join([(f"  {ctx[x]}_{i}" if i+1 != len(x.src) else f"  {ctx[x]}")+
+               f" = insertelement {ldt(x.dtype, x.max_numel())} "+(f"{ctx[x]}_{i-1}" if i != 0 else "poison")+
+               f", {ldt(u.dtype)} {ctx[u]}, i32 {i}" for i,u in enumerate(x.src)])),
+  # unary/binary/ternary ops
+  (UPat(Ops.BITCAST, name="x"), lambda ctx,x:
+   f"  {ctx[x]} = bitcast {ldt(x.src[0].dtype, x.src[0].max_numel())} {ctx[x.src[0]]} to {ldt(x.dtype, x.max_numel())}"),
+  (UPat(Ops.CAST, name="x"), lambda ctx,x: f"  {ctx[x]} = {lcast(x.src[0].dtype, x.dtype)} {ldt(x.src[0].dtype)} {ctx[x.src[0]]} to {ldt(x.dtype)}"),
+  (UPat(Ops.TRUNC, name="x"),
+   lambda ctx,x: f"  {ctx[x]} = call {ldt(x.dtype)} @llvm.trunc.{ldt(x.dtype)}({ldt(x.src[0].dtype)} {ctx[x.src[0]]})"),
+  (UPat(GroupOp.Binary, name="x"), lambda ctx,x:
+   f"  {ctx[x]} = {lop[x.src[0].dtype][x.op]} {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ctx[x.src[1]]}"),
+  (UPat(Ops.WHERE, name="x"), lambda ctx,x:
+   f"  {ctx[x]} = select {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ldt(x.src[1].dtype)} {ctx[x.src[1]]}, {ldt(x.src[2].dtype)} {ctx[x.src[2]]}"),
+
+  # loop (a void RANGE is an unbounded loop header)
+  (UPat(Ops.RANGE, dtypes.void, name="l"), lambda ctx,l: f"  br label %loop_{ctx[l][1:]}\nloop_{ctx[l][1:]}:"),
+  (UPat(Ops.BACKEDGE, src=(UPat(), UPat(Ops.RANGE, dtypes.void, name="l"), UPat(name="c"))), lambda ctx,l,c:
+    f"  br i1 {ctx[c]}, label %loop_{ctx[l][1:]}, label %loop_exit_{ctx[l][1:]}\nloop_exit_{ctx[l][1:]}:"),
+
+  # range
+  (UPat(Ops.RANGE, name="r"), lambda ctx,r:
+   f"  br label %loop_entry_{range_str(r)}\n"
+   f"loop_entry_{range_str(r)}:\n"
+   f"  br label %loop_latch_{range_str(r)}\n"
+   f"loop_latch_{range_str(r)}:\n"
+   f"  {ctx[r]} = phi {ldt(r.dtype)} [ 0, %loop_entry_{range_str(r)} ], [ {ctx[r]}phi, %loop_footer_{range_str(r)} ]\n"
+   f"  {ctx[r]}phi = add {ldt(r.dtype)} {ctx[r]}, 1\n"
+   f"  {ctx[r]}cmp = icmp ult {ldt(r.dtype)} {ctx[r]}, {ctx[r.src[0]]}\n"
+   f"  br i1 {ctx[r]}cmp, label %loop_body_{range_str(r)}, label %loop_exit_{range_str(r)}\n"
+   f"loop_body_{range_str(r)}:"),
+  (UPat(Ops.END, src=(UPat(), UPat(Ops.RANGE, name="r"))), lambda r:
+   f"  br label %loop_footer_{range_str(r)}\n"
+   f"loop_footer_{range_str(r)}:\n"
+   f"  br label %loop_latch_{range_str(r)}\n"
+   f"loop_exit_{range_str(r)}:"),
+
+  # if
+  (UPat(Ops.IF, name="x"), lambda ctx,x: f"  br i1 {ctx[x.src[0]]}, label %ifbody_{ctx[x][1:]}, label %ifskip_{ctx[x][1:]}\nifbody_{ctx[x][1:]}:"),
+  (UPat(Ops.ENDIF, name="x"), lambda ctx,x: f"  br label %ifskip_{ctx[x.src[0]][1:]}\nifskip_{ctx[x.src[0]][1:]}:"),
+
+  (UPat(Ops.BARRIER), lambda ctx: "  fence seq_cst"),
+
+  # call a function by the name of its body, the args in param order
+  (UPat(Ops.CALL, src=(UPat(Ops.LINEAR, name="body"),), allow_any_len=True, name="x"), lambda ctx,x,body: f"  call void @{ctx[body]}(" +
+   ", ".join(f"{ldt(p.dtype, ptr=p.addrspace != AddrSpace.ALU)} {ctx[x.src[p.arg.slot+1]]}" for p in body.src if p.op is Ops.PARAM) + ")"),
+])
+
+class LLVMRenderer(Renderer):
+  abi: str | None
+  string_rewrite: PatternMatcher
+  code_for_op = {k:lambda:None for v in lop.values() for k in v.keys()}
+
+  extra_matcher = create_non_native_float_pats((dtypes.bfloat16,)) + pm_manual_bf16_cast + PatternMatcher([
+    # GEP sign-extends indices to pointer width, so unsigned indices must be widened first.
+    (UPat((Ops.INDEX, Ops.SHRINK), src=(UPat(), UPat(dtype=(dtypes.uint8, dtypes.uint16, dtypes.uint32), name="i")),
+          allow_any_len=True, name="x"), lambda x,i: x.replace(src=(x.src[0], i.cast(dtypes.int64), *x.src[2:]))),
+  ])
+  def _render_fn(self, name:str, args:list[tuple[str,UOp]], kernel:list[str], prefix:list[str]|None=None) -> str:
+    # Buffer views may start at an offset from the aligned allocation.
+    sargs = ", ".join([f"{ldt(u.dtype, ptr=u.addrspace != AddrSpace.ALU)}{' noalias' if u.addrspace == AddrSpace.GLOBAL else ''} " + \
+      name for name,u in args])
+    return "\n".join((prefix or []) + [f"define{' ' + self.abi if self.abi else ''} void @{name}({sargs}) #0", "{"] + kernel + ["  ret void\n}"])
+  def _render_kernel(self, uops: list[UOp], prefix:list[str]|None=None, name="test", fns:dict[UOp, str]|None=None) -> tuple[tuple[str, ...], str]:
+    r: dict[UOp, str] = dict(fns or {}) # the functions the kernel calls, by name
+    args: list[tuple[str, UOp]] = []
+    kernel: list[str] = []
+    vc = -1
+
+    local_args: list[str] = []
+    for u in uops:
+      if u.op in {Ops.NOOP, Ops.GROUP, Ops.CONST}: continue
+      if u.op is Ops.AFTER:
+        r[u] = r[u.src[0]]
+        continue
+      if u.op is Ops.SINK:
+        if u.arg is not None: name = u.arg.function_name
+        continue
+      if u.op is Ops.PARAM:
+        r[u] = f"%data{u.arg.slot}"
+        args.append((r[u], u))
+      elif u.op is Ops.BUFFER:
+        r[u] = f"%{'local' if u.addrspace == AddrSpace.LOCAL else 'reg'}_{str(u.arg.slot)}"
+        size = u.max_numel()
+        if u.addrspace == AddrSpace.REG:
+          kernel.append(f"  {r[u]} = alloca [{size} x {ldt(u.dtype)}]")
+        elif self.has_local:
+          local_args.append(f"@{r[u][1:]} = internal unnamed_addr addrspace(3) global [{size} x {ldt(u.dtype)}] undef, align 16")
+          kernel.append(f"  {r[u]} = addrspacecast [{size} x {ldt(u.dtype)}] addrspace(3)* @{r[u][1:]} to [{size} x {ldt(u.dtype)}]*")
+        else:
+          kernel.append(f"  {r[u]} = alloca [{size} x {ldt(u.dtype)}], align 16")
+      elif u.op is Ops.CAST and u.src[0].op is Ops.CONST: r[u] = lconst(u.src[0].val, u.dtype)
+      elif u.op is Ops.CAST and ldt(u.dtype) == ldt(u.src[0].dtype):
+        r[u] = r[u.src[0]] # cast from signed to unsigned of the same size is a noop, or pointer cast
+      else:
+        vc += 1
+        r[u] = f"%v{vc}"
+
+        # do the rendering of the llvm ir code
+        l: str|None = self.string_rewrite.rewrite(u, ctx=r)
+        if l is None:
+          raise RuntimeError(f"failed to render {u.op} with {u.dtype} srcs {[x.dtype for x in u.src]}")
+        kernel.append(l)
+    return tuple(local_args), self._render_fn(name, args, kernel, prefix)
+
+class CPULLVMRenderer(LLVMRenderer):
+  has_local = False
+  global_max = (1, 0, 0)
+  abi = 'win64cc' if sys.platform == 'win32' else None
+  string_rewrite = base_rewrite
+  def render(self, uops: list[UOp]) -> str: # the kernel is first, it is the entry. its functions follow, a name traced with other args gets a suffix
+    fns = {b: f"{b.arg}_{i}" for i, b in enumerate(b for b in UOp.sink(*uops).toposort() if b.op is Ops.LINEAR)}
+    defs = [self._render_kernel(b.src, name=n, fns=fns)[1] for b, n in fns.items()]
+    return "\n".join((k:=self._render_kernel(uops, fns=fns))[0] + (k[1], *defs, self._render_footer(uops)))
+  def _render_footer(self, uops: list[UOp]) -> str: return 'attributes #0 = { alwaysinline nounwind "no-builtins" "no-trapping-math"="true" }'
+  def __init__(self, target:Target):
+    super().__init__(target)
+    from tinygrad.runtime.support.compiler_llvm import CPULLVMCompiler
+    self.compiler = CPULLVMCompiler(target.arch.split(","))
+
+  # FIXME: fp16 works on non-osx, but only if the cpu supports it
+  def supported_dtypes(self):
+    return {d for d in super().supported_dtypes() if
+            (d != dtypes.bfloat16 or self.target.arch.startswith(("x86", "arm"))) and (d != dtypes.half or OSX) and d not in dtypes.fp8s}
+
+barrier = 'fence syncscope("workgroup") release\ntail call void @llvm.amdgcn.s.barrier()\nfence syncscope("workgroup") acquire\n'
+code_for_workitem = {"g": lambda x: f"tail call i32 @llvm.amdgcn.workgroup.id.{chr(120+int(x))}()",
+                     "l": lambda x: f"tail call i32 @llvm.amdgcn.workitem.id.{chr(120+int(x))}()"}
+# https://rocm.docs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPUUsage.html#llvm-ir-intrinsics
+llvm_intrinsics = {Ops.SQRT: "sqrt", Ops.LOG2: "log2", Ops.EXP2: "exp2"}
+class AMDLLVMRenderer(LLVMRenderer):
+  shared_max = HIPRenderer.shared_max
+  global_max = HIPRenderer.global_max
+  global_prod_max = HIPRenderer.global_prod_max
+  abi = "amdgpu_kernel"
+  code_for_op = {**LLVMRenderer.code_for_op, **{op: lambda: None for op in llvm_intrinsics}}
+  string_rewrite = PatternMatcher([
+    (UPat(Ops.SPECIAL, name="x"), lambda ctx, x: f"  {ctx[x]} = " + f"{ code_for_workitem[x.arg[0]](x.arg[-1])}; "),
+    (UPat(tuple(llvm_intrinsics), name="x"),
+    lambda ctx, x: f"  {ctx[x]} = call {ldt(x.dtype)} @llvm.{llvm_intrinsics[x.op]}.{ldt(x.dtype)}({ldt(x.src[0].dtype)} {ctx[x.src[0]]})"),
+    (UPat(Ops.BARRIER), lambda ctx: barrier),
+    (UPat(Ops.CAST, dtypes.fp8s, (UPat(dtype=dtypes.float),), name="x",), lambda ctx,x:
+      f"  {ctx[x]} = call i8 @f32_to_fp8({ldt(x.src[0].dtype)}  {ctx[x.src[0]]}, i1 {fp8_index(x.dtype)})"),
+    (UPat(Ops.CAST, dtypes.float, (UPat.var("y", dtypes.fp8s),), name="x",), lambda ctx,x,y:
+      f"  {ctx[x]}_i32 = zext i8 {ctx[x.src[0]]} to i32\n"
+      f"  {ctx[x]} = call float @llvm.amdgcn.cvt.f32.{('fp8', 'bf8')[fp8_index(y.dtype)]}(i32 {ctx[x]}_i32, i32 0)"),
+  ]) + base_rewrite
+  extra_matcher = LLVMRenderer.extra_matcher + create_non_native_float_pats(dtypes.fp8s) + PatternMatcher([
+    # amd llvm intrinsics llvm.log2/llvm.exp2 don't support double
+    (UPat(Ops.LOG2, dtype=dtypes.double, src=(UPat.var("d"),)), xlog2),
+    (UPat(Ops.EXP2, dtype=dtypes.double, src=(UPat.var("d"),)), xexp2),
+  ])
+  def asm(self, prg: UOp, lin: UOp) -> bytes:
+    from tinygrad.renderer.amd.elf import assemble_linear
+    return assemble_linear(prg, lin, self.target.arch)
+  def render(self, uops: list[UOp]) -> str:
+    fp8_max = amd_fp8s(self.target.arch)[0].max if (has_fp8:=any(u.dtype in dtypes.fp8s for u in uops)) else None
+    prefix = [f"""define i8 @f32_to_fp8(float %val, i1 %is_bf8) {{
+entry: %ival = bitcast float %val to i32\n  %exp = and i32 %ival, 2139095040\n  %is_special = icmp eq i32 %exp, 2139095040
+br i1 %is_special, label %select_clip, label %clip
+clip: br i1 %is_bf8, label %bf8_clip, label %fp8_clip
+bf8_clip: %clamped_bf8 = call float @llvm.amdgcn.fmed3.f32(float %val, float 57344.0, float -57344.0)\n  br label %select_clip
+fp8_clip: %clamped_fp8 = call float @llvm.amdgcn.fmed3.f32(float %val, float {fp8_max}, float -{fp8_max})    \n  br label %select_clip
+select_clip: %phi_val = phi float [%val, %entry], [%clamped_bf8, %bf8_clip], [%clamped_fp8, %fp8_clip]\n  br i1 %is_bf8, label %do_bf8, label %do_fp8
+do_bf8: %packed_bf8 = call i32 @llvm.amdgcn.cvt.pk.bf8.f32(float %phi_val, float %phi_val, i32 0, i1 false)\n  br label %exit
+do_fp8: %packed_fp8 = call i32 @llvm.amdgcn.cvt.pk.fp8.f32(float %phi_val, float %phi_val, i32 0, i1 false)\n  br label %exit
+exit: %packed = phi i32 [%packed_bf8, %do_bf8], [%packed_fp8, %do_fp8]\n  %trunc = trunc i32 %packed to i8\n  ret i8 %trunc
+}}""".replace(": ", ":\n  ")] if has_fp8 else []
+    return "\n".join((k:=self._render_kernel(uops, prefix))[0] + (k[1], self._render_footer(uops)))
+  def _render_footer(self, uops: list[UOp]) -> str:
+    # TODO: this is copied from cstyle
+    local_dims = [u.src[0] for u in uops if u.op is Ops.SPECIAL and u.arg[0] == "l"]
+    requiredMaxThreadsPerBlock = prod([d.vmax for d in local_dims])
+    attributes = ["alwaysinline", "nounwind", '"no-builtins"',
+                  f'"amdgpu-flat-work-group-size"="1,{requiredMaxThreadsPerBlock}"', '"no-trapping-math"="true"']
+    return 'attributes #0 = { ' + ' '.join(attributes) + ' }'
+  @staticmethod
+  def is_rdna4(arch): return arch.split(':')[0] in {'gfx1200', 'gfx1201'}
+  def __init__(self, target:Target):
+    super().__init__(target)
+    from tinygrad.runtime.support.compiler_llvm import AMDLLVMCompiler
+    self.compiler, self.tensor_cores, self.is_cdna = AMDLLVMCompiler(target.arch), tc.get_amd(target.arch), HIPRenderer.is_cdna(target.arch)
+    self.string_rewrite += PatternMatcher([
+      (UPat(Ops.WMMA, name="wmma"), lambda ctx, wmma, rdna4=AMDLLVMRenderer.is_rdna4(target.arch), cdna=self.is_cdna:
+        render_wmma_amd(ctx, wmma, cdna, rdna4))
+    ])
+    if self.is_cdna: self.extra_matcher += tc.pm_validate_wmma_cdna
+    if target.arch in {"gfx1100", "gfx1151"}: self.extra_matcher += tc.pm_validate_wmma_rdna3
+    if target.arch in {"gfx1200", "gfx1201"}: self.extra_matcher += tc.pm_validate_wmma_rdna4
+
+  def supported_dtypes(self): return {d for d in super().supported_dtypes() if d not in dtypes.fp8s or d in amd_fp8s(self.target.arch)}
+
+from typing import Callable, Any
+from tinygrad.dtype import AddrSpace, DType, dtypes, truncate
+from tinygrad.helpers import DEBUG, OSX, unwrap, fromimport, Target, is_image_shape, round_up
+from tinygrad.renderer import Renderer, with_storage
+from tinygrad.renderer.cstyle import CUDARenderer
+from tinygrad.uop.ops import GroupOp, Ops, UOp, PatternMatcher, UPat, range_str
+from tinygrad.runtime.autogen import mesa, libc
+from tinygrad.runtime.support.c import POINTER
+import base64, ctypes, struct, functools, inspect, itertools
+
+def g(s:str): return getattr(mesa, s)
+def nsrc(d:mesa.nir_def) -> mesa.nir_src: return mesa.nir_src(ssa=ctypes.pointer(d))
+
+def glsl_type(t:DType): return {
+  **{getattr(dtypes,k):g(f"glsl_type_builtin_{v}") for k,v in [('double','double'),('float','float'),('float16','float16_t'),('bool','uint8_t')]},
+  **{d:g(f"glsl_type_builtin_{'u' * (d in dtypes.uints)}int{str(d.bitsize)+'_t' if d.itemsize != 4 else ''}") for d in dtypes.ints}}[t]
+
+# alu ops, aop[<dtype>][<op>]
+u_aop = { Ops.ADD: "iadd", Ops.MUL: "imul", Ops.CDIV: "udiv", Ops.CMOD: "umod", Ops.CMPLT: "ult", Ops.CMPNE: "ine", Ops.CMPEQ: "ieq", Ops.OR: "ior",
+          Ops.AND: "iand", Ops.XOR: "ixor", Ops.WHERE: "bcsel", Ops.MAX: "umax", Ops.SHL: "ishl", Ops.SHR: "ushr"}
+s_aop = {**u_aop, Ops.CMPLT: "ilt", Ops.CDIV: "idiv", Ops.CMOD: "irem", Ops.MAX: "imax", Ops.SHR: "ishr"}
+f_aop = { Ops.ADD: "fadd", Ops.MUL: "fmul", Ops.CMPLT: "flt", Ops.CMPNE: "fneu", Ops.CMPEQ: "feq", Ops.FDIV: "fdiv", Ops.RECIPROCAL: "frcp",
+          Ops.MAX: "fmax", Ops.TRUNC: "ftrunc", Ops.SIN: "fsin", Ops.EXP2: "fexp2", Ops.LOG2: "flog2"}
+aop = {**{x:u_aop for x in (dtypes.bool,)+dtypes.uints}, **{x:s_aop for x in dtypes.sints}, **{x:f_aop for x in dtypes.floats}}
+
+def c(t:DType, u:bool=True) -> str: return "u" if t in dtypes.uints and u else ("i" if t in dtypes.ints else ("f" if t in dtypes.floats else "b"))
+def ncast(b:mesa.nir_builder, src:mesa.nir_def, it:DType, ot:DType) -> mesa.nir_def:
+  return nalu(b, f"{c(it)}2{c(it) if it in dtypes.ints and ot in dtypes.ints else c(ot, ot == dtypes.bool)}{ot.bitsize}", src)
+
+def nif(b:mesa.nir_builder, cond:mesa.nir_def, then_fn:Callable, else_fn:Callable):
+  nif = mesa.nir_push_if(b, cond)
+  t = then_fn()
+  mesa.nir_push_else(b, nif)
+  e = else_fn()
+  mesa.nir_pop_if(b, nif)
+  return t, e
+
+def nalu(b:mesa.nir_builder, op:str, *srcs:mesa.nir_def) -> mesa.nir_def: return g(f"nir_build_alu{len(srcs)}")(b, g(f"nir_op_{op}"), *srcs).contents
+
+def nir_instr(nc=1, bs=lambda: None, intrins=None, srcs=None, has_def=True, df=None, also=lambda: None, **contents):
+  def dec(f:Callable):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs) -> mesa.nir_def:
+      (ba:=inspect.signature(f).bind(*args, **kwargs)).apply_defaults()
+      def go(g): return g(**{nm: ba.arguments[nm] for nm in inspect.signature(g).parameters}) if callable(g) else g
+
+      instr = f(*args, **kwargs)
+      if has_def: mesa.nir_def_init(instr.contents.instr, instr.contents._def, go(nc), go(bs))
+      for k, v in go(intrins or {}).items():
+        idx = mesa.nir_intrinsic_infos[instr.contents.intrinsic].index_map[g(f"NIR_INTRINSIC_{k}")]
+        assert idx > 0, "invalid intrinsic. mesa version mismatch?"
+        instr.contents.const_index[idx - 1] = go(v)
+      for i, src in enumerate(go(srcs or [])): ctypes.cast(instr.contents.src, ctypes.POINTER(mesa.nir_src))[i] = go(src)
+      for k,v in {k:vcomp for k,v in contents.items() if (vcomp:=go(v)) is not None}.items(): setattr(instr.contents, k, go(v))
+      mesa.nir_builder_instr_insert(ba.arguments['b'], instr.contents.instr)
+      go(also)
+      return instr.contents._def if has_def else (mesa.nir_def() if df is None else go(df))
+    return wrapper
+  return dec
+
+@nir_instr(nc=1, bs=lambda src: src.bit_size, exact=lambda b:b.exact, fp_fast_math=lambda b:b.fp_fast_math)
+def nchannel(b:mesa.nir_builder, src:mesa.nir_def, c:int):
+  alu_src = mesa.nir_alu_src(src=nsrc(src))
+  alu_src.swizzle[0] = c
+  mov = mesa.nir_alu_instr_create(b.shader, mesa.nir_op_mov)
+  ctypes.cast(mov.contents.src, ctypes.POINTER(mesa.nir_alu_src))[0] = alu_src
+  return mov
+
+def nimm_set(imm:mesa.nir_def, x, dtype:DType):
+  instr = ctypes.cast(imm.parent_instr, ctypes.POINTER(mesa.nir_load_const_instr))
+  struct.pack_into(unwrap(dtype.fmt), (ctypes.c_ubyte * dtype.itemsize).from_address(ctypes.addressof(instr.contents.value)), 0, truncate[dtype](x))
+
+@nir_instr(nc=1, bs=lambda dtype: dtype.bitsize)
+def nimm(b:mesa.nir_builder, x, dtype:DType) -> mesa.nir_def:
+  nimm_set((instr:=mesa.nir_load_const_instr_create(b.shader, 1, dtype.bitsize)).contents._def, x, dtype)
+  return instr
+@nir_instr(nc=1, bs=lambda dtype: dtype.bitsize)
+def nundef(b, dtype): return mesa.nir_undef_instr_create(b.shader, 1, dtype.bitsize)
+
+deref_var = nir_instr(nc=1, bs=32, modes=lambda var:var.data.mode, type=lambda var:var.type, var=lambda var:ctypes.pointer(var))( # pylint: disable=W0108
+  lambda b, var: mesa.nir_deref_instr_create(b.shader, mesa.nir_deref_type_var))
+
+def scope(space): return 'global' if space == AddrSpace.GLOBAL else ('shared' if space == AddrSpace.LOCAL else 'deref')
+nstore = nir_instr(has_def=False, df=lambda addr:addr, intrins=lambda space,val: {"WRITE_MASK":(1<<val.num_components)-1,
+  **({"ALIGN_MUL":val.bit_size//8*val.num_components} if space != AddrSpace.REG else {})},
+  num_components=lambda val:val.num_components, srcs=lambda space, addr, val: [nsrc(val), nsrc(addr)][::1 if space != AddrSpace.REG else -1])(
+    lambda b, space, addr, val: mesa.nir_intrinsic_instr_create(b.shader, g(f"nir_intrinsic_store_{scope(space)}")))
+nload = nir_instr(nc=lambda u:u.max_numel(), bs=lambda u:u.dtype.bitsize, num_components=lambda u:u.max_numel(),
+  intrins=lambda space,u:{**({"ACCESS":mesa.ACCESS_CAN_REORDER} if space==AddrSpace.GLOBAL else {}),
+                          **({"ALIGN_MUL":u.dtype.itemsize*u.max_numel()} if space != AddrSpace.REG else {})}, srcs=lambda addr: [nsrc(addr)])(
+    lambda b, space, addr, u: mesa.nir_intrinsic_instr_create(b.shader, g(f"nir_intrinsic_load_{scope(space)}")))
+
+ngid = nir_instr(nc=3, bs=32)(lambda b: mesa.nir_intrinsic_instr_create(b.shader, mesa.nir_intrinsic_load_workgroup_id))
+nlid = nir_instr(nc=3, bs=32)(lambda b: mesa.nir_intrinsic_instr_create(b.shader, mesa.nir_intrinsic_load_local_invocation_id))
+
+nbarrier = nir_instr(has_def=False, intrins={"EXECUTION_SCOPE":mesa.SCOPE_WORKGROUP})(
+  lambda b: mesa.nir_intrinsic_instr_create(b.shader, mesa.nir_intrinsic_barrier))
+
+@nir_instr(has_def=False, target=lambda tgt:tgt and ctypes.pointer(tgt), condition=lambda cond:cond and nsrc(cond),
+           else_target=lambda else_tgt: else_tgt and ctypes.pointer(else_tgt))
+def njump(b:mesa.nir_builder, typ, tgt=None, cond=None, else_tgt=None): return mesa.nir_jump_instr_create(b.shader, typ)
+
+def if_phi(b:mesa.nir_builder, cond, then_fn, else_fn): return mesa.nir_if_phi(b, *nif(b, cond, then_fn, else_fn)).contents
+
+def nidx(b:mesa.nir_builder, buf, off, space, itemsize, gate=None) -> mesa.nir_def:
+  @nir_instr(nc=1, bs=32, modes=lambda buf: buf.data.mode, type=lambda buf: mesa.glsl_get_array_element(buf.type))
+  def reg(b, buf):
+    deref = mesa.nir_deref_instr_create(b.shader, mesa.nir_deref_type_array)
+    deref.contents.parent, deref.contents.arr.index = nsrc(deref_var(b, buf)), nsrc(off)
+    return deref
+  f = (functools.partial(reg, b, buf) if space == AddrSpace.REG else
+       lambda: nalu(b, "iadd", buf, nalu(b, "imul", off, nimm(b, itemsize, dtypes.long))))
+  return if_phi(b, gate, f, lambda: buf) if gate is not None else f()
+
+class NIRRenderer(Renderer):
+  suffix = "NIR"
+  nir_options: bytes
+  global_max, local_max, shared_max = CUDARenderer.global_max, CUDARenderer.local_max, CUDARenderer.shared_max
+  code_for_op = {**{k:lambda:None for k in s_aop.keys()}, **{k:lambda:None for k in f_aop.keys()}}
+
+  extra_matcher = PatternMatcher([
+    # from ptx
+    (UPat.var('x', dtype=dtypes.bool)<UPat.var('y'), lambda x,y: (x^True)&y),
+    # a bool is one bit in NIR but a byte in memory, so every access to a bool buffer goes through a uint8 view of it
+    (UPat(Ops.LOAD, dtypes.bool, name="x"),
+     lambda x: x.replace(src=(with_storage(x.src[0], dtypes.uint8),)+((x.src[1].cast(dtypes.uint8),) if len(x.src)>=2 else ())
+      +x.src[2:]).cast(dtypes.bool)),
+    (UPat(Ops.STORE, src=(UPat(name="idx"), UPat(dtype=dtypes.bool)), name="x", allow_any_len=True),
+     lambda x,idx: x.replace(src=(with_storage(idx, dtypes.uint8), x.src[1].cast(dtypes.uint8))+x.src[2:])),
+    # NIR requires shift amount to be 32 bit: https://docs.mesa3d.org/nir/alu.html#nir-alu-op-ishl
+    (UPat((Ops.SHL, Ops.SHR), name="x"), lambda x: x.replace(src=(x.src[0], x.src[1].cast(dtypes.uint))) if x.src[1].dtype.bitsize != 32 else None),
+    # OpConvertFToU is undefined if Result Type is not wide enough, cast through int32
+    # ref: https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpConvertFToU
+    (UPat(Ops.CAST, (dtypes.uchar, dtypes.ushort), src=(UPat.var("x", dtypes.floats),), name="c"), lambda x,c: x.cast(dtypes.int32).cast(c.dtype)),
+    # load/store use pointer arithmetic, and the cast does nothing. NOTE: this doesn't apply to image indexing cause it's 1-D
+    # nor to REG/ALU register picks, which keep their own index dtype
+    (UPat((Ops.INDEX, Ops.SHRINK), src=(UPat.var("buf"), UPat.var("off")), allow_any_len=True, name="x"),
+     lambda x,buf,off: x.replace(src=(buf,off.ccast(dtypes.long))+x.src[2:])
+      if buf.addrspace in (AddrSpace.GLOBAL, AddrSpace.LOCAL) and not is_image_shape(buf._shape) else None),
+    # images need index to be int for nir (coordinates only: the INDEX keeps its access dtype)
+    (UPat.var("buf").index(UPat.var("idx_y"), UPat.var("idx_x"), name="x"),
+     lambda x,buf,idx_y,idx_x: x.replace(src=(buf, idx_y.cast(dtypes.int), idx_x.cast(dtypes.int)))),
+  ])
+
+  def_rewrite = PatternMatcher([
+    (UPat.cvar("c").cast(name="x"), lambda ctx,x,c: nimm(ctx.b, c.val, x.dtype)),
+    (UPat(Ops.PARAM, name="x"), lambda ctx,x: ctx.param(ctx.b, x, x.dtype.itemsize if x.addrspace is AddrSpace.ALU else 8)),
+    (UPat(Ops.SPECIAL, name="x"), lambda ctx,x: nchannel(ctx.b, {'g':ngid, 'l':nlid}[x.arg[0]](ctx.b), int(x.arg[-1]))),
+    (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), src=(UPat.var("buf"),UPat.var("off")), allow_any_len=True), UPat.var("val"))),
+     lambda ctx,buf,off,val: nstore(ctx.b, buf.addrspace, nidx(ctx.b, ctx.r[buf], ctx.r[off], buf.addrspace, buf.dtype.itemsize), ctx.r[val])),
+    (UPat(Ops.LOAD, src=(UPat((Ops.INDEX, Ops.SHRINK), src=(UPat.var("buf"), UPat.var("off")), allow_any_len=True), UPat.var("alt"),
+                         UPat.var("gate")), name="x"),
+     lambda ctx,x,buf,off,alt,gate: if_phi(ctx.b, ctx.r[gate],
+      lambda: nload(ctx.b, buf.addrspace, nidx(ctx.b, ctx.r[buf], ctx.r[off], buf.addrspace, buf.dtype.itemsize, ctx.r[gate]), x),
+      lambda: ctx.r[alt])),
+    (UPat(Ops.LOAD, src=(UPat((Ops.INDEX, Ops.SHRINK), src=(UPat.var("buf"), UPat.var("off")), allow_any_len=True),), name="x"),
+     lambda ctx,x,buf,off: nload(ctx.b, buf.addrspace, nidx(ctx.b, ctx.r[buf], ctx.r[off], buf.addrspace, buf.dtype.itemsize), x)),
+    (UPat(Ops.STACK, name="x"), lambda ctx,x: nalu(ctx.b, f"vec{x.max_numel()}", *[ctx.r[src] for src in x.src])),
+    (UPat(GroupOp.ALU, name="x"), lambda ctx,x: nalu(ctx.b, aop[x.src[0].dtype][x.op], *[ctx.r[src] for src in x.src])),
+    (UPat(Ops.CAST, name="x"), lambda ctx,x: ncast(ctx.b, ctx.r[x.src[0]], x.src[0].dtype, x.dtype)),
+    (UPat(Ops.BITCAST, src=(UPat.var("a"),), allow_any_len=True), lambda ctx,a: ctx.r[a]),
+    (UPat(Ops.BUFFER, name="x"), lambda ctx,x: mesa.nir_local_variable_create(ctx.b.impl,
+      mesa.glsl_array_type(glsl_type(x.dtype), x.max_numel(), 0).contents, f"acc{x.arg.slot}".encode()).contents),
+    (UPat(Ops.BARRIER), lambda ctx: nbarrier(ctx.b)),
+    (UPat(Ops.IF, name="x"), lambda ctx,x: mesa.nir_push_if(ctx.b, ctx.r[x.src[0]])),
+    (UPat(Ops.ENDIF, name="x"), lambda ctx,x: (lambda _: mesa.nir_def())(mesa.nir_pop_if(ctx.b, ctx.r[x.src[0]])))
+  ])
+
+  def __init__(self, target:Target):
+    super().__init__(target)
+    self.compiler = fromimport("tinygrad.runtime.support.compiler_mesa", self.__class__.__name__.replace("Renderer", "Compiler"))(target.arch)
+    if hasattr(self.compiler, "nir_options"): self.nir_options = self.compiler.nir_options
+    mesa.glsl_type_singleton_init_or_ref()
+    self._deinit_types = True
+
+  def __del__(self):
+    if getattr(self, "_deinit_types", False): mesa.glsl_type_singleton_decref()
+
+  def param(self, b:mesa.nir_builder, x, sz:int) -> mesa.nir_def: raise NotImplementedError("needs param")
+  def prerender(self, uops:list[UOp]):
+    self.b = mesa.nir_builder_init_simple_shader(mesa.MESA_SHADER_COMPUTE, mesa.nir_shader_compiler_options.from_buffer_copy(self.nir_options), None)
+  def postrender(self, uops:list[UOp]): pass
+
+  def render(self, uops:list[UOp]):
+    self.prerender(uops)
+    for u in [u for u in uops if u.op is Ops.SPECIAL and u.arg[0] == "l"]:
+      self.b.shader.contents.info.workgroup_size[int(u.arg[-1])] = u.src[0].src[0].val
+    self.r: dict[UOp, Any] = {}
+    self.param_idx = 0
+    ranges: list[mesa.nir_def|None] = []
+
+    for u in uops:
+      if u.op in {Ops.NOOP, Ops.GROUP, Ops.CONST} or (u.op is Ops.STACK and len(u.src) == 0): pass
+      elif u.op in {Ops.INDEX, Ops.SHRINK}:
+        # INDEX on a register value picks the element, memory INDEX is handled in the LOAD/STORE patterns
+        if u.src[0].op not in {Ops.PARAM, Ops.BUFFER, Ops.AFTER}: self.r[u] = nchannel(self.b, self.r[u.src[0]], u.src[1].src[0].val)
+      elif u.op is Ops.AFTER:
+        self.r[u] = self.r[u.src[0]]
+      elif u.op == Ops.SINK:
+        if u.arg is not None:
+          self.b.shader.contents.info.name = ctypes.cast(ctypes.create_string_buffer(u.arg.function_name.encode()), POINTER[ctypes.c_char])
+      elif u.op == Ops.BUFFER and u.addrspace == AddrSpace.LOCAL:
+        self.r[u] = nimm(self.b, self.b.shader.contents.info.shared_size, dtypes.long)
+        self.b.shader.contents.info.shared_size += u.max_numel()*u.dtype.itemsize
+      elif u.op == Ops.RANGE:
+        if u.dtype == dtypes.void:
+          # a RANGE with no bound is a loop header: just open the loop, BACKEDGE supplies its condition
+          ranges.append(None)
+          mesa.nir_push_loop(self.b)
+        else:
+          ranges.append(i:=deref_var(self.b, mesa.nir_local_variable_create(self.b.impl, glsl_type(u.dtype), f"idx{range_str(u)}".encode()).contents))
+          nstore(self.b, AddrSpace.REG, i, nimm(self.b, 0, u.dtype))
+          mesa.nir_push_loop(self.b)
+          self.r[u] = nload(self.b, AddrSpace.REG, i, u)
+          nif(self.b, nalu(self.b, "ilt", self.r[u], self.r[u.src[0]]), lambda: None, lambda: njump(self.b, mesa.nir_jump_break))
+      elif u.op == Ops.BACKEDGE:
+        nif(self.b, self.r[u.src[2]], lambda: None, lambda: njump(self.b, mesa.nir_jump_break))
+        ranges.pop()
+        mesa.nir_pop_loop(self.b, None)
+      elif u.op == Ops.END:
+        r = u.src[1]
+        next_i = nalu(self.b, "iadd", self.r[r], nimm(self.b, 1, r.dtype))
+        # TODO: this nif should be removable ... but TestMultiTensor.test_double_matmul_shard_W_0 segfaults with it gone
+        nif(self.b, nalu(self.b, "ilt", next_i, self.r[r.src[0]]), lambda: None, lambda: njump(self.b, mesa.nir_jump_break))
+        nstore(self.b, AddrSpace.REG, ranges.pop(), next_i),
+        mesa.nir_pop_loop(self.b, None)
+      else:
+        d: mesa.nir_def|None = self.def_rewrite.rewrite(u, ctx=self)
+        if d is None: raise RuntimeError(f"failed to render {u.op} srcs {[x.dtype for x in u.src]}")
+        self.r[u] = d
+    self.postrender(uops)
+
+    mesa.nir_validate_shader(self.b.shader, b"after render")
+    if DEBUG >= 4: mesa.nir_print_shader(self.b.shader, ctypes.POINTER(mesa.struct__IO_FILE).in_dll(libc.dll, "__stdoutp" if OSX else "stdout"))
+    mesa.nir_serialize(blob:=mesa.struct_blob(), self.b.shader, False)
+    ret = base64.b64encode(ctypes.string_at(blob.data, blob.size)).decode()
+
+    mesa.ralloc_free(self.b.shader)
+    ctypes.CDLL(None).free(blob.data)
+    del self.b, self.r
+
+    return ret
+
+  def supported_dtypes(self): return {d for d in Renderer.supported_dtypes(self) if d not in dtypes.fp8s+(dtypes.bfloat16,)}
+
+def padded_idx(param_idx:int, size:int): return round_up(param_idx, size) + size
+
+class NAKRenderer(NIRRenderer):
+  param = nir_instr(nc=1, num_components=1, bs=lambda sz:sz*8, also=lambda self,sz: setattr(self, "param_idx", padded_idx(self.param_idx, sz)),
+    intrins={"ALIGN_MUL":lambda sz:sz}, srcs=lambda self,b,sz: [nsrc(nimm(b,0,dtypes.int)), nsrc(nimm(b, round_up(self.param_idx,sz), dtypes.int))])(
+       lambda self, b, x, sz: mesa.nir_intrinsic_instr_create(b.shader, mesa.nir_intrinsic_ldc_nv))
+
+  def supported_dtypes(self): return {d for d in super().supported_dtypes() if (d != dtypes.half or int(self.target.arch[3:]) >= 53)}
+
+class LVPRenderer(NIRRenderer):
+  has_local = False
+  has_shared = False
+  global_max = (1, 0, 0)
+  nir_options = mesa.lvp_nir_options
+  # gallivm's exp2/log2 have "undefined behavior with infs, 0s and nans", so exp2(log2(0)*y) returns 0 instead of inf
+  # https://gitlab.freedesktop.org/mesa/mesa/-/blob/c200b18e876468b51fe80d9660f612dc03a5138e/src/gallium/auxiliary/gallivm/lp_bld_arit.c#L2972
+  code_for_op = {k:v for k,v in NIRRenderer.code_for_op.items() if k != Ops.EXP2}
+
+  param = nir_instr(nc=1, bs=lambda sz: sz * 8, num_components=1, intrins={"ALIGN_MUL":lambda sz: sz, "RANGE":lambda self: self.param_sz},
+    srcs=lambda b,self,sz: [nsrc(nimm(b, 0, dtypes.int)), nsrc(nimm(b, round_up(self.param_idx, sz), dtypes.int))], also=lambda self, sz:
+    setattr(self, "param_idx", padded_idx(self.param_idx, sz)))(lambda self,b,x,sz:
+                                                                mesa.nir_intrinsic_instr_create(b.shader, mesa.nir_intrinsic_load_ubo))
+
+  def prerender(self, uops:list[UOp]):
+    super().prerender(uops)
+    self.param_sz = functools.reduce(padded_idx, (u.element_size() if u.addrspace is AddrSpace.ALU else 8 for u in uops if u.op is Ops.PARAM), 0)
+
+def tovec(b, idx_y, idx_x): return nalu(b, "vec4", idx_x, idx_y, nundef(b, dtypes.int), nundef(b, dtypes.int))
+def nfloat(dtype): return mesa.nir_type_float16 if dtype == dtypes.half else mesa.nir_type_float32
+nstore_img = nir_instr(has_def=False, df=lambda img:img, num_components=lambda val:val.num_components,
+  intrins=lambda dtype:{'IMAGE_DIM':mesa.GLSL_SAMPLER_DIM_2D, 'ACCESS':mesa.ACCESS_CAN_REORDER, 'SRC_TYPE':nfloat(dtype)},
+  srcs=lambda b,img,idx_y,idx_x,val:[nsrc(x) for x in [img, tovec(b, idx_y, idx_x), nundef(b, dtypes.int), val, nimm(b, 0, dtypes.int)]])(
+    lambda b,img,idx_y,idx_x,val,dtype:mesa.nir_intrinsic_instr_create(b.shader,g("nir_intrinsic_image_store")))
+
+_nload_img = nir_instr(intrins=lambda dtype:{'IMAGE_DIM':mesa.GLSL_SAMPLER_DIM_2D, 'ACCESS':mesa.ACCESS_CAN_REORDER, 'DEST_TYPE':nfloat(dtype)},
+  nc=4, bs=32, num_components=4,
+  srcs=lambda b,img,idx_y,idx_x:[nsrc(x) for x in [img, tovec(b, idx_y, idx_x), nundef(b, dtypes.int), nimm(b, 0, dtypes.int)]])(
+      lambda b,img,idx_y,idx_x,dtype: mesa.nir_intrinsic_instr_create(b.shader, g("nir_intrinsic_image_load")))
+
+class IR3Renderer(NIRRenderer):
+  def nload_img(ctx,img,idx_y,idx_x):
+    ctx.texs.add(img)
+    return _nload_img(ctx.b, ctx.r[img], ctx.r[idx_y], ctx.r[idx_x], img.dtype)
+
+  def_rewrite = PatternMatcher([
+    (UPat(Ops.STORE, src=(UPat.var('img').index(UPat.var('idx_y'), UPat.var('idx_x')), UPat.var("val")), allow_any_len=True),
+     lambda ctx,img,idx_y,idx_x,val: nstore_img(ctx.b, ctx.r[img], ctx.r[idx_y], ctx.r[idx_x], ctx.r[val], val.dtype)),
+    (UPat(Ops.LOAD, src=(UPat.var('img').index(UPat.var('idx_y'), UPat.var('idx_x')), UPat.var("alt"), UPat.var("gate"))),
+     lambda ctx,img,idx_y,idx_x,alt,gate: if_phi(ctx.b, ctx.r[gate], lambda: ctx.nload_img(img, idx_y, idx_x), lambda: ctx.r[alt])),
+    (UPat(Ops.LOAD, src=(UPat.var('img').index(UPat.var('idx_y'), UPat.var('idx_x')),)), nload_img),
+  ]) + NIRRenderer.def_rewrite
+
+  _param = LVPRenderer.param
+  def _param_img(self, x):
+    self.img_idx += 1
+    return nimm(self.b, self.img_idx - 1, dtypes.int)
+
+  def param(self, b, x, sz): return self._param_img(x) if is_image_shape(x._shape) else self._param(b, x, sz)
+
+  def prerender(self, uops:list[UOp]):
+    super().prerender(uops)
+    self.texs:set[UOp] = set()
+    self.img_idx = 0
+    self.param_sz = functools.reduce(padded_idx, (u.element_size() if u.addrspace is AddrSpace.ALU else 8
+                                                 for u in uops if u.op is Ops.PARAM and not is_image_shape(u._shape)), 0)
+
+  def postrender(self, uops:list[UOp]):
+    bufs = [u for u in uops if u.op is Ops.PARAM and u.addrspace is not AddrSpace.ALU]
+    texs, imgs = itertools.count().__next__, itertools.count().__next__
+    for b in filter(lambda b: is_image_shape(b._shape), bufs):
+      nimm_set(self.r[b], texs() if b in self.texs else imgs(), dtypes.int)
+
+    self.b.shader.contents.info.num_ubos = len([u for u in bufs if not is_image_shape(u._shape)])
+    self.b.shader.contents.info.num_images = texs() + imgs()
+
+  def supported_dtypes(self): return {d for d in NIRRenderer.supported_dtypes(self) if d != dtypes.double}
+
+from typing import cast, Callable
+import struct
+from collections import defaultdict
+from tinygrad.renderer import tc
+from tinygrad.uop.ops import Ops, UOp, PatternMatcher, UPat, GroupOp
+from tinygrad.dtype import dtypes, DType, AddrSpace
+from tinygrad.renderer import Renderer, with_storage
+from tinygrad.renderer.cstyle import CUDARenderer
+from tinygrad.helpers import flatten, prod, unwrap, Target
+
+def render_val(x, dtype):
+  if dtypes.is_float(dtype):
+    if dtype == dtypes.double: return "0d%02X%02X%02X%02X%02X%02X%02X%02X" % tuple(struct.pack("d",x)[::-1])
+    if dtype == dtypes.half: return "0x%02X%02X" % tuple(struct.pack("e",x)[::-1])
+    return "0f%02X%02X%02X%02X" % tuple(struct.pack("f",x)[::-1])
+  return str(int(x)) + ("U" if dtypes.is_unsigned(dtype) else "")
+
+asm_for_op: dict[Ops, Callable] = {
+  Ops.RECIPROCAL: lambda d,a,dt,name: f"rcp.approx.{name} {d}, {a};",
+  Ops.EXP2: lambda d,a,dt,name: f"ex2.approx.{name} {d}, {a};", Ops.LOG2: lambda d,a,dt,name: f"lg2.approx.{name} {d}, {a};",
+  Ops.SIN: lambda d,a,dt,name: f"sin.approx.{name} {d}, {a};", Ops.SQRT: lambda d,a,dt,name: f"sqrt.approx.{name} {d}, {a};",
+  Ops.TRUNC: lambda d,a,dt,name: f"cvt.rzi.{name}.{name} {d}, {a};",
+  Ops.SHR: lambda d,a,b,dt,name: f"shr.{name} {d}, {a}, {b};", Ops.SHL: lambda d,a,b,dt,name: f"shl.b{name[1:]} {d}, {a}, {b};",
+  Ops.ADD: lambda d,a,b,dt,name: f"{'or' if dt == dtypes.bool else 'add'}.{name} {d}, {a}, {b};",
+  Ops.MUL: lambda d,a,b,dt,name: f"{'and' if dt == dtypes.bool else 'mul'}{'.lo' if dtypes.is_int(dt) else ''}.{name} {d}, {a}, {b};",
+  Ops.XOR: lambda d,a,b,dt,name: f"xor.pred {d}, {a}, {b};" if dt == dtypes.bool else f"xor.b{name[1:]} {d}, {a}, {b};",
+  Ops.AND: lambda d,a,b,dt, name: f"and.pred {d}, {a}, {b};" if dt == dtypes.bool else f"and.b{name[1:]} {d}, {a}, {b};",
+  Ops.OR: lambda d,a,b,dt, name: f"or.pred {d}, {a}, {b};" if dt == dtypes.bool else f"or.b{name[1:]} {d}, {a}, {b};",
+  Ops.CDIV: lambda d,a,b,dt,name: f"div.{name} {d}, {a}, {b};", Ops.CMOD: lambda d,a,b,dt,name: f"rem.{name} {d}, {a}, {b};",
+  Ops.MAX: lambda d,a,b,dt,name: f"max.{name} {d}, {a}, {b};", Ops.CMPEQ: lambda d,a,b,dt,name: f"setp.eq.{name} {d}, {a}, {b};",
+  Ops.CMPLT: lambda d,a,b,dt,name: f"setp.lt.{name} {d}, {a}, {b};",
+  Ops.CMPNE: lambda d,a,b,dt,name: f"setp.{'neu' if dtypes.is_float(dt) else 'ne'}.{name} {d}, {a}, {b};",
+  Ops.MULACC: lambda d,a,b,c,dt,name: f"{'fma.rn' if dtypes.is_float(dt) else 'mad.lo'}.{name} {d}, {a}, {b}, {c};",
+  Ops.WHERE: lambda d,a,b,c,dt,name: [f"@{a} mov.{name} {d}, {b};", f"@!{a} mov.{name} {d}, {c};"] if dt == dtypes.bool else \
+    f"selp.{'b16' if name == 'f16' else name} {d}, {b}, {c}, {a};"
+}
+
+supports_half = (Ops.EXP2, Ops.ADD, Ops.MUL, Ops.MAX, Ops.CMPLT, Ops.WHERE, Ops.TRUNC)
+doesnt_support_half: tuple[Ops, ...] = tuple(op for op in asm_for_op.keys() if op not in supports_half)
+ptx_matcher = PatternMatcher([
+  # bool CMPNE is XOR, bool CMPLT is XOR+AND (universal makes this slow, this is for renderer only)
+  (UPat.var('x', dtype=dtypes.bool).ne(UPat.var('y')), lambda x,y: x^y),
+  (UPat.var('x', dtype=dtypes.bool).alu(Ops.CMPEQ, UPat.var('y')), lambda x,y: (x^y)^True),
+  (UPat.var('x', dtype=dtypes.bool)<UPat.var('y'), lambda x,y: (x^True)&y),
+  # upcast to float32 all the ops that don't support half
+  (UPat(doesnt_support_half, dtype=dtypes.half, name="x"),
+    lambda x: (UOp(x.op, src=tuple(vv.cast(dtypes.float32) for vv in x.src), arg=x.arg).cast(dtypes.half))),
+  # a bool is a predicate register in PTX but a byte in memory, so a bool buffer is accessed through a uint8 view of it
+  (UPat(Ops.LOAD, dtypes.bool, src=(UPat(name="idx"),), name="x", allow_any_len=True),
+   lambda x,idx: x.replace(src=(with_storage(idx, dtypes.uint8),) + ((x.src[1].cast(dtypes.uint8),) if len(x.src) >= 2 else ())
+     + x.src[2:]).cast(dtypes.bool) if idx.addrspace != AddrSpace.REG else None),
+  (UPat(Ops.STORE, src=(UPat(name="idx"), UPat(dtype=dtypes.bool)), name="x", allow_any_len=True),
+   lambda x,idx: x.replace(src=(with_storage(idx, dtypes.uint8), x.src[1].cast(dtypes.uint8))+x.src[2:]) if idx.addrspace != AddrSpace.REG else None),
+  # ptx shr and shl instructions require y to be uint
+  (UPat.var("x") << UPat.var("y"), lambda x,y: UOp(Ops.SHL, src=(x,y.cast(dtypes.uint))) if y.dtype != dtypes.uint else None),
+  (UPat.var("x") >> UPat.var("y"), lambda x,y: UOp(Ops.SHR, src=(x,y.cast(dtypes.uint))) if y.dtype != dtypes.uint else None),
+])
+
+def mem_type(x:UOp) -> str: return 'shared' if x.addrspace == AddrSpace.LOCAL else 'global'
+
+def render_wmma(ctx: "PTXRenderer", wmma: UOp):
+  assert ctx.wmma_r, "registry values for wmma must be populated"
+  (N, M, K), dtype_in, dtype_out = wmma.arg[0], wmma.arg[1], wmma.dtype
+
+  for src, regs in zip(wmma.src, ctx.wmma_r):
+    for i, reg in enumerate(regs): # pack input and acc registers
+      if (elems_per_reg := 4 // src.dtype.itemsize) == 1: yield f"mov.b32 {reg}, {ctx.r[src][i]};"
+      else: yield f"mov.b32 {reg}, {{{', '.join(ctx.r[src][i * elems_per_reg : (i+1) * elems_per_reg])}}};"
+
+  dt_map_in, dt_map_out = {dtypes.float: "tf32", dtypes.half: "f16"}, {dtypes.float: "f32", dtypes.half: "f16"}
+  yield f'mma.sync.aligned.m{M}n{N}k{K}.row.col.{dt_map_out[dtype_out]}.{dt_map_in[dtype_in]}.{dt_map_in[dtype_in]}.{dt_map_out[dtype_out]}{" "*12}'+\
+        f'{{{", ".join(ctx.wmma_r[2])}}}, {{{", ".join(ctx.wmma_r[0])}}}, {{{", ".join(ctx.wmma_r[1])}}}, {{{", ".join(ctx.wmma_r[2])}}};'
+
+  for i, reg in enumerate(ctx.wmma_r[2]): # unpack acc registers
+    if (elems_per_reg := 4 // dtype_out.itemsize) == 1: yield f"mov.b32 {ctx.r[wmma][i]}, {reg};"
+    else: yield f"mov.b32 {{{', '.join(ctx.r[wmma][i * elems_per_reg : (i+1) * elems_per_reg])}}}, {reg};"
+
+def modifier(a: DType, b: DType): return '.rzi' if dtypes.is_int(a) and dtypes.is_float(b) else '.rn' if dtypes.is_float(a) and \
+  (a.itemsize < b.itemsize or dtypes.is_int(b) or b == dtypes.bool) else ''
+
+string_rewrite = PatternMatcher([
+  (UPat.cvar("c").cast(dtypes.bool, name="x"), lambda ctx, x, c: f"setp.ne.s16 {ctx.r[x]}, {render_val(c.val, x.dtype)}, 0;"),
+  (UPat.cvar("c").cast(name="x"), lambda ctx, x, c: f"mov.b{ctx.types[x.dtype][1:]} {ctx.r[x]}, {render_val(c.val, x.dtype)};"),
+  (UPat(Ops.SPECIAL, name="x"), lambda ctx,x: f"mov.u32 %{x.arg}, %{'ctaid' if x.arg[0] == 'g' else 'tid'}.{chr(120+int(x.arg[-1]))};"),
+  (UPat(Ops.PARAM, name="x"), lambda ctx, x:
+   f"ld.param.{ctx.types[dtypes.ulong] if x.addrspace is AddrSpace.GLOBAL else ctx.mem_types[x.dtype]} {ctx.r[x]}, [data{x.arg.slot}+0];"),
+  # address computation: addr = buf + idx*itemsize
+  (UPat((Ops.INDEX, Ops.SHRINK), src=(UPat.var("buf"), UPat.var("idx")), allow_any_len=True, name="x"), lambda ctx, x, buf, idx:
+   [f"cvt.s64.{ctx.types[idx.dtype]} {ctx.r[x]}, {ctx.r[idx]};", f"mad.lo.s64 {ctx.r[x]}, {ctx.r[x]}, {x.dtype.itemsize}, {ctx.r[buf]};"]),
+  (UPat((Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ), name="x", allow_any_len=True, src=(UPat.var("src0"),)),
+    lambda ctx, x, src0: ctx.code_for_op[x.op](ctx.r[x], *[ctx.r[v] for v in x.src], src0.dtype, ctx.types[src0.dtype])),
+  (UPat(GroupOp.ALU, name="x"), lambda ctx, x: ctx.code_for_op[x.op](ctx.r[x], *[ctx.r[v] for v in x.src], x.dtype, ctx.types[x.dtype])),
+  (UPat(Ops.BITCAST, name="x", src=(UPat.var("a"),), allow_any_len=True), lambda ctx, x, a: f"mov.b{ctx.types[x.dtype][1:]} {ctx.r[x]}, {ctx.r[a]};"),
+  (UPat(Ops.CAST, name="x", src=(UPat(dtype=dtypes.bool, name="a"),)),
+   lambda ctx, x, a: f"selp.b{ctx.types[x.dtype][1:]} {ctx.r[x]}, {render_val(1, x.dtype)}, {render_val(0, x.dtype)}, {ctx.r[a]};"),
+  (UPat(Ops.CAST, name="x", src=(UPat.var("a"),)),
+   lambda ctx, x, a: f"cvt{modifier(x.dtype, a.dtype)}.{ctx.cast_types[x.dtype]}.{ctx.cast_types[a.dtype]} {ctx.r[x]}, {ctx.r[a]};"),
+  # store / gated load / load
+  (UPat(Ops.STORE, src=(UPat(name="loc"), UPat.var("var"))), lambda ctx, loc, var:
+   f"mov.{'pred' if var.dtype == dtypes.bool else 'b'+ctx.types[var.dtype][1:]} {ctx.r[loc]}, {ctx.r[var]};" \
+     if loc.addrspace == AddrSpace.REG else None),
+  (UPat(Ops.STORE, src=(UPat((Ops.INDEX, Ops.SHRINK), name="loc"), UPat.var("var"))),
+   lambda ctx, loc, var: f"st.{mem_type(loc)}" + \
+    f"{f'.v{cnt}' if ((cnt:=var.max_numel())>1) else ''}.{ctx.mem_types[var.dtype]} " + \
+    f"[{ctx.r[loc]}+0], {('{' + ', '.join(ctx.r[var]) + '}') if var.max_numel() > 1 else ctx.r[var]};"),
+  (UPat(Ops.LOAD, name="x", src=(UPat((Ops.INDEX, Ops.SHRINK), name="loc"), UPat.var("alt"), UPat.var("gate"))),
+    lambda ctx, x, loc, alt, gate: flatten([
+    [f"mov.{ctx.mem_types[x.dtype]} {v}, {render_val(0, x.dtype)};" for v in ctx.r[x]],
+    [f"@{ctx.r[gate]} ld.{mem_type(loc)}.v{x.max_numel()}.{ctx.mem_types[x.dtype]} {{{', '.join(ctx.r[x])}}}, [{ctx.r[loc]}+0];"]
+  ]) if alt.max_numel() > 1 else [
+    f"@{ctx.r[gate]} ld.{mem_type(loc)}.{ctx.mem_types[x.dtype]} {ctx.r[x]}, [{ctx.r[loc]}+0];",
+    f"@!{ctx.r[gate]} mov.b{ctx.types[x.dtype][1:]} {ctx.r[x]}, {ctx.r[alt]};"]),
+  (UPat(Ops.LOAD, name="x", src=(UPat((Ops.INDEX, Ops.SHRINK), name="loc"),)),
+    lambda ctx, x, loc: f"ld.{mem_type(loc)}.v{x.max_numel()}.{ctx.mem_types[x.dtype]} {{{', '.join(ctx.r[x])}}}, [{ctx.r[loc]}+0];" \
+     if x.max_numel() > 1 else f"ld.{mem_type(loc)}.{ctx.mem_types[x.dtype]} {ctx.r[x]}, [{ctx.r[loc]}+0];"),
+  # simple
+  (UPat(Ops.BUFFER, name="x"), lambda ctx, x: [
+    f".shared .align 16 .b8 local{x.arg.slot}[{x.max_numel()*x.dtype.itemsize}];", f"mov.u64 {ctx.r[x]}, local{x.arg.slot}[0];"]),
+  (UPat(Ops.RANGE, dtypes.void, name="l"), lambda ctx, l: f"WAITLOOP_{ctx.uops.index(l)}:"),
+  (UPat(Ops.BACKEDGE, src=(UPat(), UPat(Ops.RANGE, dtypes.void, name="l"), UPat(name="c"))), lambda ctx, l, c:
+    f"@{ctx.r[c]} bra WAITLOOP_{ctx.uops.index(l)};"),
+  (UPat(Ops.RANGE, name="r"), lambda ctx, r: [
+    f"mov.u32 {ctx.r[r]}, -1;",
+    f"bra END_{ctx.r[r][1:]};",
+    "LOOP_" + f"{ctx.r[r][1:]}:"]),
+  (UPat(Ops.END, name="x", src=(UPat(), UPat(Ops.RANGE, name="r"))), lambda ctx, x, r: [
+    "END_" + f"{ctx.r[r][1:]}:",
+    ctx.code_for_op[Ops.ADD](ctx.r[r], ctx.r[r], "1", dtypes.int, ctx.types[dtypes.int]),
+    ctx.code_for_op[Ops.CMPLT](ctx.r[x], ctx.r[r], ctx.r[r.src[0]], dtypes.int, ctx.types[dtypes.int]),
+    f"@{ctx.r[x]} bra LOOP_{ctx.r[r][1:]};"]),
+  (UPat(Ops.IF, name="x"), lambda ctx, x: f"@!{ctx.r[x.src[0]]} bra IF_{ctx.r[x.src[0]][1:]}_{ctx.uops.index(x)};"),
+  (UPat(Ops.ENDIF, name="x"), lambda ctx, x: f"IF_{ctx.r[x.src[0].src[0]][1:]}_{ctx.uops.index(x.src[0])}:"),
+  (UPat(Ops.WMMA, name="x"), lambda ctx, x: list(render_wmma(ctx, x))),
+  (UPat(Ops.BARRIER), lambda ctx: ctx.barrier),
+])
+
+class PTXRenderer(Renderer):
+  suffix = "PTX"
+  global_max, local_max, shared_max = CUDARenderer.global_max, CUDARenderer.local_max, CUDARenderer.shared_max
+  code_for_op = asm_for_op
+  extra_matcher = ptx_matcher
+  def __init__(self, target:Target):
+    super().__init__(target)
+    from tinygrad.runtime.support.compiler_cuda import NVPTXCompiler, PTXCompiler
+    self.compiler = (PTXCompiler if target.interface.startswith("MOCK") or target.device == "CUDA" else NVPTXCompiler)(target.arch)
+    self.tensor_cores = [x for x in tc.get_cuda(target.arch) if x.dtype_in in (dtypes.half, dtypes.float)]
+    if int(target.arch[3:]) < 80: self.extra_matcher += PatternMatcher([(UPat((Ops.MAX, Ops.EXP2), dtype=dtypes.half, name="x"),
+      lambda x: UOp(x.op, src=tuple(vv.cast(dtypes.float32) for vv in x.src), arg=x.arg).cast(dtypes.half))])
+
+  # language options
+  kernel_prefix = """.version VERSION
+.target TARGET
+.address_size 64
+.visible .entry"""
+  barrier = "bar.sync\t0;"
+  types: dict[DType, str] = { dtypes.int8: "s16", dtypes.int16: "s16", dtypes.int32: "s32", dtypes.int64: "s64",
+                              dtypes.uint8: "u16", dtypes.uint16: "u16", dtypes.uint32: "u32", dtypes.uint64: "u64",
+                              dtypes.float16: "f16", dtypes.float32: "f32", dtypes.float64: "f64", dtypes.bool: "pred" }
+
+  mem_types: dict[DType, str] = {**types, dtypes.int8: "s8", dtypes.uint8: "u8", dtypes.bool: "u8", dtypes.float16: "b16"}
+  cast_types: dict[DType, str] = {**types, dtypes.int8: "s8", dtypes.uint8: "u8"}
+
+  def render_kernel(self, kernel, function_name, bufs, regs, uops) -> str:
+    def fmt(line): return "\t" + line.replace(" ", "\t" if len(line.split(" ")[0]) > 7 else "\t\t", 1)
+    kernel = '\n'.join(map(fmt, [f".reg .{reg.split('_')[-2]} %{reg}<{cnt}>;" for reg,cnt in regs] + kernel + ["ret;"]))
+    local_dims = [u.src[0] for u in uops if u.op is Ops.SPECIAL and u.arg[0] == "l"]
+    launch_bounds = prod([d.vmax for d in local_dims])
+    params = ',\n\t'.join([f".param .{'u64' if u.addrspace is AddrSpace.GLOBAL else self.types[u.dtype]} {name}" for name,u in bufs])
+    return f"{self.kernel_prefix} {function_name} (\n\t{params}\n)\n.maxntid {launch_bounds}\n{{\n{kernel}\n}}"
+
+  def render(self, uops:list[UOp]) -> str:
+    kernel:list[str] = []
+    bufs = []
+
+    c: defaultdict[str, int] = defaultdict(int)
+    r: dict[UOp, list[str]|str] = {}
+    self.r = r
+    self.uops = uops
+
+    def ssa(prefix:str, u:UOp|None=None, dtype:str|None=None) -> str:
+      prefix += f"_{dtype if dtype is not None else self.types[unwrap(u).dtype]}_"
+      c[prefix] += 1
+      return f"%{prefix}{c[prefix]-1}"
+
+    name = "test"
+    for u in uops:
+      if u.op in {Ops.NOOP, Ops.GROUP, Ops.CONST}: continue
+      if u.op is Ops.AFTER:
+        self.r[u] = self.r[u.src[0]]
+        continue
+      if u.op is Ops.SINK:
+        if u.arg is not None: name = u.arg.function_name
+        continue
+      if u.op is Ops.STACK:
+        r[u] = [cast(str,r[x]) for x in u.src]
+        continue
+      if u.op is Ops.BUFFER and u.addrspace == AddrSpace.REG:
+        r[u] = [ssa("reg", u, self.types[u.dtype]) for _ in range(u.max_numel())]
+        continue
+      if u.op in {Ops.INDEX, Ops.SHRINK, Ops.LOAD} and u.src[0].addrspace in (AddrSpace.REG, AddrSpace.ALU):
+        # on REG, INDEX/SHRINK pick the register (must be CONST) and LOAD is a noop
+        if u.op is not Ops.LOAD and not (u.src[1].op is Ops.CAST and u.src[1].src[0].op is Ops.CONST):
+          raise RuntimeError(f"PTX does not support dynamic register indexing: {u}")
+        r[u] = r[u.src[0]] if u.op is Ops.LOAD else r[u.src[0]][u.src[1].src[0].val]
+        continue
+      if u.op is Ops.SPECIAL: r[u] = "%" + u.arg
+      elif u.op is Ops.LOAD:
+        r[u] = [ssa('val', dtype=self.types[u.dtype]) for _ in range(u.max_numel())] if u.max_numel() > 1 else ssa('val', u)
+      elif u.op is Ops.PARAM: bufs.append((f"data{u.arg.slot}", u))
+      elif u.op is Ops.WMMA:
+        # registers for packing/unpacking input and acc
+        self.wmma_r = [[ssa("wmma_in", dtype="b32") for _ in range(0, len(r[u.src[0]]), 4 // u.src[0].dtype.itemsize)],
+                       [ssa("wmma_in", dtype="b32") for _ in range(0, len(r[u.src[1]]), 4 // u.src[0].dtype.itemsize)],
+                       [ssa("wmma_acc", dtype="b32") for _ in range(0, len(r[u.src[2]]), 4 // u.dtype.itemsize)]]
+        r[u] = [ssa("wmma", dtype=self.types[u.dtype]) for _ in range(u.max_numel())]
+      prefix, dtype = {Ops.CAST: ("cast", None), Ops.BITCAST: ("cast", None), Ops.END: ("pred", "pred"), Ops.RANGE: ("ridx", None),
+        Ops.BUFFER: ("local", "u64"), Ops.INDEX: ("bidx", "u64"), Ops.SHRINK: ("bidx", "u64"),
+        Ops.PARAM: ("dat", "u64" if u.addrspace is AddrSpace.GLOBAL else None), **{op: ("alu", None) for op in GroupOp.ALU}}.get(u.op, (None, None))
+      if u.op is Ops.RANGE and u.dtype == dtypes.void: prefix = None  # loop headers don't have a register
+      if prefix: r[u] = ssa(prefix, u, dtype)
+
+      l: str|list[str]|None = string_rewrite.rewrite(u, ctx=self)
+      if l is None:
+        raise RuntimeError(f"failed to render {u.op} with {u.dtype} srcs {[x.dtype for x in u.src]}")
+      kernel.extend([l] if isinstance(l, str) else l)
+
+      if u.op is Ops.SPECIAL: kernel = [f".reg .u32 %{u.arg};"] + kernel
+    return self.render_kernel(kernel, name, bufs, c.items(), uops)
+
+  def supported_dtypes(self): return {d for d in super().supported_dtypes()
+                                      if (d != dtypes.half or int(self.target.arch[3:]) >= 53) and d not in dtypes.fp8s+(dtypes.bfloat16,)}
+
+import math, functools
+from dataclasses import dataclass
+from tinygrad.dtype import DType, dtypes
+from tinygrad.uop.ops import PatternMatcher, UOp, UPat, Ops
+
+@dataclass(frozen=True)
+class TensorCore: # D = A * B + C, A is (M x K), B is (K x N), C and D are (M x N)
+  dtype_in: DType # dtype for A and B
+  dtype_out: DType # dtype for C and D
+  # A, B and C fragments as (lane bits, element bits), least significant bit first, in tile bits m<i>/n<i>/k<i>. C lanes are locals, elements upcasts
+  # a foreign lane bit is broadcast. the k bits may be permuted, identically in A and B
+  frag_a: tuple[tuple[str, ...], tuple[str, ...]]
+  frag_b: tuple[tuple[str, ...], tuple[str, ...]]
+  frag_c: tuple[tuple[str, ...], tuple[str, ...]]
+  def axis_coords(self) -> list[str]:
+    # tile bit of each tc axis in creation order, n then m then the k unrolls. split j of a dim is bit j
+    used = self.frag_a[0] + self.frag_a[1] + self.frag_c[0] + self.frag_c[1]
+    return [f"{d}{i}" for d in "nmk" for i in range(1+max([int(c[1:]) for c in used if c[0] == d], default=-1))]
+  def relabel(self) -> list[dict[str, str]]:
+    # tc axis -> fragment slot axis, per operand
+    return [{c: y for y,c in zip(self.frag_c[0] + self.base_upcast_axes()[:len(f[1])][::-1], f[0]+f[1])} for f in (self.frag_a, self.frag_b)]
+  @functools.cache  # pylint: disable=method-cache-max-size-none
+  def frag_coords(self) -> list[list[list[tuple[int, int]]]]:
+    # [operand][lane][element] -> tile coordinate
+    def coord(f, ax, lane, elem):
+      return tuple(sum(((v>>j)&1) << int(c[1:]) for bits,v in zip(f, (lane, elem)) for j,c in enumerate(bits) if c[0] == d) for d in ax)
+    return [[[coord(f, ax, lane, elem) for elem in range(2**len(f[1]))] for lane in range(2**len(f[0]))]
+            for f,ax in zip((self.frag_a, self.frag_b, self.frag_c), ("mk", "kn", "mn"))]
+  @property
+  def dims(self) -> tuple[int,int,int]: # N, M, K. every axis has size 2
+    n, m, k = (sum(c[0] == d for c in self.axis_coords()) for d in "nmk")
+    return (2**n, 2**m, 2**k)
+  @property
+  def threads(self) -> int: return 2**len(self.frag_c[0]) # threads that construct the warp
+  def base_upcast_axes(self):
+    # element slots, most significant bit first: upcast then reduce
+    return (tuple(c for c in self.axis_coords() if c[0] == "k") + self.frag_c[1])[::-1]
+  def __post_init__(self):
+    # each own bit appears once, only lane bits may be foreign and k never is
+    coords = self.axis_coords()
+    for f,dims in zip((self.frag_a, self.frag_b, self.frag_c), ("mk","kn","mn")):
+      own = {c for c in coords if c[0] in dims}
+      assert len(f[0]) == len(self.frag_c[0]), f"fragment {f} has the wrong lane count"
+      assert len(set(f[0]+f[1])) == len(f[0]+f[1]) and set(f[1]) <= own <= set(f[0]+f[1]) <= own | {c for c in coords if c[0] in "mn"}, \
+        f"fragment {f} isn't distinct bits covering {dims}"
+    # A and B must relabel k identically
+    ka, kb = ([c for c in f[1]+f[0] if c[0] == "k"] for f in (self.frag_a, self.frag_b))
+    assert ka == kb, f"{ka=} vs {kb=}"
+
+# ***** NVIDIA *****
+
+# https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-for-mma
+def mma(K:int, di:DType, do:DType) -> TensorCore:
+  # mma.m16n8kK: lane is threadID_in_group (2 k bits) then groupID (m0-m2); elements lsb first are 2**g k in a 32-bit reg, m3 (A row+8), leftover k
+  k, g = [f"k{i}" for i in range(int(math.log2(K)))], int(math.log2(4//di.itemsize))
+  lane, elem = tuple(k[g:g+2]), tuple(k[:g]+k[g+2:])
+  # (8,16,K)
+  return TensorCore(dtype_in=di, dtype_out=do, frag_a=(lane+("m0","m1","m2"), elem[:g]+("m3",)+elem[g:]),
+    frag_b=(lane+("n0","n1","n2"), elem), frag_c=(("n1","n2","m0","m1","m2"), ("n0","m3")))
+cuda_81616 = [mma(16,di,do) for di,do in [(dtypes.half,dtypes.float),(dtypes.bfloat16,dtypes.float),(dtypes.half,dtypes.half)]]
+cuda_81632_f8 = [mma(32,di,dtypes.float) for di in [dtypes.fp8e4m3, dtypes.fp8e5m2]]
+cuda_8168_f16 = [mma(8,dtypes.half,do) for do in [dtypes.float, dtypes.half]]
+cuda_8168_tf32 = [mma(8,dtypes.float,dtypes.float)]
+cuda_sm75: list[TensorCore] = cuda_8168_f16
+cuda_sm80: list[TensorCore] = cuda_81616 + cuda_8168_f16 + cuda_8168_tf32
+cuda_sm89: list[TensorCore] = cuda_sm80 + cuda_81632_f8
+
+def get_cuda(arch): return cuda_sm89 if (ver:=int(arch[3:])) >= 89 else cuda_sm80 if ver >= 80 else cuda_sm75 if ver >= 75 else []
+
+# ***** AMD *****
+
+# https://gpuopen.com/learn/wmma_on_rdna3/
+# (16,16,16)
+amd_rdna3 = [TensorCore(dtype_in=di, dtype_out=do, frag_a=(("m0", "m1", "m2", "m3", "n0"), ("k0", "k1", "k2", "k3")),
+  frag_b=(("n0", "n1", "n2", "n3", "m0"), ("k0", "k1", "k2", "k3")), frag_c=(("n0", "n1", "n2", "n3", "m0"), ("m1", "m2", "m3")))
+  for di,do in [(dtypes.half,dtypes.float),(dtypes.half,dtypes.half),(dtypes.bfloat16,dtypes.float),(dtypes.int8,dtypes.int32)]]
+# (16,16,16)
+amd_rdna4 = [TensorCore(dtype_in=di, dtype_out=do, frag_a=(("m0", "m1", "m2", "m3", "k2"), ("k0", "k1", "k3")),
+  frag_b=(("n0", "n1", "n2", "n3", "k2"), ("k0", "k1", "k3")), frag_c=(("n0", "n1", "n2", "n3", "m3"), ("m0", "m1", "m2")))
+  for di,do in [(dtypes.half,dtypes.float),(dtypes.half,dtypes.half),(dtypes.bfloat16,dtypes.float),(dtypes.bfloat16,dtypes.bfloat16)]]
+
+# https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna4-instruction-set-architecture.pdf
+def mfma(K:int, di:DType, do:DType) -> TensorCore:
+  # 16x16xK (7.1.4.1): A[i,k] is item k%K_L of lane i + 16*(k//K_L), K_L = K/4; fp8 K=128 is two K=64 halves, k//64 the high item (7.1.5.1)
+  # NOTE: fp6 and fp4 K=128 keep K_L = 32 and would need their own case
+  k, kl = [f"k{i}" for i in range(int(math.log2(K)))], int(math.log2(min(K, 64)//4))
+  lane, elem = tuple(k[kl:kl+2]), tuple(k[:kl]+k[kl+2:])
+  # (16,16,K)
+  return TensorCore(dtype_in=di, dtype_out=do, frag_a=(("m0","m1","m2","m3")+lane, elem),
+    frag_b=(("n0","n1","n2","n3")+lane, elem), frag_c=(("n0","n1","n2","n3","m2","m3"), ("m0","m1")))
+amd_cdna_161616 = [mfma(16,di,dtypes.float) for di in [dtypes.half, dtypes.bfloat16]]
+amd_cdna_161632 = [mfma(32,di,dtypes.float) for di in [dtypes.fp8e5m2, dtypes.fp8e4m3, dtypes.half, dtypes.bfloat16]]
+amd_cdna_1616128 = [mfma(128,di,dtypes.float) for di in [dtypes.fp8e5m2, dtypes.fp8e4m3]]
+amd_cdna3_161632 = [mfma(32,di,dtypes.float) for di in [dtypes.fp8e5m2fnuz, dtypes.fp8e4m3fnuz]]
+amd_cdna3 = amd_cdna3_161632 + amd_cdna_161616
+amd_cdna4 = amd_cdna_1616128 + amd_cdna_161632 + amd_cdna_161616
+
+def get_amd(arch): return {"gfx942": amd_cdna3, "gfx950": amd_cdna4, "gfx1200": amd_rdna4, "gfx1201": amd_rdna4}.get(arch, amd_rdna3)
+
+pm_validate_wmma_rdna3 = PatternMatcher([
+  (UPat(Ops.WMMA, name="x", dtype=dtypes.int32), lambda x: x.replace(
+    src=(x.src[0].bitcast(dtypes.uint32), x.src[1].bitcast(dtypes.uint32), x.src[2]))
+    if x.src[0].dtype == dtypes.int8 and x.src[0].max_numel() == 16 else None),
+  (UPat(Ops.WMMA, name="x", dtype=dtypes.half), lambda x: UOp(Ops.STACK, src=tuple(x.replace(
+      src=(x.src[0], x.src[1], UOp(Ops.STACK, src=tuple(x.src[2].index(UOp.const(j//2, dtypes.int16))
+      if j%2 == 0 else UOp.const(0.0, x.src[2].dtype)
+      for j in range(x.max_numel()*2))))).index(UOp.const(i*2, dtypes.int16))
+      for i in range(x.max_numel()))) if x.max_numel() == 8 else None),
+  (UPat(Ops.WMMA, name="x"), lambda x: x.replace(
+    src=(x.src[0].bitcast(dtypes.uint16), x.src[1].bitcast(dtypes.uint16), x.src[2]))
+    if x.src[0].dtype == dtypes.bfloat16 and x.src[0].max_numel() == 16 else None),
+])
+
+pm_validate_wmma_rdna4 = PatternMatcher([
+  (UPat(Ops.WMMA, name="x", dtype=dtypes.bfloat16), lambda x: x.replace(
+    src=(x.src[0].bitcast(dtypes.uint16), x.src[1].bitcast(dtypes.uint16), x.src[2].bitcast(dtypes.uint16)))
+      .bitcast(dtypes.bfloat16) if x.max_numel() == 8 and x.src[0].dtype == dtypes.bfloat16 and x.src[0].max_numel() == 8 else None),
+  (UPat(Ops.WMMA, name="x", dtype=dtypes.float),
+    lambda x: x.replace(src=(x.src[0].bitcast(dtypes.uint16), x.src[1].bitcast(dtypes.uint16), x.src[2]))
+    if x.max_numel() == 8 and x.src[0].dtype == dtypes.bfloat16 and x.src[0].max_numel() == 8 else None)
+])
+
+pm_validate_wmma_cdna = PatternMatcher([
+  (UPat(Ops.WMMA, name="x", dtype=dtypes.float),
+    lambda x: x.replace(src=(x.src[0].bitcast(dtypes.uint32), x.src[1].bitcast(dtypes.uint32), x.src[2]))
+    if x.arg[0][2] == 128 else None),
+  (UPat(Ops.WMMA, name="x", dtype=dtypes.float),
+    lambda x: x.replace(src=(x.src[0].bitcast(dtypes.uint16), x.src[1].bitcast(dtypes.uint16), x.src[2]))
+    if x.max_numel() == 4 and x.src[0].dtype == dtypes.bfloat16 and x.src[0].max_numel() == 4 else None),
+  (UPat(Ops.WMMA, name="x", dtype=dtypes.float),
+    lambda x: x.replace(src=(x.src[0].bitcast(dtypes.uint64), x.src[1].bitcast(dtypes.uint64), x.src[2]))
+    if x.max_numel() == 4 and x.src[0].dtype in dtypes.fp8s and x.src[0].max_numel() == 8 else None),
+])
+
+# ***** Apple Metal *****
+
+# (8,8,8)
+metal = [TensorCore(dtype_in=di, dtype_out=do, frag_a=(("k1", "m0", "m1", "k2", "m2"), ("k0",)),
+  frag_b=(("n1", "k0", "k1", "n2", "k2"), ("n0",)), frag_c=(("n1", "m0", "m1", "n2", "m2"), ("n0",)))
+  for di,do in [(dtypes.float,dtypes.float),(dtypes.half,dtypes.float),
+                (dtypes.half,dtypes.half),(dtypes.bfloat16,dtypes.float),(dtypes.bfloat16,dtypes.bfloat16)]]
+
+from tinygrad.dtype import DType, dtypes, truncate, AddrSpace
+from tinygrad.uop.ops import UOp, Ops, PatternMatcher, UPat
+from tinygrad.renderer.cstyle import CStyleLanguage, base_rewrite
+from tinygrad.helpers import strip_parens, ceildiv
+
+# a field of `width` bits sitting in the low bits of val: shift it up to the sign bit, then let the arithmetic shift fill
+def sign_extend(val:UOp, width:int): return (val << (32-width)).bitcast(dtypes.int) >> (32-width)
+
+# a packed field of dt: the word it lives in, its offset in that word, and its mask. width is 8*itemsize, bool is one bit in a byte
+def packed_field(bidx:UOp, dt:DType) -> tuple[UOp, UOp, int]:
+  elems, width = 4//dt.itemsize, 8*dt.itemsize
+  return bidx.src[0].index(bidx.src[1] // elems), (bidx.src[1].cast(dtypes.uint32) % elems) * width, (1 << width)-1
+
+# store for char: buf[idx/4] <- (var << (idx%4)*8))
+def packed_store(s:UOp):
+  bidx, var, *gate = s.src
+  idx, shift_am, mask = packed_field(bidx, var.dtype)
+  new_v, wmask = (var.cast(dtypes.uint32) & mask) << shift_am, ((mask << shift_am) ^ 0xFFFFFFFF).cast(dtypes.uint32)
+  buf = idx.cast(dtypes.uint32).load(*((UOp.const(0, dtypes.uint32), *gate) if gate else ()))
+  return idx.store((buf & wmask) | new_v, *gate)
+
+# load for char: sign_extend(buf[idx/4] >> ((idx%4)*8))
+def packed_load(root:UOp):
+  bidx, *alt = root.src
+  idx, shift_am, mask = packed_field(bidx, dtype:=root.dtype)
+  load = idx.cast(dtypes.uint32).load(*((alt[0].cast(dtypes.uint32), *alt[1:]) if alt else ()), arg=root.arg)
+  val = (load >> shift_am) & mask
+  return sign_extend(val, 8*dtype.itemsize).cast(dtype) if dtype in [dtypes.char, dtypes.short] else val.cast(dtype)
+
+def is_packed(x:UOp):
+  dt = x.src[1].dtype if x.op is Ops.STORE else x.buf_uop.dtype
+  return dt.itemsize < 4 and dt != dtypes.half and x.buf_uop.addrspace != AddrSpace.REG
+def _packed_size(u:UOp): return ceildiv(u.max_numel(), 4//u.dtype.itemsize) if is_packed(u) else u.max_numel()
+def is_nan(a):
+  bs, (exp, mant) = a.dtype.bitsize, dtypes.finfo(a.dtype)
+  return (a.bitcast(getattr(dtypes, f"uint{bs}")) & ((1 << (bs - 1)) - 1)) > (((1 << exp) - 1) << mant)
+
+# the read-modify-write packed_store emits: a load of the very index being stored to, masked (a gated store loads with 3 srcs)
+packed_rmw = UPat(Ops.LOAD, src=(UPat(Ops.CAST, dtype=dtypes.uint32, src=(UPat.var("b"),)),), allow_any_len=True) & UPat.var("wmask")
+
+wgsl_matcher = PatternMatcher([
+  (UPat((Ops.CMPLT, Ops.XOR), src=(UPat(name="a", dtype=dtypes.bool), UPat.var("b")), name="c"),
+   lambda a,b,c: a.cast(dtypes.int).alu(c.op, b.cast(dtypes.int)).cast(dtypes.bool)),
+  (UPat(Ops.LOAD, src=(UPat(Ops.INDEX),), allow_any_len=True, name="l"), lambda l: packed_load(l) if is_packed(l) else None),
+  (UPat(Ops.STORE, name="s"), lambda s: packed_store(s) if is_packed(s) else None),
+  (UPat.var("a") << UPat.var("b"),lambda a,b:(a.bitcast(dtypes.uint32)<<b.cast(dtypes.uint32)).bitcast(a.dtype) if b.dtype!=dtypes.uint32 else None),
+  (UPat.var("x") >> UPat.var("y"), lambda x,y: UOp(Ops.SHR, src=(x,y.cast(dtypes.uint))) if y.dtype != dtypes.uint else None),
+  # fix nan check: 'a != a -> is_nan()'. the decomp rewrites (a != a).logical_not() to CMPEQ, so match both forms
+  (UPat.var("a", dtypes.floats) != UPat.var("a"), is_nan),
+  (UPat.var("a", dtypes.floats).alu(Ops.CMPEQ, UPat.var("a")), lambda a: is_nan(a).ne(True)),
+  ])
+
+class WGSLRenderer(CStyleLanguage):
+  global_max = (65535, 65535, 65535)
+  local_max = (256, 256, 64)
+  code_for_workitem = {"g": lambda x: f"i32(gindex.{'xyz'[int(x)]})", "l": lambda x: f"i32(lindex.{'xyz'[int(x)]})"}
+  extra_matcher = wgsl_matcher
+  supports_float4 = False
+  barrier = "workgroupBarrier();"
+  code_for_op = {**CStyleLanguage.code_for_op, Ops.WHERE: lambda a,b,c,dtype: f"select({c},{b},{a})"}
+  nan = "nan()"
+  type_map = { dtypes.float: "f32", dtypes.uchar: "u32", dtypes.ushort: "u32", dtypes.short: "i32",
+              dtypes.char: "i32", dtypes.int32: "i32", dtypes.uint32: "u32", dtypes.bool: "bool", dtypes.half: "f16" }
+
+  string_rewrite = PatternMatcher([
+    (UPat(Ops.CAST, dtype=dtypes.uint32, src=(UPat(Ops.INDEX, name="x"),)), lambda ctx,x: ctx[x] if is_packed(x) else None),
+    (UPat(Ops.NEG, dtypes.uints, src=(UPat.var('x'))), lambda ctx,x: f"(0-{ctx[x]})"),
+    (UPat.cvar("c").cast(dtypes.bool), lambda c: "true" if c.val else "false"),
+    (UPat.cvar("c").cast((dtypes.uchar, dtypes.ushort, dtypes.uint32)),
+     lambda c: f"bitcast<u32>({c.val})" if c.val < 0 else f"{c.val&0xFFFFFFFF}u"),
+    # a negative const must state its type: contextual conversion of a bare abstract int rejects it in a u32 position
+    (UPat.cvar("c").cast(dtypes.int32, name="x"), lambda ctx,x,c: f"i32({v})" if (v:=truncate[x.dtype](c.val)) < 0 else f"{v}"),
+    (UPat(Ops.BUFFER, name="x"), lambda ctx,x:
+     f"var{'<workgroup>' if x.addrspace == AddrSpace.LOCAL else ''} {ctx[x]}: array<{ctx.buf_map(x)},{_packed_size(x)}>;"),
+    (UPat(Ops.BITCAST, dtype=dtypes.half, name="x", src=(UPat(dtype=(dtypes.short, dtypes.ushort, dtypes.uint32),),)),
+     lambda ctx,x: f"bitcast<vec2<f16>>({ctx[x.src[0]]})[0]"),
+    (UPat(Ops.BITCAST, dtype=dtypes.uchar, name="x"), lambda ctx,x: f"bitcast<u32>({ctx[x.src[0]]}&0xFF)"),
+    (UPat(Ops.BITCAST, dtype=dtypes.char, name="x"), lambda ctx,x: f"((i32({ctx[x.src[0]]}&0xFF)<<24)>>24)"),
+    (UPat(Ops.BITCAST, dtype=dtypes.ushort, name="x"), lambda ctx,x: f"bitcast<u32>(vec2<f16>({ctx[x.src[0]]},0))" \
+     if x.src[0].dtype == dtypes.half else f"bitcast<u32>({ctx[x.src[0]]}&0xFFFF)"),
+    (UPat(Ops.BITCAST, dtype=dtypes.short, name="x"), lambda ctx,x: f"bitcast<i32>(vec2<f16>({ctx[x.src[0]]},0))" \
+     if x.src[0].dtype == dtypes.half else f"((i32({ctx[x.src[0]]}&0xFFFF)<<16)>>16)"),
+    (UPat(Ops.BITCAST, name="x"), lambda ctx,x: f"bitcast<{ctx.type_map[x.dtype]}>({ctx[x.src[0]]})"),
+    (UPat.load(UPat.var("b"), UPat.var("v"), UPat.var("gate")),
+      lambda ctx,b,v,gate: f"select({ctx[v]}, {ctx.render_load(ctx[b], b.src[0])}, {ctx[gate]})"),
+    (UPat.load(UPat.var("b")), lambda ctx, b: ctx.render_load(ctx[b], b)),
+    # packed_store writes (load & wmask) | new_v: atomicAnd clears the field, atomicAdd sets it. new_v is gone when it is 0
+    (UPat.store(UPat.var("b"), UPat.any(packed_rmw, packed_rmw | UPat.var("nv"))), lambda ctx,b,wmask,nv=None:
+     f"atomicAnd(&{ctx[b]},{ctx[wmask]});"+(f"\n  atomicAdd(&{ctx[b]},{ctx[nv]});" if nv is not None else "") if is_packed(b) else None),
+    (UPat.store(UPat.var("b"), UPat.var("v")), lambda ctx,b,v: f"{ctx[b]} = {ctx[v]};"),
+    (UPat(Ops.INDEX, src=(UPat.var("b"), UPat.var("idx"))),
+     lambda ctx,b,idx: f"{ctx[b]}[{strip_parens(ctx[idx]) if idx.arg is Ops.ADD else ctx[idx]}]"),
+  ]) + base_rewrite
+
+  def render_cast(self, u:UOp, val: str) -> str:
+    ret = f"{self.type_map[u.dtype]}({val})"
+    # Small integers use 32-bit WGSL values, so casts must truncate before subsequent arithmetic.
+    if u.dtype in (dtypes.uint8, dtypes.uint16): return f"({ret}&{(1 << (8*u.dtype.itemsize))-1}u)"
+    if u.dtype in (dtypes.int8, dtypes.int16):
+      bits = 8*u.dtype.itemsize
+      return f"((({ret}&{(1 << bits)-1})^{1 << (bits-1)})-{1 << (bits-1)})"
+    return ret
+  def _render_dtype(self, dtype:DType, sz:int=1, addrspace=AddrSpace.REG, mutable=True, override_ptr=False, shape=None): return "var"
+  def render_load(self, x:str, u:UOp) -> str: return f"atomicLoad(&{x})" if is_packed(u) else x
+  def buf_map(self, u:UOp) -> str: return "atomic<u32>" if is_packed(u) else self.type_map[u.dtype]
+  def render_kernel(self, function_name:str, kernel:list[str], bufs:list[tuple[str,tuple[UOp,bool]]], uops:list[UOp], prefix=None) -> str:
+    local_size = [u.src[0].ssimplify() for u in sorted([u for u in uops if u.op is Ops.SPECIAL and u.arg[0] == 'l'], key=lambda u: u.arg)]
+    if not local_size: local_size = [1]
+    bind_it = iter(range(len(bufs)))
+    external_local_bufs = [line.lstrip() for line in kernel if "var<workgroup>" in line]
+    kernel[:] = [line for line in kernel if "var<workgroup>" not in line]
+    prg = "enable f16;\n" if any(uop.dtype == dtypes.half for uop in uops) else ""
+    prg += "fn nan() -> f32 { let bits = 0xffffffffu; return bitcast<f32>(bits); }\n"
+    prg += "@group(0) @binding(0)\nvar<uniform> INFINITY : f32;\n"
+    prg += "\n".join(external_local_bufs+[f"@group(0) @binding({next(bind_it)+1})" +
+      f"{'var<storage,read_write>' if u.addrspace == AddrSpace.GLOBAL else 'var<uniform>'}" +
+      f"{name}:{f'array<{self.buf_map(u)}>' if u.addrspace == AddrSpace.GLOBAL else self.buf_map(u)};" for name,(u,_) in bufs])
+    prg += f"\n@compute @workgroup_size({','.join([str(x) for x in local_size])}) fn {function_name}(@builtin(workgroup_id) gindex: vec3<u32>,"
+    return prg + "@builtin(local_invocation_id) lindex: vec3<u32>) {\n" + "\n".join(kernel) + "\n}"
+
+  def supported_dtypes(self): return {dtypes.bool, dtypes.char, dtypes.uchar, dtypes.short, dtypes.ushort, dtypes.int32, dtypes.uint32,
+                                      dtypes.float, *((dtypes.half,) if "shader-f16" in self.target.arch else ())}
+
+
+import glob, importlib, os, pathlib, subprocess
+from tinygrad.helpers import fetch, flatten, system, getenv
+
+root = (here:=pathlib.Path(__file__).parent).parents[2]
+nv_src = {"nv_570": "https://github.com/NVIDIA/open-gpu-kernel-modules/archive/81fe4fb417c8ac3b9bdcc1d56827d116743892a5.tar.gz",
+          "nv_580": "https://github.com/NVIDIA/open-gpu-kernel-modules/archive/2af9f1f0f7de4988432d4ae875b5858ffdb09cc2.tar.gz",
+          "nv_610": "https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/610.43.03.tar.gz"}
+ffmpeg_src = "https://ffmpeg.org/releases/ffmpeg-8.0.1.tar.gz"
+rocr_src = "https://github.com/ROCm/rocm-systems/archive/refs/tags/rocm-7.1.1.tar.gz"
+linux_headers_deb = "https://snapshot.debian.org/archive/debian/20260207T145350Z/pool/main/l/linux/linux-libc-dev_6.18.9-1_all.deb"
+linux_headers_kern_deb = "https://snapshot.debian.org/archive/debian/20260207T145350Z/pool/main/l/linux/linux-headers-6.18.9+deb14-common_6.18.9-1_all.deb"
+liburing_src = "https://raw.githubusercontent.com/axboe/liburing/refs/tags/liburing-2.14/src/include/liburing.h"
+bnxt_src = ["https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/plain/drivers/" + s + "?h=v6.18" for s in
+            ("infiniband/hw/bnxt_re/roce_hsi.h", "infiniband/hw/bnxt_re/qplib_rcfw.h", "infiniband/hw/bnxt_re/qplib_res.h",
+             "net/ethernet/broadcom/bnxt/bnxt_hwrm.h")]
+ggml_common_src = "https://raw.githubusercontent.com/ggml-org/ggml/d4fcfe88a8bcf5c9840be14be6c2fbf1f5b3b2db/src/ggml-common.h"
+cudart_src = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/linux-x86_64/cuda_cudart-linux-x86_64-12.0.146-archive.tar.xz"
+nvrtc_src = "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/linux-x86_64/cuda_nvrtc-linux-x86_64-12.0.140-archive.tar.xz"
+opencl_src = "https://github.com/KhronosGroup/OpenCL-Headers/archive/2e30669d48718fd460f085b4b35b160dad51ce9d.tar.gz"
+comgr_2_src = "https://repo.radeon.com/rocm/apt/6.2/pool/main/c/comgr/comgr_2.8.0.60200-66~24.04_amd64.deb"
+def macossdk(): return system("xcrun --show-sdk-path")
+
+llvm_lib = (
+  (win_llvm:=r"'C:\\Program Files\\LLVM\\bin\\LLVM-C.dll' if WIN else ") +
+  (mac_llvm:=repr([f'/opt/homebrew/opt/llvm@{i}/lib/libLLVM.dylib' for i in reversed(range(14, 21+1))]) + " if OSX else ") +
+  (other_llvm:=repr([f'LLVM-{i}' for i in reversed(range(14, 21+1))] + ['LLVM'])))
+clang_lib = win_llvm.replace("LLVM-C", "libclang") + (mac_llvm + other_llvm).replace("LLVM", "clang")
+
+webgpu_lib = "os.path.join(sysconfig.get_paths()['purelib'], 'pydawn', 'lib', 'libwebgpu_dawn.dll') if WIN else 'webgpu_dawn'"
+tinymesa_path = "os.path.join(sysconfig.get_paths()['platlib'], 'tinymesa')"
+nv_lib_path = ("[f'/{pre}/cuda/targets/{tgt}/lib' for pre in ['opt', 'usr/local'] for tgt in "
+               "[sysconfig.get_config_vars().get(\"MULTIARCH\", \"\").rsplit(\"-\", 1)[0], 'sbsa-linux']]")
+
+def load(name, files, **kwargs):
+  if not (f:=(root/(path:=kwargs.pop("path", __name__)).replace('.','/')/f"{name}.py")).exists() or getenv('REGEN'):
+    files, kwargs['args'] = files() if callable(files) else files, args() if callable(args:=kwargs.get('args', [])) else args
+    if (srcs:=kwargs.pop('srcs', None)):
+      import tempfile, tarfile
+      srcpath = (td:=tempfile.TemporaryDirectory(f"autogen-src-{name.replace('/','-')}")).name + "/"
+      for src in (srcs if isinstance(srcs, list) else [srcs]):
+        if 'tar' in src:
+          # dangerous for arbitrary urls!
+          with tarfile.open(fetch(src, gunzip=src.endswith("gz"))) as tf:
+            tf.extractall(srcpath)
+            if not isinstance(srcs, list): srcpath += tf.getnames()[0] # if we just have a single tarball, make this the root
+        else: fetch(src, name=srcpath + src.split('/')[-1].split('?')[0])
+      files, kwargs['args'] = [str(f).format(srcpath) for f in files], [a.format(srcpath) for a in kwargs.get('args', [])]
+      kwargs['anon_names'] = {k.format(srcpath):v for k,v in kwargs.get('anon_names', {}).items()}
+      if (preprocess:=kwargs.pop('preprocess', None)): preprocess(srcpath)
+    files = flatten(sorted(glob.glob(p, recursive=True)) if isinstance(p, str) and '*' in p else [p] for p in files)
+    kwargs['epilog'] = (epi(srcpath) if srcs else epi()) if callable(epi:=kwargs.get('epilog', [])) else epi
+    try: f.write_text(kwargs.pop("gen", importlib.import_module("tinygrad.runtime.support.autogen").gen)(name, files, **kwargs))
+    except Exception as e: raise RuntimeError(f"error while generating {name}") from e
+    if srcs: td.cleanup()
+  return importlib.import_module(f"{path}.{name.replace('/', '.')}")
+
+def _extract_deb(path:str): subprocess.run("ar x *.deb && tar xf data.tar.*", cwd=path, shell=True, check=True)
+
+def __getattr__(nm):
+  match nm:
+    case "libc":
+      return load("libc", lambda: ([i for i in system("dpkg -L libc6-dev").split() if 'sys/mman.h' in i or 'bits/mman-shared.h' in i] +
+                                   ["/usr/include/string.h", "/usr/include/elf.h", "/usr/include/unistd.h", "/usr/include/stdio.h", "/usr/include/semaphore.h",
+                                    "/usr/include/asm-generic/mman-common.h"]),
+                  args=["-D__USE_GNU", "-D_GNU_SOURCE"], dll="'c'", errno=True, recsym=True, rules=[(r'([a-z]+) = \1', '')]) # removes stdin = stdin
+    case "avcodec": return load("avcodec", ["{}/libavcodec/hevc/hevc.h", "{}/libavcodec/cbs_h265.h"], srcs=ffmpeg_src)
+    case "opencl": return load("opencl", ["{}/CL/cl.h"], dll="'OpenCL'", args=["-I{}"], srcs=opencl_src)
+    case "cuda": return load("cuda", ["{}/include/cuda.h"], dll="'nvcuda' if WIN else 'cuda'", args=["-D__CUDA_API_VERSION_INTERNAL"], srcs=cudart_src, macros=False, prolog=["from tinygrad.helpers import WIN"])
+    case "nvrtc": return load("nvrtc", ["{}/include/nvrtc.h"], dll="'nvrtc'", paths=nv_lib_path, srcs=nvrtc_src, prolog=["import sysconfig"])
+    case "nvjitlink": load("nvjitlink", [root/"extra/nvJitLink.h"], dll="'nvJitLink'", paths=nv_lib_path, prolog=["import sysconfig"])
+    case "kfd": return load("kfd", [root/"extra/hip_gpu_driver/kfd_ioctl.h"])
+    case "nv_570" | "nv_580" | "nv_610":
+      return load(nm, [
+        *[root/"extra/nv_gpu_driver"/s for s in ["clc9b0.h", "clc6c0qmd.h","clcec0qmd.h", "nvdec_drv.h"]], "{}/kernel-open/common/inc/nvmisc.h",
+        *[f"{{}}/src/common/sdk/nvidia/inc/class/cl{s}.h" for s in ["0000", "0070", "0080", "2080", "2080_notification", "c56f", "c86f", "c96f", "c761",
+                                                                    "83de", "b2cc", "c6c0", "cdc0"]],
+        *[f"{{}}/kernel-open/nvidia-uvm/{s}.h" for s in ["clc6b5", "clc9b5", "clcfb0", "uvm_ioctl", "uvm_linux_ioctl", "hwref/ampere/ga100/dev_fault"]],
+        *[f"{{}}/src/nvidia/arch/nvalloc/unix/include/nv{s}.h" for s in ["_escape", "-ioctl", "-ioctl-numbers",
+                                                                         "-ioctl-numa", "-unix-nvos-params-wrappers"]],
+        *[f"{{}}/src/common/sdk/nvidia/inc/{s}.h" for s in ["alloc/alloc_channel", "nvos", "ctrl/ctrlc36f", "ctrl/ctrlcb33",
+                                                            "ctrl/ctrla06c", "ctrl/ctrl90f1", "ctrl/ctrla06f/ctrla06fgpfifo"]],
+        *[f"{{}}/src/common/sdk/nvidia/inc/ctrl/ctrl{s}/*.h" for s in ["0000", "0080", "2080", "83de", "b0cc"]],
+        "{}/kernel-open/common/inc/nvstatus.h", "{}/src/nvidia/generated/g_allclasses.h"
+      ], args=[
+        "-include", "{}/src/common/sdk/nvidia/inc/nvtypes.h", "-I{}/src/common/inc", "-I{}/kernel-open/nvidia-uvm", "-I{}/kernel-open/common/inc",
+        "-I{}/src/common/sdk/nvidia/inc", "-I{}/src/nvidia/arch/nvalloc/unix/include", "-I{}/src/common/sdk/nvidia/inc/ctrl"
+      ], rules=[(r'MW\(([^:]+):(.+)\)',r'(\1, \2)'), (r'(\d+):(\d+)', r'(\1, \2)')], srcs=nv_src[nm], anon_names={"{}/kernel-open/common/inc/nvstatus.h:37":"nv_status_codes"})
+    case "nv": return load("nv", [
+      *[f"{{}}/src/nvidia/inc/kernel/gpu/{s}.h" for s in ["fsp/kern_fsp_cot_payload", "gsp/gsp_init_args"]],
+      *[f"{{}}/src/nvidia/arch/nvalloc/common/inc/{s}.h" for s in ["gsp/gspifpub", "gsp/gsp_fw_wpr_meta", "gsp/gsp_fw_sr_meta", "rmRiscvUcode",
+                                                                   "fsp/fsp_nvdm_format"]],
+      *[f"{{}}/src/nvidia/inc/kernel/vgpu/{s}.h" for s in ["rpc_headers", "rpc_global_enums"]],
+      "{}/src/common/uproc/os/common/include/libos_init_args.h", "{}/src/common/shared/msgq/inc/msgq/msgq_priv.h",
+      "{}/src/nvidia/generated/g_rpc-structures.h", root/"extra/nv_gpu_driver/g_rpc-message-header.h", root/"extra/nv_gpu_driver/gsp_static_config.h",
+      *[root/f"extra/nv_gpu_driver/{s}.h" for s in ["vbios", "pci_exp_table", "fw", "hs"]]
+    ], args=[
+      "-DRPC_MESSAGE_STRUCTURES", "-DRPC_STRUCTURES", "-include", "{}/src/common/sdk/nvidia/inc/nvtypes.h", "-I{}/src/nvidia/generated",
+      "-I{}/src/common/inc", "-I{}/src/nvidia/inc", "-I{}/src/nvidia/interface/", "-I{}/src/nvidia/inc/kernel", "-I{}/src/nvidia/inc/libraries",
+      "-I{}/src/nvidia/arch/nvalloc/common/inc", "-I{}/kernel-open/nvidia-uvm", "-I{}/kernel-open/common/inc", "-I{}/src/common/sdk/nvidia/inc",
+      "-I{}/src/nvidia/arch/nvalloc/unix/include", "-I{}/src/common/sdk/nvidia/inc/ctrl"
+    ], srcs=nv_src["nv_570"], anon_names={
+      "{}/src/nvidia/inc/kernel/vgpu/rpc_global_enums.h:8": "rpc_fns",
+      "{}/src/nvidia/inc/kernel/vgpu/rpc_global_enums.h:244": "rpc_events"
+    })
+    # this defines all syscall numbers. should probably unify linux autogen?
+    case "io_uring":
+      return load("io_uring", ["{}/liburing.h", "{}/usr/include/linux/io_uring.h", "{}/usr/include/asm-generic/unistd.h"],
+                  args=["-I{}/usr/include"], srcs=[linux_headers_deb, liburing_src], rules=[('__NR', 'NR')], preprocess=_extract_deb)
+    case "llvm": return load("llvm", lambda: [system("llvm-config-20 --includedir")+"/llvm-c/**/*.h"], dll=llvm_lib,
+                             args=lambda: system("llvm-config-20 --cflags").split(), recsym=True, prolog=["from tinygrad.helpers import WIN, OSX"])
+    case "pci": return load("pci", ["{}/usr/include/linux/pci_regs.h"], srcs=linux_headers_deb, preprocess=_extract_deb)
+    case "vfio": return load("vfio", ["{}/usr/include/linux/vfio.h"], args=["-I{}/usr/include"], srcs=linux_headers_deb, preprocess=_extract_deb)
+    # could add rule: WGPU_COMMA -> ','
+    case "webgpu": return load("webgpu", [root/"extra/webgpu/webgpu.h"], dll=webgpu_lib,
+                               prolog=["from tinygrad.helpers import WIN, OSX", "import sysconfig, os"])
+    case "libusb": return load("libusb", ["/usr/include/libusb-1.0/libusb.h"], dll="'usb-1.0'")
+    case "hip": return load("hip", ["/opt/rocm/include/hip/hip_ext.h", "/opt/rocm/include/hip/hiprtc.h",
+                                    "/opt/rocm/include/hip/hip_runtime_api.h", "/opt/rocm/include/hip/driver_types.h"],
+                            dll="os.getenv('ROCM_PATH', '/opt/rocm')+'/lib/libamdhip64.so'",
+                            args=["-D__HIP_PLATFORM_AMD__", "-I/opt/rocm/include", "-x", "c++"], prolog=["import os"])
+    case "comgr" | "comgr_3":
+      prefix = "{}/opt/rocm-6.2.0" if nm == "comgr" else "/opt/rocm"
+      return load(nm, [f"{prefix}/include/amd_comgr/amd_comgr.h"], dll="[os.getenv('ROCM_PATH', '/opt/rocm')+'/lib/libamd_comgr.so', 'amd_comgr']",
+                  args=["-D__HIP_PLATFORM_AMD__", f"-I{prefix}/include", "-x", "c++"], prolog=["import os"], srcs=comgr_2_src if nm == "comgr" else None,
+                  **({'preprocess':_extract_deb} if nm == "comgr" else {}))
+    case "hsa": return load("hsa", [*[f"{{}}/projects/rocr-runtime/runtime/hsa-runtime/core/inc/{s}.h" for s in ["registers"]],
+                                    *[f"{{}}/projects/rocr-runtime/runtime/hsa-runtime/inc/{s}.h" for s in [
+                                        "hsa", "hsa_ext_amd", "amd_hsa_signal", "amd_hsa_queue", "amd_hsa_kernel_code",
+                                        "hsa_ext_finalize", "hsa_ext_image", "hsa_ven_amd_aqlprofile"]]],
+      srcs=rocr_src, args=["-DLITTLEENDIAN_CPU"], prolog=["import os"])
+    case "amdgpu_kd": return load("amdgpu_kd", lambda: [f"{system('llvm-config-20 --includedir')}/llvm/Support/AMDHSAKernelDescriptor.h"],
+                                  args=lambda: system("llvm-config-20 --cflags").split() + ["-x", "c++"], recsym=True, macros=False)
+    case "amd_gpu": return load("amd_gpu", [root/f"extra/hip_gpu_driver/{s}.h" for s in ["sdma_registers", "nvd", "gc_11_0_0_offset",
+                                                                                               "sienna_cichlid_ip_offset"]],
+                                args=["-I/opt/rocm/include", "-x", "c++"])
+    case "amdgpu_drm": return load("amdgpu_drm", [ "/usr/include/drm/drm.h", *[root/f"extra/hip_gpu_driver/{s}.h" for s in ["amdgpu_drm"]]])
+    case "kgsl": return load("kgsl", [root/"extra/qcom_gpu_driver/msm_kgsl.h"], args=["-D__user="])
+    case "qcom_dsp":
+      return load("qcom_dsp", [root/f"extra/dsp/include/{s}.h" for s in ["ion", "msm_ion", "adsprpc_shared", "remote_default", "apps_std"]])
+    case "sqtt": return load("sqtt", [root/"extra/sqtt/sqtt.h"])
+    case "rocprof":
+      return load("rocprof", [f"{{}}/include/{s}.h" for s in ["rocprof_trace_decoder", "trace_decoder_instrument", "trace_decoder_types"]],
+                  dll= "['rocprof-trace-decoder', p:='/usr/local/lib/rocprof-trace-decoder.so', p.replace('so','dylib')]",
+                  srcs="https://github.com/ROCm/rocprof-trace-decoder/archive/dd0485100971522cc4cd8ae136bdda431061a04d.tar.gz")
+    case "mesa": return load("mesa", [
+        *[f"{{}}/src/compiler/nir/{s}.h" for s in ["nir", "nir_builder", "nir_shader_compiler_options", "nir_serialize"]], "{}/gen/nir_intrinsics.h",
+        *[f"{{}}/src/nouveau/{s}.h" for s in ["headers/nv_device_info", "compiler/nak"]],
+        *[f"{{}}/src/gallium/auxiliary/gallivm/lp_bld{s}.h" for s in ["", "_passmgr", "_misc", "_type", "_init", "_nir", "_struct", "_jit_types",
+                                                                     "_flow", "_const"]],
+        *[f"{{}}/src/freedreno/{s}.h" for s in ["common/freedreno_dev_info", "ir3/ir3_compiler", "ir3/ir3_shader", "ir3/ir3_nir"]],
+        "{}/src/compiler/glsl_types.h", "{}/src/util/blob.h", "{}/src/util/ralloc.h", "{}/gen/ir3-isa.h", "{}/gen/builtin_types.h",
+        "{}/gen/a6xx.xml.h", "{}/gen/adreno_pm4.xml.h", "{}/gen/a6xx_enums.xml.h", "{}/gen/a6xx_descriptors.xml.h"], args=lambda:[
+          "-DHAVE_ENDIAN_H", "-DHAVE_STRUCT_TIMESPEC", "-DHAVE_PTHREAD", "-DHAVE_FUNC_ATTRIBUTE_PACKED", "-I{}/src", "-I{}/include", "-I{}/gen",
+          "-I{}/src/compiler/nir", "-I{}/src/gallium/auxiliary", "-I{}/src/gallium/include", "-I{}/src/freedreno/common",
+          f"-I{system('llvm-config-20 --includedir')}"],
+        preprocess=lambda path: subprocess.run("\n".join(["mkdir -p gen/util/format", "python3 src/compiler/builtin_types_h.py gen/builtin_types.h",
+          "python3 src/compiler/isaspec/decode.py --xml src/freedreno/isa/ir3.xml --out-c /dev/null --out-h gen/ir3-isa.h",
+          "python3 src/util/format/u_format_table.py src/util/format/u_format.yaml --enums > gen/util/format/u_format_gen.h",
+          *["python3 src/freedreno/registers/gen_header.py --rnn src/freedreno/registers/ --xml " +
+            f"src/freedreno/registers/adreno/{s}.xml c-defines > gen/{s}.xml.h" for s in ["a6xx", "adreno_pm4", "a6xx_enums", "a6xx_descriptors"]],
+          *[f"python3 src/compiler/{s}_h.py > gen/{s.split('/')[-1]}.h" for s in ["nir/nir_opcodes", "nir/nir_builder_opcodes"]],
+          *[f"python3 src/compiler/nir/nir_{s}_h.py --outdir gen" for s in ["intrinsics", "intrinsics_indices"]]]), cwd=path, shell=True, check=True),
+  srcs="https://gitlab.freedesktop.org/mesa/mesa/-/archive/mesa-25.2.7/mesa-25.2.7.tar.gz",
+  dll=f"'tinymesa_cpu' if DEV.renderer == 'LVP' else 'tinymesa', {tinymesa_path}, emsg='pip install tinymesa==25.2.7.2'",
+  prolog=["from tinygrad.helpers import DEV", "import gzip, base64, sysconfig, os"],
+  epilog=lambda path: [system(f"{root}/extra/mesa/lvp_nir_options.sh {path}")])
+    case "libclang":
+      return load("libclang",
+                  lambda: [f"{system('llvm-config-20 --includedir')}/clang-c/{s}.h" for s in ["Index", "CXString", "CXSourceLocation", "CXFile"]],
+                  dll=clang_lib, prolog=["from tinygrad.helpers import WIN, OSX"], args=lambda: system("llvm-config-20 --cflags").split())
+    case "metal":
+      return load("metal", lambda: [f"{macossdk()}/System/Library/Frameworks/Metal.framework/Headers/MTL{s}.h" for s in
+                  ["ComputeCommandEncoder", "ComputePipeline", "CommandQueue", "Device", "IndirectCommandBuffer", "Resource", "CommandEncoder"]],
+                  dll="'Metal'", args=lambda: ["-xobjective-c", "-isysroot", macossdk()], types={"dispatch_data_t":"objc.id_"})
+    case "iokit": return load("iokit", lambda: [f"{macossdk()}/System/Library/Frameworks/IOKit.framework/Headers/IOKitLib.h"], dll="'IOKit'",
+                              args=lambda: ["-isysroot", macossdk()])
+    case "corefoundation": return load("corefoundation", lambda: [f"{macossdk()}/System/Library/Frameworks/CoreFoundation.framework/Headers/CF{s}.h"
+                                       for s in ["String", "Data"]], dll="'CoreFoundation'", args=lambda: ["-isysroot", macossdk()])
+    case "llvm_qcom": return load("llvm_qcom", [root/"extra/tinydreno.h"], dll="'llvm-qcom'")
+    case "ggml_common": return load("ggml_common", ["{}/ggml-common.h"], srcs=ggml_common_src,
+                                    args=["-DGGML_COMMON_DECL_C", "-DGGML_COMMON_IMPL_C"], macros=False)
+    case "mlx5":
+      kh = "{}/usr/src/linux-headers-6.18.9+deb14-common/include/linux/mlx5"
+      return load("mlx5", [root/"extra/mlx_driver/mlx5.h", f"{kh}/mlx5_ifc.h"], srcs=linux_headers_kern_deb,
+                  args=["-Du8=unsigned char", "-Du16=unsigned short", "-Du32=unsigned int", "-Du64=unsigned long long",
+                        "-D__be16=unsigned short", "-D__be32=unsigned int", "-D__be64=unsigned long long", f"-I{kh}"],
+                  preprocess=_extract_deb)
+    case "bnxt":
+      kh = "{}/usr/src/linux-headers-6.18.9+deb14-common/include"
+      return load("bnxt", [f"{kh}/linux/bnxt/hsi.h", *[f"{{}}/{s.split('/')[-1].split('?')[0]}" for s in bnxt_src]],
+                  srcs=[linux_headers_kern_deb, *bnxt_src],
+                  args=["-Du8=unsigned char", "-Du32=unsigned int", "-Du64=unsigned long long", "-D__le16=unsigned short",
+                        "-D__le32=unsigned int", "-D__le64=unsigned long long", "-D__be16=unsigned short", "-D__be32=unsigned int", f"-I{kh}"],
+                  patterns=[r"hwrm_((ver_get|func_(qcaps|qcfg|reset|drv_(un)?rgtr|backing_store_(qcaps|cfg)_v2)|stat_ctx_alloc|ring_alloc"
+                            r"|vnic_(alloc|cfg)|cfa_l2_filter_alloc|port_phy_cfg)_(input|output)|(cmd|resp)_hdr)$",
+                            r"((cmdq|creq)_(base|init|add_gid|create_(cq|qp)|initialize_fw|modify_qp|query_version|(de)?register_mr)(_resp)?"
+                            r"|cq_(base|req)|sq_(rdma_hdr|sge))$",
+                            r"(BNXT|CMDQ|CREQ|CQ|SQ|DBC|PTU|RCFW|HWRM|VNIC|RING_ALLOC|STAT_CTX|CFA_L2_FILTER|PORT_PHY_CFG|FIRMWARE_FIRST"
+                            r"|FUNC_(QCAPS|QCFG|RESET|DRV_RGTR|BACKING_STORE))_"], preprocess=_extract_deb)
+    case _: raise AttributeError(f"no such autogen: {nm}")
+
+import pathlib, hashlib, re, itertools
+from tinygrad.runtime.autogen import load, root
+
+__all__ = ["am", "pm4_soc15", "pm4_nv", "sdma_4_0_0", "sdma_5_0_0", "sdma_6_0_0", "smu_13_0_0", "smu_13_0_6", "smu_13_0_12", "smu_14_0_2",
+           "fw", "navi_offsets", "vega_offsets", "regs", "soc_9", "soc_11", "soc_12", "pmc"]
+
+am_src="https://github.com/ROCm/ROCK-Kernel-Driver/archive/33970e1351f5e511029602454979f3de7e22260f.tar.gz"
+rocm_src="https://github.com/ROCm/rocm-systems/archive/cccc350dc620e61ae2554978b62ab3532dc10bd9.tar.gz"
+AMD, AMDINC = "{}/drivers/gpu/drm/amd", "{}/drivers/gpu/drm/amd/include"
+inc, kern_rules = ["-include", "stdint.h"], [(r'le32_to_cpu', ''),]
+fw_src="https://gitlab.com/kernel-firmware/linux-firmware/-/archive/0a6871b19abf5d6e024b5d208b101ae53e7fa0de/0a6871b19abf5d6e024b5d208b101ae53e7fa0de.tar.gz"
+pmc_src="https://raw.githubusercontent.com/ROCm/rocm-systems/cccc350dc620e61ae2554978b62ab3532dc10bd9/projects/rocprofiler-compute/src/rocprof_compute_soc/profile_configs/counter_defs.yaml"
+
+reg_files = {
+  "gc": [(9,4,3), (11,0,0), (11,0,3), (11,5,0), (12,0,0)],
+  "mmhub": [(1,8,0), (3,0,0), (3,0,1), (3,0,2), (3,3,0), (4,1,0)],
+  "nbio": [(4,3,0), (7,2,0), (7,7,0), (7,9,0), (7,11,0)], "nbif": [(6,3,1)],
+  "mp": [(11,0,0), (13,0,0), (14,0,2)], "hdp": [(4,4,2), (6,0,0), (7,0,0)],
+  "osssys": [(4,4,2), (6,0,0), (6,1,0), (7,0,0)], "sdma": [(4,4,2)]
+}
+
+reg_patterns = {
+  "gc": ["GCVM", "GCMC_VM", "CP_(HQD|MQD|MEC|ME_CNTL|PERFMON|RB_WPTR_POLL_CNTL|INT_CNTL|STAT|PFP_PRGRM|ME_PRGRM|COHER_START)", "COMPUTE_",
+         "(SQ|GL2C|TCC)_PERFCOUNTER", "SQ_THREAD_TRACE", "SPI_(CONFIG_CNTL|COMPUTE_QUEUE_RESET)", "GRBM", "SH_MEM", "RLC", "TCP", "GB_ADDR_CONFIG",
+         "SDMA[01]_(WATCHDOG_CNTL|UTCL1_(CNTL|PAGE)|MCU_CNTL|F32_CNTL|CNTL|QUEUE0_|RLC_CGCG_CTRL)", "SCRATCH_REG[0-35-7]"],
+  "mmhub": ["MMVM", "MMMC_VM", "MM_ATC_L2_MISC_CG"],
+  "nbio": (nbio:=["BIF_BX_PF[01]_GPU_HDP_FLUSH", "BIF_BX_PF0_RSMU", "BIF_BX0_(REMAP_HDP_MEM_FLUSH_CNTL|BIF_DOORBELL_INT_CNTL|PCIE_INDEX2|PCIE_DATA2)",
+                  "BIFC_(DOORBELL_ACCESS_EN_PF|GFX_INT_MONITOR_MASK)", "XCC_DOORBELL_FENCE", "DOORBELL0_CTRL_ENTRY", "GDC_S2A0_S2A_DOORBELL_ENTRY",
+                  "S2A_DOORBELL_ENTRY", "RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN",
+                  "BIF_BX_DEV0_EPF0_VF0_HDP_MEM_COHERENCY_FLUSH_CNTL", "RCC_DEV0_EPF2_STRAP2"]),
+  "nbif": nbio,
+  "mp": ["MP([01]|ASP)_SMN_C2PMSG"], "hdp": ["HDP_MEM_POWER_CTRL"], "oss": ["IH_"], "sdma": ["SDMA_GFX", "SDMA_CNTL"]
+}
+
+soc_patterns = ["SQ_TT", "VGT_EVENT_TYPE", "CS", "MTYPE", "SH"]
+
+def __getattr__(nm):
+  match nm:
+    case "am": return load("am/am", [root/f"extra/amdpci/headers/{s}.h" for s in ["v11_structs", "v12_structs", "amdgpu_vm",
+      "discovery", "amdgpu_ucode", "psp_gfx_if", "amdgpu_psp", "amdgpu_irq", "amdgpu_doorbell"]] + [f"{AMD}/amdkfd/soc15_int.h"] + \
+      [f"{AMDINC}/ivsrcid/{s}.h" for s in [f"gfx/irqsrcs_gfx_{x}_0" for x in ('9','11_0','12_0')] + [f"sdma0/irqsrcs_sdma0_{x}_0" for x in (4,5)]] + \
+      [f"{AMDINC}/{s}.h" for s in ["v9_structs", "soc15_ih_clientid"]] + [f"{AMD}/amdgpu/{s}.h" for s in ["mxgpu_nv", "amdgpu_virt"]], args=inc, srcs=am_src, rules=kern_rules)
+    case "pm4_soc15": return load("am/pm4_soc15", [f"{AMD}/amdkfd/kfd_pm4_headers_ai.h", f"{AMD}/amdgpu/soc15d.h"], srcs=am_src)
+    case "pm4_nv": return load("am/pm4_nv", [f"{AMD}/amdkfd/kfd_pm4_headers_ai.h", f"{AMD}/amdgpu/nvd.h"], srcs=am_src)
+    case "sdma_4_0_0": return load("am/sdma_4_0_0", [root/"extra/hip_gpu_driver/sdma_registers.h", f"{AMD}/amdgpu/vega10_sdma_pkt_open.h"],
+                                   args=["-I/opt/rocm/include", "-x", "c++"], srcs=am_src)
+    case "sdma_5_0_0": return load("am/sdma_5_0_0", [root/"extra/hip_gpu_driver/sdma_registers.h", f"{AMD}/amdgpu/navi10_sdma_pkt_open.h"],
+                                   args=["-I/opt/rocm/include", "-x", "c++"], srcs=am_src)
+    case "sdma_6_0_0": return load("am/sdma_6_0_0", [root/"extra/hip_gpu_driver/sdma_registers.h", f"{AMD}/amdgpu/sdma_v6_0_0_pkt_open.h"],
+                                   args=["-I/opt/rocm/include", "-x", "c++"], srcs=am_src)
+    case "smu_13_0_0": return load("am/smu_13_0_0", [f"{AMD}/pm/swsmu/inc/pmfw_if/{s}.h" for s in ["smu_v13_0_0_ppsmc","smu13_driver_if_v13_0_0"]]
+                                    +[root/"extra/amdpci/headers/amdgpu_smu.h"], args=inc, srcs=am_src)
+    case "smu_13_0_6": return load("am/smu_13_0_6", [f"{AMD}/pm/swsmu/inc/pmfw_if/{s}.h" for s in ["smu_v13_0_6_ppsmc","smu_v13_0_6_pmfw", \
+      "smu13_driver_if_v13_0_6"]] +[root/"extra/amdpci/headers/amdgpu_smu.h"], args=inc, srcs=am_src)
+    case "smu_13_0_12": return load("am/smu_13_0_12", [f"{AMD}/pm/swsmu/inc/pmfw_if/{s}.h" for s in ["smu_v13_0_12_ppsmc","smu_v13_0_12_pmfw",
+      "smu13_driver_if_v13_0_6"]] +[root/"extra/amdpci/headers/amdgpu_smu.h"], args=inc, srcs=am_src)
+    case "smu_14_0_2": return load("am/smu_14_0_2", [f"{AMD}/pm/swsmu/inc/pmfw_if/{s}.h" for s in ["smu_v14_0_0_pmfw", "smu_v14_0_2_ppsmc",
+                                    "smu14_driver_if_v14_0"]]+[root/"extra/amdpci/headers/amdgpu_smu.h"], args=inc, srcs=am_src)
+    # firmware hashes
+    case "fw":
+      def genfw(name, files, **kwargs): return "\n".join(["hashes = {"] + [f"  {p.name!r}: {hashlib.sha256(p.read_bytes()).hexdigest()!r},"
+                                                                           for f in files if (p:=pathlib.Path(f)).is_file()] + ["}"])
+      return load("am/fw", ["{}/amdgpu/psp_*_sos.bin", "{}/amdgpu/smu_*.bin", "{}/amdgpu/sdma_*.bin"] +
+                           [f"{{}}/amdgpu/gc_*_{x}.bin" for x in ["pfp", "me", "mec", "imu", "rlc"]], srcs=fw_src, gen=genfw)
+    case "navi_offsets": return load("am/navi_offsets", [f"{AMD}/include/sienna_cichlid_ip_offset.h"], srcs=am_src)
+    case "vega_offsets": return load("am/vega_offsets", [f"{AMD}/include/vega20_ip_offset.h"], srcs=am_src)
+    case "regs":
+      def genreg(_, files, **kwargs):
+        out = ["__all__ = " + repr([file.split('/')[-1] for file in files])]
+        for file, nm in [(file.replace("mp_11_0_0", "mp_11_0"), file.split('/')[-1]) for file in files]:
+          pats = reg_patterns[prefix := {"osssys": "oss"}.get(x:=nm.split("_", 1)[0], x)]
+
+          def split_name(name): return name[:(pos:=next((i for i,c in enumerate(name) if c.isupper()), len(name)))], name[pos:]
+          # handle CDNA's different register names
+          def normalize(reg):
+            return s[0] + prefix.upper()[:2] + s[1] if prefix in ("gc", "mmhub") and (s:=split_name(reg))[1].startswith(("VM_", "MC_VM_")) else reg
+          def extract(lines, pat): return ((normalize(m.group(1)), int(m.group(2), 0)) for l in lines if (m:=re.match(pat, l)))
+
+          offset, sh_mask = pathlib.Path(f"{file}_offset.h").read_text().splitlines(), pathlib.Path(f"{file}_sh_mask.h").read_text().splitlines()
+          defs = {k:v for k,v in extract(offset, r'#define\s+((?:mm|reg)\S+)\s+(0x[\da-fA-F]+|\d+)') if any(re.match("(mm|reg)"+p, k) for p in pats)}
+          fields = {reg: {name.split('__')[1].lower(): ((mask & -mask).bit_length() - 1, mask.bit_length() - 1) for name, mask in fs}
+                    for reg, fs in itertools.groupby(extract(sh_mask, r'#define\s+(\S+)_MASK\s+(0x[\da-fA-F]+|\d+)'), lambda x: x[0].split('__')[0])}
+
+          regs = {reg: (off, defs[f"{reg}_BASE_IDX"], fields.get(split_name(reg)[1], {})) for reg,off in defs.items() if f"{reg}_BASE_IDX" in defs}
+          print(f"defined {len(regs)} registers for {nm}")
+          out.extend([f"{nm} = {{"] + [f"  {k!r}: {v!r}," for k,v in regs.items()] + ["}"])
+        return "\n".join(out)
+      return load("am/regs", [AMDINC + "/asic_reg/" + {"osssys":"oss"}.get(pre, pre) + f"/{pre}_{'_'.join(map(str, ver))}"
+                              for pre in reg_files for ver in sorted(reg_files[pre])], srcs=am_src, gen=genreg)
+    case "soc_9" | "soc_11" | "soc_12":
+      return load(f"am/{nm}", ["{}/projects/aqlprofile/linux/" + {9: "vega10", 11: "soc21", 12: "soc24"}[int(nm.split('_')[1])] + "_enum.h"],
+                  srcs=rocm_src, patterns=soc_patterns, macros=False)
+    case "pmc":
+      def genpmc(_, files, **kwargs):
+        from yaml import safe_load # type: ignore
+        with open(files[0], "r") as f: data = safe_load(f)
+        out = ["counters = {"]
+        for counter in [c for c in data['rocprofiler-sdk']['counters'] if any('block' in d for d in c['definitions'])]:
+          out.extend([f"  {counter['name']!r}: {{",
+                      *[f"    {a!r}: ({d['block']!r}, {d['event']})," for d in counter['definitions'] for a in d['architectures']], "  },"])
+        return "\n".join(out + ["}"])
+      return load("am/pmc", ["{}/counter_defs.yaml"], srcs=pmc_src, gen=genpmc)
+    case _: raise AttributeError(f"no such autogen: {nm}")
+
+# mypy: disable-error-code="empty-body"
+from __future__ import annotations
+import ctypes
+from typing import Literal, TypeAlias
+from tinygrad.runtime.support.c import _IO, _IOW, _IOR, _IOWR
+from tinygrad.runtime.support import c
+@c.record
+class struct_v11_gfx_mqd(c.Struct):
+  SIZE = 2048
+  shadow_base_lo: int
+  shadow_base_hi: int
+  gds_bkup_base_lo: int
+  gds_bkup_base_hi: int
+  fw_work_area_base_lo: int
+  fw_work_area_base_hi: int
+  shadow_initialized: int
+  ib_vmid: int
+  reserved_8: int
+  reserved_9: int
+  reserved_10: int
+  reserved_11: int
+  reserved_12: int
+  reserved_13: int
+  reserved_14: int
+  reserved_15: int
+  reserved_16: int
+  reserved_17: int
+  reserved_18: int
+  reserved_19: int
+  reserved_20: int
+  reserved_21: int
+  reserved_22: int
+  reserved_23: int
+  reserved_24: int
+  reserved_25: int
+  reserved_26: int
+  reserved_27: int
+  reserved_28: int
+  reserved_29: int
+  reserved_30: int
+  reserved_31: int
+  reserved_32: int
+  reserved_33: int
+  reserved_34: int
+  reserved_35: int
+  reserved_36: int
+  reserved_37: int
+  reserved_38: int
+  reserved_39: int
+  reserved_40: int
+  reserved_41: int
+  reserved_42: int
+  reserved_43: int
+  reserved_44: int
+  reserved_45: int
+  reserved_46: int
+  reserved_47: int
+  reserved_48: int
+  reserved_49: int
+  reserved_50: int
+  reserved_51: int
+  reserved_52: int
+  reserved_53: int
+  reserved_54: int
+  reserved_55: int
+  reserved_56: int
+  reserved_57: int
+  reserved_58: int
+  reserved_59: int
+  reserved_60: int
+  reserved_61: int
+  reserved_62: int
+  reserved_63: int
+  reserved_64: int
+  reserved_65: int
+  reserved_66: int
+  reserved_67: int
+  reserved_68: int
+  reserved_69: int
+  reserved_70: int
+  reserved_71: int
+  reserved_72: int
+  reserved_73: int
+  reserved_74: int
+  reserved_75: int
+  reserved_76: int
+  reserved_77: int
+  reserved_78: int
+  reserved_79: int
+  reserved_80: int
+  reserved_81: int
+  reserved_82: int
+  reserved_83: int
+  checksum_lo: int
+  checksum_hi: int
+  cp_mqd_query_time_lo: int
+  cp_mqd_query_time_hi: int
+  reserved_88: int
+  reserved_89: int
+  reserved_90: int
+  reserved_91: int
+  cp_mqd_query_wave_count: int
+  cp_mqd_query_gfx_hqd_rptr: int
+  cp_mqd_query_gfx_hqd_wptr: int
+  cp_mqd_query_gfx_hqd_offset: int
+  reserved_96: int
+  reserved_97: int
+  reserved_98: int
+  reserved_99: int
+  reserved_100: int
+  reserved_101: int
+  reserved_102: int
+  reserved_103: int
+  control_buf_addr_lo: int
+  control_buf_addr_hi: int
+  disable_queue: int
+  reserved_107: int
+  reserved_108: int
+  reserved_109: int
+  reserved_110: int
+  reserved_111: int
+  reserved_112: int
+  reserved_113: int
+  reserved_114: int
+  reserved_115: int
+  reserved_116: int
+  reserved_117: int
+  reserved_118: int
+  reserved_119: int
+  reserved_120: int
+  reserved_121: int
+  reserved_122: int
+  reserved_123: int
+  reserved_124: int
+  reserved_125: int
+  reserved_126: int
+  reserved_127: int
+  cp_mqd_base_addr: int
+  cp_mqd_base_addr_hi: int
+  cp_gfx_hqd_active: int
+  cp_gfx_hqd_vmid: int
+  reserved_131: int
+  reserved_132: int
+  cp_gfx_hqd_queue_priority: int
+  cp_gfx_hqd_quantum: int
+  cp_gfx_hqd_base: int
+  cp_gfx_hqd_base_hi: int
+  cp_gfx_hqd_rptr: int
+  cp_gfx_hqd_rptr_addr: int
+  cp_gfx_hqd_rptr_addr_hi: int
+  cp_rb_wptr_poll_addr_lo: int
+  cp_rb_wptr_poll_addr_hi: int
+  cp_rb_doorbell_control: int
+  cp_gfx_hqd_offset: int
+  cp_gfx_hqd_cntl: int
+  reserved_146: int
+  reserved_147: int
+  cp_gfx_hqd_csmd_rptr: int
+  cp_gfx_hqd_wptr: int
+  cp_gfx_hqd_wptr_hi: int
+  reserved_151: int
+  reserved_152: int
+  reserved_153: int
+  reserved_154: int
+  reserved_155: int
+  cp_gfx_hqd_mapped: int
+  cp_gfx_hqd_que_mgr_control: int
+  reserved_158: int
+  reserved_159: int
+  cp_gfx_hqd_hq_status0: int
+  cp_gfx_hqd_hq_control0: int
+  cp_gfx_mqd_control: int
+  reserved_163: int
+  reserved_164: int
+  reserved_165: int
+  reserved_166: int
+  reserved_167: int
+  reserved_168: int
+  reserved_169: int
+  cp_num_prim_needed_count0_lo: int
+  cp_num_prim_needed_count0_hi: int
+  cp_num_prim_needed_count1_lo: int
+  cp_num_prim_needed_count1_hi: int
+  cp_num_prim_needed_count2_lo: int
+  cp_num_prim_needed_count2_hi: int
+  cp_num_prim_needed_count3_lo: int
+  cp_num_prim_needed_count3_hi: int
+  cp_num_prim_written_count0_lo: int
+  cp_num_prim_written_count0_hi: int
+  cp_num_prim_written_count1_lo: int
+  cp_num_prim_written_count1_hi: int
+  cp_num_prim_written_count2_lo: int
+  cp_num_prim_written_count2_hi: int
+  cp_num_prim_written_count3_lo: int
+  cp_num_prim_written_count3_hi: int
+  reserved_186: int
+  reserved_187: int
+  reserved_188: int
+  reserved_189: int
+  mp1_smn_fps_cnt: int
+  sq_thread_trace_buf0_base: int
+  sq_thread_trace_buf0_size: int
+  sq_thread_trace_buf1_base: int
+  sq_thread_trace_buf1_size: int
+  sq_thread_trace_wptr: int
+  sq_thread_trace_mask: int
+  sq_thread_trace_token_mask: int
+  sq_thread_trace_ctrl: int
+  sq_thread_trace_status: int
+  sq_thread_trace_dropped_cntr: int
+  sq_thread_trace_finish_done_debug: int
+  sq_thread_trace_gfx_draw_cntr: int
+  sq_thread_trace_gfx_marker_cntr: int
+  sq_thread_trace_hp3d_draw_cntr: int
+  sq_thread_trace_hp3d_marker_cntr: int
+  reserved_206: int
+  reserved_207: int
+  cp_sc_psinvoc_count0_lo: int
+  cp_sc_psinvoc_count0_hi: int
+  cp_pa_cprim_count_lo: int
+  cp_pa_cprim_count_hi: int
+  cp_pa_cinvoc_count_lo: int
+  cp_pa_cinvoc_count_hi: int
+  cp_vgt_vsinvoc_count_lo: int
+  cp_vgt_vsinvoc_count_hi: int
+  cp_vgt_gsinvoc_count_lo: int
+  cp_vgt_gsinvoc_count_hi: int
+  cp_vgt_gsprim_count_lo: int
+  cp_vgt_gsprim_count_hi: int
+  cp_vgt_iaprim_count_lo: int
+  cp_vgt_iaprim_count_hi: int
+  cp_vgt_iavert_count_lo: int
+  cp_vgt_iavert_count_hi: int
+  cp_vgt_hsinvoc_count_lo: int
+  cp_vgt_hsinvoc_count_hi: int
+  cp_vgt_dsinvoc_count_lo: int
+  cp_vgt_dsinvoc_count_hi: int
+  cp_vgt_csinvoc_count_lo: int
+  cp_vgt_csinvoc_count_hi: int
+  reserved_230: int
+  reserved_231: int
+  reserved_232: int
+  reserved_233: int
+  reserved_234: int
+  reserved_235: int
+  reserved_236: int
+  reserved_237: int
+  reserved_238: int
+  reserved_239: int
+  reserved_240: int
+  reserved_241: int
+  reserved_242: int
+  reserved_243: int
+  reserved_244: int
+  reserved_245: int
+  reserved_246: int
+  reserved_247: int
+  reserved_248: int
+  reserved_249: int
+  reserved_250: int
+  reserved_251: int
+  reserved_252: int
+  reserved_253: int
+  reserved_254: int
+  reserved_255: int
+  reserved_256: int
+  reserved_257: int
+  reserved_258: int
+  reserved_259: int
+  reserved_260: int
+  reserved_261: int
+  reserved_262: int
+  reserved_263: int
+  reserved_264: int
+  reserved_265: int
+  reserved_266: int
+  reserved_267: int
+  vgt_strmout_buffer_filled_size_0: int
+  vgt_strmout_buffer_filled_size_1: int
+  vgt_strmout_buffer_filled_size_2: int
+  vgt_strmout_buffer_filled_size_3: int
+  reserved_272: int
+  reserved_273: int
+  reserved_274: int
+  reserved_275: int
+  vgt_dma_max_size: int
+  vgt_dma_num_instances: int
+  reserved_278: int
+  reserved_279: int
+  reserved_280: int
+  reserved_281: int
+  reserved_282: int
+  reserved_283: int
+  reserved_284: int
+  reserved_285: int
+  reserved_286: int
+  reserved_287: int
+  it_set_base_ib_addr_lo: int
+  it_set_base_ib_addr_hi: int
+  reserved_290: int
+  reserved_291: int
+  reserved_292: int
+  reserved_293: int
+  reserved_294: int
+  reserved_295: int
+  reserved_296: int
+  reserved_297: int
+  reserved_298: int
+  reserved_299: int
+  reserved_300: int
+  reserved_301: int
+  reserved_302: int
+  reserved_303: int
+  reserved_304: int
+  reserved_305: int
+  reserved_306: int
+  reserved_307: int
+  reserved_308: int
+  reserved_309: int
+  reserved_310: int
+  reserved_311: int
+  reserved_312: int
+  reserved_313: int
+  reserved_314: int
+  reserved_315: int
+  reserved_316: int
+  reserved_317: int
+  reserved_318: int
+  reserved_319: int
+  reserved_320: int
+  reserved_321: int
+  reserved_322: int
+  reserved_323: int
+  reserved_324: int
+  reserved_325: int
+  reserved_326: int
+  reserved_327: int
+  reserved_328: int
+  reserved_329: int
+  reserved_330: int
+  reserved_331: int
+  reserved_332: int
+  reserved_333: int
+  reserved_334: int
+  reserved_335: int
+  reserved_336: int
+  reserved_337: int
+  reserved_338: int
+  reserved_339: int
+  reserved_340: int
+  reserved_341: int
+  reserved_342: int
+  reserved_343: int
+  reserved_344: int
+  reserved_345: int
+  reserved_346: int
+  reserved_347: int
+  reserved_348: int
+  reserved_349: int
+  reserved_350: int
+  reserved_351: int
+  reserved_352: int
+  reserved_353: int
+  reserved_354: int
+  reserved_355: int
+  spi_shader_pgm_rsrc3_ps: int
+  spi_shader_pgm_rsrc3_vs: int
+  spi_shader_pgm_rsrc3_gs: int
+  spi_shader_pgm_rsrc3_hs: int
+  spi_shader_pgm_rsrc4_ps: int
+  spi_shader_pgm_rsrc4_vs: int
+  spi_shader_pgm_rsrc4_gs: int
+  spi_shader_pgm_rsrc4_hs: int
+  db_occlusion_count0_low_00: int
+  db_occlusion_count0_hi_00: int
+  db_occlusion_count1_low_00: int
+  db_occlusion_count1_hi_00: int
+  db_occlusion_count2_low_00: int
+  db_occlusion_count2_hi_00: int
+  db_occlusion_count3_low_00: int
+  db_occlusion_count3_hi_00: int
+  db_occlusion_count0_low_01: int
+  db_occlusion_count0_hi_01: int
+  db_occlusion_count1_low_01: int
+  db_occlusion_count1_hi_01: int
+  db_occlusion_count2_low_01: int
+  db_occlusion_count2_hi_01: int
+  db_occlusion_count3_low_01: int
+  db_occlusion_count3_hi_01: int
+  db_occlusion_count0_low_02: int
+  db_occlusion_count0_hi_02: int
+  db_occlusion_count1_low_02: int
+  db_occlusion_count1_hi_02: int
+  db_occlusion_count2_low_02: int
+  db_occlusion_count2_hi_02: int
+  db_occlusion_count3_low_02: int
+  db_occlusion_count3_hi_02: int
+  db_occlusion_count0_low_03: int
+  db_occlusion_count0_hi_03: int
+  db_occlusion_count1_low_03: int
+  db_occlusion_count1_hi_03: int
+  db_occlusion_count2_low_03: int
+  db_occlusion_count2_hi_03: int
+  db_occlusion_count3_low_03: int
+  db_occlusion_count3_hi_03: int
+  db_occlusion_count0_low_04: int
+  db_occlusion_count0_hi_04: int
+  db_occlusion_count1_low_04: int
+  db_occlusion_count1_hi_04: int
+  db_occlusion_count2_low_04: int
+  db_occlusion_count2_hi_04: int
+  db_occlusion_count3_low_04: int
+  db_occlusion_count3_hi_04: int
+  db_occlusion_count0_low_05: int
+  db_occlusion_count0_hi_05: int
+  db_occlusion_count1_low_05: int
+  db_occlusion_count1_hi_05: int
+  db_occlusion_count2_low_05: int
+  db_occlusion_count2_hi_05: int
+  db_occlusion_count3_low_05: int
+  db_occlusion_count3_hi_05: int
+  db_occlusion_count0_low_06: int
+  db_occlusion_count0_hi_06: int
+  db_occlusion_count1_low_06: int
+  db_occlusion_count1_hi_06: int
+  db_occlusion_count2_low_06: int
+  db_occlusion_count2_hi_06: int
+  db_occlusion_count3_low_06: int
+  db_occlusion_count3_hi_06: int
+  db_occlusion_count0_low_07: int
+  db_occlusion_count0_hi_07: int
+  db_occlusion_count1_low_07: int
+  db_occlusion_count1_hi_07: int
+  db_occlusion_count2_low_07: int
+  db_occlusion_count2_hi_07: int
+  db_occlusion_count3_low_07: int
+  db_occlusion_count3_hi_07: int
+  db_occlusion_count0_low_10: int
+  db_occlusion_count0_hi_10: int
+  db_occlusion_count1_low_10: int
+  db_occlusion_count1_hi_10: int
+  db_occlusion_count2_low_10: int
+  db_occlusion_count2_hi_10: int
+  db_occlusion_count3_low_10: int
+  db_occlusion_count3_hi_10: int
+  db_occlusion_count0_low_11: int
+  db_occlusion_count0_hi_11: int
+  db_occlusion_count1_low_11: int
+  db_occlusion_count1_hi_11: int
+  db_occlusion_count2_low_11: int
+  db_occlusion_count2_hi_11: int
+  db_occlusion_count3_low_11: int
+  db_occlusion_count3_hi_11: int
+  db_occlusion_count0_low_12: int
+  db_occlusion_count0_hi_12: int
+  db_occlusion_count1_low_12: int
+  db_occlusion_count1_hi_12: int
+  db_occlusion_count2_low_12: int
+  db_occlusion_count2_hi_12: int
+  db_occlusion_count3_low_12: int
+  db_occlusion_count3_hi_12: int
+  db_occlusion_count0_low_13: int
+  db_occlusion_count0_hi_13: int
+  db_occlusion_count1_low_13: int
+  db_occlusion_count1_hi_13: int
+  db_occlusion_count2_low_13: int
+  db_occlusion_count2_hi_13: int
+  db_occlusion_count3_low_13: int
+  db_occlusion_count3_hi_13: int
+  db_occlusion_count0_low_14: int
+  db_occlusion_count0_hi_14: int
+  db_occlusion_count1_low_14: int
+  db_occlusion_count1_hi_14: int
+  db_occlusion_count2_low_14: int
+  db_occlusion_count2_hi_14: int
+  db_occlusion_count3_low_14: int
+  db_occlusion_count3_hi_14: int
+  db_occlusion_count0_low_15: int
+  db_occlusion_count0_hi_15: int
+  db_occlusion_count1_low_15: int
+  db_occlusion_count1_hi_15: int
+  db_occlusion_count2_low_15: int
+  db_occlusion_count2_hi_15: int
+  db_occlusion_count3_low_15: int
+  db_occlusion_count3_hi_15: int
+  db_occlusion_count0_low_16: int
+  db_occlusion_count0_hi_16: int
+  db_occlusion_count1_low_16: int
+  db_occlusion_count1_hi_16: int
+  db_occlusion_count2_low_16: int
+  db_occlusion_count2_hi_16: int
+  db_occlusion_count3_low_16: int
+  db_occlusion_count3_hi_16: int
+  db_occlusion_count0_low_17: int
+  db_occlusion_count0_hi_17: int
+  db_occlusion_count1_low_17: int
+  db_occlusion_count1_hi_17: int
+  db_occlusion_count2_low_17: int
+  db_occlusion_count2_hi_17: int
+  db_occlusion_count3_low_17: int
+  db_occlusion_count3_hi_17: int
+  reserved_492: int
+  reserved_493: int
+  reserved_494: int
+  reserved_495: int
+  reserved_496: int
+  reserved_497: int
+  reserved_498: int
+  reserved_499: int
+  reserved_500: int
+  reserved_501: int
+  reserved_502: int
+  reserved_503: int
+  reserved_504: int
+  reserved_505: int
+  reserved_506: int
+  reserved_507: int
+  reserved_508: int
+  reserved_509: int
+  reserved_510: int
+  reserved_511: int
+struct_v11_gfx_mqd.register_fields([('shadow_base_lo', ctypes.c_uint32, 0), ('shadow_base_hi', ctypes.c_uint32, 4), ('gds_bkup_base_lo', ctypes.c_uint32, 8), ('gds_bkup_base_hi', ctypes.c_uint32, 12), ('fw_work_area_base_lo', ctypes.c_uint32, 16), ('fw_work_area_base_hi', ctypes.c_uint32, 20), ('shadow_initialized', ctypes.c_uint32, 24), ('ib_vmid', ctypes.c_uint32, 28), ('reserved_8', ctypes.c_uint32, 32), ('reserved_9', ctypes.c_uint32, 36), ('reserved_10', ctypes.c_uint32, 40), ('reserved_11', ctypes.c_uint32, 44), ('reserved_12', ctypes.c_uint32, 48), ('reserved_13', ctypes.c_uint32, 52), ('reserved_14', ctypes.c_uint32, 56), ('reserved_15', ctypes.c_uint32, 60), ('reserved_16', ctypes.c_uint32, 64), ('reserved_17', ctypes.c_uint32, 68), ('reserved_18', ctypes.c_uint32, 72), ('reserved_19', ctypes.c_uint32, 76), ('reserved_20', ctypes.c_uint32, 80), ('reserved_21', ctypes.c_uint32, 84), ('reserved_22', ctypes.c_uint32, 88), ('reserved_23', ctypes.c_uint32, 92), ('reserved_24', ctypes.c_uint32, 96), ('reserved_25', ctypes.c_uint32, 100), ('reserved_26', ctypes.c_uint32, 104), ('reserved_27'
